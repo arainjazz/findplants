@@ -843,11 +843,19 @@ export function PlantEditor({ initial }: Props) {
           <div className="space-y-2">
             <button
               type="button"
-              onClick={() => htmlInputRef.current?.click()}
+              onClick={() => htmlFolderInputRef.current?.click()}
               disabled={uploadingHtml || extracting}
               className="border border-ink px-4 py-2 hover:bg-ink hover:text-background transition-colors disabled:opacity-60 text-sm"
             >
-              {uploadingHtml ? "上传中…" : extracting ? "AI 识别中…" : "选择 HTML 文件"}
+              {uploadingHtml ? "上传中…" : extracting ? "AI 识别中…" : "选择 HTML 所在文件夹"}
+            </button>
+            <button
+              type="button"
+              onClick={() => htmlInputRef.current?.click()}
+              disabled={uploadingHtml || extracting}
+              className="border border-ink/40 px-4 py-2 hover:bg-paper-deep transition-colors disabled:opacity-60 text-sm ml-2"
+            >
+              仅上传单个 HTML
             </button>
             {htmlUrl && (
               <>
@@ -915,7 +923,7 @@ export function PlantEditor({ initial }: Props) {
             <p className="text-xs text-ink-faint">
               提示：上传后整页将以原样在 iframe 中渲染（保留你的字体与排版）。
               <br />
-              <strong>含本地图片的页面：</strong>直接选中 .html 文件即可——系统会自动解析 HTML 中引用的本地图片路径，并立刻弹出第二个对话框让你一次性选中这些图片，随后自动上传到站内并改写链接，无需逐个核对文件名。
+              <strong>含本地图片的页面：</strong>选择 HTML 所在文件夹后，系统会自动按相对路径匹配图片、上传到站内并改写链接；不会再弹出二次选图窗口。
             </p>
             {htmlUrl && (
               <div className="mt-5 pt-5 border-t border-rule">
