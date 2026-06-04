@@ -928,6 +928,11 @@ export function applyEditMarkers(
   const kindLabel: Record<string, string> = { text: "文字", image: "图片" };
   const applied: AppliedEditMark[] = [];
   for (const [el, info] of entries) {
+    // Skip no-op edits: user merely focused/clicked into the block but never
+    // actually changed any markup. Comparing the current outerHTML (still
+    // pristine — no marker appended yet) to the snapshot taken on the first
+    // dirty event detects this and keeps the audit log clean.
+    if (el.outerHTML === info.beforeHtml) continue;
     maxN += 1;
     el.setAttribute("data-edit-mark-host", "");
     let row = el.querySelector(":scope > .lov-edit-mark-row") as HTMLElement | null;
