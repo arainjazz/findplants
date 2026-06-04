@@ -141,10 +141,10 @@ export function CameraIdentify() {
     <section className="mb-12 border-2 border-ink bg-paper-deep/30 p-6 md:p-8">
       <div className="flex items-start justify-between flex-wrap gap-4 mb-4">
         <div>
-          <p className="label text-vermilion mb-1">Photo → AI</p>
-          <h2 className="font-display text-2xl md:text-3xl font-bold">拍一张植物，让 AI 写一页</h2>
+          <p className="label text-vermilion mb-1">AI copilot · Plantspedia</p>
+          <h2 className="font-display text-2xl md:text-3xl font-bold">让 AI 识别植物身份并向你介绍这位新遇见的朋友吧</h2>
           <p className="text-sm text-ink-faint mt-1">
-            访客也能直接拍摄并生成草稿，等待编辑审核后正式收录。位置信息来自浏览器定位。
+            访客也能直接拍摄并生成草稿，等待编辑审核后正式收录。位置信息来自浏览器定位或照片 EXIF。
           </p>
         </div>
         {coords && (
@@ -158,16 +158,19 @@ export function CameraIdentify() {
         <div className="flex flex-col sm:flex-row gap-3">
           <button
             onClick={startCamera}
-            className="flex-1 bg-ink text-background px-6 py-3 hover:bg-vermilion transition-colors font-semibold"
+            className="flex-1 bg-ink text-background px-6 py-3 hover:bg-vermilion transition-colors font-semibold inline-flex items-center justify-center gap-2"
           >
-            📷 打开摄像头拍照
+            <CameraIcon className="w-5 h-5" />
+            <span>打开摄像头拍照</span>
           </button>
-          <label className="flex-1 border-2 border-ink px-6 py-3 hover:bg-ink hover:text-background transition-colors text-center cursor-pointer font-semibold">
-            🖼 从相册选择
+          <label className="flex-1 border-2 border-ink px-6 py-3 hover:bg-ink hover:text-background transition-colors text-center cursor-pointer font-semibold inline-flex items-center justify-center gap-2">
+            <GalleryIcon className="w-5 h-5" />
+            <span>从相册选择</span>
             <input type="file" accept="image/*" capture="environment" className="hidden" onChange={onUpload} />
           </label>
         </div>
       )}
+
 
       {(phase === "permission" || phase === "ready") && (
         <div>
