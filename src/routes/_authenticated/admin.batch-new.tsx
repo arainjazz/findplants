@@ -9,6 +9,7 @@ import { useAuth } from "@/hooks/use-auth";
 import { slugify } from "@/lib/plants";
 import { IUCN_CATEGORIES } from "@/lib/catalogs";
 import { HtmlDocEditor, type HtmlDocEditorHandle, ImageSearchDialog } from "@/components/html-doc-editor";
+import { findLocalAssetRefs, rewriteLocalAssetPaths } from "@/components/plant-editor";
 
 export const Route = createFileRoute("/_authenticated/admin/batch-new")({
   component: BatchNewPage,
