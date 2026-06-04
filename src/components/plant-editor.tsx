@@ -402,13 +402,17 @@ export function PlantEditor({ initial }: Props) {
   };
 
   // Finalize: rewrite refs (if image map provided) and upload HTML to storage.
-  const finalizeHtmlUpload = async (htmlFile: File, text: string, imageFiles: File[]) => {
+  const finalizeHtmlUpload = async (htmlFile: File, text: string, matchedImages: Map<string, File>) => {
     let finalText = text;
-    if (imageFiles.length > 0) {
-      toast.message(`正在上传 ${imageFiles.length} 张配图…`);
+    if (matchedImages.size > 0) {
+      const uniqueFiles = Array.from(new Set(matchedImages.values()));
+      toast.message(`正在上传 ${uniqueFiles.length} 张配图…`);
       const nameMap = new Map<string, string>();
-      for (const img of imageFiles) {
-        const url = await uploadFile(img, "plant-images");
+      const uploaded = await Promise.all(uniqueFiles.map(async (img) => [img, await uploadFile(img, "plant-images")] as const));
+      const fileToUrl = new Map<File, string>(uploaded);
+      for (const [ref, img] of matchedImages.entries()) {
+        const url = fileToUrl.get(img)!;
+        nameMap.set(ref, url);
         nameMap.set(img.name, url);
         const rel = (img as File & { webkitRelativePath?: string }).webkitRelativePath;
         if (rel) {
@@ -418,7 +422,7 @@ export function PlantEditor({ initial }: Props) {
         }
       }
       finalText = rewriteLocalAssetPaths(text, nameMap);
-      toast.success(`已重写 HTML 中的本地图片路径（${imageFiles.length} 张）`);
+      toast.success(`已重写 HTML 中的本地图片路径（${uniqueFiles.length} 张）`);
     }
     const finalHtmlFile = new File([finalText], htmlFile.name, { type: "text/html" });
     const uploadedUrl = await uploadFile(finalHtmlFile, "plant-html");
@@ -431,16 +435,7 @@ export function PlantEditor({ initial }: Props) {
   const isImageFile = (file: File) =>
     file.type.startsWith("image/") || /\.(png|jpe?g|webp|gif|svg|avif|bmp|tiff?)$/i.test(file.name);
 
-  const assetLookupKeys = (value: string) => {
-    const cleaned = value.split(/[?#]/)[0].replace(/\\/g, "/").replace(/^\.?\/+/, "");
-    const keys = new Set([cleaned, cleaned.split("/").pop() || ""]);
-    try {
-      const decoded = decodeURIComponent(cleaned);
-      keys.add(decoded);
-      keys.add(decoded.split("/").pop() || "");
-    } catch { /* ignore */ }
-    return Array.from(keys).filter(Boolean).map((k) => k.toLowerCase());
-  };
+  const assetLookupKeys = (value: string) => buildAssetLookupKeys(value);
 
   // Match each local HTML ref (e.g. "images/leaf.jpg") to one of the user-selected image files.
   const matchRefsToFiles = (refs: string[], imageFiles: File[]) => {
@@ -454,11 +449,11 @@ export function PlantEditor({ initial }: Props) {
         filesByName.set(parts.slice(i).join("/").toLowerCase(), f);
       }
     }
-    const matched = new Set<File>();
+    const matched = new Map<string, File>();
     const missing: string[] = [];
     for (const ref of refs) {
       const file = assetLookupKeys(ref).map((k) => filesByName.get(k)).find(Boolean);
-      if (file) matched.add(file);
+      if (file) matched.set(ref, file);
       else missing.push(ref);
     }
     return { matched, missing };
@@ -482,7 +477,11 @@ export function PlantEditor({ initial }: Props) {
           { duration: 6000 },
         );
       }
-      await finalizeHtmlUpload(htmlFile, text, Array.from(matched));
+      if (localRefs.length > 0 && matched.size === 0) {
+        toast.error("HTML 中有本地图片引用，但未在所选文件中找到图片。请直接选择 HTML 所在文件夹，系统会自动匹配并上传。", { duration: 8000 });
+        return;
+      }
+      await finalizeHtmlUpload(htmlFile, text, matched);
     } catch (err) {
       toast.error((err as Error).message);
     } finally {
