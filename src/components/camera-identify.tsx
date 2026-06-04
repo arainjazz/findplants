@@ -229,3 +229,26 @@ function blobToBase64(blob: Blob): Promise<string> {
     reader.readAsDataURL(blob);
   });
 }
+
+// Flat-style inline SVG icons (stroke = currentColor so they inherit theme).
+function CameraIcon({ className }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6"
+      strokeLinecap="round" strokeLinejoin="round" className={className} aria-hidden="true">
+      <path d="M3 8.5A2.5 2.5 0 0 1 5.5 6h2l1.2-2h6.6L16.5 6h2A2.5 2.5 0 0 1 21 8.5v9A2.5 2.5 0 0 1 18.5 20h-13A2.5 2.5 0 0 1 3 17.5v-9Z"/>
+      <circle cx="12" cy="13" r="3.6"/>
+    </svg>
+  );
+}
+
+function GalleryIcon({ className }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6"
+      strokeLinecap="round" strokeLinejoin="round" className={className} aria-hidden="true">
+      <rect x="3.5" y="4.5" width="17" height="13" rx="2"/>
+      <circle cx="8.5" cy="9" r="1.4"/>
+      <path d="m4 16 4.5-4.5 4 4 3-3L20 17"/>
+    </svg>
+  );
+}
+
