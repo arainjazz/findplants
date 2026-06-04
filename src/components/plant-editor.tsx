@@ -31,13 +31,7 @@ export function PlantEditor({ initial }: Props) {
   const navigate = useNavigate();
   const qc = useQueryClient();
   const htmlInputRef = useRef<HTMLInputElement>(null);
-  const imageInputRef = useRef<HTMLInputElement>(null);
-  const pendingHtmlRef = useRef<{
-    file: File;
-    text: string;
-    matched: Set<File>;
-    missing: string[];
-  } | null>(null);
+  const htmlFolderInputRef = useRef<HTMLInputElement>(null);
   const hydratedDraftRef = useRef(false);
   const draftKey = `plant-editor-draft:${initial?.id ?? "new"}`;
 
@@ -463,40 +457,20 @@ export function PlantEditor({ initial }: Props) {
     e.target.value = "";
     if (files.length === 0) return;
     const htmlFile = files.find((f) => /\.html?$/i.test(f.name) || f.type === "text/html");
-    if (!htmlFile) return toast.error("请选择 .html 文件（也可同时多选本地图片或整个文件夹）");
+    if (!htmlFile) return toast.error("请选择 .html 文件，或选择包含 HTML 与图片的文件夹");
     setUploadingHtml(true);
     try {
       const text = await htmlFile.text();
       const localRefs = findLocalAssetRefs(text);
       const imageFiles = files.filter((f) => f !== htmlFile && f.type.startsWith("image/"));
       const { matched, missing } = matchRefsToFiles(localRefs, imageFiles);
-      if (localRefs.length === 0 || missing.length === 0) {
-        await finalizeHtmlUpload(htmlFile, text, Array.from(matched));
-        return;
+      if (missing.length > 0) {
+        toast.message(
+          `已自动匹配 ${matched.size} 张配图；${missing.length} 张未在本次选择中找到。选择 HTML 所在文件夹可一次性自动上传全部配图。`,
+          { duration: 6000 },
+        );
       }
-      // Auto-prompt the user to pick the still-missing images, no need to know exact names.
-      pendingHtmlRef.current = { file: htmlFile, text, matched, missing };
-      toast.message(
-        `HTML 中引用了 ${missing.length} 张本地图片（${missing.slice(0, 2).join("、")}${missing.length > 2 ? "…" : ""}），请一次性选中它们`,
-        { duration: 6000 },
-      );
-      imageInputRef.current?.click();
-    } catch (err) {
-      toast.error((err as Error).message);
-      setUploadingHtml(false);
-    }
-  };
-
-  const onPendingImagesPicked = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = Array.from(e.target.files ?? []);
-    e.target.value = "";
-    const pending = pendingHtmlRef.current;
-    pendingHtmlRef.current = null;
-    if (!pending) return;
-    try {
-      const { matched: extra } = matchRefsToFiles(pending.missing, files);
-      const all = new Set<File>([...pending.matched, ...extra]);
-      await finalizeHtmlUpload(pending.file, pending.text, Array.from(all));
+      await finalizeHtmlUpload(htmlFile, text, Array.from(matched));
     } catch (err) {
       toast.error((err as Error).message);
     } finally {
