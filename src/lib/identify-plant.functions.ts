@@ -16,18 +16,17 @@ async function callAiIdentify(photoDataUrl: string, hintPlace: string): Promise<
   const key = process.env.LOVABLE_API_KEY;
   if (!key) throw new Error("LOVABLE_API_KEY 未配置");
 
-  const systemPrompt = `你是植物图鉴编辑助手。给定一张实地拍摄的植物照片（可选附带拍摄地点），请尽你所能识别物种，并按 emit_plant_draft 工具返回中英双语的科普草稿。
-要求：
-- 中文段落使用 Noto Serif SC 风格的正式植物志措辞，每段 150–300 字。
-- 英文段落为对应中文段落的精炼意译，70–150 词。
-- summary：一段总览，体现植物名、所属科属、最显著的形态/生态特征。
-- name_origin：解释中文名与拉丁学名（Zizania, latifolia 这种）的含义和命名史，如不确定可基于词源给出最合理推断。
-- morphology：描述根/茎/叶/花/果等关键形态。
-- habitat：描述其常见生境与分布范围，并在中文段落里自然带出"本次拍摄于 ${hintPlace || "（未知地点）"}"这一信息。
-- culture：描述文化、食用、药用或园艺利用，若该物种无相关用途则简述生态角色。
-- tags：3–8 个简短标签（中英文均可），用于站内检索，如「水生」「禾本科」「多年生」「invasive」等。
-- iucn_status：仅在你有充分把握时填入 LC/NT/VU/EN/CR/DD 之一，否则留空字符串。
-- 若识别不确定，仍要给出最可能的物种，并在 summary 中标注"疑似"。`;
+  const systemPrompt = `你是 Plantspedia 的资深植物图鉴编辑。给定一张实地拍摄的植物照片（可选附带拍摄地点），请尽你所能识别物种，并按 emit_plant_draft 工具返回一份**完整、信息密度高**的中英双语科普草稿——直接对标 Plantspedia 已收录的精品条目（如「戈壁天门冬」）。
+内容要求（请逐条满足，缺一不可）：
+- summary_zh：180–280 字，一段总览，必须包含中文名、所属科属、拉丁学名、典型形态、生境概要、识别要点；如不确定物种，开头使用「疑似……」并说明判断依据。summary_en：60–110 词的精炼意译。
+- name_origin_zh：220–360 字，分两部分：① 中文名（俗名、古名、地方名）的字源、典籍出处；② 拉丁学名属名 + 种加词的词根含义、命名人/命名年代背景。name_origin_en：80–140 词。
+- morphology_zh：320–500 字，按 株型/根 → 茎 → 叶 → 花 → 果实/种子 顺序描述，包含具体数值（如高度 cm、叶长 mm、花期月份）。morphology_en：100–160 词。
+- habitat_zh：260–400 字，包含：典型生境与海拔/土壤、世界分布范围、中国分布省份、本次拍摄地点的生态记录（必须自然带入「本次拍摄于 ${hintPlace || "（未知地点）"}」一句）。habitat_en：90–140 词。
+- culture_zh：260–400 字，包含：① 文化/民俗/文学引用；② 食用、药用、园艺、生态等实用价值；③ 保护与威胁。如该物种无相关用途，请详述其生态角色与近缘种对比。culture_en：90–140 词。
+- tags：5–10 个简短中文/英文标签，用于站内检索，如「水生」「禾本科」「多年生」「invasive」「荒漠植物」。
+- iucn_status：仅在你**确有把握**时填入 LC/NT/VU/EN/CR/DD 之一，否则留空字符串。
+- 所有中文段落采用 Noto Serif SC 风格的正式植物志措辞，避免空话套话；英文段落为对应中文段落的精炼意译，保留拉丁学名斜体（用 *Genus species* 标记）。
+- 若识别不确定，仍要给出最可能的物种，并在 summary 标注「疑似」。`;
 
   const body = {
     model: AI_MODEL,
@@ -38,13 +37,13 @@ async function callAiIdentify(photoDataUrl: string, hintPlace: string): Promise<
         content: [
           {
             type: "text",
-            text: `请识别这张植物照片。${hintPlace ? `拍摄地点：${hintPlace}。` : ""}请直接调用工具返回结构化结果。`,
+            text: `请识别这张植物照片。${hintPlace ? `拍摄地点：${hintPlace}。` : ""}请直接调用工具返回完整的结构化结果，所有字段都必须按指定字数填满，不要省略任何段落。`,
           },
           { type: "image_url", image_url: { url: photoDataUrl } },
         ],
       },
     ],
-    max_tokens: 16000,
+    max_tokens: 32000,
     tools: [
       {
         type: "function",

@@ -92,80 +92,131 @@ export function SiteHeader() {
     };
   }, [isEditorOrAdmin, qc]);
 
+  const [menuOpen, setMenuOpen] = useState(false);
+
   return (
     <header className="border-b border-ink/80 bg-background/70 backdrop-blur-sm">
-      <div className="mx-auto max-w-[min(100vw-2rem,1800px)] px-6 py-3 flex items-center justify-between gap-4 flex-wrap">
-        <nav className="flex items-center gap-x-4 gap-y-2 text-sm flex-wrap">
-          <Link to="/" className="flex items-center gap-2 mr-2" aria-label="Plantspedia 首页">
-            <img src={logoUrl} alt="Plantspedia" className="w-8 h-8 object-contain" />
-          </Link>
+      <div className="mx-auto max-w-[min(100vw-2rem,1800px)] px-4 md:px-6 py-3 flex items-center gap-3 md:gap-4">
+        {/* Logo — always visible, links home */}
+        <Link to="/" className="flex items-center gap-2 shrink-0" aria-label="Plantspedia 首页" onClick={() => setMenuOpen(false)}>
+          <img src={logoUrl} alt="Plantspedia" className="w-8 h-8 object-contain" />
+        </Link>
+
+        {/* Search — always visible, grows on mobile */}
+        <form
+          onSubmit={(e) => {
+            e.preventDefault();
+            if (!q.trim()) return;
+            setMenuOpen(false);
+            navigate({ to: "/search", search: { q: q.trim() } });
+          }}
+          className="flex items-center flex-1 min-w-0"
+        >
+          <input
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            placeholder="搜索全文…"
+            className="border border-ink/40 px-3 py-1 text-sm bg-transparent focus:outline-none focus:border-vermilion w-full md:w-48"
+          />
+        </form>
+
+        {/* Desktop full nav */}
+        <nav className="hidden md:flex items-center gap-x-4 text-sm">
           <Link to="/" className="hover:text-vermilion transition-colors" activeProps={{ className: "font-semibold" }}>首页</Link>
-          <form
-            onSubmit={(e) => {
-              e.preventDefault();
-              if (!q.trim()) return;
-              navigate({ to: "/search", search: { q: q.trim() } });
-            }}
-            className="flex items-center"
-          >
-            <input
-              value={q}
-              onChange={(e) => setQ(e.target.value)}
-              placeholder="搜索全文…"
-              className="border border-ink/40 px-3 py-1 text-sm bg-transparent focus:outline-none focus:border-vermilion w-48"
-            />
-          </form>
-        </nav>
-        <nav className="flex items-center justify-end gap-x-4 gap-y-2 text-sm flex-wrap">
           <Link to="/plants" className="hover:text-vermilion transition-colors" activeProps={{ className: "font-semibold" }}>已收录档案检索</Link>
           <Link to="/blog" className="hover:text-vermilion transition-colors" activeProps={{ className: "font-semibold" }}>编辑博客</Link>
           <Link to="/edits" className="hover:text-vermilion transition-colors" activeProps={{ className: "font-semibold" }}>修改记录</Link>
+          {user && isEditorOrAdmin && (
+            <Link to="/" hash="drafts" className="relative hover:text-vermilion transition-colors" title="待审核 AI 草稿">
+              待审草稿
+              {pendingDraftCount > 0 && (
+                <span className="absolute -top-2 -right-3 bg-vermilion text-background text-[10px] leading-none px-1.5 py-0.5 rounded-full">
+                  {pendingDraftCount}
+                </span>
+              )}
+            </Link>
+          )}
+          {user && isAdmin && (
+            <Link to="/admin/applications" className="relative hover:text-vermilion transition-colors" title="编辑申请审核">
+              编辑申请
+              {pendingCount > 0 && (
+                <span className="absolute -top-2 -right-3 bg-vermilion text-background text-[10px] leading-none px-1.5 py-0.5 rounded-full">
+                  {pendingCount}
+                </span>
+              )}
+            </Link>
+          )}
+          {user && <Link to="/admin" className="hover:text-vermilion transition-colors">管理</Link>}
+          {user && isAdmin && <AdminExportButton />}
+        </nav>
+
+        {/* Login / logout — always visible */}
+        <div className="hidden sm:flex items-center gap-2 text-sm shrink-0">
           {user ? (
-            <>
-              {isEditorOrAdmin && (
-                <Link
-                  to="/"
-                  hash="drafts"
-                  className="relative hover:text-vermilion transition-colors"
-                  title="待审核 AI 草稿"
-                >
-                  待审草稿
-                  {pendingDraftCount > 0 && (
-                    <span className="absolute -top-2 -right-3 bg-vermilion text-background text-[10px] leading-none px-1.5 py-0.5 rounded-full">
-                      {pendingDraftCount}
-                    </span>
-                  )}
-                </Link>
-              )}
-              {isAdmin && (
-                <Link
-                  to="/admin/applications"
-                  className="relative hover:text-vermilion transition-colors"
-                  title="编辑申请审核"
-                >
-                  编辑申请
-                  {pendingCount > 0 && (
-                    <span className="absolute -top-2 -right-3 bg-vermilion text-background text-[10px] leading-none px-1.5 py-0.5 rounded-full">
-                      {pendingCount}
-                    </span>
-                  )}
-                </Link>
-              )}
-              <Link to="/admin" className="hover:text-vermilion transition-colors">管理</Link>
-              <button onClick={() => signOut()} className="text-ink-faint hover:text-ink transition-colors">退出</button>
-              {isAdmin && <AdminExportButton />}
-            </>
+            <button onClick={() => signOut()} className="text-ink-faint hover:text-ink transition-colors">退出</button>
           ) : (
             <>
-              <Link to="/signup" className="rounded border border-ink px-3 py-1 hover:bg-ink hover:text-background transition-colors">申请成为编辑</Link>
+              <Link to="/signup" className="hidden md:inline-block rounded border border-ink px-3 py-1 hover:bg-ink hover:text-background transition-colors">申请成为编辑</Link>
               <Link to="/login" className="rounded border border-ink px-3 py-1 hover:bg-ink hover:text-background transition-colors">登录</Link>
             </>
           )}
-        </nav>
+        </div>
+
+        {/* Mobile hamburger */}
+        <button
+          type="button"
+          aria-label="菜单"
+          onClick={() => setMenuOpen((v) => !v)}
+          className="md:hidden relative w-9 h-9 inline-flex items-center justify-center border border-ink/40 hover:bg-paper-deep shrink-0"
+        >
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round">
+            {menuOpen ? (
+              <>
+                <path d="M5 5l14 14" />
+                <path d="M19 5L5 19" />
+              </>
+            ) : (
+              <>
+                <path d="M3.5 7h17" />
+                <path d="M3.5 12h17" />
+                <path d="M3.5 17h17" />
+              </>
+            )}
+          </svg>
+          {(pendingDraftCount + pendingCount) > 0 && !menuOpen && (
+            <span className="absolute -top-1 -right-1 bg-vermilion text-background text-[10px] leading-none px-1.5 py-0.5 rounded-full">
+              {pendingDraftCount + pendingCount}
+            </span>
+          )}
+        </button>
       </div>
+
+      {/* Mobile drawer */}
+      {menuOpen && (
+        <nav className="md:hidden border-t border-ink/30 bg-background px-4 py-3 flex flex-col gap-3 text-sm">
+          <Link to="/" onClick={() => setMenuOpen(false)} className="hover:text-vermilion">首页</Link>
+          <Link to="/plants" onClick={() => setMenuOpen(false)} className="hover:text-vermilion">已收录档案检索</Link>
+          <Link to="/blog" onClick={() => setMenuOpen(false)} className="hover:text-vermilion">编辑博客</Link>
+          <Link to="/edits" onClick={() => setMenuOpen(false)} className="hover:text-vermilion">修改记录</Link>
+          {user && isEditorOrAdmin && (
+            <Link to="/" hash="drafts" onClick={() => setMenuOpen(false)} className="hover:text-vermilion">
+              待审草稿{pendingDraftCount > 0 && <span className="ml-2 bg-vermilion text-background text-[10px] px-1.5 py-0.5 rounded-full">{pendingDraftCount}</span>}
+            </Link>
+          )}
+          {user && isAdmin && (
+            <Link to="/admin/applications" onClick={() => setMenuOpen(false)} className="hover:text-vermilion">
+              编辑申请{pendingCount > 0 && <span className="ml-2 bg-vermilion text-background text-[10px] px-1.5 py-0.5 rounded-full">{pendingCount}</span>}
+            </Link>
+          )}
+          {user && <Link to="/admin" onClick={() => setMenuOpen(false)} className="hover:text-vermilion">管理</Link>}
+          {!user && <Link to="/signup" onClick={() => setMenuOpen(false)} className="hover:text-vermilion">申请成为编辑</Link>}
+          {user && <button onClick={() => { setMenuOpen(false); signOut(); }} className="text-left text-ink-faint hover:text-ink">退出</button>}
+        </nav>
+      )}
     </header>
   );
 }
+
 
 export function SiteFooter() {
   return (
