@@ -829,7 +829,7 @@ export function PlantEditor({ initial }: Props) {
               checked={contentType === "html"}
               onChange={() => {
                 setContentType("html");
-                htmlInputRef.current?.click();
+                htmlFolderInputRef.current?.click();
               }}
             />
             上传 HTML 文件
