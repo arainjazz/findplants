@@ -449,7 +449,7 @@ function BatchNewPage() {
 
         {items.length === 0 ? (
           <div className="border border-dashed border-rule py-20 text-center text-ink-faint">
-            <p className="mb-4">选择多个 HTML 文件开始批量录入。</p>
+            <p className="mb-4">选择多个 HTML 文件开始批量录入；含本地图片的 HTML，系统会自动检测并弹出二次选择框统一上传配图，无需重命名或逐个匹配。</p>
             <button
               onClick={() => fileRef.current?.click()}
               className="border border-ink px-4 py-2 hover:bg-ink hover:text-background transition-colors"
