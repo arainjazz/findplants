@@ -142,8 +142,8 @@ export function CameraIdentify() {
       <div className="flex items-start justify-between flex-wrap gap-4 mb-4">
         <div className="min-w-0 flex-1">
           <p className="label text-vermilion mb-1">AI copilot · Plantspedia</p>
-          <FitOneLine className="text-ink block w-full font-serif" weight={400} aspect={0.03}>让 AI 识别植物身份并向你介绍这位新遇见的朋友吧</FitOneLine>
-          <FitOneLine className="text-ink-faint block w-full mt-1 font-serif" weight={400} aspect={0.022}>访客也能直接拍摄并生成草稿，等待编辑审核后正式收录。</FitOneLine>
+          <FitOneLine className="text-ink block w-full" weight={400} aspect={0.03} family="var(--font-serif)">让 AI 识别植物身份并向你介绍这位新遇见的朋友吧</FitOneLine>
+          <FitOneLine className="text-ink-faint block w-full mt-1" weight={400} aspect={0.022} family="var(--font-serif)">访客也能直接拍摄并生成草稿，等待编辑审核后正式收录。</FitOneLine>
         </div>
         {coords && (
           <p className="label text-xs text-ink-faint inline-flex items-center gap-1">
