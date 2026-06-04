@@ -122,6 +122,21 @@ export function SiteHeader() {
           <Link to="/edits" className="hover:text-vermilion transition-colors" activeProps={{ className: "font-semibold" }}>修改记录</Link>
           {user ? (
             <>
+              {isEditorOrAdmin && (
+                <Link
+                  to="/"
+                  hash="drafts"
+                  className="relative hover:text-vermilion transition-colors"
+                  title="待审核 AI 草稿"
+                >
+                  待审草稿
+                  {pendingDraftCount > 0 && (
+                    <span className="absolute -top-2 -right-3 bg-vermilion text-background text-[10px] leading-none px-1.5 py-0.5 rounded-full">
+                      {pendingDraftCount}
+                    </span>
+                  )}
+                </Link>
+              )}
               {isAdmin && (
                 <Link
                   to="/admin/applications"
