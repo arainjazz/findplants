@@ -49,12 +49,26 @@ function BatchNewPage() {
   const editorRefs = useRef<Map<string, HtmlDocEditorHandle | null>>(new Map());
 
   // Build a normalized lookup of image files by name + relative path suffixes.
+  const isImageFile = (file: File) =>
+    file.type.startsWith("image/") || /\.(png|jpe?g|webp|gif|svg|avif|bmp|tiff?)$/i.test(file.name);
+
+  const assetLookupKeys = (value: string) => {
+    const cleaned = value.split(/[?#]/)[0].replace(/\\/g, "/").replace(/^\.?\/+/, "");
+    const keys = new Set([cleaned, cleaned.split("/").pop() || ""]);
+    try {
+      const decoded = decodeURIComponent(cleaned);
+      keys.add(decoded);
+      keys.add(decoded.split("/").pop() || "");
+    } catch { /* ignore */ }
+    return Array.from(keys).filter(Boolean).map((k) => k.toLowerCase());
+  };
+
   const indexImageFiles = (imageFiles: File[]) => {
     const idx = new Map<string, File>();
     for (const f of imageFiles) {
-      const rel = (f as File & { webkitRelativePath?: string }).webkitRelativePath || f.name;
-      idx.set(rel.toLowerCase(), f);
-      idx.set(f.name.toLowerCase(), f);
+      const rel = ((f as File & { webkitRelativePath?: string }).webkitRelativePath || f.name).replace(/\\/g, "/");
+      assetLookupKeys(rel).forEach((k) => idx.set(k, f));
+      assetLookupKeys(f.name).forEach((k) => idx.set(k, f));
       const parts = rel.split("/");
       for (let i = 1; i < parts.length; i++) idx.set(parts.slice(i).join("/").toLowerCase(), f);
     }
@@ -65,8 +79,7 @@ function BatchNewPage() {
     const matched = new Map<string, File>();
     const missing: string[] = [];
     for (const ref of refs) {
-      const cleaned = ref.split(/[?#]/)[0].replace(/^\.?\//, "").toLowerCase();
-      const file = idx.get(cleaned) || idx.get(cleaned.split("/").pop() || "");
+      const file = assetLookupKeys(ref).map((k) => idx.get(k)).find(Boolean);
       if (file) matched.set(ref, file);
       else missing.push(ref);
     }
@@ -162,7 +175,7 @@ function BatchNewPage() {
     setUploading(true);
     try {
       const htmlFiles = files.filter((f) => /\.html?$/i.test(f.name) || f.type === "text/html");
-      const imageFiles = files.filter((f) => f.type.startsWith("image/"));
+      const imageFiles = files.filter((f) => isImageFile(f));
       if (htmlFiles.length === 0) {
         toast.error("请至少选择一个 .html 文件，或选择包含 HTML 与图片的文件夹");
         return;
