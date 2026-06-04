@@ -1142,6 +1142,22 @@ function splitSrcset(v: string): string[] {
   return v.split(",").map((s) => s.trim().split(/\s+/)[0]).filter(Boolean);
 }
 
+export function buildAssetLookupKeys(value: string): string[] {
+  const cleaned = value.split(/[?#]/)[0].replace(/\\/g, "/").replace(/^file:\/\/+/, "").replace(/^\.?\/+/, "");
+  const variants = new Set<string>();
+  const add = (v: string) => {
+    if (!v) return;
+    const normalized = v.replace(/\\/g, "/").replace(/^\.?\/+/, "");
+    variants.add(normalized);
+    variants.add(normalized.split("/").pop() || "");
+    const parts = normalized.split("/").filter(Boolean);
+    for (let i = 1; i < parts.length; i++) variants.add(parts.slice(i).join("/"));
+  };
+  add(cleaned);
+  try { add(decodeURIComponent(cleaned)); } catch { /* ignore */ }
+  return Array.from(variants).filter(Boolean).map((k) => k.toLowerCase());
+}
+
 export function findLocalAssetRefs(html: string): string[] {
   const out = new Set<string>();
   let m: RegExpExecArray | null;
