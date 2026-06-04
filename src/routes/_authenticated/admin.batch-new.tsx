@@ -40,10 +40,7 @@ function BatchNewPage() {
   const navigate = useNavigate();
   const qc = useQueryClient();
   const fileRef = useRef<HTMLInputElement>(null);
-  const imageRef = useRef<HTMLInputElement>(null);
-  const pendingRef = useRef<{
-    htmlFiles: { file: File; text: string; missing: string[]; matched: Map<string, File> }[];
-  } | null>(null);
+  const htmlOnlyRef = useRef<HTMLInputElement>(null);
   const [items, setItems] = useState<Item[]>([]);
   const [uploading, setUploading] = useState(false);
   const [fullscreen, setFullscreen] = useState(false);
@@ -52,12 +49,26 @@ function BatchNewPage() {
   const editorRefs = useRef<Map<string, HtmlDocEditorHandle | null>>(new Map());
 
   // Build a normalized lookup of image files by name + relative path suffixes.
+  const isImageFile = (file: File) =>
+    file.type.startsWith("image/") || /\.(png|jpe?g|webp|gif|svg|avif|bmp|tiff?)$/i.test(file.name);
+
+  const assetLookupKeys = (value: string) => {
+    const cleaned = value.split(/[?#]/)[0].replace(/\\/g, "/").replace(/^\.?\/+/, "");
+    const keys = new Set([cleaned, cleaned.split("/").pop() || ""]);
+    try {
+      const decoded = decodeURIComponent(cleaned);
+      keys.add(decoded);
+      keys.add(decoded.split("/").pop() || "");
+    } catch { /* ignore */ }
+    return Array.from(keys).filter(Boolean).map((k) => k.toLowerCase());
+  };
+
   const indexImageFiles = (imageFiles: File[]) => {
     const idx = new Map<string, File>();
     for (const f of imageFiles) {
-      const rel = (f as File & { webkitRelativePath?: string }).webkitRelativePath || f.name;
-      idx.set(rel.toLowerCase(), f);
-      idx.set(f.name.toLowerCase(), f);
+      const rel = ((f as File & { webkitRelativePath?: string }).webkitRelativePath || f.name).replace(/\\/g, "/");
+      assetLookupKeys(rel).forEach((k) => idx.set(k, f));
+      assetLookupKeys(f.name).forEach((k) => idx.set(k, f));
       const parts = rel.split("/");
       for (let i = 1; i < parts.length; i++) idx.set(parts.slice(i).join("/").toLowerCase(), f);
     }
@@ -68,8 +79,7 @@ function BatchNewPage() {
     const matched = new Map<string, File>();
     const missing: string[] = [];
     for (const ref of refs) {
-      const cleaned = ref.split(/[?#]/)[0].replace(/^\.?\//, "").toLowerCase();
-      const file = idx.get(cleaned) || idx.get(cleaned.split("/").pop() || "");
+      const file = assetLookupKeys(ref).map((k) => idx.get(k)).find(Boolean);
       if (file) matched.set(ref, file);
       else missing.push(ref);
     }
@@ -165,9 +175,9 @@ function BatchNewPage() {
     setUploading(true);
     try {
       const htmlFiles = files.filter((f) => /\.html?$/i.test(f.name) || f.type === "text/html");
-      const imageFiles = files.filter((f) => f.type.startsWith("image/"));
+      const imageFiles = files.filter((f) => isImageFile(f));
       if (htmlFiles.length === 0) {
-        toast.error("请至少选择一个 .html 文件（可同时多选本地图片或整个文件夹）");
+        toast.error("请至少选择一个 .html 文件，或选择包含 HTML 与图片的文件夹");
         return;
       }
       const idx = indexImageFiles(imageFiles);
@@ -180,41 +190,14 @@ function BatchNewPage() {
         parsed.push({ file: f, text, matched, missing });
       }
       const totalMissing = parsed.reduce((n, p) => n + p.missing.length, 0);
-      if (totalMissing === 0) {
-        await finalizeBatch(parsed.map(({ file, text, matched }) => ({ file, text, matched })));
-        return;
+      if (totalMissing > 0) {
+        const matchedCount = parsed.reduce((n, p) => n + p.matched.size, 0);
+        toast.message(
+          `已自动匹配 ${matchedCount} 张配图；${totalMissing} 张未在本次选择中找到。选择 HTML 所在文件夹可一次性自动上传全部配图。`,
+          { duration: 6000 },
+        );
       }
-      // Auto-prompt for missing images in one combined picker.
-      pendingRef.current = { htmlFiles: parsed };
-      const sample = parsed.flatMap((p) => p.missing).slice(0, 3);
-      toast.message(
-        `批量 HTML 中共有 ${totalMissing} 张本地图片未找到（如 ${sample.join("、")}），请一次性选中它们`,
-        { duration: 6000 },
-      );
-      imageRef.current?.click();
-    } catch (err) {
-      toast.error((err as Error).message);
-    } finally {
-      setUploading(false);
-    }
-  };
-
-  const onPickMissingImages = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = Array.from(e.target.files ?? []);
-    e.target.value = "";
-    const pending = pendingRef.current;
-    pendingRef.current = null;
-    if (!pending) return;
-    setUploading(true);
-    try {
-      const idx = indexImageFiles(files);
-      const entries = pending.htmlFiles.map((p) => {
-        const { matched: extra } = resolveRefs(p.missing, idx);
-        const combined = new Map(p.matched);
-        for (const [k, v] of extra.entries()) combined.set(k, v);
-        return { file: p.file, text: p.text, matched: combined };
-      });
-      await finalizeBatch(entries);
+      await finalizeBatch(parsed.map(({ file, text, matched }) => ({ file, text, matched })));
     } catch (err) {
       toast.error((err as Error).message);
     } finally {
@@ -426,35 +409,43 @@ function BatchNewPage() {
               disabled={uploading}
               className="bg-ink text-background px-5 py-2 hover:bg-vermilion transition-colors disabled:opacity-60"
             >
-              {uploading ? "上传中…" : "+ 批量添加 HTML"}
+              {uploading ? "上传中…" : "+ 选择 HTML 所在文件夹"}
+            </button>
+            <button
+              type="button"
+              onClick={() => htmlOnlyRef.current?.click()}
+              disabled={uploading}
+              className="border border-ink/40 px-5 py-2 hover:bg-paper-deep transition-colors disabled:opacity-60"
+            >
+              仅上传 HTML
             </button>
             <input
               ref={fileRef}
+              type="file"
+              multiple
+              {...({ webkitdirectory: "", directory: "" } as React.InputHTMLAttributes<HTMLInputElement> & { webkitdirectory: string; directory: string })}
+              className="sr-only"
+              onChange={onPickFiles}
+            />
+            <input
+              ref={htmlOnlyRef}
               type="file"
               accept=".html,.htm,text/html,image/*"
               multiple
               className="sr-only"
               onChange={onPickFiles}
             />
-            <input
-              ref={imageRef}
-              type="file"
-              accept="image/*"
-              multiple
-              className="sr-only"
-              onChange={onPickMissingImages}
-            />
           </div>
         </div>
 
         {items.length === 0 ? (
           <div className="border border-dashed border-rule py-20 text-center text-ink-faint">
-            <p className="mb-4">选择多个 HTML 文件开始批量录入；含本地图片的 HTML，系统会自动检测并弹出二次选择框统一上传配图，无需重命名或逐个匹配。</p>
+            <p className="mb-4">选择包含 HTML 与图片的文件夹开始批量录入；系统会按 HTML 中的相对路径自动上传配图并改写链接，不再弹出二次选图窗口。</p>
             <button
               onClick={() => fileRef.current?.click()}
               className="border border-ink px-4 py-2 hover:bg-ink hover:text-background transition-colors"
             >
-              + 批量添加 HTML
+              + 选择 HTML 所在文件夹
             </button>
           </div>
         ) : (
