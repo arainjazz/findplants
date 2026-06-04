@@ -1,0 +1,1 @@
+ALTER TABLE public.plants ADD COLUMN IF NOT EXISTS comments_count integer NOT NULL DEFAULT 0;

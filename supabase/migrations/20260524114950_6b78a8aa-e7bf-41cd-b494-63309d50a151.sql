@@ -1,0 +1,1 @@
+REVOKE EXECUTE ON FUNCTION public.scrub_email_like_name() FROM PUBLIC, anon, authenticated;

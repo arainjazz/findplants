@@ -1,0 +1,2 @@
+ALTER TABLE public.plant_edits ADD COLUMN IF NOT EXISTS source text;
+COMMENT ON COLUMN public.plant_edits.source IS 'Origin of the edit: html_editor, plant_editor, batch_upload, catalog_editor, tag_editor, blog_editor, or ai:<model>@<platform>+<entry-point>';

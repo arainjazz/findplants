@@ -1,0 +1,120 @@
+@import "tailwindcss" source(none);
+@source "../src";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-rule: var(--rule);
+  --color-ink: var(--ink);
+  --color-ink-soft: var(--ink-soft);
+  --color-ink-faint: var(--ink-faint);
+  --color-leaf: var(--leaf);
+  --color-leaf-deep: var(--leaf-deep);
+  --color-vermilion: var(--vermilion);
+  --font-display: 'Cormorant Garamond', 'Noto Serif SC', Georgia, serif;
+  --font-serif: 'EB Garamond', 'Noto Serif SC', Georgia, serif;
+  --font-label: 'Cormorant SC', 'Noto Serif SC', serif;
+}
+
+:root {
+  --radius: 0.25rem;
+
+  /* Plantspedia magazine palette */
+  --paper: oklch(0.948 0.018 90);
+  --paper-deep: oklch(0.905 0.025 88);
+  --ink: oklch(0.20 0.01 60);
+  --ink-soft: oklch(0.32 0.012 60);
+  --ink-faint: oklch(0.50 0.018 70);
+  --rule: oklch(0.70 0.045 75);
+  --rule-soft: oklch(0.82 0.030 80);
+  --leaf: oklch(0.52 0.085 140);
+  --leaf-deep: oklch(0.36 0.075 145);
+  --vermilion: oklch(0.55 0.165 30);
+
+  --background: var(--paper);
+  --foreground: var(--ink);
+  --card: oklch(0.97 0.012 90);
+  --card-foreground: var(--ink);
+  --popover: var(--card);
+  --popover-foreground: var(--ink);
+  --primary: var(--leaf-deep);
+  --primary-foreground: oklch(0.97 0.012 90);
+  --secondary: var(--paper-deep);
+  --secondary-foreground: var(--ink);
+  --muted: var(--paper-deep);
+  --muted-foreground: var(--ink-faint);
+  --accent: var(--vermilion);
+  --accent-foreground: oklch(0.97 0.012 90);
+  --destructive: oklch(0.55 0.20 25);
+  --destructive-foreground: oklch(0.97 0.012 90);
+  --border: var(--rule-soft);
+  --input: var(--rule-soft);
+  --ring: var(--leaf);
+}
+
+.dark {
+  --background: oklch(0.18 0.01 60);
+  --foreground: oklch(0.94 0.012 90);
+  --card: oklch(0.22 0.012 60);
+  --card-foreground: oklch(0.94 0.012 90);
+  --primary: oklch(0.94 0.012 90);
+  --primary-foreground: oklch(0.22 0.012 60);
+  --border: oklch(1 0 0 / 12%);
+  --input: oklch(1 0 0 / 15%);
+  --muted: oklch(0.26 0.012 60);
+  --muted-foreground: oklch(0.7 0.018 70);
+}
+
+@layer base {
+  * { border-color: var(--color-border); }
+  html { scroll-behavior: smooth; }
+  body {
+    background-color: var(--color-background);
+    color: var(--color-foreground);
+    font-family: var(--font-serif);
+    font-size: 16px;
+    line-height: 1.7;
+    background-image:
+      radial-gradient(ellipse at 12% 5%, color-mix(in oklch, var(--vermilion) 10%, transparent) 0%, transparent 52%),
+      radial-gradient(ellipse at 88% 92%, color-mix(in oklch, var(--leaf) 12%, transparent) 0%, transparent 55%);
+    min-height: 100vh;
+  }
+  h1, h2, h3, h4 { font-family: var(--font-display); font-weight: 600; letter-spacing: -0.01em; line-height: 1.15; }
+  .label { font-family: var(--font-label); letter-spacing: 0.22em; text-transform: uppercase; font-size: 11px; color: var(--ink-soft); }
+}
+
+/* Slightly tighter typography on small screens — body, headings and
+   editorial labels all step down so long-form articles read comfortably
+   on phones without losing the magazine feel. */
+@media (max-width: 640px) {
+  body { font-size: 14px; line-height: 1.6; }
+  h1 { font-size: 1.85rem; }
+  h2 { font-size: 1.4rem; }
+  h3 { font-size: 1.15rem; }
+  h4 { font-size: 1rem; }
+  .label { font-size: 10px; letter-spacing: 0.18em; }
+}
