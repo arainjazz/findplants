@@ -1064,3 +1064,52 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
     </div>
   );
 }
+
+// ─── Local asset helpers for HTML uploads ───────────────────────────────────
+// Detect <img src>, <source src/srcset>, <link href> and inline url(...) that
+// point to local relative paths (not http/https/data/blob URLs).
+const LOCAL_REF_RE =
+  /(?:src|href)\s*=\s*["']([^"'#?][^"']*)["']|url\(\s*["']?([^"')]+)["']?\s*\)/gi;
+
+function isExternalRef(v: string): boolean {
+  return /^(https?:|data:|blob:|\/\/|#|mailto:|cid:)/i.test(v);
+}
+
+export function findLocalAssetRefs(html: string): string[] {
+  const out = new Set<string>();
+  let m: RegExpExecArray | null;
+  const re = new RegExp(LOCAL_REF_RE.source, "gi");
+  while ((m = re.exec(html))) {
+    const v = (m[1] ?? m[2] ?? "").trim();
+    if (!v) continue;
+    if (isExternalRef(v)) continue;
+    // Skip pure anchor / query-only refs
+    if (v.startsWith("#") || v.startsWith("?")) continue;
+    out.add(v);
+  }
+  return Array.from(out);
+}
+
+export function rewriteLocalAssetPaths(html: string, map: Map<string, string>): string {
+  return html.replace(LOCAL_REF_RE, (full, srcVal: string | undefined, urlVal: string | undefined) => {
+    const raw = (srcVal ?? urlVal ?? "").trim();
+    if (!raw || isExternalRef(raw)) return full;
+    // Try exact, then basename, then strip leading "./" or "../"
+    const candidates = [
+      raw,
+      raw.replace(/^\.?\.?\/+/, ""),
+      raw.split("/").pop() ?? raw,
+      decodeURIComponent(raw),
+      decodeURIComponent(raw.split("/").pop() ?? raw),
+    ];
+    for (const c of candidates) {
+      const hit = map.get(c);
+      if (hit) {
+        return srcVal !== undefined
+          ? full.replace(raw, hit)
+          : `url("${hit}")`;
+      }
+    }
+    return full;
+  });
+}
