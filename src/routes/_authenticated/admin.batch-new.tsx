@@ -9,7 +9,7 @@ import { useAuth } from "@/hooks/use-auth";
 import { slugify } from "@/lib/plants";
 import { IUCN_CATEGORIES } from "@/lib/catalogs";
 import { HtmlDocEditor, type HtmlDocEditorHandle, ImageSearchDialog } from "@/components/html-doc-editor";
-import { findLocalAssetRefs, rewriteLocalAssetPaths } from "@/components/plant-editor";
+import { buildAssetLookupKeys, findLocalAssetRefs, rewriteLocalAssetPaths } from "@/components/plant-editor";
 
 export const Route = createFileRoute("/_authenticated/admin/batch-new")({
   component: BatchNewPage,
@@ -52,16 +52,7 @@ function BatchNewPage() {
   const isImageFile = (file: File) =>
     file.type.startsWith("image/") || /\.(png|jpe?g|webp|gif|svg|avif|bmp|tiff?)$/i.test(file.name);
 
-  const assetLookupKeys = (value: string) => {
-    const cleaned = value.split(/[?#]/)[0].replace(/\\/g, "/").replace(/^\.?\/+/, "");
-    const keys = new Set([cleaned, cleaned.split("/").pop() || ""]);
-    try {
-      const decoded = decodeURIComponent(cleaned);
-      keys.add(decoded);
-      keys.add(decoded.split("/").pop() || "");
-    } catch { /* ignore */ }
-    return Array.from(keys).filter(Boolean).map((k) => k.toLowerCase());
-  };
+  const assetLookupKeys = (value: string) => buildAssetLookupKeys(value);
 
   const indexImageFiles = (imageFiles: File[]) => {
     const idx = new Map<string, File>();
@@ -189,6 +180,7 @@ function BatchNewPage() {
         const { matched, missing } = resolveRefs(refs, idx);
         parsed.push({ file: f, text, matched, missing });
       }
+      const totalRefs = parsed.reduce((n, p) => n + p.matched.size + p.missing.length, 0);
       const totalMissing = parsed.reduce((n, p) => n + p.missing.length, 0);
       if (totalMissing > 0) {
         const matchedCount = parsed.reduce((n, p) => n + p.matched.size, 0);
@@ -196,6 +188,10 @@ function BatchNewPage() {
           `已自动匹配 ${matchedCount} 张配图；${totalMissing} 张未在本次选择中找到。选择 HTML 所在文件夹可一次性自动上传全部配图。`,
           { duration: 6000 },
         );
+      }
+      if (totalRefs > 0 && parsed.every((p) => p.matched.size === 0)) {
+        toast.error("HTML 中有本地图片引用，但未在所选文件中找到图片。请直接选择 HTML 所在文件夹，系统会自动匹配并上传。", { duration: 8000 });
+        return;
       }
       await finalizeBatch(parsed.map(({ file, text, matched }) => ({ file, text, matched })));
     } catch (err) {
