@@ -6,6 +6,7 @@ import StarterKit from "@tiptap/starter-kit";
 import Image from "@tiptap/extension-image";
 import Link from "@tiptap/extension-link";
 import Placeholder from "@tiptap/extension-placeholder";
+import { FolderOpen, Link2, Search, Pencil, ExternalLink, Trash2, Image as ImageIcon } from "lucide-react";
 import { supabase } from "@/integrations/supabase/client";
 import { useAuth } from "@/hooks/use-auth";
 import { toast } from "sonner";
@@ -410,14 +411,14 @@ function ImageContextMenu({
       <div className="px-3 py-1.5 text-[10px] uppercase tracking-wider text-ink-faint border-b border-rule">
         图片操作
       </div>
-      <Item onClick={onReplaceLocal}>📁 替换为本地图片</Item>
-      <Item onClick={onReplaceUrl}>🔗 替换为图片网址</Item>
-      <Item onClick={onSearchOnline}>🔍 在线搜索替换</Item>
-      <Item onClick={onEditAlt}>✏️ 修改说明文字</Item>
-      <Item onClick={onOpenInNewTab}>↗ 新标签打开原图</Item>
+      <Item onClick={onReplaceLocal}><span className="inline-flex items-center gap-2"><FolderOpen className="w-4 h-4" />替换为本地图片</span></Item>
+      <Item onClick={onReplaceUrl}><span className="inline-flex items-center gap-2"><Link2 className="w-4 h-4" />替换为图片网址</span></Item>
+      <Item onClick={onSearchOnline}><span className="inline-flex items-center gap-2"><Search className="w-4 h-4" />在线搜索替换</span></Item>
+      <Item onClick={onEditAlt}><span className="inline-flex items-center gap-2"><Pencil className="w-4 h-4" />修改说明文字</span></Item>
+      <Item onClick={onOpenInNewTab}><span className="inline-flex items-center gap-2"><ExternalLink className="w-4 h-4" />新标签打开原图</span></Item>
       <div className="border-t border-rule my-1" />
       <Item onClick={onDelete} danger>
-        🗑 删除图片
+        <span className="inline-flex items-center gap-2"><Trash2 className="w-4 h-4" />删除图片</span>
       </Item>
       <button
         type="button"
@@ -855,10 +856,10 @@ function Toolbar({ editor, onPickImage }: { editor: Editor; onPickImage: () => v
       </Btn>
       <span className="w-px bg-rule mx-1" />
       <Btn title="链接" active={editor.isActive("link")} onClick={setLink}>
-        🔗 链接
+        <span className="inline-flex items-center gap-1"><Link2 className="w-3.5 h-3.5" />链接</span>
       </Btn>
       <Btn title="插入图片" onClick={onPickImage}>
-        🖼 图片
+        <span className="inline-flex items-center gap-1"><ImageIcon className="w-3.5 h-3.5" />图片</span>
       </Btn>
       <span className="w-px bg-rule mx-1" />
       <Btn title="撤销" onClick={() => editor.chain().focus().undo().run()}>

@@ -1,5 +1,6 @@
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { FolderOpen, Clipboard, Link2, Globe, Pencil, ExternalLink, Trash2 } from "lucide-react";
 import { supabase } from "@/integrations/supabase/client";
 import { useAuth } from "@/hooks/use-auth";
 import { RichEditor } from "@/components/rich-editor";
@@ -768,15 +769,15 @@ function ImageContextMenu({
       <div className="px-3 py-1.5 text-[10px] uppercase tracking-wider text-ink-faint border-b border-rule">
         图片操作
       </div>
-      <Item onClick={onReplaceLocal}>📁 替换为本地图片</Item>
-      <Item onClick={onReplaceFromClipboard}>📋 从剪贴板粘贴替换</Item>
-      <Item onClick={onReplaceUrl}>🔗 粘贴图片地址 URL 替换</Item>
-      <Item onClick={onSearchWiki}>🌐 在线搜索替换图片（iNaturalist / Wikimedia）</Item>
-      <Item onClick={onEditAlt}>✏️ 修改说明文字</Item>
-      <Item onClick={onOpenInNewTab}>↗ 新标签打开原图</Item>
+      <Item onClick={onReplaceLocal}><span className="inline-flex items-center gap-2"><FolderOpen className="w-4 h-4" />替换为本地图片</span></Item>
+      <Item onClick={onReplaceFromClipboard}><span className="inline-flex items-center gap-2"><Clipboard className="w-4 h-4" />从剪贴板粘贴替换</span></Item>
+      <Item onClick={onReplaceUrl}><span className="inline-flex items-center gap-2"><Link2 className="w-4 h-4" />粘贴图片地址 URL 替换</span></Item>
+      <Item onClick={onSearchWiki}><span className="inline-flex items-center gap-2"><Globe className="w-4 h-4" />在线搜索替换图片（iNaturalist / Wikimedia）</span></Item>
+      <Item onClick={onEditAlt}><span className="inline-flex items-center gap-2"><Pencil className="w-4 h-4" />修改说明文字</span></Item>
+      <Item onClick={onOpenInNewTab}><span className="inline-flex items-center gap-2"><ExternalLink className="w-4 h-4" />新标签打开原图</span></Item>
       <div className="border-t border-rule my-1" />
       <Item onClick={onDelete} danger>
-        🗑 删除图片
+        <span className="inline-flex items-center gap-2"><Trash2 className="w-4 h-4" />删除图片</span>
       </Item>
       <button
         type="button"

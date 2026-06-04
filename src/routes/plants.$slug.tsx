@@ -11,6 +11,7 @@ import { embedVideosInHtml } from "@/lib/embed";
 import { ImageSearchDialog } from "@/components/html-doc-editor";
 import { ShareButton } from "@/components/share-button";
 import { supabase } from "@/integrations/supabase/client";
+import { FolderOpen, Link2, Image as ImageIcon, Globe } from "lucide-react";
 
 export const Route = createFileRoute("/plants/$slug")({
   component: PlantDetail,
@@ -210,14 +211,14 @@ function PlantDetail() {
           style={{ position: "fixed", left: coverMenu.x, top: coverMenu.y, zIndex: 70 }}
           className="bg-background border border-ink shadow-lg py-1 w-56 text-sm"
         >
-          <button type="button" onClick={() => { setCoverMenu(null); coverFileRef.current?.click(); }} className="w-full text-left px-3 py-2 hover:bg-paper-deep">📁 替换为本地图片</button>
+          <button type="button" onClick={() => { setCoverMenu(null); coverFileRef.current?.click(); }} className="w-full text-left px-3 py-2 hover:bg-paper-deep inline-flex items-center gap-2"><FolderOpen className="w-4 h-4" />替换为本地图片</button>
           <button type="button" onClick={() => {
             const url = window.prompt("封面图片网址：", plant.cover_url ?? "");
             setCoverMenu(null);
             if (url !== null && url.trim()) updateCover(url.trim());
-          }} className="w-full text-left px-3 py-2 hover:bg-paper-deep">🔗 替换为图片网址</button>
-          <button type="button" onClick={() => { setCoverMenu(null); setCoverPagePicker(true); }} disabled={pageImages.length === 0} className="w-full text-left px-3 py-2 hover:bg-paper-deep disabled:opacity-50">🖼 选择详情页中已有图片（{pageImages.length}）</button>
-          <button type="button" onClick={() => { setCoverMenu(null); setCoverSearch(true); }} className="w-full text-left px-3 py-2 hover:bg-paper-deep">🌐 在线搜索替换图片</button>
+          }} className="w-full text-left px-3 py-2 hover:bg-paper-deep inline-flex items-center gap-2"><Link2 className="w-4 h-4" />替换为图片网址</button>
+          <button type="button" onClick={() => { setCoverMenu(null); setCoverPagePicker(true); }} disabled={pageImages.length === 0} className="w-full text-left px-3 py-2 hover:bg-paper-deep disabled:opacity-50 inline-flex items-center gap-2"><ImageIcon className="w-4 h-4" />选择详情页中已有图片（{pageImages.length}）</button>
+          <button type="button" onClick={() => { setCoverMenu(null); setCoverSearch(true); }} className="w-full text-left px-3 py-2 hover:bg-paper-deep inline-flex items-center gap-2"><Globe className="w-4 h-4" />在线搜索替换图片</button>
         </div>
       )}
       {coverSearch && (

@@ -223,7 +223,7 @@ export function SiteFooter() {
     <footer className="mt-24 border-t border-ink/40">
       <div className="mx-auto max-w-6xl px-6 py-6 text-center">
         <p className="text-xs text-ink-faint">
-          开放的植物志社区 · 内容 copilot with AI，需要编辑进行校对和修改（尤其是配图缺失需要补充），加入编辑协作团队或投稿请联系{" "}
+          开放的植物志社区 · 内容 copilot with AI，需要编辑进行校对和修改（尤其是配图的替换和配图缺失问题），想成为网站运维成员请联系{" "}
           <a href="mailto:arainjazz@163.com" className="hover:text-vermilion underline">
             arainjazz@163.com
           </a>

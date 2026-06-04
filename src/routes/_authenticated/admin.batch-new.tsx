@@ -2,6 +2,7 @@ import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { useEffect, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
+import { FolderOpen, Link2, Image as ImageIcon, Globe, Trash2 } from "lucide-react";
 import { SiteHeader, SiteFooter } from "@/components/site-header";
 import { supabase } from "@/integrations/supabase/client";
 import { useAuth } from "@/hooks/use-auth";
@@ -585,14 +586,14 @@ function BatchCard({
               {item.coverUrl || "未设置（创建条目时将自动取 HTML 第一张图）"}
             </p>
             <div className="flex flex-wrap gap-1 text-[10px]">
-              <button type="button" onClick={() => fileRef.current?.click()} className="border border-ink/40 px-2 py-0.5 hover:bg-paper-deep">📁 本地</button>
+              <button type="button" onClick={() => fileRef.current?.click()} className="border border-ink/40 px-2 py-0.5 hover:bg-paper-deep inline-flex items-center gap-1"><FolderOpen className="w-3 h-3" />本地</button>
               <button type="button" onClick={() => {
                 const u = window.prompt("封面图片网址：", item.coverUrl);
                 if (u !== null) onUpdate({ coverUrl: u.trim() });
-              }} className="border border-ink/40 px-2 py-0.5 hover:bg-paper-deep">🔗 网址</button>
-              <button type="button" onClick={pickFirstFromHtml} className="border border-ink/40 px-2 py-0.5 hover:bg-paper-deep">🖼 第一张</button>
-              <button type="button" disabled={pageImages.length === 0} onClick={() => setPagePickerOpen(true)} className="border border-ink/40 px-2 py-0.5 hover:bg-paper-deep disabled:opacity-50">🖼 选页面图({pageImages.length})</button>
-              <button type="button" onClick={() => setSearchOpen(true)} className="border border-ink/40 px-2 py-0.5 hover:bg-paper-deep">🌐 在线搜索</button>
+              }} className="border border-ink/40 px-2 py-0.5 hover:bg-paper-deep inline-flex items-center gap-1"><Link2 className="w-3 h-3" />网址</button>
+              <button type="button" onClick={pickFirstFromHtml} className="border border-ink/40 px-2 py-0.5 hover:bg-paper-deep inline-flex items-center gap-1"><ImageIcon className="w-3 h-3" />第一张</button>
+              <button type="button" disabled={pageImages.length === 0} onClick={() => setPagePickerOpen(true)} className="border border-ink/40 px-2 py-0.5 hover:bg-paper-deep disabled:opacity-50 inline-flex items-center gap-1"><ImageIcon className="w-3 h-3" />选页面图({pageImages.length})</button>
+              <button type="button" onClick={() => setSearchOpen(true)} className="border border-ink/40 px-2 py-0.5 hover:bg-paper-deep inline-flex items-center gap-1"><Globe className="w-3 h-3" />在线搜索</button>
               {item.coverUrl && (
                 <button type="button" onClick={() => onUpdate({ coverUrl: "" })} className="border border-destructive/40 text-destructive px-2 py-0.5 hover:bg-destructive hover:text-background">清除</button>
               )}
@@ -609,19 +610,19 @@ function BatchCard({
             style={{ position: "fixed", left: menu.x, top: menu.y, zIndex: 70 }}
             className="bg-background border border-ink shadow-lg py-1 w-56 text-sm"
           >
-            <button type="button" onClick={() => { setMenu(null); fileRef.current?.click(); }} className="w-full text-left px-3 py-2 hover:bg-paper-deep">📁 替换为本地图片</button>
+            <button type="button" onClick={() => { setMenu(null); fileRef.current?.click(); }} className="w-full text-left px-3 py-2 hover:bg-paper-deep inline-flex items-center gap-2"><FolderOpen className="w-4 h-4" />替换为本地图片</button>
             <button type="button" onClick={() => {
               setMenu(null);
               const u = window.prompt("封面图片网址：", item.coverUrl);
               if (u !== null) onUpdate({ coverUrl: u.trim() });
-            }} className="w-full text-left px-3 py-2 hover:bg-paper-deep">🔗 替换为图片网址</button>
-            <button type="button" onClick={() => { setMenu(null); pickFirstFromHtml(); }} className="w-full text-left px-3 py-2 hover:bg-paper-deep">🖼 使用 HTML 中第一张图</button>
-            <button type="button" disabled={pageImages.length === 0} onClick={() => { setMenu(null); setPagePickerOpen(true); }} className="w-full text-left px-3 py-2 hover:bg-paper-deep disabled:opacity-50">🖼 从页面图中选择（{pageImages.length}）</button>
-            <button type="button" onClick={() => { setMenu(null); setSearchOpen(true); }} className="w-full text-left px-3 py-2 hover:bg-paper-deep">🌐 在线搜索图片替换</button>
+            }} className="w-full text-left px-3 py-2 hover:bg-paper-deep inline-flex items-center gap-2"><Link2 className="w-4 h-4" />替换为图片网址</button>
+            <button type="button" onClick={() => { setMenu(null); pickFirstFromHtml(); }} className="w-full text-left px-3 py-2 hover:bg-paper-deep inline-flex items-center gap-2"><ImageIcon className="w-4 h-4" />使用 HTML 中第一张图</button>
+            <button type="button" disabled={pageImages.length === 0} onClick={() => { setMenu(null); setPagePickerOpen(true); }} className="w-full text-left px-3 py-2 hover:bg-paper-deep disabled:opacity-50 inline-flex items-center gap-2"><ImageIcon className="w-4 h-4" />从页面图中选择（{pageImages.length}）</button>
+            <button type="button" onClick={() => { setMenu(null); setSearchOpen(true); }} className="w-full text-left px-3 py-2 hover:bg-paper-deep inline-flex items-center gap-2"><Globe className="w-4 h-4" />在线搜索图片替换</button>
             {item.coverUrl && (
               <>
                 <div className="border-t border-rule my-1" />
-                <button type="button" onClick={() => { setMenu(null); onUpdate({ coverUrl: "" }); }} className="w-full text-left px-3 py-2 text-destructive hover:bg-paper-deep">🗑 清除封面</button>
+                <button type="button" onClick={() => { setMenu(null); onUpdate({ coverUrl: "" }); }} className="w-full text-left px-3 py-2 text-destructive hover:bg-paper-deep inline-flex items-center gap-2"><Trash2 className="w-4 h-4" />清除封面</button>
               </>
             )}
           </div>

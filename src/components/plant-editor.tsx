@@ -1,6 +1,14 @@
 import { useState, useEffect, useRef } from "react";
 import { useNavigate } from "@tanstack/react-router";
 import { useQueryClient } from "@tanstack/react-query";
+import {
+  FolderOpen,
+  Link2,
+  Image as ImageIcon,
+  Globe,
+  Trash2,
+  Wand2,
+} from "lucide-react";
 import { supabase } from "@/integrations/supabase/client";
 import { useAuth } from "@/hooks/use-auth";
 import { slugify, type Plant } from "@/lib/plants";
@@ -23,6 +31,8 @@ export function PlantEditor({ initial }: Props) {
   const navigate = useNavigate();
   const qc = useQueryClient();
   const htmlInputRef = useRef<HTMLInputElement>(null);
+  const imageInputRef = useRef<HTMLInputElement>(null);
+  const pendingHtmlRef = useRef<{ file: File; text: string; refs: string[] } | null>(null);
   const hydratedDraftRef = useRef(false);
   const draftKey = `plant-editor-draft:${initial?.id ?? "new"}`;
 
@@ -392,6 +402,32 @@ export function PlantEditor({ initial }: Props) {
     toast.message("已设为分支，保存时将关联到原条目并显示「由 X 创建」标签");
   };
 
+  // Finalize: rewrite refs (if image map provided) and upload HTML to storage.
+  const finalizeHtmlUpload = async (htmlFile: File, text: string, imageFiles: File[]) => {
+    let finalText = text;
+    if (imageFiles.length > 0) {
+      toast.message(`正在上传 ${imageFiles.length} 张配图…`);
+      const nameMap = new Map<string, string>();
+      for (const img of imageFiles) {
+        const url = await uploadFile(img, "plant-images");
+        nameMap.set(img.name, url);
+        const rel = (img as File & { webkitRelativePath?: string }).webkitRelativePath;
+        if (rel) {
+          nameMap.set(rel, url);
+          const stripped = rel.split("/").slice(1).join("/");
+          if (stripped) nameMap.set(stripped, url);
+        }
+      }
+      finalText = rewriteLocalAssetPaths(text, nameMap);
+      toast.success(`已重写 HTML 中的本地图片路径（${imageFiles.length} 张）`);
+    }
+    const finalHtmlFile = new File([finalText], htmlFile.name, { type: "text/html" });
+    const uploadedUrl = await uploadFile(finalHtmlFile, "plant-html");
+    setHtmlUrl(uploadedUrl);
+    toast.success("HTML 已上传");
+    await extractMetaFromUrl(uploadedUrl, "已根据 HTML 自动填入标题和字段，请检查后保存");
+  };
+
   const onHtmlUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files ?? []);
     e.target.value = "";
@@ -401,53 +437,53 @@ export function PlantEditor({ initial }: Props) {
     const imageFiles = files.filter((f) => f !== htmlFile && f.type.startsWith("image/"));
     setUploadingHtml(true);
     try {
-      let finalHtmlFile: File = htmlFile;
-      // If the editor also selected accompanying images, upload each to storage
-      // and rewrite the HTML so that all <img src> / inline url(...) references
-      // point to the public URLs instead of local file paths.
-      if (imageFiles.length > 0) {
-        toast.message(`正在上传 ${imageFiles.length} 张配图…`);
-        const nameMap = new Map<string, string>(); // basename + relpath -> public URL
-        for (const img of imageFiles) {
-          const url = await uploadFile(img, "plant-images");
-          // Map by basename, and by webkitRelativePath when present (folder upload).
-          const base = img.name;
-          nameMap.set(base, url);
-          const rel = (img as File & { webkitRelativePath?: string }).webkitRelativePath;
-          if (rel) {
-            nameMap.set(rel, url);
-            // Also map the path without the top-level folder
-            const stripped = rel.split("/").slice(1).join("/");
-            if (stripped) nameMap.set(stripped, url);
-          }
+      const text = await htmlFile.text();
+      // If user only picked the HTML (no images alongside), check for local refs.
+      // When found, auto-open a second image picker so the user only has to
+      // choose the referenced images — no manual Ctrl/⌘ multi-select required.
+      if (imageFiles.length === 0) {
+        const localRefs = findLocalAssetRefs(text);
+        if (localRefs.length > 0) {
+          pendingHtmlRef.current = { file: htmlFile, text, refs: localRefs };
+          const sample = localRefs.slice(0, 3).join("、");
+          toast.message(
+            `检测到 ${localRefs.length} 张本地图片（如 ${sample}${localRefs.length > 3 ? " …" : ""}），请在弹窗中选中它们`,
+            { duration: 6000 },
+          );
+          setUploadingHtml(false);
+          setTimeout(() => imageInputRef.current?.click(), 50);
+          return;
         }
-        const rawText = await htmlFile.text();
-        const rewritten = rewriteLocalAssetPaths(rawText, nameMap);
-        finalHtmlFile = new File([rewritten], htmlFile.name, { type: "text/html" });
-        toast.success(`已重写 HTML 中的本地图片路径（${imageFiles.length} 张）`);
-      } else {
-        // No images selected; warn if HTML references local files that won't load on the site.
-        try {
-          const txt = await htmlFile.text();
-          const localRefs = findLocalAssetRefs(txt);
-          if (localRefs.length > 0) {
-            toast.warning(
-              `HTML 中有 ${localRefs.length} 个本地图片引用未上传（如 ${localRefs[0]}），网站上将无法显示。请重新选择，同时勾选 HTML 旁边的图片文件。`,
-              { duration: 8000 },
-            );
-          }
-        } catch { /* ignore */ }
       }
-      const uploadedUrl = await uploadFile(finalHtmlFile, "plant-html");
-      setHtmlUrl(uploadedUrl);
-      toast.success("HTML 已上传");
-      await extractMetaFromUrl(uploadedUrl, "已根据 HTML 自动填入标题和字段，请检查后保存");
+      await finalizeHtmlUpload(htmlFile, text, imageFiles);
     } catch (err) {
       toast.error((err as Error).message);
     } finally {
       setUploadingHtml(false);
     }
   };
+
+  const onImagesForPendingHtml = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files ?? []);
+    e.target.value = "";
+    const pending = pendingHtmlRef.current;
+    if (!pending) return;
+    setUploadingHtml(true);
+    try {
+      if (files.length === 0) {
+        toast.warning("未选择图片，已按原样上传 HTML；线上将无法显示这些本地图片");
+        await finalizeHtmlUpload(pending.file, pending.text, []);
+      } else {
+        await finalizeHtmlUpload(pending.file, pending.text, files.filter((f) => f.type.startsWith("image/")));
+      }
+    } catch (err) {
+      toast.error((err as Error).message);
+    } finally {
+      pendingHtmlRef.current = null;
+      setUploadingHtml(false);
+    }
+  };
+
 
   const onExtractMeta = async () => {
     if (!htmlUrl) return;
@@ -576,6 +612,15 @@ export function PlantEditor({ initial }: Props) {
         className="sr-only"
         tabIndex={-1}
       />
+      <input
+        ref={imageInputRef}
+        type="file"
+        accept="image/*"
+        multiple
+        onChange={onImagesForPendingHtml}
+        className="sr-only"
+        tabIndex={-1}
+      />
       <Field label="标题 *">
         <input value={title} onChange={(e) => setTitle(e.target.value)} className={inputCls} />
       </Field>
@@ -683,18 +728,14 @@ export function PlantEditor({ initial }: Props) {
                   setCoverMenu({ x: e.clientX, y: e.clientY });
                 }}
               />
-              <div className="text-xs text-ink-faint space-y-1">
-                <p>右键点击封面可：📁 本地上传 · 🔗 输入网址 · 🖼 从详情页选图 · 🌐 在线搜索（GBIF/iNaturalist/Wikimedia）</p>
-                <button
-                  type="button"
-                  onClick={(e) => {
-                    const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
-                    setCoverMenu({ x: r.left, y: r.bottom });
-                  }}
-                  className="border border-ink/40 px-2 py-1 hover:bg-paper-deep"
-                >
-                  编辑封面 ▾
-                </button>
+              <div className="text-xs text-ink-faint space-y-1 max-w-md">
+                <p>默认选择页面中的第一张作为封面图,你也可以右键点击封面可:</p>
+                <ul className="space-y-0.5 list-none">
+                  <li className="inline-flex items-center gap-1.5"><FolderOpen className="w-3.5 h-3.5" /> 本地上传</li>
+                  <li className="inline-flex items-center gap-1.5 ml-3"><Link2 className="w-3.5 h-3.5" /> 输入网址</li>
+                  <li className="inline-flex items-center gap-1.5 ml-3"><ImageIcon className="w-3.5 h-3.5" /> 从详情页选图</li>
+                  <li className="inline-flex items-center gap-1.5 ml-3"><Globe className="w-3.5 h-3.5" /> 在线搜索(GBIF/iNaturalist/Wikimedia)</li>
+                </ul>
               </div>
             </div>
           ) : (
@@ -703,28 +744,31 @@ export function PlantEditor({ initial }: Props) {
                 type="button"
                 onClick={() => coverFileRef.current?.click()}
                 disabled={uploadingCover}
-                className="border border-ink px-3 py-1.5 hover:bg-ink hover:text-background transition-colors disabled:opacity-60"
+                className="border border-ink px-3 py-1.5 hover:bg-ink hover:text-background transition-colors disabled:opacity-60 inline-flex items-center gap-1.5"
               >
-                {uploadingCover ? "上传中…" : "📁 本地上传"}
+                <FolderOpen className="w-4 h-4" />
+                {uploadingCover ? "上传中…" : "本地上传"}
               </button>
               <button
                 type="button"
                 onClick={() => setShowCoverSearch(true)}
-                className="border border-ink px-3 py-1.5 hover:bg-ink hover:text-background transition-colors"
+                className="border border-ink px-3 py-1.5 hover:bg-ink hover:text-background transition-colors inline-flex items-center gap-1.5"
               >
-                🌐 在线搜索
+                <Globe className="w-4 h-4" />
+                在线搜索
               </button>
               {pageImages.length > 0 && (
                 <button
                   type="button"
                   onClick={() => setShowPagePicker(true)}
-                  className="border border-ink px-3 py-1.5 hover:bg-ink hover:text-background transition-colors"
+                  className="border border-ink px-3 py-1.5 hover:bg-ink hover:text-background transition-colors inline-flex items-center gap-1.5"
                 >
-                  🖼 从详情页选图（{pageImages.length}）
+                  <ImageIcon className="w-4 h-4" />
+                  从详情页选图({pageImages.length})
                 </button>
               )}
               {contentType === "html" && htmlUrl && (
-                <span className="text-xs text-ink-faint">未设置封面：保存时将自动选取 HTML 中的第一张图片。</span>
+                <span className="text-xs text-ink-faint">未设置封面:保存时将自动选取 HTML 中的第一张图片。</span>
               )}
             </div>
           )}
@@ -733,63 +777,40 @@ export function PlantEditor({ initial }: Props) {
               role="menu"
               onClick={(e) => e.stopPropagation()}
               style={{ position: "fixed", left: coverMenu.x, top: coverMenu.y, zIndex: 60 }}
-              className="bg-background border border-ink shadow-lg py-1 w-56 text-sm"
+              className="bg-background border border-ink shadow-lg py-1 w-60 text-sm"
             >
-              <button
-                type="button"
-                onClick={() => { setCoverMenu(null); coverFileRef.current?.click(); }}
-                className="w-full text-left px-3 py-2 hover:bg-paper-deep"
-              >
-                📁 替换为本地图片
-              </button>
-              <button
-                type="button"
+              <MenuItem onClick={() => { setCoverMenu(null); coverFileRef.current?.click(); }} icon={<FolderOpen className="w-4 h-4" />}>替换为本地图片</MenuItem>
+              <MenuItem
                 onClick={() => {
-                  const url = window.prompt("封面图片网址：", coverUrl);
+                  const url = window.prompt("封面图片网址:", coverUrl);
                   if (url !== null) { setCoverUrl(url.trim()); coverEdited.current = true; }
                   setCoverMenu(null);
                 }}
-                className="w-full text-left px-3 py-2 hover:bg-paper-deep"
-              >
-                🔗 替换为图片网址
-              </button>
-              <button
-                type="button"
+                icon={<Link2 className="w-4 h-4" />}
+              >替换为图片网址</MenuItem>
+              <MenuItem
                 onClick={async () => {
                   setCoverMenu(null);
-                  if (!htmlUrl) return toast.error("还未上传 HTML，无法选取");
+                  if (!htmlUrl) return toast.error("还未上传 HTML,无法选取");
                   const first = await firstImageFromHtml(htmlUrl);
                   if (!first) return toast.error("HTML 中未找到图片");
                   setCoverUrl(first); coverEdited.current = true;
                   toast.success("已使用 HTML 中第一张图片");
                 }}
-                className="w-full text-left px-3 py-2 hover:bg-paper-deep"
-              >
-                🖼 使用 HTML 中第一张图
-              </button>
-              <button
-                type="button"
+                icon={<ImageIcon className="w-4 h-4" />}
+              >使用 HTML 中第一张图</MenuItem>
+              <MenuItem
                 onClick={() => { setCoverMenu(null); setShowPagePicker(true); }}
-                className="w-full text-left px-3 py-2 hover:bg-paper-deep"
                 disabled={pageImages.length === 0}
-              >
-                🖼 从详情页已有图片中选择（{pageImages.length}）
-              </button>
-              <button
-                type="button"
-                onClick={() => { setCoverMenu(null); setShowCoverSearch(true); }}
-                className="w-full text-left px-3 py-2 hover:bg-paper-deep"
-              >
-                🌐 在线搜索图片替换封面
-              </button>
+                icon={<ImageIcon className="w-4 h-4" />}
+              >从详情页已有图片中选择({pageImages.length})</MenuItem>
+              <MenuItem onClick={() => { setCoverMenu(null); setShowCoverSearch(true); }} icon={<Globe className="w-4 h-4" />}>在线搜索图片替换封面</MenuItem>
               <div className="border-t border-rule my-1" />
-              <button
-                type="button"
+              <MenuItem
                 onClick={() => { setCoverUrl(""); coverEdited.current = false; setCoverMenu(null); }}
-                className="w-full text-left px-3 py-2 text-destructive hover:bg-paper-deep"
-              >
-                🗑 清除封面
-              </button>
+                icon={<Trash2 className="w-4 h-4" />}
+                danger
+              >清除封面</MenuItem>
             </div>
           )}
         </div>
@@ -849,9 +870,10 @@ export function PlantEditor({ initial }: Props) {
                   type="button"
                   onClick={onExtractMeta}
                   disabled={extracting}
-                  className="border border-ink px-4 py-2 hover:bg-ink hover:text-background transition-colors disabled:opacity-60 text-sm"
+                  className="border border-ink px-4 py-2 hover:bg-ink hover:text-background transition-colors disabled:opacity-60 text-sm inline-flex items-center gap-1.5"
                 >
-                  {extracting ? "AI 识别中…" : "🪄 AI 识别并自动填充字段"}
+                  <Wand2 className="w-4 h-4" />
+                  {extracting ? "AI 识别中…" : "AI 识别并自动填充字段"}
                 </button>
                 <p className="text-xs text-ink-faint">
                   将自动填入：学名、Slug、科属（科+属）、物种入侵、标签、摘要。已手动改过的 Slug 不会被覆盖。
@@ -897,9 +919,7 @@ export function PlantEditor({ initial }: Props) {
             <p className="text-xs text-ink-faint">
               提示：上传后整页将以原样在 iframe 中渲染（保留你的字体与排版）。
               <br />
-              <strong>含本地图片的页面：</strong>在弹出的文件选择框中按住 Ctrl/⌘
-              同时选中 HTML 文件 <em>以及</em> 它引用的图片文件（或整个文件夹），系统会自动把图片
-              上传到站内并改写 HTML 中的相对路径，避免线上无法显示。
+              <strong>含本地图片的页面：</strong>只需选择 HTML 文件即可——系统会自动检测其中引用的本地图片，并弹出第二个窗口让你一次选中所有图片，自动上传到站内并改写 HTML 中的相对路径，避免线上无法显示。
             </p>
             {htmlUrl && (
               <div className="mt-5 pt-5 border-t border-rule">
@@ -1064,6 +1084,34 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
     </div>
   );
 }
+
+function MenuItem({
+  onClick,
+  icon,
+  disabled,
+  danger,
+  children,
+}: {
+  onClick: () => void;
+  icon?: React.ReactNode;
+  disabled?: boolean;
+  danger?: boolean;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      className={`w-full text-left px-3 py-2 hover:bg-paper-deep inline-flex items-center gap-2 ${danger ? "text-destructive" : ""} disabled:opacity-50`}
+    >
+      {icon}
+      <span>{children}</span>
+    </button>
+  );
+}
+
+
 
 // ─── Local asset helpers for HTML uploads ───────────────────────────────────
 // Detect <img src>, <source src/srcset>, <link href>, plain href, and inline

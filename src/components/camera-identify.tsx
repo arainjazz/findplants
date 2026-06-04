@@ -148,8 +148,9 @@ export function CameraIdentify() {
           </p>
         </div>
         {coords && (
-          <p className="label text-xs text-ink-faint">
-            📍 {coords.lat.toFixed(4)}, {coords.lng.toFixed(4)}
+          <p className="label text-xs text-ink-faint inline-flex items-center gap-1">
+            <MapPinIcon className="w-3.5 h-3.5" />
+            {coords.lat.toFixed(4)}, {coords.lng.toFixed(4)}
           </p>
         )}
       </div>
@@ -180,9 +181,10 @@ export function CameraIdentify() {
           {phase === "ready" && (
             <button
               onClick={captureFrame}
-              className="w-full bg-vermilion text-background px-6 py-3 font-semibold hover:bg-ink transition-colors"
+              className="w-full bg-vermilion text-background px-6 py-3 font-semibold hover:bg-ink transition-colors inline-flex items-center justify-center gap-2"
             >
-              📸 拍摄
+              <CameraIcon className="w-5 h-5" />
+              <span>拍摄</span>
             </button>
           )}
           {statusText && <p className="text-sm text-ink-faint mt-2">{statusText}</p>}
@@ -198,9 +200,9 @@ export function CameraIdentify() {
             <button
               onClick={onSubmit}
               disabled={phase === "submitting"}
-              className="flex-1 bg-ink text-background px-6 py-3 hover:bg-vermilion transition-colors font-semibold disabled:opacity-60"
+              className="flex-1 bg-ink text-background px-6 py-3 hover:bg-vermilion transition-colors font-semibold disabled:opacity-60 inline-flex items-center justify-center gap-2"
             >
-              {phase === "submitting" ? "AI 识别中… 约需 10–30 秒" : "✨ 让 AI 识别并生成草稿"}
+              {phase === "submitting" ? <span>AI 识别中… 约需 10–30 秒</span> : (<><SparkleIcon className="w-5 h-5" /><span>让 AI 识别并生成草稿</span></>)}
             </button>
             <button
               onClick={retake}
@@ -248,6 +250,25 @@ function GalleryIcon({ className }: { className?: string }) {
       <rect x="3.5" y="4.5" width="17" height="13" rx="2"/>
       <circle cx="8.5" cy="9" r="1.4"/>
       <path d="m4 16 4.5-4.5 4 4 3-3L20 17"/>
+    </svg>
+  );
+}
+
+function MapPinIcon({ className }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6"
+      strokeLinecap="round" strokeLinejoin="round" className={className} aria-hidden="true">
+      <path d="M12 21s-7-6.2-7-11a7 7 0 0 1 14 0c0 4.8-7 11-7 11Z"/>
+      <circle cx="12" cy="10" r="2.6"/>
+    </svg>
+  );
+}
+
+function SparkleIcon({ className }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6"
+      strokeLinecap="round" strokeLinejoin="round" className={className} aria-hidden="true">
+      <path d="M12 3v4M12 17v4M3 12h4M17 12h4M5.5 5.5l2.8 2.8M15.7 15.7l2.8 2.8M5.5 18.5l2.8-2.8M15.7 8.3l2.8-2.8"/>
     </svg>
   );
 }
