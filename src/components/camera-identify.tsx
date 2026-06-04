@@ -140,12 +140,10 @@ export function CameraIdentify() {
   return (
     <section className="mb-12 border-2 border-ink bg-paper-deep/30 p-6 md:p-8">
       <div className="flex items-start justify-between flex-wrap gap-4 mb-4">
-        <div>
+        <div className="min-w-0 flex-1">
           <p className="label text-vermilion mb-1">AI copilot · Plantspedia</p>
-          <h2 className="font-display font-bold whitespace-nowrap text-[15px] sm:text-lg md:text-2xl lg:text-3xl">让 AI 识别植物身份并向你介绍这位新遇见的朋友吧</h2>
-          <p className="text-ink-faint mt-1 whitespace-nowrap overflow-hidden text-ellipsis text-[10px] sm:text-xs md:text-sm">
-            访客也能直接拍摄并生成草稿，等待编辑审核后正式收录。位置信息来自浏览器定位或照片 EXIF。
-          </p>
+          <FitOneLine className="font-display font-bold text-ink block w-full">让 AI 识别植物身份并向你介绍这位新遇见的朋友吧</FitOneLine>
+          <FitOneLine className="text-ink-faint block w-full mt-1" weight={400}>访客也能直接拍摄并生成草稿，等待编辑审核后正式收录。</FitOneLine>
         </div>
         {coords && (
           <p className="label text-xs text-ink-faint inline-flex items-center gap-1">
