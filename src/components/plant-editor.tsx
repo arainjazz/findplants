@@ -945,7 +945,7 @@ export function PlantEditor({ initial }: Props) {
             <p className="text-xs text-ink-faint">
               提示：上传后整页将以原样在 iframe 中渲染（保留你的字体与排版）。
               <br />
-              <strong>含本地图片的页面：</strong>请直接选中包含 HTML 与其引用图片的<strong>整个文件夹</strong>。系统会自动识别 HTML 中的相对路径，把对应图片上传到站内并改写链接——无需手动多选。
+              <strong>含本地图片的页面：</strong>直接选中 .html 文件即可——系统会自动解析 HTML 中引用的本地图片路径，并立刻弹出第二个对话框让你一次性选中这些图片，随后自动上传到站内并改写链接，无需逐个核对文件名。
             </p>
             {htmlUrl && (
               <div className="mt-5 pt-5 border-t border-rule">
