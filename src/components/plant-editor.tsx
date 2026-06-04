@@ -32,7 +32,12 @@ export function PlantEditor({ initial }: Props) {
   const qc = useQueryClient();
   const htmlInputRef = useRef<HTMLInputElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
-  const pendingHtmlRef = useRef<{ file: File; text: string; refs: string[] } | null>(null);
+  const pendingHtmlRef = useRef<{
+    file: File;
+    text: string;
+    matched: Set<File>;
+    missing: string[];
+  } | null>(null);
   const hydratedDraftRef = useRef(false);
   const draftKey = `plant-editor-draft:${initial?.id ?? "new"}`;
 
