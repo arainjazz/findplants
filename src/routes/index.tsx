@@ -289,6 +289,41 @@ function EmptyState() {
   );
 }
 
+function DraftsStrip({ drafts }: { drafts: PlantDraft[] }) {
+  return (
+    <section className="mb-12 border-t border-rule pt-8">
+      <div className="flex items-baseline justify-between mb-4">
+        <div>
+          <p className="label text-vermilion">最新识别 · Pending AI Drafts</p>
+          <p className="text-xs text-ink-faint mt-1">由访客拍摄并经 AI 识别的草稿，等待编辑审核后正式收录</p>
+        </div>
+        <span className="text-xs text-ink-faint">{drafts.length} 份待审</span>
+      </div>
+      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-4">
+        {drafts.map((d) => (
+          <Link
+            key={d.id}
+            to="/drafts/$id"
+            params={{ id: d.id }}
+            className="group block border border-rule bg-paper-deep/30 hover:border-vermilion transition-colors"
+          >
+            <div className="aspect-[4/3] overflow-hidden bg-paper-deep">
+              <img src={d.photo_url} alt={d.title} className="w-full h-full object-cover group-hover:scale-[1.03] transition-transform duration-500" />
+            </div>
+            <div className="p-3">
+              <p className="label text-[10px] text-vermilion mb-1">草稿 · {d.creator_label}</p>
+              <h3 className="font-display text-base font-semibold leading-tight truncate group-hover:text-vermilion transition-colors">{d.title}</h3>
+              {d.scientific_name && <p className="italic text-xs text-ink-faint truncate mt-0.5">{d.scientific_name}</p>}
+              <p className="text-[11px] text-ink-faint mt-1.5 truncate">📍 {d.capture_place || "未知地点"}</p>
+            </div>
+          </Link>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+
 function TagsBrowser({
   tags,
   plants,
