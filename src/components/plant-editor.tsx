@@ -1138,6 +1138,15 @@ function splitSrcset(v: string): string[] {
   return v.split(",").map((s) => s.trim().split(/\s+/)[0]).filter(Boolean);
 }
 
+function isLikelyImageAssetRef(value: string): boolean {
+  const clean = value.split(/[?#]/)[0];
+  try {
+    return /\.(png|jpe?g|webp|gif|svg|avif|bmp|tiff?|ico)$/i.test(decodeURIComponent(clean));
+  } catch {
+    return /\.(png|jpe?g|webp|gif|svg|avif|bmp|tiff?|ico)$/i.test(clean);
+  }
+}
+
 export function buildAssetLookupKeys(value: string): string[] {
   const cleaned = value.split(/[?#]/)[0].replace(/\\/g, "/").replace(/^file:\/\/+/, "").replace(/^\.?\/+/, "");
   const variants = new Set<string>();
@@ -1167,6 +1176,7 @@ export function findLocalAssetRefs(html: string): string[] {
       const v = raw.trim();
       if (!v || isExternalRef(v)) continue;
       if (v.startsWith("#") || v.startsWith("?")) continue;
+      if (!isLikelyImageAssetRef(v)) continue;
       out.add(v);
     }
   }
