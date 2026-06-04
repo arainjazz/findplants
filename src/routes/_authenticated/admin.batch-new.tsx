@@ -40,10 +40,7 @@ function BatchNewPage() {
   const navigate = useNavigate();
   const qc = useQueryClient();
   const fileRef = useRef<HTMLInputElement>(null);
-  const imageRef = useRef<HTMLInputElement>(null);
-  const pendingRef = useRef<{
-    htmlFiles: { file: File; text: string; missing: string[]; matched: Map<string, File> }[];
-  } | null>(null);
+  const htmlOnlyRef = useRef<HTMLInputElement>(null);
   const [items, setItems] = useState<Item[]>([]);
   const [uploading, setUploading] = useState(false);
   const [fullscreen, setFullscreen] = useState(false);
@@ -167,7 +164,7 @@ function BatchNewPage() {
       const htmlFiles = files.filter((f) => /\.html?$/i.test(f.name) || f.type === "text/html");
       const imageFiles = files.filter((f) => f.type.startsWith("image/"));
       if (htmlFiles.length === 0) {
-        toast.error("请至少选择一个 .html 文件（可同时多选本地图片或整个文件夹）");
+        toast.error("请至少选择一个 .html 文件，或选择包含 HTML 与图片的文件夹");
         return;
       }
       const idx = indexImageFiles(imageFiles);
@@ -180,41 +177,14 @@ function BatchNewPage() {
         parsed.push({ file: f, text, matched, missing });
       }
       const totalMissing = parsed.reduce((n, p) => n + p.missing.length, 0);
-      if (totalMissing === 0) {
-        await finalizeBatch(parsed.map(({ file, text, matched }) => ({ file, text, matched })));
-        return;
+      if (totalMissing > 0) {
+        const matchedCount = parsed.reduce((n, p) => n + p.matched.size, 0);
+        toast.message(
+          `已自动匹配 ${matchedCount} 张配图；${totalMissing} 张未在本次选择中找到。选择 HTML 所在文件夹可一次性自动上传全部配图。`,
+          { duration: 6000 },
+        );
       }
-      // Auto-prompt for missing images in one combined picker.
-      pendingRef.current = { htmlFiles: parsed };
-      const sample = parsed.flatMap((p) => p.missing).slice(0, 3);
-      toast.message(
-        `批量 HTML 中共有 ${totalMissing} 张本地图片未找到（如 ${sample.join("、")}），请一次性选中它们`,
-        { duration: 6000 },
-      );
-      imageRef.current?.click();
-    } catch (err) {
-      toast.error((err as Error).message);
-    } finally {
-      setUploading(false);
-    }
-  };
-
-  const onPickMissingImages = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = Array.from(e.target.files ?? []);
-    e.target.value = "";
-    const pending = pendingRef.current;
-    pendingRef.current = null;
-    if (!pending) return;
-    setUploading(true);
-    try {
-      const idx = indexImageFiles(files);
-      const entries = pending.htmlFiles.map((p) => {
-        const { matched: extra } = resolveRefs(p.missing, idx);
-        const combined = new Map(p.matched);
-        for (const [k, v] of extra.entries()) combined.set(k, v);
-        return { file: p.file, text: p.text, matched: combined };
-      });
-      await finalizeBatch(entries);
+      await finalizeBatch(parsed.map(({ file, text, matched }) => ({ file, text, matched })));
     } catch (err) {
       toast.error((err as Error).message);
     } finally {
