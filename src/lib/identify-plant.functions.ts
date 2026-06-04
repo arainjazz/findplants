@@ -112,9 +112,23 @@ async function callAiIdentify(photoDataUrl: string, hintPlace: string): Promise<
     throw new Error(`AI 网关错误 ${resp.status}`);
   }
   const data = await resp.json();
-  const args = data.choices?.[0]?.message?.tool_calls?.[0]?.function?.arguments;
-  if (!args) throw new Error("AI 未返回结构化结果");
-  return typeof args === "string" ? JSON.parse(args) : args;
+  const choice = data.choices?.[0];
+  const finish = choice?.finish_reason;
+  const args = choice?.message?.tool_calls?.[0]?.function?.arguments;
+  if (!args) {
+    console.error("AI no tool_call", JSON.stringify(data).slice(0, 800));
+    throw new Error("AI 未返回结构化结果");
+  }
+  try {
+    return typeof args === "string" ? JSON.parse(args) : args;
+  } catch (e) {
+    console.error("AI args parse failed; finish_reason=", finish, "len=", String(args).length);
+    throw new Error(
+      finish === "length"
+        ? "AI 返回内容被截断，请重试（已自动放大 token 上限）"
+        : "AI 返回格式不完整，请重试",
+    );
+  }
 }
 
 async function reverseGeocode(lat: number, lng: number): Promise<string> {
