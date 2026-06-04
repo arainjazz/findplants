@@ -148,8 +148,9 @@ export function CameraIdentify() {
           </p>
         </div>
         {coords && (
-          <p className="label text-xs text-ink-faint">
-            📍 {coords.lat.toFixed(4)}, {coords.lng.toFixed(4)}
+          <p className="label text-xs text-ink-faint inline-flex items-center gap-1">
+            <MapPinIcon className="w-3.5 h-3.5" />
+            {coords.lat.toFixed(4)}, {coords.lng.toFixed(4)}
           </p>
         )}
       </div>
