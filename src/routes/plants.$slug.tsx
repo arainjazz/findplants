@@ -11,6 +11,7 @@ import { embedVideosInHtml } from "@/lib/embed";
 import { ImageSearchDialog } from "@/components/html-doc-editor";
 import { ShareButton } from "@/components/share-button";
 import { supabase } from "@/integrations/supabase/client";
+import { FolderOpen, Link2, Image as ImageIcon, Globe } from "lucide-react";
 
 export const Route = createFileRoute("/plants/$slug")({
   component: PlantDetail,
