@@ -81,11 +81,10 @@ function DraftPage() {
         ) : (
           <>
             <div className="mx-auto max-w-5xl px-6 pt-6 flex flex-wrap items-center gap-3 text-sm">
-              <Link to="/" className="label hover:text-vermilion">← 返回首页</Link>
+              <Link to="/identify" className="label hover:text-vermilion">← 返回 AI 识别</Link>
               <span className="label text-vermilion">
                 {draft.status === "pending" ? "待审核草稿" : draft.status === "approved" ? "已收录" : "已驳回"}
               </span>
-              <span className="text-ink-faint">提交者：{draft.creator_label}</span>
               {isEditor && draft.status === "pending" && (
                 <div className="ml-auto flex gap-2">
                   <button
@@ -105,19 +104,65 @@ function DraftPage() {
                 </div>
               )}
               {draft.status === "approved" && draft.published_plant_id && (
-                <Link
-                  to="/plants"
-                  className="ml-auto text-sm text-vermilion hover:underline"
-                >
+                <Link to="/plants" className="ml-auto text-sm text-vermilion hover:underline">
                   浏览已收录 →
                 </Link>
               )}
             </div>
+
+            {/* Draft metadata: identifier / time / place / summary */}
+            <section className="mx-auto max-w-5xl px-6 pt-6">
+              <div className="border border-rule bg-paper-deep/30 p-5 md:p-6">
+                <h1 className="font-display text-2xl md:text-3xl font-bold leading-tight">{draft.title}</h1>
+                {draft.scientific_name && (
+                  <p className="italic text-ink-faint mt-1">{draft.scientific_name}</p>
+                )}
+                <dl className="mt-4 grid grid-cols-1 sm:grid-cols-3 gap-x-6 gap-y-3 text-sm">
+                  <div>
+                    <dt className="label text-[10px] text-ink-faint">识别人</dt>
+                    <dd className="mt-0.5">{draft.creator_label || "访客"}</dd>
+                  </div>
+                  <div>
+                    <dt className="label text-[10px] text-ink-faint">识别时间</dt>
+                    <dd className="mt-0.5">{new Date(draft.created_at).toLocaleString("zh-CN")}</dd>
+                  </div>
+                  <div>
+                    <dt className="label text-[10px] text-ink-faint">识别地点</dt>
+                    <dd className="mt-0.5 inline-flex items-center gap-1">
+                      <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                        <path d="M12 21s-7-6.2-7-11a7 7 0 0 1 14 0c0 4.8-7 11-7 11Z"/>
+                        <circle cx="12" cy="10" r="2.6"/>
+                      </svg>
+                      <span>{draft.capture_place || "未知地点"}</span>
+                      {draft.capture_lat != null && draft.capture_lng != null && (
+                        <span className="text-ink-faint text-xs">
+                          ({draft.capture_lat.toFixed(4)}, {draft.capture_lng.toFixed(4)})
+                        </span>
+                      )}
+                    </dd>
+                  </div>
+                </dl>
+                {draft.summary && (
+                  <div className="mt-4">
+                    <dt className="label text-[10px] text-ink-faint">摘要 · Summary</dt>
+                    <p className="mt-1.5 text-ink-soft leading-relaxed">{draft.summary}</p>
+                  </div>
+                )}
+                {draft.tags && draft.tags.length > 0 && (
+                  <div className="mt-4 flex flex-wrap gap-2">
+                    {draft.tags.map((t) => (
+                      <span key={t} className="text-xs border border-rule px-2 py-0.5 text-ink-faint">#{t}</span>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </section>
+
             {/* Render AI-generated HTML directly */}
             <iframe
               title={draft.title}
               srcDoc={draft.html_content}
-              className="w-full border-0"
+              className="w-full border-0 mt-6"
               style={{ minHeight: "calc(100vh - 200px)" }}
             />
           </>
