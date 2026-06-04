@@ -919,9 +919,7 @@ export function PlantEditor({ initial }: Props) {
             <p className="text-xs text-ink-faint">
               提示：上传后整页将以原样在 iframe 中渲染（保留你的字体与排版）。
               <br />
-              <strong>含本地图片的页面：</strong>在弹出的文件选择框中按住 Ctrl/⌘
-              同时选中 HTML 文件 <em>以及</em> 它引用的图片文件（或整个文件夹），系统会自动把图片
-              上传到站内并改写 HTML 中的相对路径，避免线上无法显示。
+              <strong>含本地图片的页面：</strong>只需选择 HTML 文件即可——系统会自动检测其中引用的本地图片，并弹出第二个窗口让你一次选中所有图片，自动上传到站内并改写 HTML 中的相对路径，避免线上无法显示。
             </p>
             {htmlUrl && (
               <div className="mt-5 pt-5 border-t border-rule">
