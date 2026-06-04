@@ -396,35 +396,43 @@ function BatchNewPage() {
               disabled={uploading}
               className="bg-ink text-background px-5 py-2 hover:bg-vermilion transition-colors disabled:opacity-60"
             >
-              {uploading ? "上传中…" : "+ 批量添加 HTML"}
+              {uploading ? "上传中…" : "+ 选择 HTML 所在文件夹"}
+            </button>
+            <button
+              type="button"
+              onClick={() => htmlOnlyRef.current?.click()}
+              disabled={uploading}
+              className="border border-ink/40 px-5 py-2 hover:bg-paper-deep transition-colors disabled:opacity-60"
+            >
+              仅上传 HTML
             </button>
             <input
               ref={fileRef}
+              type="file"
+              multiple
+              {...({ webkitdirectory: "", directory: "" } as React.InputHTMLAttributes<HTMLInputElement> & { webkitdirectory: string; directory: string })}
+              className="sr-only"
+              onChange={onPickFiles}
+            />
+            <input
+              ref={htmlOnlyRef}
               type="file"
               accept=".html,.htm,text/html,image/*"
               multiple
               className="sr-only"
               onChange={onPickFiles}
             />
-            <input
-              ref={imageRef}
-              type="file"
-              accept="image/*"
-              multiple
-              className="sr-only"
-              onChange={onPickMissingImages}
-            />
           </div>
         </div>
 
         {items.length === 0 ? (
           <div className="border border-dashed border-rule py-20 text-center text-ink-faint">
-            <p className="mb-4">选择多个 HTML 文件开始批量录入；含本地图片的 HTML，系统会自动检测并弹出二次选择框统一上传配图，无需重命名或逐个匹配。</p>
+            <p className="mb-4">选择包含 HTML 与图片的文件夹开始批量录入；系统会按 HTML 中的相对路径自动上传配图并改写链接，不再弹出二次选图窗口。</p>
             <button
               onClick={() => fileRef.current?.click()}
               className="border border-ink px-4 py-2 hover:bg-ink hover:text-background transition-colors"
             >
-              + 批量添加 HTML
+              + 选择 HTML 所在文件夹
             </button>
           </div>
         ) : (
