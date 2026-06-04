@@ -240,6 +240,89 @@ export type Database = {
           },
         ]
       }
+      plant_drafts: {
+        Row: {
+          ai_model: string | null
+          ai_payload: Json | null
+          capture_lat: number | null
+          capture_lng: number | null
+          capture_place: string | null
+          common_name_en: string | null
+          created_at: string
+          created_by: string | null
+          creator_label: string
+          family: string | null
+          genus: string | null
+          html_content: string
+          id: string
+          iucn_status: string | null
+          photo_url: string
+          published_plant_id: string | null
+          scientific_name: string | null
+          status: string
+          summary: string | null
+          tags: string[]
+          title: string
+          updated_at: string
+        }
+        Insert: {
+          ai_model?: string | null
+          ai_payload?: Json | null
+          capture_lat?: number | null
+          capture_lng?: number | null
+          capture_place?: string | null
+          common_name_en?: string | null
+          created_at?: string
+          created_by?: string | null
+          creator_label?: string
+          family?: string | null
+          genus?: string | null
+          html_content: string
+          id?: string
+          iucn_status?: string | null
+          photo_url: string
+          published_plant_id?: string | null
+          scientific_name?: string | null
+          status?: string
+          summary?: string | null
+          tags?: string[]
+          title: string
+          updated_at?: string
+        }
+        Update: {
+          ai_model?: string | null
+          ai_payload?: Json | null
+          capture_lat?: number | null
+          capture_lng?: number | null
+          capture_place?: string | null
+          common_name_en?: string | null
+          created_at?: string
+          created_by?: string | null
+          creator_label?: string
+          family?: string | null
+          genus?: string | null
+          html_content?: string
+          id?: string
+          iucn_status?: string | null
+          photo_url?: string
+          published_plant_id?: string | null
+          scientific_name?: string | null
+          status?: string
+          summary?: string | null
+          tags?: string[]
+          title?: string
+          updated_at?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "plant_drafts_published_plant_id_fkey"
+            columns: ["published_plant_id"]
+            isOneToOne: false
+            referencedRelation: "plants"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
       plant_edits: {
         Row: {
           after_html: string | null

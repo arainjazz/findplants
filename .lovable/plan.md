@@ -1,70 +1,67 @@
-## 实施计划
+## 目标
 
-继续完成剩余 7 项功能。
+1. 任何访问者（含未登录）可在首页用摄像头拍植物 → AI 识别 → AI 按附件 HTML 的样式生成详情页 → 自动带 GPS 拍摄地点 → 保存为"待审核草稿"。
+2. 草稿在首页"最新识别"卡片区显示（含照片缩略、植物名、拍摄地点摘要），点击进入完整详情页（只有作者/编辑/管理员能访问）。
+3. 已正式收录的条目，按时间倒序在首页下方"已收录条目流"展示。
+4. 编辑/管理员在草稿详情页点"收录到本站"→ 条目转为正式 plants 记录，所有改动写入 plant_edits 修改日志（source=`ai_camera_capture`+审核人）。
+5. 你（arainjazz@gmail.com / zhou19869021）首次登录后自动获得 admin 角色 + editor 角色，拥有所有权限。
 
-### 1. 首页头部（src/routes/index.tsx + src/components/site-header.tsx）
-- 大标题头改为「Plantspedia · 草木志」（文字，不带 logo）
-- `SiteHeader` 导航栏：最左放 logo 缩略图标，紧挨着是「首页」链接，其余 Tab 顺延
+## 数据库改动
 
-### 2. 首页第 4 个 Tab「地区」
-在 `src/routes/index.tsx` 现有 Tab 切换（最新更新 / 编辑推荐 / 热度）后加「地区」：
-- 从 `regional_catalogs` + `catalog_entries` 聚合：按 `province → city → county` 三级树展示
-- 每个叶节点列出该地区目录中、`scientific_name` 与 `plants.scientific_name` 匹配的条目（蓝色链接跳转 `/plants/$slug`）
-- 仅显示有匹配条目的地区
+新增表 `plant_drafts`：
+- `id uuid pk`, `created_at`, `updated_at`
+- `created_by uuid null`（未登录为 null）、`creator_label text`（匿名时显示"访客"，登录时显示昵称）
+- `photo_url text`（上传到 `plant-images` bucket 的拍摄照片）
+- `capture_lat numeric`, `capture_lng numeric`, `capture_place text`（反查的地名/用户可编辑）
+- `ai_model text`、`ai_payload jsonb`（AI 原始返回，便于回放/再生成）
+- `title`, `scientific_name`, `common_name_en`, `family`, `genus`, `summary`, `tags text[]`, `iucn_status`
+- `html_content text`（按附件模板生成的完整 HTML，复用现有 plant-html 渲染）
+- `status text check in ('pending','approved','rejected') default 'pending'`
+- `published_plant_id uuid null`（收录后指向 plants.id）
 
-### 3.「已收录档案」页 4 个下拉筛选（src/routes/plants.index.tsx）
-- 搜索框左侧新增 4 个 `FilterDropdown`：科 / 属 / IUCN / 地区
-- 选项来源：
-  - 科 = `plants.family` distinct
-  - 属 = `plants.genus` distinct
-  - IUCN = 固定 8 类 EX/EW/CR/EN/VU/NT/LC/DD（中英对照）
-  - 地区 = `regional_catalogs` 聚合的省/市/县
-- URL 搜索参数：`?family=&genus=&iucn=&region=`（zod + fallback）
-- 鼠标悬停展开下拉，点击设置参数过滤列表
+RLS：
+- `SELECT`：所有人（含 anon）可读 `status='pending'` + 自己创建的 + editor/admin 可读全部
+- `INSERT`：anon + authenticated 都允许（写入时 created_by = auth.uid() 或 null）
+- `UPDATE/DELETE`：仅 admin/editor 或 created_by 本人
+- 显式 `GRANT SELECT, INSERT ON public.plant_drafts TO anon, authenticated; GRANT ALL TO service_role;`
 
-### 4. 地区目录合并展示（src/routes/_authenticated/admin.catalogs.$id.tsx 重构）
-- 同一 `province+city+county` 的多个 `regional_catalogs` 视为一个合并目录
-- 列表中每个条目显示 `added_by_name`（哪位编辑添加的）
-- 已有植物详细页 → 蓝色 `<Link>`，否则黑色文字
-- 新增聚合路由 `/regions/$province/$city?/$county?`（公开浏览页）
+存储 bucket `plant-images` 已存在；为 anon 增加上传策略（仅允许写 `drafts/` 前缀，限制 mimetype + size 在 edge 校验）。
 
-### 5. PlantEditor 增加 genus / iucn_status（src/components/plant-editor.tsx）
-- 在 family 字段下方加 `genus` 文本输入
-- 加 `iucn_status` 下拉（8 类 + 空值）
-- 保存时一并写入 plants
+## 后端 server functions（src/lib/identify-plant.functions.ts）
 
-### 6. 修改记录页摘要展示（src/routes/edits.tsx + src/lib/edits.ts）
-- `EditRow` 识别 `kind === 'catalog_create' | 'catalog_append'`：
-  - catalog_create → 「X 编辑添加了 X 地区的目录 N 条」
-  - catalog_append → 「X 编辑在 X 地区目录下新增 N 条，该地区共计 M 条」
-- 该类不展示 before/after diff，仅展示 `summary`
-- 不显示「撤销/恢复」按钮（目录类操作走管理页删除）
+- `identifyPlantFromPhoto(photoBase64, lat, lng)`：调用 Lovable AI `google/gemini-2.5-pro`（多模态），prompt 要求按附件 HTML 同款字段返回结构化（tool calling）：title/scientific_name/family/genus/summary/tags 等。
+- `renderPlantHtml(meta, photoUrl, place)`：调用 `google/gemini-3-flash-preview`，把上面提到的附件模板（loaded once on server）与字段拼成完整 HTML，严格保留 CSS。
+- `submitDraft(photoBase64, lat, lng, place)`：链式调用上面两步，写入 storage + 插入 `plant_drafts`，返回 draft id。匿名也能调。
+- `approveDraft(draftId)`：仅 editor/admin，将 draft 转为 `plants` 行 + html 上传到 `plant-html` bucket + 写 `plant_edits` 一条 `approved` 记录（source=`ai_camera_capture+catalog_editor`）+ 标记 draft `approved` + `published_plant_id`。
 
-### 7. 管理页目录展示（src/routes/_authenticated/admin.index.tsx）
-- 在「我的条目」下方加「我创建的地区植物目录」区块
-- 每行：`为 {省市县} 添加了 {n} 种植物目录 · {时间} · 来源：{source}` + 编辑/删除按钮
-- 编辑按钮 → `/admin/catalogs/$id`；删除 → 调用 `regional_catalogs` delete（RLS 保证只能删自己创建的）
+## 前端
 
-### 8. HTML 编辑器全宽（src/components/html-doc-editor.tsx + src/routes/_authenticated/admin.edit.$id.tsx）
-- 编辑页 `max-w-6xl` → `max-w-none px-4` 或 `max-w-[min(100vw-2rem,1800px)]`
-- 编辑器容器宽度 100%，iframe `width:100%`，`min-height: calc(100vh - 220px)`
-- 工具栏 sticky top
+- 首页 `src/routes/index.tsx` 顶部新增"拍照识植"区块：
+  - 调 `navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'}})` 取后置摄像头，捕获 frame → JPEG base64。
+  - `navigator.geolocation.getCurrentPosition` 取经纬度 → 反查地名（Lovable AI 文本调用，无需第三方 key）。
+  - 显示识别进度 → 跳到 `/drafts/$id`。
+- 首页两个流：
+  1. "最新识别（待审核）" 横向卡片：缩略图 + 植物名 + 拍摄地 + "草稿" 徽章
+  2. "已收录条目" 网格：现有 plants 流
+- 新路由 `src/routes/drafts.$id.tsx`：渲染 draft 的 html_content（复用现有 html 渲染），editor/admin 顶部显示"收录到本站 / 删除草稿"按钮。
 
-### 文件改动汇总
+## 所有者账号 & 权限
 
-**修改：**
-- `src/components/site-header.tsx`（logo + 首页位置）
-- `src/routes/index.tsx`（头部文案 + 地区 Tab）
-- `src/routes/plants.index.tsx`（4 下拉 + URL 筛选）
-- `src/routes/_authenticated/admin.index.tsx`（目录列表区块）
-- `src/routes/_authenticated/admin.catalogs.$id.tsx`（合并展示）
-- `src/routes/_authenticated/admin.edit.$id.tsx`（全宽）
-- `src/components/html-doc-editor.tsx`（全宽 + 工具栏）
-- `src/components/plant-editor.tsx`（genus / iucn）
-- `src/routes/edits.tsx`（catalog 摘要行）
-- `src/lib/catalogs.ts`（合并查询辅助）
+- 通过 admin API 创建 auth 用户 arainjazz@gmail.com（已确认邮箱），写入 profiles。
+- 在 `user_roles` 插入 `(user_id, 'admin')` 和 `(user_id, 'editor')`，让你登录后即获全部权限。
 
-**新建：**
-- `src/routes/regions.tsx`（首页地区 Tab 复用的浏览组件，可选）
+## 修改记录
 
-无新增数据库迁移（schema 已就绪）。
+所有 draft → published 的转换以及编辑改动都写 `plant_edits`，source 使用 `aiSource({model:'google/gemini-2.5-pro', platform:'lovable-ai', via:'ai_camera_capture'})` 或附加 `+catalog_editor`，并在 `/edits` 页正常展示。
+
+## 不在本次范围
+
+- 摄像头页面的细节美化、reverse-geocoding 的高精度回退、批量导入草稿。
+- 详情页之外的"修订对比"。
+
+---
+如确认这个方案，我会按以下顺序实施：
+1. 数据库迁移（plant_drafts + 存储策略 + 你的所有者账号 & 角色）
+2. server functions（identify / render / submit / approve）
+3. 首页改造 + drafts 详情路由
+4. 验收 SSR/build + 用账号登录验证管理员权限

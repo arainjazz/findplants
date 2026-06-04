@@ -19,6 +19,7 @@ import { Route as PlantsIndexRouteImport } from './routes/plants.index'
 import { Route as BlogIndexRouteImport } from './routes/blog.index'
 import { Route as TagsSlugRouteImport } from './routes/tags.$slug'
 import { Route as PlantsSlugRouteImport } from './routes/plants.$slug'
+import { Route as DraftsIdRouteImport } from './routes/drafts.$id'
 import { Route as BlogSlugRouteImport } from './routes/blog.$slug'
 import { Route as AuthenticatedAdminIndexRouteImport } from './routes/_authenticated/admin.index'
 import { Route as AuthenticatedAdminTagsRouteImport } from './routes/_authenticated/admin.tags'
@@ -78,6 +79,11 @@ const TagsSlugRoute = TagsSlugRouteImport.update({
 const PlantsSlugRoute = PlantsSlugRouteImport.update({
   id: '/plants/$slug',
   path: '/plants/$slug',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const DraftsIdRoute = DraftsIdRouteImport.update({
+  id: '/drafts/$id',
+  path: '/drafts/$id',
   getParentRoute: () => rootRouteImport,
 } as any)
 const BlogSlugRoute = BlogSlugRouteImport.update({
@@ -150,6 +156,7 @@ export interface FileRoutesByFullPath {
   '/search': typeof SearchRoute
   '/signup': typeof SignupRoute
   '/blog/$slug': typeof BlogSlugRoute
+  '/drafts/$id': typeof DraftsIdRoute
   '/plants/$slug': typeof PlantsSlugRoute
   '/tags/$slug': typeof TagsSlugRoute
   '/blog/': typeof BlogIndexRoute
@@ -172,6 +179,7 @@ export interface FileRoutesByTo {
   '/search': typeof SearchRoute
   '/signup': typeof SignupRoute
   '/blog/$slug': typeof BlogSlugRoute
+  '/drafts/$id': typeof DraftsIdRoute
   '/plants/$slug': typeof PlantsSlugRoute
   '/tags/$slug': typeof TagsSlugRoute
   '/blog': typeof BlogIndexRoute
@@ -196,6 +204,7 @@ export interface FileRoutesById {
   '/search': typeof SearchRoute
   '/signup': typeof SignupRoute
   '/blog/$slug': typeof BlogSlugRoute
+  '/drafts/$id': typeof DraftsIdRoute
   '/plants/$slug': typeof PlantsSlugRoute
   '/tags/$slug': typeof TagsSlugRoute
   '/blog/': typeof BlogIndexRoute
@@ -220,6 +229,7 @@ export interface FileRouteTypes {
     | '/search'
     | '/signup'
     | '/blog/$slug'
+    | '/drafts/$id'
     | '/plants/$slug'
     | '/tags/$slug'
     | '/blog/'
@@ -242,6 +252,7 @@ export interface FileRouteTypes {
     | '/search'
     | '/signup'
     | '/blog/$slug'
+    | '/drafts/$id'
     | '/plants/$slug'
     | '/tags/$slug'
     | '/blog'
@@ -265,6 +276,7 @@ export interface FileRouteTypes {
     | '/search'
     | '/signup'
     | '/blog/$slug'
+    | '/drafts/$id'
     | '/plants/$slug'
     | '/tags/$slug'
     | '/blog/'
@@ -289,6 +301,7 @@ export interface RootRouteChildren {
   SearchRoute: typeof SearchRoute
   SignupRoute: typeof SignupRoute
   BlogSlugRoute: typeof BlogSlugRoute
+  DraftsIdRoute: typeof DraftsIdRoute
   PlantsSlugRoute: typeof PlantsSlugRoute
   TagsSlugRoute: typeof TagsSlugRoute
   BlogIndexRoute: typeof BlogIndexRoute
@@ -365,6 +378,13 @@ declare module '@tanstack/react-router' {
       path: '/plants/$slug'
       fullPath: '/plants/$slug'
       preLoaderRoute: typeof PlantsSlugRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/drafts/$id': {
+      id: '/drafts/$id'
+      path: '/drafts/$id'
+      fullPath: '/drafts/$id'
+      preLoaderRoute: typeof DraftsIdRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/blog/$slug': {
@@ -485,6 +505,7 @@ const rootRouteChildren: RootRouteChildren = {
   SearchRoute: SearchRoute,
   SignupRoute: SignupRoute,
   BlogSlugRoute: BlogSlugRoute,
+  DraftsIdRoute: DraftsIdRoute,
   PlantsSlugRoute: PlantsSlugRoute,
   TagsSlugRoute: TagsSlugRoute,
   BlogIndexRoute: BlogIndexRoute,
@@ -493,13 +514,3 @@ const rootRouteChildren: RootRouteChildren = {
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)
   ._addFileTypes<FileRouteTypes>()
-
-import type { getRouter } from './router.tsx'
-import type { startInstance } from './start.ts'
-declare module '@tanstack/react-start' {
-  interface Register {
-    ssr: true
-    router: Awaited<ReturnType<typeof getRouter>>
-    config: Awaited<ReturnType<typeof startInstance.getOptions>>
-  }
-}
