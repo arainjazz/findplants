@@ -603,7 +603,9 @@ export function PlantEditor({ initial }: Props) {
       <input
         ref={htmlInputRef}
         type="file"
-        accept=".html,.htm,text/html,image/*"
+        // Folder picker: user picks the folder containing the HTML + images,
+        // we auto-detect everything. No second prompt, no Ctrl/⌘ multi-select.
+        {...({ webkitdirectory: "", directory: "" } as Record<string, string>)}
         multiple
         onChange={onHtmlUpload}
         disabled={uploadingHtml || extracting}
@@ -615,10 +617,11 @@ export function PlantEditor({ initial }: Props) {
         type="file"
         accept="image/*"
         multiple
-        onChange={onImagesForPendingHtml}
         className="sr-only"
         tabIndex={-1}
+        onChange={() => { /* legacy slot, no longer used */ }}
       />
+
       <Field label="标题 *">
         <input value={title} onChange={(e) => setTitle(e.target.value)} className={inputCls} />
       </Field>
