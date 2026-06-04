@@ -87,6 +87,13 @@ function HomePage() {
           </div>
         </section>
 
+        {/* Camera-based AI plant identification (anyone, including signed-out) */}
+        <CameraIdentify />
+
+        {/* Pending drafts feed */}
+        {drafts.length > 0 && <DraftsStrip drafts={drafts} />}
+
+
         {/* Tabs */}
         <div className="flex items-center gap-1 mb-8 border-b border-rule">
           {(
