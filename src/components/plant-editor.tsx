@@ -1066,13 +1066,17 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
 }
 
 // ─── Local asset helpers for HTML uploads ───────────────────────────────────
-// Detect <img src>, <source src/srcset>, <link href> and inline url(...) that
-// point to local relative paths (not http/https/data/blob URLs).
+// Detect <img src>, <source src/srcset>, <link href>, plain href, and inline
+// url(...) references that point to local relative paths (not http/https/data/blob).
 const LOCAL_REF_RE =
-  /(?:src|href)\s*=\s*["']([^"'#?][^"']*)["']|url\(\s*["']?([^"')]+)["']?\s*\)/gi;
+  /(?:src|href)\s*=\s*["']([^"'#?][^"']*)["']|srcset\s*=\s*["']([^"']+)["']|url\(\s*["']?([^"')]+)["']?\s*\)/gi;
 
 function isExternalRef(v: string): boolean {
   return /^(https?:|data:|blob:|\/\/|#|mailto:|cid:)/i.test(v);
+}
+
+function splitSrcset(v: string): string[] {
+  return v.split(",").map((s) => s.trim().split(/\s+/)[0]).filter(Boolean);
 }
 
 export function findLocalAssetRefs(html: string): string[] {
@@ -1080,36 +1084,74 @@ export function findLocalAssetRefs(html: string): string[] {
   let m: RegExpExecArray | null;
   const re = new RegExp(LOCAL_REF_RE.source, "gi");
   while ((m = re.exec(html))) {
-    const v = (m[1] ?? m[2] ?? "").trim();
-    if (!v) continue;
-    if (isExternalRef(v)) continue;
-    // Skip pure anchor / query-only refs
-    if (v.startsWith("#") || v.startsWith("?")) continue;
-    out.add(v);
+    const candidates: string[] = [];
+    if (m[1]) candidates.push(m[1]);
+    if (m[2]) candidates.push(...splitSrcset(m[2]));
+    if (m[3]) candidates.push(m[3]);
+    for (const raw of candidates) {
+      const v = raw.trim();
+      if (!v || isExternalRef(v)) continue;
+      if (v.startsWith("#") || v.startsWith("?")) continue;
+      out.add(v);
+    }
   }
   return Array.from(out);
 }
 
-export function rewriteLocalAssetPaths(html: string, map: Map<string, string>): string {
-  return html.replace(LOCAL_REF_RE, (full, srcVal: string | undefined, urlVal: string | undefined) => {
-    const raw = (srcVal ?? urlVal ?? "").trim();
-    if (!raw || isExternalRef(raw)) return full;
-    // Try exact, then basename, then strip leading "./" or "../"
-    const candidates = [
-      raw,
-      raw.replace(/^\.?\.?\/+/, ""),
-      raw.split("/").pop() ?? raw,
-      decodeURIComponent(raw),
-      decodeURIComponent(raw.split("/").pop() ?? raw),
-    ];
-    for (const c of candidates) {
-      const hit = map.get(c);
-      if (hit) {
-        return srcVal !== undefined
-          ? full.replace(raw, hit)
-          : `url("${hit}")`;
-      }
+function lookupAsset(raw: string, map: Map<string, string>): string | null {
+  const tries = new Set<string>();
+  const push = (s: string) => { if (s) tries.add(s); tries.add(s.toLowerCase()); };
+  push(raw);
+  push(raw.replace(/^\.{0,2}\/+/, ""));
+  push(raw.split("/").pop() ?? raw);
+  try { push(decodeURIComponent(raw)); } catch { /* ignore */ }
+  try { push(decodeURIComponent(raw.split("/").pop() ?? raw)); } catch { /* ignore */ }
+  // last 2 segments (e.g. images/foo.jpg)
+  const parts = raw.split("/").filter(Boolean);
+  if (parts.length >= 2) push(parts.slice(-2).join("/"));
+  for (const c of tries) {
+    const hit = map.get(c);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+export function rewriteLocalAssetPaths(html: string, srcMap: Map<string, string>): string {
+  // Build a case-insensitive lookup map (preserve original keys too).
+  const map = new Map<string, string>();
+  for (const [k, v] of srcMap.entries()) {
+    map.set(k, v);
+    map.set(k.toLowerCase(), v);
+  }
+  return html.replace(LOCAL_REF_RE, (full, srcVal?: string, srcsetVal?: string, urlVal?: string) => {
+    if (srcVal !== undefined) {
+      const raw = srcVal.trim();
+      if (!raw || isExternalRef(raw)) return full;
+      const hit = lookupAsset(raw, map);
+      return hit ? full.replace(raw, hit) : full;
+    }
+    if (srcsetVal !== undefined) {
+      // Rewrite each candidate inside the srcset string.
+      const rewritten = srcsetVal
+        .split(",")
+        .map((part) => {
+          const trimmed = part.trim();
+          if (!trimmed) return part;
+          const [u, ...rest] = trimmed.split(/\s+/);
+          if (!u || isExternalRef(u)) return part;
+          const hit = lookupAsset(u, map);
+          return hit ? [hit, ...rest].join(" ") : part;
+        })
+        .join(", ");
+      return full.replace(srcsetVal, rewritten);
+    }
+    if (urlVal !== undefined) {
+      const raw = urlVal.trim();
+      if (!raw || isExternalRef(raw)) return full;
+      const hit = lookupAsset(raw, map);
+      return hit ? `url("${hit}")` : full;
     }
     return full;
   });
 }
+
