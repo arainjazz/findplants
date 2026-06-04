@@ -27,6 +27,23 @@ async function callAiIdentify(photoDataUrl: string, hintPlace: string): Promise<
 - iucn_status：仅在你**确有把握**时填入 LC/NT/VU/EN/CR/DD 之一，否则留空字符串。
 - 所有中文段落采用 Noto Serif SC 风格的正式植物志措辞，避免空话套话；英文段落为对应中文段落的精炼意译，保留拉丁学名斜体（用 *Genus species* 标记）。
 - 若识别不确定，仍要给出最可能的物种，并在 summary 标注「疑似」。`;
+
+  const body = {
+    model: AI_MODEL,
+    messages: [
+      { role: "system", content: systemPrompt },
+      {
+        role: "user",
+        content: [
+          {
+            type: "text",
+            text: `请识别这张植物照片。${hintPlace ? `拍摄地点：${hintPlace}。` : ""}请直接调用工具返回完整的结构化结果，所有字段都必须按指定字数填满，不要省略任何段落。`,
+          },
+          { type: "image_url", image_url: { url: photoDataUrl } },
+        ],
+      },
+    ],
+    max_tokens: 32000,
     tools: [
       {
         type: "function",
