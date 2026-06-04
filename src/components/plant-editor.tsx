@@ -402,6 +402,32 @@ export function PlantEditor({ initial }: Props) {
     toast.message("已设为分支，保存时将关联到原条目并显示「由 X 创建」标签");
   };
 
+  // Finalize: rewrite refs (if image map provided) and upload HTML to storage.
+  const finalizeHtmlUpload = async (htmlFile: File, text: string, imageFiles: File[]) => {
+    let finalText = text;
+    if (imageFiles.length > 0) {
+      toast.message(`正在上传 ${imageFiles.length} 张配图…`);
+      const nameMap = new Map<string, string>();
+      for (const img of imageFiles) {
+        const url = await uploadFile(img, "plant-images");
+        nameMap.set(img.name, url);
+        const rel = (img as File & { webkitRelativePath?: string }).webkitRelativePath;
+        if (rel) {
+          nameMap.set(rel, url);
+          const stripped = rel.split("/").slice(1).join("/");
+          if (stripped) nameMap.set(stripped, url);
+        }
+      }
+      finalText = rewriteLocalAssetPaths(text, nameMap);
+      toast.success(`已重写 HTML 中的本地图片路径（${imageFiles.length} 张）`);
+    }
+    const finalHtmlFile = new File([finalText], htmlFile.name, { type: "text/html" });
+    const uploadedUrl = await uploadFile(finalHtmlFile, "plant-html");
+    setHtmlUrl(uploadedUrl);
+    toast.success("HTML 已上传");
+    await extractMetaFromUrl(uploadedUrl, "已根据 HTML 自动填入标题和字段，请检查后保存");
+  };
+
   const onHtmlUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files ?? []);
     e.target.value = "";
@@ -411,53 +437,53 @@ export function PlantEditor({ initial }: Props) {
     const imageFiles = files.filter((f) => f !== htmlFile && f.type.startsWith("image/"));
     setUploadingHtml(true);
     try {
-      let finalHtmlFile: File = htmlFile;
-      // If the editor also selected accompanying images, upload each to storage
-      // and rewrite the HTML so that all <img src> / inline url(...) references
-      // point to the public URLs instead of local file paths.
-      if (imageFiles.length > 0) {
-        toast.message(`正在上传 ${imageFiles.length} 张配图…`);
-        const nameMap = new Map<string, string>(); // basename + relpath -> public URL
-        for (const img of imageFiles) {
-          const url = await uploadFile(img, "plant-images");
-          // Map by basename, and by webkitRelativePath when present (folder upload).
-          const base = img.name;
-          nameMap.set(base, url);
-          const rel = (img as File & { webkitRelativePath?: string }).webkitRelativePath;
-          if (rel) {
-            nameMap.set(rel, url);
-            // Also map the path without the top-level folder
-            const stripped = rel.split("/").slice(1).join("/");
-            if (stripped) nameMap.set(stripped, url);
-          }
+      const text = await htmlFile.text();
+      // If user only picked the HTML (no images alongside), check for local refs.
+      // When found, auto-open a second image picker so the user only has to
+      // choose the referenced images — no manual Ctrl/⌘ multi-select required.
+      if (imageFiles.length === 0) {
+        const localRefs = findLocalAssetRefs(text);
+        if (localRefs.length > 0) {
+          pendingHtmlRef.current = { file: htmlFile, text, refs: localRefs };
+          const sample = localRefs.slice(0, 3).join("、");
+          toast.message(
+            `检测到 ${localRefs.length} 张本地图片（如 ${sample}${localRefs.length > 3 ? " …" : ""}），请在弹窗中选中它们`,
+            { duration: 6000 },
+          );
+          setUploadingHtml(false);
+          setTimeout(() => imageInputRef.current?.click(), 50);
+          return;
         }
-        const rawText = await htmlFile.text();
-        const rewritten = rewriteLocalAssetPaths(rawText, nameMap);
-        finalHtmlFile = new File([rewritten], htmlFile.name, { type: "text/html" });
-        toast.success(`已重写 HTML 中的本地图片路径（${imageFiles.length} 张）`);
-      } else {
-        // No images selected; warn if HTML references local files that won't load on the site.
-        try {
-          const txt = await htmlFile.text();
-          const localRefs = findLocalAssetRefs(txt);
-          if (localRefs.length > 0) {
-            toast.warning(
-              `HTML 中有 ${localRefs.length} 个本地图片引用未上传（如 ${localRefs[0]}），网站上将无法显示。请重新选择，同时勾选 HTML 旁边的图片文件。`,
-              { duration: 8000 },
-            );
-          }
-        } catch { /* ignore */ }
       }
-      const uploadedUrl = await uploadFile(finalHtmlFile, "plant-html");
-      setHtmlUrl(uploadedUrl);
-      toast.success("HTML 已上传");
-      await extractMetaFromUrl(uploadedUrl, "已根据 HTML 自动填入标题和字段，请检查后保存");
+      await finalizeHtmlUpload(htmlFile, text, imageFiles);
     } catch (err) {
       toast.error((err as Error).message);
     } finally {
       setUploadingHtml(false);
     }
   };
+
+  const onImagesForPendingHtml = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files ?? []);
+    e.target.value = "";
+    const pending = pendingHtmlRef.current;
+    if (!pending) return;
+    setUploadingHtml(true);
+    try {
+      if (files.length === 0) {
+        toast.warning("未选择图片，已按原样上传 HTML；线上将无法显示这些本地图片");
+        await finalizeHtmlUpload(pending.file, pending.text, []);
+      } else {
+        await finalizeHtmlUpload(pending.file, pending.text, files.filter((f) => f.type.startsWith("image/")));
+      }
+    } catch (err) {
+      toast.error((err as Error).message);
+    } finally {
+      pendingHtmlRef.current = null;
+      setUploadingHtml(false);
+    }
+  };
+
 
   const onExtractMeta = async () => {
     if (!htmlUrl) return;
