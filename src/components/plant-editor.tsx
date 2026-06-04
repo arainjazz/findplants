@@ -32,7 +32,12 @@ export function PlantEditor({ initial }: Props) {
   const qc = useQueryClient();
   const htmlInputRef = useRef<HTMLInputElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
-  const pendingHtmlRef = useRef<{ file: File; text: string; refs: string[] } | null>(null);
+  const pendingHtmlRef = useRef<{
+    file: File;
+    text: string;
+    matched: Set<File>;
+    missing: string[];
+  } | null>(null);
   const hydratedDraftRef = useRef(false);
   const draftKey = `plant-editor-draft:${initial?.id ?? "new"}`;
 
@@ -428,52 +433,70 @@ export function PlantEditor({ initial }: Props) {
     await extractMetaFromUrl(uploadedUrl, "已根据 HTML 自动填入标题和字段，请检查后保存");
   };
 
+  // Match each local HTML ref (e.g. "images/leaf.jpg") to one of the user-selected image files.
+  const matchRefsToFiles = (refs: string[], imageFiles: File[]) => {
+    const filesByName = new Map<string, File>();
+    for (const f of imageFiles) {
+      const rel = (f as File & { webkitRelativePath?: string }).webkitRelativePath || f.name;
+      filesByName.set(rel.toLowerCase(), f);
+      filesByName.set(f.name.toLowerCase(), f);
+      const parts = rel.split("/");
+      for (let i = 1; i < parts.length; i++) {
+        filesByName.set(parts.slice(i).join("/").toLowerCase(), f);
+      }
+    }
+    const matched = new Set<File>();
+    const missing: string[] = [];
+    for (const ref of refs) {
+      const cleaned = ref.split(/[?#]/)[0].replace(/^\.?\//, "").toLowerCase();
+      const file =
+        filesByName.get(cleaned) ||
+        filesByName.get(cleaned.split("/").pop() || "");
+      if (file) matched.add(file);
+      else missing.push(ref);
+    }
+    return { matched, missing };
+  };
+
   const onHtmlUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files ?? []);
     e.target.value = "";
     if (files.length === 0) return;
-    // User picks the folder containing the HTML page (and any local images).
-    // We auto-detect the HTML file and all referenced images — no second prompt.
     const htmlFile = files.find((f) => /\.html?$/i.test(f.name) || f.type === "text/html");
-    if (!htmlFile) return toast.error("文件夹中没有 .html 文件，请选择包含 HTML 的文件夹");
+    if (!htmlFile) return toast.error("请选择 .html 文件（也可同时多选本地图片或整个文件夹）");
     setUploadingHtml(true);
     try {
       const text = await htmlFile.text();
       const localRefs = findLocalAssetRefs(text);
-      // Build a normalized lookup of files picked from the folder.
-      const filesByName = new Map<string, File>();
-      for (const f of files) {
-        if (f === htmlFile) continue;
-        if (!f.type.startsWith("image/")) continue;
-        const rel =
-          (f as File & { webkitRelativePath?: string }).webkitRelativePath || f.name;
-        filesByName.set(rel.toLowerCase(), f);
-        filesByName.set(f.name.toLowerCase(), f);
-        // Also store every path-suffix so "images/leaf.jpg" matches
-        // "<folder>/images/leaf.jpg".
-        const parts = rel.split("/");
-        for (let i = 1; i < parts.length; i++) {
-          filesByName.set(parts.slice(i).join("/").toLowerCase(), f);
-        }
+      const imageFiles = files.filter((f) => f !== htmlFile && f.type.startsWith("image/"));
+      const { matched, missing } = matchRefsToFiles(localRefs, imageFiles);
+      if (localRefs.length === 0 || missing.length === 0) {
+        await finalizeHtmlUpload(htmlFile, text, Array.from(matched));
+        return;
       }
-      // Resolve each local reference to a File from the folder.
-      const matched = new Set<File>();
-      const missing: string[] = [];
-      for (const ref of localRefs) {
-        const cleaned = ref.split(/[?#]/)[0].replace(/^\.?\//, "").toLowerCase();
-        const file =
-          filesByName.get(cleaned) ||
-          filesByName.get(cleaned.split("/").pop() || "");
-        if (file) matched.add(file);
-        else missing.push(ref);
-      }
-      if (missing.length > 0) {
-        toast.warning(
-          `有 ${missing.length} 张图片未在文件夹中找到（如 ${missing.slice(0, 2).join("、")}）；请把它们和 HTML 放在同一文件夹后重试`,
-          { duration: 6000 },
-        );
-      }
-      await finalizeHtmlUpload(htmlFile, text, Array.from(matched));
+      // Auto-prompt the user to pick the still-missing images, no need to know exact names.
+      pendingHtmlRef.current = { file: htmlFile, text, matched, missing };
+      toast.message(
+        `HTML 中引用了 ${missing.length} 张本地图片（${missing.slice(0, 2).join("、")}${missing.length > 2 ? "…" : ""}），请一次性选中它们`,
+        { duration: 6000 },
+      );
+      imageInputRef.current?.click();
+    } catch (err) {
+      toast.error((err as Error).message);
+      setUploadingHtml(false);
+    }
+  };
+
+  const onPendingImagesPicked = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files ?? []);
+    e.target.value = "";
+    const pending = pendingHtmlRef.current;
+    pendingHtmlRef.current = null;
+    if (!pending) return;
+    try {
+      const { matched: extra } = matchRefsToFiles(pending.missing, files);
+      const all = new Set<File>([...pending.matched, ...extra]);
+      await finalizeHtmlUpload(pending.file, pending.text, Array.from(all));
     } catch (err) {
       toast.error((err as Error).message);
     } finally {
@@ -603,9 +626,11 @@ export function PlantEditor({ initial }: Props) {
       <input
         ref={htmlInputRef}
         type="file"
-        // Folder picker: user picks the folder containing the HTML + images,
-        // we auto-detect everything. No second prompt, no Ctrl/⌘ multi-select.
-        {...({ webkitdirectory: "", directory: "" } as Record<string, string>)}
+        // Accept a single HTML, or HTML + images, or a whole folder.
+        // Browsers that support `webkitdirectory` will also expose a "select folder" affordance
+        // in their file dialog when this attribute is set, but `multiple` still lets the user
+        // select an individual `.html` file.
+        accept=".html,.htm,text/html,image/*"
         multiple
         onChange={onHtmlUpload}
         disabled={uploadingHtml || extracting}
@@ -619,7 +644,7 @@ export function PlantEditor({ initial }: Props) {
         multiple
         className="sr-only"
         tabIndex={-1}
-        onChange={() => { /* legacy slot, no longer used */ }}
+        onChange={onPendingImagesPicked}
       />
 
       <Field label="标题 *">
@@ -852,7 +877,7 @@ export function PlantEditor({ initial }: Props) {
               disabled={uploadingHtml || extracting}
               className="border border-ink px-4 py-2 hover:bg-ink hover:text-background transition-colors disabled:opacity-60 text-sm"
             >
-              {uploadingHtml ? "上传中…" : extracting ? "AI 识别中…" : "选择含 HTML 的文件夹"}
+              {uploadingHtml ? "上传中…" : extracting ? "AI 识别中…" : "选择 HTML 文件"}
             </button>
             {htmlUrl && (
               <>
@@ -920,7 +945,7 @@ export function PlantEditor({ initial }: Props) {
             <p className="text-xs text-ink-faint">
               提示：上传后整页将以原样在 iframe 中渲染（保留你的字体与排版）。
               <br />
-              <strong>含本地图片的页面：</strong>请直接选中包含 HTML 与其引用图片的<strong>整个文件夹</strong>。系统会自动识别 HTML 中的相对路径，把对应图片上传到站内并改写链接——无需手动多选。
+              <strong>含本地图片的页面：</strong>直接选中 .html 文件即可——系统会自动解析 HTML 中引用的本地图片路径，并立刻弹出第二个对话框让你一次性选中这些图片，随后自动上传到站内并改写链接，无需逐个核对文件名。
             </p>
             {htmlUrl && (
               <div className="mt-5 pt-5 border-t border-rule">
