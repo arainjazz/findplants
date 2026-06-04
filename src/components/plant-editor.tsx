@@ -1085,6 +1085,31 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
   );
 }
 
+function MenuItem({
+  onClick,
+  icon,
+  disabled,
+  danger,
+  children,
+}: {
+  onClick: () => void;
+  icon?: React.ReactNode;
+  disabled?: boolean;
+  danger?: boolean;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      className={`w-full text-left px-3 py-2 hover:bg-paper-deep inline-flex items-center gap-2 ${danger ? "text-destructive" : ""} disabled:opacity-50`}
+    >
+      {icon}
+      <span>{children}</span>
+    </button>
+  );
+
 // ─── Local asset helpers for HTML uploads ───────────────────────────────────
 // Detect <img src>, <source src/srcset>, <link href>, plain href, and inline
 // url(...) references that point to local relative paths (not http/https/data/blob).
