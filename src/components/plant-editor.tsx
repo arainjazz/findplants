@@ -428,13 +428,27 @@ export function PlantEditor({ initial }: Props) {
     await extractMetaFromUrl(uploadedUrl, "已根据 HTML 自动填入标题和字段，请检查后保存");
   };
 
+  const isImageFile = (file: File) =>
+    file.type.startsWith("image/") || /\.(png|jpe?g|webp|gif|svg|avif|bmp|tiff?)$/i.test(file.name);
+
+  const assetLookupKeys = (value: string) => {
+    const cleaned = value.split(/[?#]/)[0].replace(/\\/g, "/").replace(/^\.?\/+/, "");
+    const keys = new Set([cleaned, cleaned.split("/").pop() || ""]);
+    try {
+      const decoded = decodeURIComponent(cleaned);
+      keys.add(decoded);
+      keys.add(decoded.split("/").pop() || "");
+    } catch { /* ignore */ }
+    return Array.from(keys).filter(Boolean).map((k) => k.toLowerCase());
+  };
+
   // Match each local HTML ref (e.g. "images/leaf.jpg") to one of the user-selected image files.
   const matchRefsToFiles = (refs: string[], imageFiles: File[]) => {
     const filesByName = new Map<string, File>();
     for (const f of imageFiles) {
-      const rel = (f as File & { webkitRelativePath?: string }).webkitRelativePath || f.name;
-      filesByName.set(rel.toLowerCase(), f);
-      filesByName.set(f.name.toLowerCase(), f);
+      const rel = ((f as File & { webkitRelativePath?: string }).webkitRelativePath || f.name).replace(/\\/g, "/");
+      assetLookupKeys(rel).forEach((k) => filesByName.set(k, f));
+      assetLookupKeys(f.name).forEach((k) => filesByName.set(k, f));
       const parts = rel.split("/");
       for (let i = 1; i < parts.length; i++) {
         filesByName.set(parts.slice(i).join("/").toLowerCase(), f);
@@ -443,10 +457,7 @@ export function PlantEditor({ initial }: Props) {
     const matched = new Set<File>();
     const missing: string[] = [];
     for (const ref of refs) {
-      const cleaned = ref.split(/[?#]/)[0].replace(/^\.?\//, "").toLowerCase();
-      const file =
-        filesByName.get(cleaned) ||
-        filesByName.get(cleaned.split("/").pop() || "");
+      const file = assetLookupKeys(ref).map((k) => filesByName.get(k)).find(Boolean);
       if (file) matched.add(file);
       else missing.push(ref);
     }
@@ -463,7 +474,7 @@ export function PlantEditor({ initial }: Props) {
     try {
       const text = await htmlFile.text();
       const localRefs = findLocalAssetRefs(text);
-      const imageFiles = files.filter((f) => f !== htmlFile && f.type.startsWith("image/"));
+      const imageFiles = files.filter((f) => f !== htmlFile && isImageFile(f));
       const { matched, missing } = matchRefsToFiles(localRefs, imageFiles);
       if (missing.length > 0) {
         toast.message(
