@@ -229,7 +229,7 @@ export const submitPlantDraft = createServerFn({ method: "POST" })
         capture_lng: lng,
         capture_place: place,
         ai_model: AI_MODEL,
-        ai_payload: meta as unknown as Record<string, unknown>,
+        ai_payload: JSON.parse(JSON.stringify(meta)),
         title: meta.title,
         scientific_name: meta.scientific_name,
         common_name_en: meta.common_name_en,
