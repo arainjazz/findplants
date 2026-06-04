@@ -181,9 +181,10 @@ export function CameraIdentify() {
           {phase === "ready" && (
             <button
               onClick={captureFrame}
-              className="w-full bg-vermilion text-background px-6 py-3 font-semibold hover:bg-ink transition-colors"
+              className="w-full bg-vermilion text-background px-6 py-3 font-semibold hover:bg-ink transition-colors inline-flex items-center justify-center gap-2"
             >
-              📸 拍摄
+              <CameraIcon className="w-5 h-5" />
+              <span>拍摄</span>
             </button>
           )}
           {statusText && <p className="text-sm text-ink-faint mt-2">{statusText}</p>}
@@ -199,9 +200,9 @@ export function CameraIdentify() {
             <button
               onClick={onSubmit}
               disabled={phase === "submitting"}
-              className="flex-1 bg-ink text-background px-6 py-3 hover:bg-vermilion transition-colors font-semibold disabled:opacity-60"
+              className="flex-1 bg-ink text-background px-6 py-3 hover:bg-vermilion transition-colors font-semibold disabled:opacity-60 inline-flex items-center justify-center gap-2"
             >
-              {phase === "submitting" ? "AI 识别中… 约需 10–30 秒" : "✨ 让 AI 识别并生成草稿"}
+              {phase === "submitting" ? <span>AI 识别中… 约需 10–30 秒</span> : (<><SparkleIcon className="w-5 h-5" /><span>让 AI 识别并生成草稿</span></>)}
             </button>
             <button
               onClick={retake}
