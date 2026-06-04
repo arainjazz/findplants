@@ -728,18 +728,14 @@ export function PlantEditor({ initial }: Props) {
                   setCoverMenu({ x: e.clientX, y: e.clientY });
                 }}
               />
-              <div className="text-xs text-ink-faint space-y-1">
-                <p>右键点击封面可：📁 本地上传 · 🔗 输入网址 · 🖼 从详情页选图 · 🌐 在线搜索（GBIF/iNaturalist/Wikimedia）</p>
-                <button
-                  type="button"
-                  onClick={(e) => {
-                    const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
-                    setCoverMenu({ x: r.left, y: r.bottom });
-                  }}
-                  className="border border-ink/40 px-2 py-1 hover:bg-paper-deep"
-                >
-                  编辑封面 ▾
-                </button>
+              <div className="text-xs text-ink-faint space-y-1 max-w-md">
+                <p>默认选择页面中的第一张作为封面图,你也可以右键点击封面可:</p>
+                <ul className="space-y-0.5 list-none">
+                  <li className="inline-flex items-center gap-1.5"><FolderOpen className="w-3.5 h-3.5" /> 本地上传</li>
+                  <li className="inline-flex items-center gap-1.5 ml-3"><Link2 className="w-3.5 h-3.5" /> 输入网址</li>
+                  <li className="inline-flex items-center gap-1.5 ml-3"><ImageIcon className="w-3.5 h-3.5" /> 从详情页选图</li>
+                  <li className="inline-flex items-center gap-1.5 ml-3"><Globe className="w-3.5 h-3.5" /> 在线搜索(GBIF/iNaturalist/Wikimedia)</li>
+                </ul>
               </div>
             </div>
           ) : (
@@ -748,28 +744,31 @@ export function PlantEditor({ initial }: Props) {
                 type="button"
                 onClick={() => coverFileRef.current?.click()}
                 disabled={uploadingCover}
-                className="border border-ink px-3 py-1.5 hover:bg-ink hover:text-background transition-colors disabled:opacity-60"
+                className="border border-ink px-3 py-1.5 hover:bg-ink hover:text-background transition-colors disabled:opacity-60 inline-flex items-center gap-1.5"
               >
-                {uploadingCover ? "上传中…" : "📁 本地上传"}
+                <FolderOpen className="w-4 h-4" />
+                {uploadingCover ? "上传中…" : "本地上传"}
               </button>
               <button
                 type="button"
                 onClick={() => setShowCoverSearch(true)}
-                className="border border-ink px-3 py-1.5 hover:bg-ink hover:text-background transition-colors"
+                className="border border-ink px-3 py-1.5 hover:bg-ink hover:text-background transition-colors inline-flex items-center gap-1.5"
               >
-                🌐 在线搜索
+                <Globe className="w-4 h-4" />
+                在线搜索
               </button>
               {pageImages.length > 0 && (
                 <button
                   type="button"
                   onClick={() => setShowPagePicker(true)}
-                  className="border border-ink px-3 py-1.5 hover:bg-ink hover:text-background transition-colors"
+                  className="border border-ink px-3 py-1.5 hover:bg-ink hover:text-background transition-colors inline-flex items-center gap-1.5"
                 >
-                  🖼 从详情页选图（{pageImages.length}）
+                  <ImageIcon className="w-4 h-4" />
+                  从详情页选图({pageImages.length})
                 </button>
               )}
               {contentType === "html" && htmlUrl && (
-                <span className="text-xs text-ink-faint">未设置封面：保存时将自动选取 HTML 中的第一张图片。</span>
+                <span className="text-xs text-ink-faint">未设置封面:保存时将自动选取 HTML 中的第一张图片。</span>
               )}
             </div>
           )}
@@ -778,63 +777,40 @@ export function PlantEditor({ initial }: Props) {
               role="menu"
               onClick={(e) => e.stopPropagation()}
               style={{ position: "fixed", left: coverMenu.x, top: coverMenu.y, zIndex: 60 }}
-              className="bg-background border border-ink shadow-lg py-1 w-56 text-sm"
+              className="bg-background border border-ink shadow-lg py-1 w-60 text-sm"
             >
-              <button
-                type="button"
-                onClick={() => { setCoverMenu(null); coverFileRef.current?.click(); }}
-                className="w-full text-left px-3 py-2 hover:bg-paper-deep"
-              >
-                📁 替换为本地图片
-              </button>
-              <button
-                type="button"
+              <MenuItem onClick={() => { setCoverMenu(null); coverFileRef.current?.click(); }} icon={<FolderOpen className="w-4 h-4" />}>替换为本地图片</MenuItem>
+              <MenuItem
                 onClick={() => {
-                  const url = window.prompt("封面图片网址：", coverUrl);
+                  const url = window.prompt("封面图片网址:", coverUrl);
                   if (url !== null) { setCoverUrl(url.trim()); coverEdited.current = true; }
                   setCoverMenu(null);
                 }}
-                className="w-full text-left px-3 py-2 hover:bg-paper-deep"
-              >
-                🔗 替换为图片网址
-              </button>
-              <button
-                type="button"
+                icon={<Link2 className="w-4 h-4" />}
+              >替换为图片网址</MenuItem>
+              <MenuItem
                 onClick={async () => {
                   setCoverMenu(null);
-                  if (!htmlUrl) return toast.error("还未上传 HTML，无法选取");
+                  if (!htmlUrl) return toast.error("还未上传 HTML,无法选取");
                   const first = await firstImageFromHtml(htmlUrl);
                   if (!first) return toast.error("HTML 中未找到图片");
                   setCoverUrl(first); coverEdited.current = true;
                   toast.success("已使用 HTML 中第一张图片");
                 }}
-                className="w-full text-left px-3 py-2 hover:bg-paper-deep"
-              >
-                🖼 使用 HTML 中第一张图
-              </button>
-              <button
-                type="button"
+                icon={<ImageIcon className="w-4 h-4" />}
+              >使用 HTML 中第一张图</MenuItem>
+              <MenuItem
                 onClick={() => { setCoverMenu(null); setShowPagePicker(true); }}
-                className="w-full text-left px-3 py-2 hover:bg-paper-deep"
                 disabled={pageImages.length === 0}
-              >
-                🖼 从详情页已有图片中选择（{pageImages.length}）
-              </button>
-              <button
-                type="button"
-                onClick={() => { setCoverMenu(null); setShowCoverSearch(true); }}
-                className="w-full text-left px-3 py-2 hover:bg-paper-deep"
-              >
-                🌐 在线搜索图片替换封面
-              </button>
+                icon={<ImageIcon className="w-4 h-4" />}
+              >从详情页已有图片中选择({pageImages.length})</MenuItem>
+              <MenuItem onClick={() => { setCoverMenu(null); setShowCoverSearch(true); }} icon={<Globe className="w-4 h-4" />}>在线搜索图片替换封面</MenuItem>
               <div className="border-t border-rule my-1" />
-              <button
-                type="button"
+              <MenuItem
                 onClick={() => { setCoverUrl(""); coverEdited.current = false; setCoverMenu(null); }}
-                className="w-full text-left px-3 py-2 text-destructive hover:bg-paper-deep"
-              >
-                🗑 清除封面
-              </button>
+                icon={<Trash2 className="w-4 h-4" />}
+                danger
+              >清除封面</MenuItem>
             </div>
           )}
         </div>
