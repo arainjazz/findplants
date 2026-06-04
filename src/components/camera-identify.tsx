@@ -142,8 +142,8 @@ export function CameraIdentify() {
       <div className="flex items-start justify-between flex-wrap gap-4 mb-4">
         <div className="min-w-0 flex-1">
           <p className="label text-vermilion mb-1">AI copilot · Plantspedia</p>
-          <FitOneLine className="font-sans text-ink block w-full" weight={900} aspect={0.04}>让 AI 识别植物身份并向你介绍这位新遇见的朋友吧</FitOneLine>
-          <FitOneLine className="text-ink-faint block w-full mt-1" weight={400} aspect={0.028}>访客也能直接拍摄并生成草稿，等待编辑审核后正式收录。</FitOneLine>
+          <FitOneLine className="text-ink block w-full" weight={900} aspect={0.03} family="SimHei, 'Heiti SC', 'Microsoft YaHei', sans-serif">让 AI 识别植物身份并向你介绍这位新遇见的朋友吧</FitOneLine>
+          <FitOneLine className="text-ink-faint block w-full mt-1" weight={400} aspect={0.022}>访客也能直接拍摄并生成草稿，等待编辑审核后正式收录。</FitOneLine>
         </div>
         {coords && (
           <p className="label text-xs text-ink-faint inline-flex items-center gap-1">
@@ -278,11 +278,13 @@ function FitOneLine({
   className,
   weight = 700,
   aspect = 0.11,
+  family,
 }: {
   children: string;
   className?: string;
   weight?: number;
   aspect?: number;
+  family?: string;
 }) {
   const H = Math.round(1000 * aspect);
   return (
@@ -301,7 +303,7 @@ function FitOneLine({
         fill="currentColor"
         textLength="1000"
         lengthAdjust="spacingAndGlyphs"
-        style={{ fontFamily: "inherit" }}
+        style={{ fontFamily: family ?? "inherit" }}
       >
         {children}
       </text>
