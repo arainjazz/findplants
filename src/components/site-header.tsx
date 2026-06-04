@@ -19,6 +19,17 @@ export function SiteHeader() {
     enabled: !!user,
   });
 
+  // Anyone with editor or admin role gets the pending drafts notification.
+  const { data: isEditorOrAdmin = false } = useQuery({
+    queryKey: ["is-editor-or-admin", user?.id],
+    enabled: !!user,
+    queryFn: async () => {
+      if (!user) return false;
+      const { data } = await supabase.from("user_roles").select("role").eq("user_id", user.id);
+      return !!data?.some((r) => r.role === "editor" || r.role === "admin");
+    },
+  });
+
   const { data: pendingCount = 0 } = useQuery({
     queryKey: ["pending-applications-count"],
     queryFn: async () => {
@@ -29,6 +40,19 @@ export function SiteHeader() {
       return count ?? 0;
     },
     enabled: isAdmin,
+    refetchInterval: 30000,
+  });
+
+  const { data: pendingDraftCount = 0 } = useQuery({
+    queryKey: ["pending-drafts-count"],
+    queryFn: async () => {
+      const { count } = await supabase
+        .from("plant_drafts")
+        .select("id", { count: "exact", head: true })
+        .eq("status", "pending");
+      return count ?? 0;
+    },
+    enabled: isEditorOrAdmin,
     refetchInterval: 30000,
   });
 
@@ -49,6 +73,24 @@ export function SiteHeader() {
       supabase.removeChannel(ch);
     };
   }, [isAdmin, qc]);
+
+  useEffect(() => {
+    if (!isEditorOrAdmin) return;
+    const ch = supabase
+      .channel("plant_drafts-header")
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "plant_drafts" },
+        () => {
+          qc.invalidateQueries({ queryKey: ["pending-drafts-count"] });
+          qc.invalidateQueries({ queryKey: ["home-drafts"] });
+        },
+      )
+      .subscribe();
+    return () => {
+      supabase.removeChannel(ch);
+    };
+  }, [isEditorOrAdmin, qc]);
 
   return (
     <header className="border-b border-ink/80 bg-background/70 backdrop-blur-sm">
