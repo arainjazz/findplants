@@ -12,6 +12,7 @@ import { Route as rootRouteImport } from './routes/__root'
 import { Route as SignupRouteImport } from './routes/signup'
 import { Route as SearchRouteImport } from './routes/search'
 import { Route as LoginRouteImport } from './routes/login'
+import { Route as IdentifyRouteImport } from './routes/identify'
 import { Route as EditsRouteImport } from './routes/edits'
 import { Route as AuthenticatedRouteImport } from './routes/_authenticated'
 import { Route as IndexRouteImport } from './routes/index'
@@ -45,6 +46,11 @@ const SearchRoute = SearchRouteImport.update({
 const LoginRoute = LoginRouteImport.update({
   id: '/login',
   path: '/login',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const IdentifyRoute = IdentifyRouteImport.update({
+  id: '/identify',
+  path: '/identify',
   getParentRoute: () => rootRouteImport,
 } as any)
 const EditsRoute = EditsRouteImport.update({
@@ -152,6 +158,7 @@ const AuthenticatedAdminBlogEditIdRoute =
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/edits': typeof EditsRoute
+  '/identify': typeof IdentifyRoute
   '/login': typeof LoginRoute
   '/search': typeof SearchRoute
   '/signup': typeof SignupRoute
@@ -175,6 +182,7 @@ export interface FileRoutesByFullPath {
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/edits': typeof EditsRoute
+  '/identify': typeof IdentifyRoute
   '/login': typeof LoginRoute
   '/search': typeof SearchRoute
   '/signup': typeof SignupRoute
@@ -200,6 +208,7 @@ export interface FileRoutesById {
   '/': typeof IndexRoute
   '/_authenticated': typeof AuthenticatedRouteWithChildren
   '/edits': typeof EditsRoute
+  '/identify': typeof IdentifyRoute
   '/login': typeof LoginRoute
   '/search': typeof SearchRoute
   '/signup': typeof SignupRoute
@@ -225,6 +234,7 @@ export interface FileRouteTypes {
   fullPaths:
     | '/'
     | '/edits'
+    | '/identify'
     | '/login'
     | '/search'
     | '/signup'
@@ -248,6 +258,7 @@ export interface FileRouteTypes {
   to:
     | '/'
     | '/edits'
+    | '/identify'
     | '/login'
     | '/search'
     | '/signup'
@@ -272,6 +283,7 @@ export interface FileRouteTypes {
     | '/'
     | '/_authenticated'
     | '/edits'
+    | '/identify'
     | '/login'
     | '/search'
     | '/signup'
@@ -297,6 +309,7 @@ export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   AuthenticatedRoute: typeof AuthenticatedRouteWithChildren
   EditsRoute: typeof EditsRoute
+  IdentifyRoute: typeof IdentifyRoute
   LoginRoute: typeof LoginRoute
   SearchRoute: typeof SearchRoute
   SignupRoute: typeof SignupRoute
@@ -329,6 +342,13 @@ declare module '@tanstack/react-router' {
       path: '/login'
       fullPath: '/login'
       preLoaderRoute: typeof LoginRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/identify': {
+      id: '/identify'
+      path: '/identify'
+      fullPath: '/identify'
+      preLoaderRoute: typeof IdentifyRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/edits': {
@@ -501,6 +521,7 @@ const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   AuthenticatedRoute: AuthenticatedRouteWithChildren,
   EditsRoute: EditsRoute,
+  IdentifyRoute: IdentifyRoute,
   LoginRoute: LoginRoute,
   SearchRoute: SearchRoute,
   SignupRoute: SignupRoute,
