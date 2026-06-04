@@ -432,30 +432,48 @@ export function PlantEditor({ initial }: Props) {
     const files = Array.from(e.target.files ?? []);
     e.target.value = "";
     if (files.length === 0) return;
+    // User picks the folder containing the HTML page (and any local images).
+    // We auto-detect the HTML file and all referenced images — no second prompt.
     const htmlFile = files.find((f) => /\.html?$/i.test(f.name) || f.type === "text/html");
-    if (!htmlFile) return toast.error("请至少选择一个 HTML 文件");
-    const imageFiles = files.filter((f) => f !== htmlFile && f.type.startsWith("image/"));
+    if (!htmlFile) return toast.error("文件夹中没有 .html 文件，请选择包含 HTML 的文件夹");
     setUploadingHtml(true);
     try {
       const text = await htmlFile.text();
-      // If user only picked the HTML (no images alongside), check for local refs.
-      // When found, auto-open a second image picker so the user only has to
-      // choose the referenced images — no manual Ctrl/⌘ multi-select required.
-      if (imageFiles.length === 0) {
-        const localRefs = findLocalAssetRefs(text);
-        if (localRefs.length > 0) {
-          pendingHtmlRef.current = { file: htmlFile, text, refs: localRefs };
-          const sample = localRefs.slice(0, 3).join("、");
-          toast.message(
-            `检测到 ${localRefs.length} 张本地图片（如 ${sample}${localRefs.length > 3 ? " …" : ""}），请在弹窗中选中它们`,
-            { duration: 6000 },
-          );
-          setUploadingHtml(false);
-          setTimeout(() => imageInputRef.current?.click(), 50);
-          return;
+      const localRefs = findLocalAssetRefs(text);
+      // Build a normalized lookup of files picked from the folder.
+      const filesByName = new Map<string, File>();
+      for (const f of files) {
+        if (f === htmlFile) continue;
+        if (!f.type.startsWith("image/")) continue;
+        const rel =
+          (f as File & { webkitRelativePath?: string }).webkitRelativePath || f.name;
+        filesByName.set(rel.toLowerCase(), f);
+        filesByName.set(f.name.toLowerCase(), f);
+        // Also store every path-suffix so "images/leaf.jpg" matches
+        // "<folder>/images/leaf.jpg".
+        const parts = rel.split("/");
+        for (let i = 1; i < parts.length; i++) {
+          filesByName.set(parts.slice(i).join("/").toLowerCase(), f);
         }
       }
-      await finalizeHtmlUpload(htmlFile, text, imageFiles);
+      // Resolve each local reference to a File from the folder.
+      const matched = new Set<File>();
+      const missing: string[] = [];
+      for (const ref of localRefs) {
+        const cleaned = ref.split(/[?#]/)[0].replace(/^\.?\//, "").toLowerCase();
+        const file =
+          filesByName.get(cleaned) ||
+          filesByName.get(cleaned.split("/").pop() || "");
+        if (file) matched.add(file);
+        else missing.push(ref);
+      }
+      if (missing.length > 0) {
+        toast.warning(
+          `有 ${missing.length} 张图片未在文件夹中找到（如 ${missing.slice(0, 2).join("、")}）；请把它们和 HTML 放在同一文件夹后重试`,
+          { duration: 6000 },
+        );
+      }
+      await finalizeHtmlUpload(htmlFile, text, Array.from(matched));
     } catch (err) {
       toast.error((err as Error).message);
     } finally {
@@ -463,26 +481,6 @@ export function PlantEditor({ initial }: Props) {
     }
   };
 
-  const onImagesForPendingHtml = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = Array.from(e.target.files ?? []);
-    e.target.value = "";
-    const pending = pendingHtmlRef.current;
-    if (!pending) return;
-    setUploadingHtml(true);
-    try {
-      if (files.length === 0) {
-        toast.warning("未选择图片，已按原样上传 HTML；线上将无法显示这些本地图片");
-        await finalizeHtmlUpload(pending.file, pending.text, []);
-      } else {
-        await finalizeHtmlUpload(pending.file, pending.text, files.filter((f) => f.type.startsWith("image/")));
-      }
-    } catch (err) {
-      toast.error((err as Error).message);
-    } finally {
-      pendingHtmlRef.current = null;
-      setUploadingHtml(false);
-    }
-  };
 
 
   const onExtractMeta = async () => {
