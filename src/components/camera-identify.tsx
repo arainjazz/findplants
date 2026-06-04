@@ -142,8 +142,8 @@ export function CameraIdentify() {
       <div className="flex items-start justify-between flex-wrap gap-4 mb-4">
         <div>
           <p className="label text-vermilion mb-1">AI copilot · Plantspedia</p>
-          <h2 className="font-display text-2xl md:text-3xl font-bold">让 AI 识别植物身份并向你介绍这位新遇见的朋友吧</h2>
-          <p className="text-sm text-ink-faint mt-1">
+          <h2 className="font-display font-bold whitespace-nowrap text-[15px] sm:text-lg md:text-2xl lg:text-3xl">让 AI 识别植物身份并向你介绍这位新遇见的朋友吧</h2>
+          <p className="text-ink-faint mt-1 whitespace-nowrap overflow-hidden text-ellipsis text-[10px] sm:text-xs md:text-sm">
             访客也能直接拍摄并生成草稿，等待编辑审核后正式收录。位置信息来自浏览器定位或照片 EXIF。
           </p>
         </div>
