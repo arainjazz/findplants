@@ -626,9 +626,11 @@ export function PlantEditor({ initial }: Props) {
       <input
         ref={htmlInputRef}
         type="file"
-        // Folder picker: user picks the folder containing the HTML + images,
-        // we auto-detect everything. No second prompt, no Ctrl/⌘ multi-select.
-        {...({ webkitdirectory: "", directory: "" } as Record<string, string>)}
+        // Accept a single HTML, or HTML + images, or a whole folder.
+        // Browsers that support `webkitdirectory` will also expose a "select folder" affordance
+        // in their file dialog when this attribute is set, but `multiple` still lets the user
+        // select an individual `.html` file.
+        accept=".html,.htm,text/html,image/*"
         multiple
         onChange={onHtmlUpload}
         disabled={uploadingHtml || extracting}
@@ -642,7 +644,7 @@ export function PlantEditor({ initial }: Props) {
         multiple
         className="sr-only"
         tabIndex={-1}
-        onChange={() => { /* legacy slot, no longer used */ }}
+        onChange={onPendingImagesPicked}
       />
 
       <Field label="标题 *">
