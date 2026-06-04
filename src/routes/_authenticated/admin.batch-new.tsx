@@ -610,19 +610,19 @@ function BatchCard({
             style={{ position: "fixed", left: menu.x, top: menu.y, zIndex: 70 }}
             className="bg-background border border-ink shadow-lg py-1 w-56 text-sm"
           >
-            <button type="button" onClick={() => { setMenu(null); fileRef.current?.click(); }} className="w-full text-left px-3 py-2 hover:bg-paper-deep">📁 替换为本地图片</button>
+            <button type="button" onClick={() => { setMenu(null); fileRef.current?.click(); }} className="w-full text-left px-3 py-2 hover:bg-paper-deep inline-flex items-center gap-2"><FolderOpen className="w-4 h-4" />替换为本地图片</button>
             <button type="button" onClick={() => {
               setMenu(null);
               const u = window.prompt("封面图片网址：", item.coverUrl);
               if (u !== null) onUpdate({ coverUrl: u.trim() });
-            }} className="w-full text-left px-3 py-2 hover:bg-paper-deep">🔗 替换为图片网址</button>
-            <button type="button" onClick={() => { setMenu(null); pickFirstFromHtml(); }} className="w-full text-left px-3 py-2 hover:bg-paper-deep">🖼 使用 HTML 中第一张图</button>
-            <button type="button" disabled={pageImages.length === 0} onClick={() => { setMenu(null); setPagePickerOpen(true); }} className="w-full text-left px-3 py-2 hover:bg-paper-deep disabled:opacity-50">🖼 从页面图中选择（{pageImages.length}）</button>
-            <button type="button" onClick={() => { setMenu(null); setSearchOpen(true); }} className="w-full text-left px-3 py-2 hover:bg-paper-deep">🌐 在线搜索图片替换</button>
+            }} className="w-full text-left px-3 py-2 hover:bg-paper-deep inline-flex items-center gap-2"><Link2 className="w-4 h-4" />替换为图片网址</button>
+            <button type="button" onClick={() => { setMenu(null); pickFirstFromHtml(); }} className="w-full text-left px-3 py-2 hover:bg-paper-deep inline-flex items-center gap-2"><ImageIcon className="w-4 h-4" />使用 HTML 中第一张图</button>
+            <button type="button" disabled={pageImages.length === 0} onClick={() => { setMenu(null); setPagePickerOpen(true); }} className="w-full text-left px-3 py-2 hover:bg-paper-deep disabled:opacity-50 inline-flex items-center gap-2"><ImageIcon className="w-4 h-4" />从页面图中选择（{pageImages.length}）</button>
+            <button type="button" onClick={() => { setMenu(null); setSearchOpen(true); }} className="w-full text-left px-3 py-2 hover:bg-paper-deep inline-flex items-center gap-2"><Globe className="w-4 h-4" />在线搜索图片替换</button>
             {item.coverUrl && (
               <>
                 <div className="border-t border-rule my-1" />
-                <button type="button" onClick={() => { setMenu(null); onUpdate({ coverUrl: "" }); }} className="w-full text-left px-3 py-2 text-destructive hover:bg-paper-deep">🗑 清除封面</button>
+                <button type="button" onClick={() => { setMenu(null); onUpdate({ coverUrl: "" }); }} className="w-full text-left px-3 py-2 text-destructive hover:bg-paper-deep inline-flex items-center gap-2"><Trash2 className="w-4 h-4" />清除封面</button>
               </>
             )}
           </div>
