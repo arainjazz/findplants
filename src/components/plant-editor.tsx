@@ -852,7 +852,7 @@ export function PlantEditor({ initial }: Props) {
               disabled={uploadingHtml || extracting}
               className="border border-ink px-4 py-2 hover:bg-ink hover:text-background transition-colors disabled:opacity-60 text-sm"
             >
-              {uploadingHtml ? "上传中…" : extracting ? "AI 识别中…" : "选择 HTML 文件"}
+              {uploadingHtml ? "上传中…" : extracting ? "AI 识别中…" : "选择含 HTML 的文件夹"}
             </button>
             {htmlUrl && (
               <>
