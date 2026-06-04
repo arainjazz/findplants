@@ -423,6 +423,7 @@ export function PlantEditor({ initial }: Props) {
     const finalHtmlFile = new File([finalText], htmlFile.name, { type: "text/html" });
     const uploadedUrl = await uploadFile(finalHtmlFile, "plant-html");
     setHtmlUrl(uploadedUrl);
+    setUploadingHtml(false);
     toast.success("HTML 已上传");
     await extractMetaFromUrl(uploadedUrl, "已根据 HTML 自动填入标题和字段，请检查后保存");
   };
