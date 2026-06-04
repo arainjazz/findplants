@@ -184,13 +184,10 @@ function BatchNewPage() {
       const totalMissing = parsed.reduce((n, p) => n + p.missing.length, 0);
       if (totalMissing > 0) {
         const matchedCount = parsed.reduce((n, p) => n + p.matched.size, 0);
-        toast.message(
-          `已自动匹配 ${matchedCount} 张配图；${totalMissing} 张未在本次选择中找到。选择 HTML 所在文件夹可一次性自动上传全部配图。`,
-          { duration: 6000 },
+        toast.error(
+          `已自动匹配 ${matchedCount} 张配图；仍有 ${totalMissing} 个本地图片路径未找到。请点“选择 HTML 所在文件夹”，系统会自动上传全部配图。`,
+          { duration: 8000 },
         );
-      }
-      if (totalRefs > 0 && parsed.every((p) => p.matched.size === 0)) {
-        toast.error("HTML 中有本地图片引用，但未在所选文件中找到图片。请直接选择 HTML 所在文件夹，系统会自动匹配并上传。", { duration: 8000 });
         return;
       }
       await finalizeBatch(parsed.map(({ file, text, matched }) => ({ file, text, matched })));
