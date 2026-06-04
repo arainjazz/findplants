@@ -271,39 +271,36 @@ function SparkleIcon({ className }: { className?: string }) {
   );
 }
 
-// Renders text as SVG so it always fits the container width on one line,
-// scaling font size down on narrow screens without truncating.
+// Renders text as SVG that always fits the container width on a single line.
+// `aspect` controls the visual height: rendered height = containerWidth * aspect.
 function FitOneLine({
   children,
   className,
   weight = 700,
+  aspect = 0.11,
 }: {
   children: string;
   className?: string;
   weight?: number;
+  aspect?: number;
 }) {
-  const ref = useRef<SVGTextElement | null>(null);
-  const [box, setBox] = useState<{ w: number; h: number }>({ w: 1000, h: 100 });
-  useEffect(() => {
-    if (!ref.current) return;
-    const bb = ref.current.getBBox();
-    if (bb.width > 0 && bb.height > 0) setBox({ w: bb.width, h: bb.height });
-  }, [children, weight]);
+  const H = Math.round(1000 * aspect);
   return (
     <svg
-      viewBox={`0 0 ${box.w} ${box.h}`}
+      viewBox={`0 0 1000 ${H}`}
       preserveAspectRatio="xMidYMid meet"
       className={className}
       role="img"
       aria-label={children}
     >
       <text
-        ref={ref}
         x="0"
-        y={box.h * 0.82}
-        fontSize={box.h * 0.9}
+        y={H * 0.8}
+        fontSize={H * 0.85}
         fontWeight={weight}
         fill="currentColor"
+        textLength="1000"
+        lengthAdjust="spacingAndGlyphs"
         style={{ fontFamily: "inherit" }}
       >
         {children}
@@ -311,4 +308,5 @@ function FitOneLine({
     </svg>
   );
 }
+
 
