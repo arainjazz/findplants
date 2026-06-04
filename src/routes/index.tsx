@@ -8,6 +8,8 @@ import { supabase } from "@/integrations/supabase/client";
 import { toast } from "sonner";
 import { fetchAllCatalogs, fetchAllEntries, buildPlantMatcher, type RegionalCatalog, type CatalogEntry } from "@/lib/catalogs";
 import { fetchAllTags, fetchAllPlantTags, type TagWithCount } from "@/lib/tags";
+import { CameraIdentify } from "@/components/camera-identify";
+import { fetchPendingDrafts, type PlantDraft } from "@/lib/drafts";
 
 export const Route = createFileRoute("/")({
   head: () => ({
