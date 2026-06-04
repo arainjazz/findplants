@@ -75,14 +75,14 @@ function HomePage() {
           <h1 className="text-center font-display text-4xl md:text-6xl font-bold tracking-tight">
             Plantspedia · 草木志
           </h1>
-          <div className="mt-4 hidden md:flex items-start justify-between gap-4 flex-wrap">
-            <div>
-              <div className="text-sm md:text-base">地球上还有10万种植物等着你去发现</div>
-              <div className="label mt-0.5">Another 100,000 plant species remain to be discovered.</div>
+          <div className="mt-4 hidden md:flex items-start justify-between gap-3 flex-nowrap">
+            <div className="min-w-0">
+              <div className="text-[11px] md:text-xs lg:text-base whitespace-nowrap">地球上还有10万种植物等着你去发现</div>
+              <div className="label mt-0.5 text-[10px] md:text-[10px] lg:text-xs whitespace-nowrap">Another 100,000 plant species remain to be discovered.</div>
             </div>
-            <div className="text-right">
-              <div className="text-sm md:text-base">由社区编纂 · 持续更新</div>
-              <div className="label mt-0.5">Community-compiled, continuously updated.</div>
+            <div className="text-right min-w-0">
+              <div className="text-[11px] md:text-xs lg:text-base whitespace-nowrap">由社区编纂 · 持续更新</div>
+              <div className="label mt-0.5 text-[10px] md:text-[10px] lg:text-xs whitespace-nowrap">Community-compiled, continuously updated.</div>
             </div>
           </div>
         </section>
