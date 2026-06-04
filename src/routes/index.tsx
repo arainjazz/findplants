@@ -8,8 +8,8 @@ import { supabase } from "@/integrations/supabase/client";
 import { toast } from "sonner";
 import { fetchAllCatalogs, fetchAllEntries, buildPlantMatcher, type RegionalCatalog, type CatalogEntry } from "@/lib/catalogs";
 import { fetchAllTags, fetchAllPlantTags, type TagWithCount } from "@/lib/tags";
-import { CameraIdentify } from "@/components/camera-identify";
 import { fetchPendingDrafts, type PlantDraft } from "@/lib/drafts";
+import { DraftCard } from "@/components/draft-card";
 
 export const Route = createFileRoute("/")({
   head: () => ({
@@ -30,7 +30,20 @@ function HomePage() {
   });
   const { data: tags = [] } = useQuery({ queryKey: ["all-tags"], queryFn: fetchAllTags });
   const { data: plantTags = [] } = useQuery({ queryKey: ["all-plant-tags"], queryFn: fetchAllPlantTags });
-  const { data: drafts = [] } = useQuery({ queryKey: ["home-drafts"], queryFn: () => fetchPendingDrafts(8) });
+  const { data: isEditorOrAdmin = false } = useQuery({
+    queryKey: ["is-editor-or-admin", user?.id],
+    enabled: !!user,
+    queryFn: async () => {
+      if (!user) return false;
+      const { data } = await supabase.from("user_roles").select("role").eq("user_id", user.id);
+      return !!data?.some((r) => r.role === "editor" || r.role === "admin");
+    },
+  });
+  const { data: drafts = [] } = useQuery({
+    queryKey: ["home-drafts"],
+    queryFn: () => fetchPendingDrafts(3),
+    enabled: isEditorOrAdmin,
+  });
   type Tab = "latest" | "featured" | "hot" | "regions" | "tags";
   const [tab, setTab] = useState<Tab>("latest");
 
@@ -88,11 +101,8 @@ function HomePage() {
         </section>
 
 
-        {/* Camera-based AI plant identification (anyone, including signed-out) */}
-        <CameraIdentify />
-
-        {/* Pending drafts feed */}
-        {drafts.length > 0 && <DraftsStrip drafts={drafts} />}
+        {/* Pending drafts feed — editors / admins only, max 3 on home */}
+        {isEditorOrAdmin && drafts.length > 0 && <DraftsStrip drafts={drafts} />}
 
 
         {/* Tabs */}
