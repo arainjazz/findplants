@@ -89,7 +89,21 @@ export function CameraIdentify() {
     capturedBlobRef.current = file;
     if (previewUrl) URL.revokeObjectURL(previewUrl);
     setPreviewUrl(URL.createObjectURL(file));
-    if (navigator.geolocation) {
+    // 1) Try EXIF GPS from the uploaded photo itself (most accurate).
+    let gotExif = false;
+    try {
+      const exifr = (await import("exifr")).default;
+      const gps = await exifr.gps(file);
+      if (gps && typeof gps.latitude === "number" && typeof gps.longitude === "number") {
+        setCoords({ lat: gps.latitude, lng: gps.longitude });
+        gotExif = true;
+        toast.success("已从照片 EXIF 中读取拍摄地点");
+      }
+    } catch {
+      /* ignore */
+    }
+    // 2) Fall back to current browser geolocation if EXIF missing.
+    if (!gotExif && navigator.geolocation) {
       navigator.geolocation.getCurrentPosition(
         (pos) => setCoords({ lat: pos.coords.latitude, lng: pos.coords.longitude }),
         () => setCoords(null),

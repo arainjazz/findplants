@@ -393,11 +393,52 @@ export function PlantEditor({ initial }: Props) {
   };
 
   const onHtmlUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const f = e.target.files?.[0];
-    if (!f) return;
+    const files = Array.from(e.target.files ?? []);
+    e.target.value = "";
+    if (files.length === 0) return;
+    const htmlFile = files.find((f) => /\.html?$/i.test(f.name) || f.type === "text/html");
+    if (!htmlFile) return toast.error("请至少选择一个 HTML 文件");
+    const imageFiles = files.filter((f) => f !== htmlFile && f.type.startsWith("image/"));
     setUploadingHtml(true);
     try {
-      const uploadedUrl = await uploadFile(f, "plant-html");
+      let finalHtmlFile: File = htmlFile;
+      // If the editor also selected accompanying images, upload each to storage
+      // and rewrite the HTML so that all <img src> / inline url(...) references
+      // point to the public URLs instead of local file paths.
+      if (imageFiles.length > 0) {
+        toast.message(`正在上传 ${imageFiles.length} 张配图…`);
+        const nameMap = new Map<string, string>(); // basename + relpath -> public URL
+        for (const img of imageFiles) {
+          const url = await uploadFile(img, "plant-images");
+          // Map by basename, and by webkitRelativePath when present (folder upload).
+          const base = img.name;
+          nameMap.set(base, url);
+          const rel = (img as File & { webkitRelativePath?: string }).webkitRelativePath;
+          if (rel) {
+            nameMap.set(rel, url);
+            // Also map the path without the top-level folder
+            const stripped = rel.split("/").slice(1).join("/");
+            if (stripped) nameMap.set(stripped, url);
+          }
+        }
+        const rawText = await htmlFile.text();
+        const rewritten = rewriteLocalAssetPaths(rawText, nameMap);
+        finalHtmlFile = new File([rewritten], htmlFile.name, { type: "text/html" });
+        toast.success(`已重写 HTML 中的本地图片路径（${imageFiles.length} 张）`);
+      } else {
+        // No images selected; warn if HTML references local files that won't load on the site.
+        try {
+          const txt = await htmlFile.text();
+          const localRefs = findLocalAssetRefs(txt);
+          if (localRefs.length > 0) {
+            toast.warning(
+              `HTML 中有 ${localRefs.length} 个本地图片引用未上传（如 ${localRefs[0]}），网站上将无法显示。请重新选择，同时勾选 HTML 旁边的图片文件。`,
+              { duration: 8000 },
+            );
+          }
+        } catch { /* ignore */ }
+      }
+      const uploadedUrl = await uploadFile(finalHtmlFile, "plant-html");
       setHtmlUrl(uploadedUrl);
       toast.success("HTML 已上传");
       await extractMetaFromUrl(uploadedUrl, "已根据 HTML 自动填入标题和字段，请检查后保存");
@@ -528,7 +569,8 @@ export function PlantEditor({ initial }: Props) {
       <input
         ref={htmlInputRef}
         type="file"
-        accept=".html,text/html"
+        accept=".html,.htm,text/html,image/*"
+        multiple
         onChange={onHtmlUpload}
         disabled={uploadingHtml || extracting}
         className="sr-only"
@@ -854,6 +896,10 @@ export function PlantEditor({ initial }: Props) {
             )}
             <p className="text-xs text-ink-faint">
               提示：上传后整页将以原样在 iframe 中渲染（保留你的字体与排版）。
+              <br />
+              <strong>含本地图片的页面：</strong>在弹出的文件选择框中按住 Ctrl/⌘
+              同时选中 HTML 文件 <em>以及</em> 它引用的图片文件（或整个文件夹），系统会自动把图片
+              上传到站内并改写 HTML 中的相对路径，避免线上无法显示。
             </p>
             {htmlUrl && (
               <div className="mt-5 pt-5 border-t border-rule">
@@ -1017,4 +1063,53 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
       {children}
     </div>
   );
+}
+
+// ─── Local asset helpers for HTML uploads ───────────────────────────────────
+// Detect <img src>, <source src/srcset>, <link href> and inline url(...) that
+// point to local relative paths (not http/https/data/blob URLs).
+const LOCAL_REF_RE =
+  /(?:src|href)\s*=\s*["']([^"'#?][^"']*)["']|url\(\s*["']?([^"')]+)["']?\s*\)/gi;
+
+function isExternalRef(v: string): boolean {
+  return /^(https?:|data:|blob:|\/\/|#|mailto:|cid:)/i.test(v);
+}
+
+export function findLocalAssetRefs(html: string): string[] {
+  const out = new Set<string>();
+  let m: RegExpExecArray | null;
+  const re = new RegExp(LOCAL_REF_RE.source, "gi");
+  while ((m = re.exec(html))) {
+    const v = (m[1] ?? m[2] ?? "").trim();
+    if (!v) continue;
+    if (isExternalRef(v)) continue;
+    // Skip pure anchor / query-only refs
+    if (v.startsWith("#") || v.startsWith("?")) continue;
+    out.add(v);
+  }
+  return Array.from(out);
+}
+
+export function rewriteLocalAssetPaths(html: string, map: Map<string, string>): string {
+  return html.replace(LOCAL_REF_RE, (full, srcVal: string | undefined, urlVal: string | undefined) => {
+    const raw = (srcVal ?? urlVal ?? "").trim();
+    if (!raw || isExternalRef(raw)) return full;
+    // Try exact, then basename, then strip leading "./" or "../"
+    const candidates = [
+      raw,
+      raw.replace(/^\.?\.?\/+/, ""),
+      raw.split("/").pop() ?? raw,
+      decodeURIComponent(raw),
+      decodeURIComponent(raw.split("/").pop() ?? raw),
+    ];
+    for (const c of candidates) {
+      const hit = map.get(c);
+      if (hit) {
+        return srcVal !== undefined
+          ? full.replace(raw, hit)
+          : `url("${hit}")`;
+      }
+    }
+    return full;
+  });
 }

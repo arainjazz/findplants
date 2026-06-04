@@ -291,7 +291,7 @@ function EmptyState() {
 
 function DraftsStrip({ drafts }: { drafts: PlantDraft[] }) {
   return (
-    <section className="mb-12 border-t border-rule pt-8">
+    <section id="drafts" className="mb-12 border-t border-rule pt-8 scroll-mt-20">
       <div className="flex items-baseline justify-between mb-4">
         <div>
           <p className="label text-vermilion">最新识别 · Pending AI Drafts</p>
