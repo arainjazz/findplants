@@ -612,6 +612,15 @@ export function PlantEditor({ initial }: Props) {
         className="sr-only"
         tabIndex={-1}
       />
+      <input
+        ref={imageInputRef}
+        type="file"
+        accept="image/*"
+        multiple
+        onChange={onImagesForPendingHtml}
+        className="sr-only"
+        tabIndex={-1}
+      />
       <Field label="标题 *">
         <input value={title} onChange={(e) => setTitle(e.target.value)} className={inputCls} />
       </Field>
