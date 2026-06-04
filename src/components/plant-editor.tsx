@@ -1109,6 +1109,9 @@ function MenuItem({
       <span>{children}</span>
     </button>
   );
+}
+
+
 
 // ─── Local asset helpers for HTML uploads ───────────────────────────────────
 // Detect <img src>, <source src/srcset>, <link href>, plain href, and inline
