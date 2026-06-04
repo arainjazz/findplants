@@ -306,34 +306,15 @@ function DraftsStrip({ drafts }: { drafts: PlantDraft[] }) {
       <div className="flex items-baseline justify-between mb-4">
         <div>
           <p className="label text-vermilion">最新识别 · Pending AI Drafts</p>
-          <p className="text-xs text-ink-faint mt-1">由访客拍摄并经 AI 识别的草稿，等待编辑审核后正式收录</p>
+          <p className="text-xs text-ink-faint mt-1">由访客拍摄并经 AI 识别的草稿，等待编辑审核后正式收录（首页仅展示最新 3 条）</p>
         </div>
-        <span className="text-xs text-ink-faint">{drafts.length} 份待审</span>
+        <Link to="/identify" className="text-xs text-ink-faint hover:text-vermilion">查看全部 →</Link>
       </div>
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
         {drafts.map((d) => (
-          <Link
-            key={d.id}
-            to="/drafts/$id"
-            params={{ id: d.id }}
-            className="group flex gap-3 border border-rule bg-paper-deep/30 hover:border-vermilion transition-colors p-3"
-          >
-            <div className="w-24 h-24 sm:w-28 sm:h-28 flex-shrink-0 overflow-hidden bg-paper-deep">
-              <img src={d.photo_url} alt={d.title} className="w-full h-full object-cover group-hover:scale-[1.04] transition-transform duration-500" />
-            </div>
-            <div className="min-w-0 flex-1">
-              <p className="label text-[10px] text-vermilion mb-0.5">草稿 · {d.creator_label}</p>
-              <h3 className="font-display text-base font-semibold leading-tight truncate group-hover:text-vermilion transition-colors">{d.title}</h3>
-              {d.scientific_name && <p className="italic text-xs text-ink-faint truncate mt-0.5">{d.scientific_name}</p>}
-              {d.summary && (
-                <p className="text-[12px] text-ink-soft mt-1 line-clamp-3 leading-snug">{d.summary}</p>
-              )}
-              <p className="text-[11px] text-ink-faint mt-1.5 truncate inline-flex items-center gap-1"><svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M12 21s-7-6.2-7-11a7 7 0 0 1 14 0c0 4.8-7 11-7 11Z"/><circle cx="12" cy="10" r="2.6"/></svg>{d.capture_place || "未知地点"}</p>
-            </div>
-          </Link>
+          <DraftCard key={d.id} draft={d} showPendingBadge />
         ))}
       </div>
-
     </section>
   );
 }
