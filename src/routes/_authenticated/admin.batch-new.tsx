@@ -40,6 +40,10 @@ function BatchNewPage() {
   const navigate = useNavigate();
   const qc = useQueryClient();
   const fileRef = useRef<HTMLInputElement>(null);
+  const imageRef = useRef<HTMLInputElement>(null);
+  const pendingRef = useRef<{
+    htmlFiles: { file: File; text: string; missing: string[]; matched: Map<string, File> }[];
+  } | null>(null);
   const [items, setItems] = useState<Item[]>([]);
   const [uploading, setUploading] = useState(false);
   const [fullscreen, setFullscreen] = useState(false);
@@ -47,28 +51,90 @@ function BatchNewPage() {
   const [creatingAll, setCreatingAll] = useState(false);
   const editorRefs = useRef<Map<string, HtmlDocEditorHandle | null>>(new Map());
 
-  const onPickFiles = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = Array.from(e.target.files ?? []);
-    e.target.value = "";
-    if (!files.length || !user) return;
-    setUploading(true);
+  // Build a normalized lookup of image files by name + relative path suffixes.
+  const indexImageFiles = (imageFiles: File[]) => {
+    const idx = new Map<string, File>();
+    for (const f of imageFiles) {
+      const rel = (f as File & { webkitRelativePath?: string }).webkitRelativePath || f.name;
+      idx.set(rel.toLowerCase(), f);
+      idx.set(f.name.toLowerCase(), f);
+      const parts = rel.split("/");
+      for (let i = 1; i < parts.length; i++) idx.set(parts.slice(i).join("/").toLowerCase(), f);
+    }
+    return idx;
+  };
+
+  const resolveRefs = (refs: string[], idx: Map<string, File>) => {
+    const matched = new Map<string, File>();
+    const missing: string[] = [];
+    for (const ref of refs) {
+      const cleaned = ref.split(/[?#]/)[0].replace(/^\.?\//, "").toLowerCase();
+      const file = idx.get(cleaned) || idx.get(cleaned.split("/").pop() || "");
+      if (file) matched.set(ref, file);
+      else missing.push(ref);
+    }
+    return { matched, missing };
+  };
+
+  const uploadOneImage = async (img: File) => {
+    if (!user) throw new Error("未登录");
+    const ext = img.name.split(".").pop() || "bin";
+    const path = `${user.id}/batch-img/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
+    const { error } = await supabase.storage.from("plant-images").upload(path, img, {
+      cacheControl: "3600", upsert: false, contentType: img.type || undefined,
+    });
+    if (error) throw error;
+    return supabase.storage.from("plant-images").getPublicUrl(path).data.publicUrl;
+  };
+
+  // For a single HTML, given matched image files, upload them, rewrite the HTML, then upload the HTML.
+  const uploadHtmlWithImages = async (
+    htmlFile: File,
+    text: string,
+    matched: Map<string, File>,
+  ): Promise<string> => {
+    if (!user) throw new Error("未登录");
+    let finalText = text;
+    if (matched.size > 0) {
+      const nameMap = new Map<string, string>();
+      // Avoid re-uploading the same File twice when multiple refs share it.
+      const fileToUrl = new Map<File, string>();
+      for (const [ref, file] of matched.entries()) {
+        let url = fileToUrl.get(file);
+        if (!url) { url = await uploadOneImage(file); fileToUrl.set(file, url); }
+        nameMap.set(ref, url);
+        nameMap.set(file.name, url);
+        const rel = (file as File & { webkitRelativePath?: string }).webkitRelativePath;
+        if (rel) {
+          nameMap.set(rel, url);
+          const stripped = rel.split("/").slice(1).join("/");
+          if (stripped) nameMap.set(stripped, url);
+        }
+      }
+      finalText = rewriteLocalAssetPaths(text, nameMap);
+    }
+    const blob = new Blob([finalText], { type: "text/html" });
+    const ext = htmlFile.name.split(".").pop() || "html";
+    const path = `${user.id}/batch/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
+    const { error } = await supabase.storage.from("plant-html").upload(path, blob, {
+      cacheControl: "3600", upsert: false, contentType: "text/html",
+    });
+    if (error) throw error;
+    return supabase.storage.from("plant-html").getPublicUrl(path).data.publicUrl;
+  };
+
+  const finalizeBatch = async (
+    htmlEntries: { file: File; text: string; matched: Map<string, File> }[],
+  ) => {
     const next: Item[] = [];
-    for (const f of files) {
+    for (const ent of htmlEntries) {
       try {
-        const ext = f.name.split(".").pop() || "html";
-        const path = `${user.id}/batch/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
-        const { error } = await supabase.storage.from("plant-html").upload(path, f, {
-          cacheControl: "3600",
-          upsert: false,
-          contentType: f.type || "text/html",
-        });
-        if (error) throw error;
-        const url = supabase.storage.from("plant-html").getPublicUrl(path).data.publicUrl;
+        const url = await uploadHtmlWithImages(ent.file, ent.text, ent.matched);
         next.push({
           key: `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-          fileName: f.name,
+          fileName: ent.file.name,
           htmlUrl: url,
-          title: f.name.replace(/\.html?$/i, ""),
+          title: ent.file.name.replace(/\.html?$/i, ""),
           slug: "",
           scientificName: "",
           commonNameEn: "",
@@ -84,14 +150,76 @@ function BatchNewPage() {
           createdId: null,
         });
       } catch (err) {
-        toast.error(`${f.name}: ${(err as Error).message}`);
+        toast.error(`${ent.file.name}: ${(err as Error).message}`);
       }
     }
     setItems((prev) => [...prev, ...next]);
-    setUploading(false);
     if (next.length) toast.success(`已上传 ${next.length} 个文件，正在识别…`);
-    // Run AI extraction in parallel.
     next.forEach((it) => runExtract(it.key, it.htmlUrl));
+  };
+
+  const onPickFiles = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files ?? []);
+    e.target.value = "";
+    if (!files.length || !user) return;
+    setUploading(true);
+    try {
+      const htmlFiles = files.filter((f) => /\.html?$/i.test(f.name) || f.type === "text/html");
+      const imageFiles = files.filter((f) => f.type.startsWith("image/"));
+      if (htmlFiles.length === 0) {
+        toast.error("请至少选择一个 .html 文件（可同时多选本地图片或整个文件夹）");
+        return;
+      }
+      const idx = indexImageFiles(imageFiles);
+      // Pre-parse every HTML to resolve refs against the user's selection.
+      const parsed: { file: File; text: string; matched: Map<string, File>; missing: string[] }[] = [];
+      for (const f of htmlFiles) {
+        const text = await f.text();
+        const refs = findLocalAssetRefs(text);
+        const { matched, missing } = resolveRefs(refs, idx);
+        parsed.push({ file: f, text, matched, missing });
+      }
+      const totalMissing = parsed.reduce((n, p) => n + p.missing.length, 0);
+      if (totalMissing === 0) {
+        await finalizeBatch(parsed.map(({ file, text, matched }) => ({ file, text, matched })));
+        return;
+      }
+      // Auto-prompt for missing images in one combined picker.
+      pendingRef.current = { htmlFiles: parsed };
+      const sample = parsed.flatMap((p) => p.missing).slice(0, 3);
+      toast.message(
+        `批量 HTML 中共有 ${totalMissing} 张本地图片未找到（如 ${sample.join("、")}），请一次性选中它们`,
+        { duration: 6000 },
+      );
+      imageRef.current?.click();
+    } catch (err) {
+      toast.error((err as Error).message);
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  const onPickMissingImages = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files ?? []);
+    e.target.value = "";
+    const pending = pendingRef.current;
+    pendingRef.current = null;
+    if (!pending) return;
+    setUploading(true);
+    try {
+      const idx = indexImageFiles(files);
+      const entries = pending.htmlFiles.map((p) => {
+        const { matched: extra } = resolveRefs(p.missing, idx);
+        const combined = new Map(p.matched);
+        for (const [k, v] of extra.entries()) combined.set(k, v);
+        return { file: p.file, text: p.text, matched: combined };
+      });
+      await finalizeBatch(entries);
+    } catch (err) {
+      toast.error((err as Error).message);
+    } finally {
+      setUploading(false);
+    }
   };
 
   const updateItem = (key: string, patch: Partial<Item>) =>
