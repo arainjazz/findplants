@@ -856,10 +856,10 @@ function Toolbar({ editor, onPickImage }: { editor: Editor; onPickImage: () => v
       </Btn>
       <span className="w-px bg-rule mx-1" />
       <Btn title="链接" active={editor.isActive("link")} onClick={setLink}>
-        🔗 链接
+        <span className="inline-flex items-center gap-1"><Link2 className="w-3.5 h-3.5" />链接</span>
       </Btn>
       <Btn title="插入图片" onClick={onPickImage}>
-        🖼 图片
+        <span className="inline-flex items-center gap-1"><ImageIcon className="w-3.5 h-3.5" />图片</span>
       </Btn>
       <span className="w-px bg-rule mx-1" />
       <Btn title="撤销" onClick={() => editor.chain().focus().undo().run()}>
