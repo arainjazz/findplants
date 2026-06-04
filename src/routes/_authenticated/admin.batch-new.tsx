@@ -180,7 +180,6 @@ function BatchNewPage() {
         const { matched, missing } = resolveRefs(refs, idx);
         parsed.push({ file: f, text, matched, missing });
       }
-      const totalRefs = parsed.reduce((n, p) => n + p.matched.size + p.missing.length, 0);
       const totalMissing = parsed.reduce((n, p) => n + p.missing.length, 0);
       if (totalMissing > 0) {
         const matchedCount = parsed.reduce((n, p) => n + p.matched.size, 0);
