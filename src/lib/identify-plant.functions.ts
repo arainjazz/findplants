@@ -44,6 +44,7 @@ async function callAiIdentify(photoDataUrl: string, hintPlace: string): Promise<
         ],
       },
     ],
+    max_tokens: 16000,
     tools: [
       {
         type: "function",
