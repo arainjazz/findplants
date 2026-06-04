@@ -569,7 +569,8 @@ export function PlantEditor({ initial }: Props) {
       <input
         ref={htmlInputRef}
         type="file"
-        accept=".html,text/html"
+        accept=".html,.htm,text/html,image/*"
+        multiple
         onChange={onHtmlUpload}
         disabled={uploadingHtml || extracting}
         className="sr-only"
