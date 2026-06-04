@@ -472,13 +472,10 @@ export function PlantEditor({ initial }: Props) {
       const imageFiles = files.filter((f) => f !== htmlFile && isImageFile(f));
       const { matched, missing } = matchRefsToFiles(localRefs, imageFiles);
       if (missing.length > 0) {
-        toast.message(
-          `已自动匹配 ${matched.size} 张配图；${missing.length} 张未在本次选择中找到。选择 HTML 所在文件夹可一次性自动上传全部配图。`,
-          { duration: 6000 },
+        toast.error(
+          `HTML 中有 ${missing.length} 个本地图片路径未找到。请点“选择 HTML 所在文件夹”，系统会自动匹配、上传并改写路径。`,
+          { duration: 8000 },
         );
-      }
-      if (localRefs.length > 0 && matched.size === 0) {
-        toast.error("HTML 中有本地图片引用，但未在所选文件中找到图片。请直接选择 HTML 所在文件夹，系统会自动匹配并上传。", { duration: 8000 });
         return;
       }
       await finalizeHtmlUpload(htmlFile, text, matched);
@@ -840,7 +837,6 @@ export function PlantEditor({ initial }: Props) {
               checked={contentType === "html"}
               onChange={() => {
                 setContentType("html");
-                htmlFolderInputRef.current?.click();
               }}
             />
             上传 HTML 文件
@@ -858,7 +854,7 @@ export function PlantEditor({ initial }: Props) {
               disabled={uploadingHtml || extracting}
               className="border border-ink px-4 py-2 hover:bg-ink hover:text-background transition-colors disabled:opacity-60 text-sm"
             >
-              {uploadingHtml ? "上传中…" : extracting ? "AI 识别中…" : "选择 HTML 所在文件夹"}
+              {uploadingHtml ? "上传中…" : extracting ? "AI 识别中…" : "选择 HTML 所在文件夹（自动带图）"}
             </button>
             <button
               type="button"
@@ -866,7 +862,7 @@ export function PlantEditor({ initial }: Props) {
               disabled={uploadingHtml || extracting}
               className="border border-ink/40 px-4 py-2 hover:bg-paper-deep transition-colors disabled:opacity-60 text-sm ml-2"
             >
-              仅上传单个 HTML
+              单个 HTML（无本地图）
             </button>
             {htmlUrl && (
               <>
