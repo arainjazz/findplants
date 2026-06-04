@@ -431,10 +431,18 @@ function BatchNewPage() {
             <input
               ref={fileRef}
               type="file"
-              accept=".html,text/html"
+              accept=".html,.htm,text/html,image/*"
               multiple
               className="sr-only"
               onChange={onPickFiles}
+            />
+            <input
+              ref={imageRef}
+              type="file"
+              accept="image/*"
+              multiple
+              className="sr-only"
+              onChange={onPickMissingImages}
             />
           </div>
         </div>
