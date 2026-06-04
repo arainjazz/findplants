@@ -870,9 +870,10 @@ export function PlantEditor({ initial }: Props) {
                   type="button"
                   onClick={onExtractMeta}
                   disabled={extracting}
-                  className="border border-ink px-4 py-2 hover:bg-ink hover:text-background transition-colors disabled:opacity-60 text-sm"
+                  className="border border-ink px-4 py-2 hover:bg-ink hover:text-background transition-colors disabled:opacity-60 text-sm inline-flex items-center gap-1.5"
                 >
-                  {extracting ? "AI 识别中…" : "🪄 AI 识别并自动填充字段"}
+                  <Wand2 className="w-4 h-4" />
+                  {extracting ? "AI 识别中…" : "AI 识别并自动填充字段"}
                 </button>
                 <p className="text-xs text-ink-faint">
                   将自动填入：学名、Slug、科属（科+属）、物种入侵、标签、摘要。已手动改过的 Slug 不会被覆盖。
