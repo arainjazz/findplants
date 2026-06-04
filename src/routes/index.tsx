@@ -30,6 +30,7 @@ function HomePage() {
   });
   const { data: tags = [] } = useQuery({ queryKey: ["all-tags"], queryFn: fetchAllTags });
   const { data: plantTags = [] } = useQuery({ queryKey: ["all-plant-tags"], queryFn: fetchAllPlantTags });
+  const { data: drafts = [] } = useQuery({ queryKey: ["home-drafts"], queryFn: () => fetchPendingDrafts(8) });
   type Tab = "latest" | "featured" | "hot" | "regions" | "tags";
   const [tab, setTab] = useState<Tab>("latest");
 
