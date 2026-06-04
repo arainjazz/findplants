@@ -75,10 +75,10 @@ function HomePage() {
           <h1 className="text-center font-display text-4xl md:text-6xl font-bold tracking-tight">
             Plantspedia · 草木志
           </h1>
-          <div className="mt-4 flex items-start justify-between gap-4 flex-wrap">
+          <div className="mt-4 hidden md:flex items-start justify-between gap-4 flex-wrap">
             <div>
-              <div className="text-sm md:text-base">未来还会有10万种植物将被命名</div>
-              <div className="label mt-0.5">Another 100,000 plant species remain to be named.</div>
+              <div className="text-sm md:text-base">地球上还有10万种植物等着你去发现</div>
+              <div className="label mt-0.5">Another 100,000 plant species remain to be discovered.</div>
             </div>
             <div className="text-right">
               <div className="text-sm md:text-base">由社区编纂 · 持续更新</div>
@@ -86,6 +86,7 @@ function HomePage() {
             </div>
           </div>
         </section>
+
 
         {/* Camera-based AI plant identification (anyone, including signed-out) */}
         <CameraIdentify />
