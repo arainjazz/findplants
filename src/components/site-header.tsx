@@ -120,8 +120,8 @@ export function SiteHeader() {
           />
         </form>
 
-        {/* Desktop full nav */}
-        <nav className="hidden md:flex items-center gap-x-4 text-sm">
+        {/* Desktop full nav — only at lg+ to avoid iPad overlap */}
+        <nav className="hidden lg:flex items-center gap-x-4 text-sm">
           <Link to="/" className="hover:text-vermilion transition-colors" activeProps={{ className: "font-semibold" }}>首页</Link>
           <Link to="/plants" className="hover:text-vermilion transition-colors" activeProps={{ className: "font-semibold" }}>已收录档案检索</Link>
           <Link to="/blog" className="hover:text-vermilion transition-colors" activeProps={{ className: "font-semibold" }}>编辑博客</Link>
@@ -156,18 +156,18 @@ export function SiteHeader() {
             <button onClick={() => signOut()} className="text-ink-faint hover:text-ink transition-colors">退出</button>
           ) : (
             <>
-              <Link to="/signup" className="hidden md:inline-block rounded border border-ink px-3 py-1 hover:bg-ink hover:text-background transition-colors">申请成为编辑</Link>
+              <Link to="/signup" className="hidden lg:inline-block rounded border border-ink px-3 py-1 hover:bg-ink hover:text-background transition-colors">申请成为编辑</Link>
               <Link to="/login" className="rounded border border-ink px-3 py-1 hover:bg-ink hover:text-background transition-colors">登录</Link>
             </>
           )}
         </div>
 
-        {/* Mobile hamburger */}
+        {/* Hamburger — shown on tablet + mobile (below lg) */}
         <button
           type="button"
           aria-label="菜单"
           onClick={() => setMenuOpen((v) => !v)}
-          className="md:hidden relative w-9 h-9 inline-flex items-center justify-center border border-ink/40 hover:bg-paper-deep shrink-0"
+          className="lg:hidden relative w-9 h-9 inline-flex items-center justify-center border border-ink/40 hover:bg-paper-deep shrink-0"
         >
           <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round">
             {menuOpen ? (
@@ -191,9 +191,9 @@ export function SiteHeader() {
         </button>
       </div>
 
-      {/* Mobile drawer */}
+      {/* Drawer — tablet + mobile */}
       {menuOpen && (
-        <nav className="md:hidden border-t border-ink/30 bg-background px-4 py-3 flex flex-col gap-3 text-sm">
+        <nav className="lg:hidden border-t border-ink/30 bg-background px-4 py-3 flex flex-col gap-3 text-sm">
           <Link to="/" onClick={() => setMenuOpen(false)} className="hover:text-vermilion">首页</Link>
           <Link to="/plants" onClick={() => setMenuOpen(false)} className="hover:text-vermilion">已收录档案检索</Link>
           <Link to="/blog" onClick={() => setMenuOpen(false)} className="hover:text-vermilion">编辑博客</Link>
