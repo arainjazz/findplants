@@ -300,26 +300,30 @@ function DraftsStrip({ drafts }: { drafts: PlantDraft[] }) {
         </div>
         <span className="text-xs text-ink-faint">{drafts.length} 份待审</span>
       </div>
-      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-4">
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
         {drafts.map((d) => (
           <Link
             key={d.id}
             to="/drafts/$id"
             params={{ id: d.id }}
-            className="group block border border-rule bg-paper-deep/30 hover:border-vermilion transition-colors"
+            className="group flex gap-3 border border-rule bg-paper-deep/30 hover:border-vermilion transition-colors p-3"
           >
-            <div className="aspect-[4/3] overflow-hidden bg-paper-deep">
-              <img src={d.photo_url} alt={d.title} className="w-full h-full object-cover group-hover:scale-[1.03] transition-transform duration-500" />
+            <div className="w-24 h-24 sm:w-28 sm:h-28 flex-shrink-0 overflow-hidden bg-paper-deep">
+              <img src={d.photo_url} alt={d.title} className="w-full h-full object-cover group-hover:scale-[1.04] transition-transform duration-500" />
             </div>
-            <div className="p-3">
-              <p className="label text-[10px] text-vermilion mb-1">草稿 · {d.creator_label}</p>
+            <div className="min-w-0 flex-1">
+              <p className="label text-[10px] text-vermilion mb-0.5">草稿 · {d.creator_label}</p>
               <h3 className="font-display text-base font-semibold leading-tight truncate group-hover:text-vermilion transition-colors">{d.title}</h3>
               {d.scientific_name && <p className="italic text-xs text-ink-faint truncate mt-0.5">{d.scientific_name}</p>}
+              {d.summary && (
+                <p className="text-[12px] text-ink-soft mt-1 line-clamp-3 leading-snug">{d.summary}</p>
+              )}
               <p className="text-[11px] text-ink-faint mt-1.5 truncate">📍 {d.capture_place || "未知地点"}</p>
             </div>
           </Link>
         ))}
       </div>
+
     </section>
   );
 }
