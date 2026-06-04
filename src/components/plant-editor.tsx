@@ -600,10 +600,6 @@ export function PlantEditor({ initial }: Props) {
       <input
         ref={htmlInputRef}
         type="file"
-        // Accept a single HTML, or HTML + images, or a whole folder.
-        // Browsers that support `webkitdirectory` will also expose a "select folder" affordance
-        // in their file dialog when this attribute is set, but `multiple` still lets the user
-        // select an individual `.html` file.
         accept=".html,.htm,text/html,image/*"
         multiple
         onChange={onHtmlUpload}
@@ -612,13 +608,13 @@ export function PlantEditor({ initial }: Props) {
         tabIndex={-1}
       />
       <input
-        ref={imageInputRef}
+        ref={htmlFolderInputRef}
         type="file"
-        accept="image/*"
         multiple
+        {...({ webkitdirectory: "", directory: "" } as React.InputHTMLAttributes<HTMLInputElement> & { webkitdirectory: string; directory: string })}
         className="sr-only"
         tabIndex={-1}
-        onChange={onPendingImagesPicked}
+        onChange={onHtmlUpload}
       />
 
       <Field label="标题 *">
