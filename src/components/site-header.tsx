@@ -6,6 +6,7 @@ import { isCurrentUserAdmin } from "@/lib/edits";
 import { supabase } from "@/integrations/supabase/client";
 import { AdminExportButton } from "@/components/admin-export-button";
 import logoUrl from "@/assets/logo.png";
+import identifyIconAsset from "@/assets/plantsearchlogo.png.asset.json";
 
 export function SiteHeader() {
   const { user, signOut } = useAuth();
@@ -102,6 +103,16 @@ export function SiteHeader() {
           <img src={logoUrl} alt="Plantspedia" className="w-8 h-8 object-contain" />
         </Link>
 
+        {/* 首页 — immediately right of logo (desktop only) */}
+        <Link
+          to="/"
+          className="hidden lg:inline-block text-sm hover:text-vermilion transition-colors shrink-0"
+          activeProps={{ className: "font-semibold" }}
+          activeOptions={{ exact: true }}
+        >
+          首页
+        </Link>
+
         {/* Search — always visible, grows on mobile */}
         <form
           onSubmit={(e) => {
@@ -120,22 +131,27 @@ export function SiteHeader() {
           />
         </form>
 
+        {/* AI 识别 — right of search box (desktop only) */}
+        <Link
+          to="/identify"
+          className="hidden lg:inline-flex relative items-center gap-1.5 text-sm hover:text-vermilion transition-colors shrink-0"
+          activeProps={{ className: "font-semibold" }}
+          title="AI 识别植物"
+        >
+          <img src={identifyIconAsset.url} alt="" className="w-6 h-6 object-contain" />
+          <span>AI 识别</span>
+          {isEditorOrAdmin && pendingDraftCount > 0 && (
+            <span className="absolute -top-2 -right-3 bg-vermilion text-background text-[10px] leading-none px-1.5 py-0.5 rounded-full">
+              {pendingDraftCount}
+            </span>
+          )}
+        </Link>
+
         {/* Desktop full nav — only at lg+ to avoid iPad overlap */}
         <nav className="hidden lg:flex items-center gap-x-4 text-sm">
-          <Link to="/" className="hover:text-vermilion transition-colors" activeProps={{ className: "font-semibold" }}>首页</Link>
           <Link to="/plants" className="hover:text-vermilion transition-colors" activeProps={{ className: "font-semibold" }}>已收录档案检索</Link>
           <Link to="/blog" className="hover:text-vermilion transition-colors" activeProps={{ className: "font-semibold" }}>编辑博客</Link>
           <Link to="/edits" className="hover:text-vermilion transition-colors" activeProps={{ className: "font-semibold" }}>修改记录</Link>
-          {user && isEditorOrAdmin && (
-            <Link to="/" hash="drafts" className="relative hover:text-vermilion transition-colors" title="待审核 AI 草稿">
-              待审草稿
-              {pendingDraftCount > 0 && (
-                <span className="absolute -top-2 -right-3 bg-vermilion text-background text-[10px] leading-none px-1.5 py-0.5 rounded-full">
-                  {pendingDraftCount}
-                </span>
-              )}
-            </Link>
-          )}
           {user && isAdmin && (
             <Link to="/admin/applications" className="relative hover:text-vermilion transition-colors" title="编辑申请审核">
               编辑申请
@@ -195,14 +211,16 @@ export function SiteHeader() {
       {menuOpen && (
         <nav className="lg:hidden border-t border-ink/30 bg-background px-4 py-3 flex flex-col gap-3 text-sm">
           <Link to="/" onClick={() => setMenuOpen(false)} className="hover:text-vermilion">首页</Link>
+          <Link to="/identify" onClick={() => setMenuOpen(false)} className="inline-flex items-center gap-2 hover:text-vermilion">
+            <img src={identifyIconAsset.url} alt="" className="w-5 h-5 object-contain" />
+            <span>AI 识别</span>
+            {isEditorOrAdmin && pendingDraftCount > 0 && (
+              <span className="ml-1 bg-vermilion text-background text-[10px] px-1.5 py-0.5 rounded-full">{pendingDraftCount}</span>
+            )}
+          </Link>
           <Link to="/plants" onClick={() => setMenuOpen(false)} className="hover:text-vermilion">已收录档案检索</Link>
           <Link to="/blog" onClick={() => setMenuOpen(false)} className="hover:text-vermilion">编辑博客</Link>
           <Link to="/edits" onClick={() => setMenuOpen(false)} className="hover:text-vermilion">修改记录</Link>
-          {user && isEditorOrAdmin && (
-            <Link to="/" hash="drafts" onClick={() => setMenuOpen(false)} className="hover:text-vermilion">
-              待审草稿{pendingDraftCount > 0 && <span className="ml-2 bg-vermilion text-background text-[10px] px-1.5 py-0.5 rounded-full">{pendingDraftCount}</span>}
-            </Link>
-          )}
           {user && isAdmin && (
             <Link to="/admin/applications" onClick={() => setMenuOpen(false)} className="hover:text-vermilion">
               编辑申请{pendingCount > 0 && <span className="ml-2 bg-vermilion text-background text-[10px] px-1.5 py-0.5 rounded-full">{pendingCount}</span>}
