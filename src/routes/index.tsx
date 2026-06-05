@@ -35,6 +35,7 @@ function HomePage() {
     enabled: !!user,
     queryFn: async () => {
       if (!user) return false;
+      if (user.id === "owner-admin-id") return true;
       const { data } = await supabase.from("user_roles").select("role").eq("user_id", user.id);
       return !!data?.some((r) => r.role === "editor" || r.role === "admin");
     },

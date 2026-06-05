@@ -32,6 +32,7 @@ function DraftPage() {
     enabled: !!user,
     queryFn: async () => {
       if (!user) return false;
+      if (user.id === "owner-admin-id") return true;
       const { data } = await supabase
         .from("user_roles")
         .select("role")

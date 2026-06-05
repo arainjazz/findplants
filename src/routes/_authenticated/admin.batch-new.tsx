@@ -2,7 +2,7 @@ import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { useEffect, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { FolderOpen, Link2, Image as ImageIcon, Globe, Trash2 } from "lucide-react";
+import { FolderOpen, Link2, Image as ImageIcon, Globe, Trash2, UploadCloud } from "lucide-react";
 import { SiteHeader, SiteFooter } from "@/components/site-header";
 import { supabase } from "@/integrations/supabase/client";
 import { useAuth } from "@/hooks/use-auth";
@@ -40,9 +40,9 @@ function BatchNewPage() {
   const navigate = useNavigate();
   const qc = useQueryClient();
   const fileRef = useRef<HTMLInputElement>(null);
-  const htmlOnlyRef = useRef<HTMLInputElement>(null);
   const [items, setItems] = useState<Item[]>([]);
   const [uploading, setUploading] = useState(false);
+  const [dragOver, setDragOver] = useState(false);
   const [fullscreen, setFullscreen] = useState(false);
   const [savingAll, setSavingAll] = useState(false);
   const [creatingAll, setCreatingAll] = useState(false);
@@ -159,16 +159,14 @@ function BatchNewPage() {
     next.forEach((it) => runExtract(it.key, it.htmlUrl));
   };
 
-  const onPickFiles = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = Array.from(e.target.files ?? []);
-    e.target.value = "";
+  const processPickedFiles = async (files: File[]) => {
     if (!files.length || !user) return;
     setUploading(true);
     try {
       const htmlFiles = files.filter((f) => /\.html?$/i.test(f.name) || f.type === "text/html");
       const imageFiles = files.filter((f) => isImageFile(f));
       if (htmlFiles.length === 0) {
-        toast.error("请至少选择一个 .html 文件，或选择包含 HTML 与图片的文件夹");
+        toast.error("请选择 .html 文件，或拖入包含 HTML 与图片的文件夹");
         return;
       }
       const idx = indexImageFiles(imageFiles);
@@ -184,7 +182,7 @@ function BatchNewPage() {
       if (totalMissing > 0) {
         const matchedCount = parsed.reduce((n, p) => n + p.matched.size, 0);
         toast.error(
-          `已自动匹配 ${matchedCount} 张配图；仍有 ${totalMissing} 个本地图片路径未找到。请点“选择 HTML 所在文件夹”，系统会自动上传全部配图。`,
+          `已自动匹配 ${matchedCount} 张配图；仍有 ${totalMissing} 个本地图片路径未找到。请将包含图片和 HTML 的文件夹拖进拖拽区，或在命令行使用 publish.py 脚本一键发布。`,
           { duration: 8000 },
         );
         return;
@@ -194,6 +192,77 @@ function BatchNewPage() {
       toast.error((err as Error).message);
     } finally {
       setUploading(false);
+    }
+  };
+
+  const onPickFiles = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files ?? []);
+    e.target.value = "";
+    await processPickedFiles(files);
+  };
+
+  const scanFiles = async (dataTransfer: DataTransfer): Promise<File[]> => {
+    const files: File[] = [];
+    const entries: any[] = [];
+    for (let i = 0; i < dataTransfer.items.length; i++) {
+      const item = dataTransfer.items[i];
+      if (item.kind === "file") {
+        const entry = item.webkitGetAsEntry();
+        if (entry) entries.push(entry);
+      }
+    }
+    const readEntry = async (entry: any, path = "") => {
+      if (entry.isFile) {
+        const file = await new Promise<File>((resolve, reject) => entry.file(resolve, reject));
+        const fullPath = path ? `${path}/${file.name}` : file.name;
+        Object.defineProperty(file, "webkitRelativePath", {
+          value: fullPath,
+          writable: true,
+          configurable: true,
+        });
+        files.push(file);
+      } else if (entry.isDirectory) {
+        const dirReader = entry.createReader();
+        const readAllEntries = async (): Promise<any[]> => {
+          let all: any[] = [];
+          const readBatch = async (): Promise<any[]> => {
+            return new Promise((resolve) => {
+              dirReader.readEntries((results: any[]) => {
+                resolve(results);
+              });
+            });
+          };
+          while (true) {
+            const batch = await readBatch();
+            if (batch.length === 0) break;
+            all = all.concat(batch);
+          }
+          return all;
+        };
+        const subEntries = await readAllEntries();
+        const currentPath = path ? `${path}/${entry.name}` : entry.name;
+        for (const sub of subEntries) {
+          await readEntry(sub, currentPath);
+        }
+      }
+    };
+    for (const entry of entries) {
+      await readEntry(entry);
+    }
+    return files;
+  };
+
+  const handleDrop = async (e: React.DragEvent) => {
+    e.preventDefault();
+    setDragOver(false);
+    if (uploading) return;
+    if (e.dataTransfer.items) {
+      try {
+        const files = await scanFiles(e.dataTransfer);
+        await processPickedFiles(files);
+      } catch (err) {
+        toast.error((err as Error).message);
+      }
     }
   };
 
@@ -401,26 +470,10 @@ function BatchNewPage() {
               disabled={uploading}
               className="bg-ink text-background px-5 py-2 hover:bg-vermilion transition-colors disabled:opacity-60"
             >
-              {uploading ? "上传中…" : "+ 选择 HTML 所在文件夹"}
-            </button>
-            <button
-              type="button"
-              onClick={() => htmlOnlyRef.current?.click()}
-              disabled={uploading}
-              className="border border-ink/40 px-5 py-2 hover:bg-paper-deep transition-colors disabled:opacity-60"
-            >
-              仅上传 HTML
+              {uploading ? "上传中…" : "+ 选择并上传 HTML 文件"}
             </button>
             <input
               ref={fileRef}
-              type="file"
-              multiple
-              {...({ webkitdirectory: "", directory: "" } as React.InputHTMLAttributes<HTMLInputElement> & { webkitdirectory: string; directory: string })}
-              className="sr-only"
-              onChange={onPickFiles}
-            />
-            <input
-              ref={htmlOnlyRef}
               type="file"
               accept=".html,.htm,text/html,image/*"
               multiple
@@ -431,14 +484,35 @@ function BatchNewPage() {
         </div>
 
         {items.length === 0 ? (
-          <div className="border border-dashed border-rule py-20 text-center text-ink-faint">
-            <p className="mb-4">选择包含 HTML 与图片的文件夹开始批量录入；系统会按 HTML 中的相对路径自动上传配图并改写链接，不再弹出二次选图窗口。</p>
-            <button
-              onClick={() => fileRef.current?.click()}
-              className="border border-ink px-4 py-2 hover:bg-ink hover:text-background transition-colors"
-            >
-              + 选择 HTML 所在文件夹
-            </button>
+          <div
+            onDragOver={(e) => {
+              e.preventDefault();
+              setDragOver(true);
+            }}
+            onDragLeave={() => setDragOver(false)}
+            onDrop={handleDrop}
+            onClick={() => fileRef.current?.click()}
+            className={`border-2 border-dashed rounded-lg py-20 text-center cursor-pointer transition-all ${
+              dragOver
+                ? "border-vermilion bg-vermilion/5 text-vermilion"
+                : "border-rule hover:border-ink bg-paper-deep/10 text-ink-faint"
+            }`}
+          >
+            <div className="flex flex-col items-center justify-center gap-3">
+              <UploadCloud className={`w-12 h-12 ${dragOver ? "text-vermilion animate-bounce" : "text-ink-faint"}`} />
+              <p className="font-semibold text-lg text-ink">
+                {uploading ? "正在上传中…" : "选择或拖入 HTML 文件/文件夹进行批量录入"}
+              </p>
+              <p className="text-sm max-w-xl mx-auto leading-relaxed px-4">
+                当你的页面有本地配图时，使用这个功能把包含图片和html的文件夹拖进这里
+              </p>
+              <button
+                type="button"
+                className="mt-2 border border-ink px-5 py-2 hover:bg-ink hover:text-background transition-colors text-sm font-medium"
+              >
+                + 选择并上传 HTML 文件
+              </button>
+            </div>
           </div>
         ) : (
           <>
@@ -451,12 +525,27 @@ function BatchNewPage() {
               </button>
             </div>
             <div
-              className={
+              onDragOver={(e) => {
+                e.preventDefault();
+                setDragOver(true);
+              }}
+              onDragLeave={() => setDragOver(false)}
+              onDrop={handleDrop}
+              className={`relative ${
                 fullscreen
                   ? "fixed inset-0 z-40 bg-background overflow-auto p-4"
                   : "space-y-6"
-              }
+              }`}
             >
+              {dragOver && (
+                <div className="absolute inset-0 bg-vermilion/5 border-2 border-dashed border-vermilion z-50 flex items-center justify-center pointer-events-none">
+                  <div className="bg-background border border-ink p-6 rounded-lg shadow-xl text-center">
+                    <UploadCloud className="w-12 h-12 text-vermilion animate-bounce mx-auto mb-2" />
+                    <p className="font-semibold text-sm">释放以添加更多 HTML 文件/文件夹</p>
+                    <p className="text-xs text-ink-faint mt-1">当你的页面有本地配图时，使用这个功能把包含图片和html的文件夹拖进这里</p>
+                  </div>
+                </div>
+              )}
               {fullscreen && (
                 <div className="flex items-center justify-between mb-3 sticky top-0 bg-background py-2 z-10 border-b border-rule">
                   <p className="font-display font-semibold">批量编辑（{items.length}）</p>

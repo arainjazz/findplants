@@ -8,6 +8,7 @@ import {
   Globe,
   Trash2,
   Wand2,
+  UploadCloud,
 } from "lucide-react";
 import { supabase } from "@/integrations/supabase/client";
 import { useAuth } from "@/hooks/use-auth";
@@ -31,7 +32,6 @@ export function PlantEditor({ initial }: Props) {
   const navigate = useNavigate();
   const qc = useQueryClient();
   const htmlInputRef = useRef<HTMLInputElement>(null);
-  const htmlFolderInputRef = useRef<HTMLInputElement>(null);
   const hydratedDraftRef = useRef(false);
   const draftKey = `plant-editor-draft:${initial?.id ?? "new"}`;
 
@@ -53,6 +53,7 @@ export function PlantEditor({ initial }: Props) {
   const [saving, setSaving] = useState(false);
   const [uploadingCover, setUploadingCover] = useState(false);
   const [uploadingHtml, setUploadingHtml] = useState(false);
+  const [dragOver, setDragOver] = useState(false);
   const [extracting, setExtracting] = useState(false);
   const [coverMenu, setCoverMenu] = useState<{ x: number; y: number } | null>(null);
   const coverFileRef = useRef<HTMLInputElement>(null);
@@ -459,12 +460,10 @@ export function PlantEditor({ initial }: Props) {
     return { matched, missing };
   };
 
-  const onHtmlUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = Array.from(e.target.files ?? []);
-    e.target.value = "";
+  const processHtmlFiles = async (files: File[]) => {
     if (files.length === 0) return;
     const htmlFile = files.find((f) => /\.html?$/i.test(f.name) || f.type === "text/html");
-    if (!htmlFile) return toast.error("请选择 .html 文件，或选择包含 HTML 与图片的文件夹");
+    if (!htmlFile) return toast.error("请选择 .html 文件，或拖入包含 HTML 与图片的文件夹");
     setUploadingHtml(true);
     try {
       const text = await htmlFile.text();
@@ -473,7 +472,7 @@ export function PlantEditor({ initial }: Props) {
       const { matched, missing } = matchRefsToFiles(localRefs, imageFiles);
       if (missing.length > 0) {
         toast.error(
-          `HTML 中有 ${missing.length} 个本地图片路径未找到。请点“选择 HTML 所在文件夹”，系统会自动匹配、上传并改写路径。`,
+          `HTML 中有 ${missing.length} 个本地图片路径未找到。请将包含图片和 HTML 的文件夹拖进拖拽区，或在命令行使用 publish.py 脚本一键发布。`,
           { duration: 8000 },
         );
         return;
@@ -483,6 +482,77 @@ export function PlantEditor({ initial }: Props) {
       toast.error((err as Error).message);
     } finally {
       setUploadingHtml(false);
+    }
+  };
+
+  const onHtmlUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files ?? []);
+    e.target.value = "";
+    await processHtmlFiles(files);
+  };
+
+  const scanFiles = async (dataTransfer: DataTransfer): Promise<File[]> => {
+    const files: File[] = [];
+    const entries: any[] = [];
+    for (let i = 0; i < dataTransfer.items.length; i++) {
+      const item = dataTransfer.items[i];
+      if (item.kind === "file") {
+        const entry = item.webkitGetAsEntry();
+        if (entry) entries.push(entry);
+      }
+    }
+    const readEntry = async (entry: any, path = "") => {
+      if (entry.isFile) {
+        const file = await new Promise<File>((resolve, reject) => entry.file(resolve, reject));
+        const fullPath = path ? `${path}/${file.name}` : file.name;
+        Object.defineProperty(file, "webkitRelativePath", {
+          value: fullPath,
+          writable: true,
+          configurable: true,
+        });
+        files.push(file);
+      } else if (entry.isDirectory) {
+        const dirReader = entry.createReader();
+        const readAllEntries = async (): Promise<any[]> => {
+          let all: any[] = [];
+          const readBatch = async (): Promise<any[]> => {
+            return new Promise((resolve) => {
+              dirReader.readEntries((results: any[]) => {
+                resolve(results);
+              });
+            });
+          };
+          while (true) {
+            const batch = await readBatch();
+            if (batch.length === 0) break;
+            all = all.concat(batch);
+          }
+          return all;
+        };
+        const subEntries = await readAllEntries();
+        const currentPath = path ? `${path}/${entry.name}` : entry.name;
+        for (const sub of subEntries) {
+          await readEntry(sub, currentPath);
+        }
+      }
+    };
+    for (const entry of entries) {
+      await readEntry(entry);
+    }
+    return files;
+  };
+
+  const handleDrop = async (e: React.DragEvent) => {
+    e.preventDefault();
+    setDragOver(false);
+    if (uploadingHtml || extracting) return;
+    if (e.dataTransfer.items) {
+      try {
+        const files = await scanFiles(e.dataTransfer);
+        await processHtmlFiles(files);
+      } catch (err) {
+        toast.error((err as Error).message);
+      }
     }
   };
 
@@ -614,15 +684,6 @@ export function PlantEditor({ initial }: Props) {
         disabled={uploadingHtml || extracting}
         className="sr-only"
         tabIndex={-1}
-      />
-      <input
-        ref={htmlFolderInputRef}
-        type="file"
-        multiple
-        {...({ webkitdirectory: "", directory: "" } as React.InputHTMLAttributes<HTMLInputElement> & { webkitdirectory: string; directory: string })}
-        className="sr-only"
-        tabIndex={-1}
-        onChange={onHtmlUpload}
       />
 
       <Field label="标题 *">
@@ -848,22 +909,30 @@ export function PlantEditor({ initial }: Props) {
           </Field>
         ) : (
           <div className="space-y-2">
-            <button
-              type="button"
-              onClick={() => htmlFolderInputRef.current?.click()}
-              disabled={uploadingHtml || extracting}
-              className="border border-ink px-4 py-2 hover:bg-ink hover:text-background transition-colors disabled:opacity-60 text-sm"
-            >
-              {uploadingHtml ? "上传中…" : extracting ? "AI 识别中…" : "选择 HTML 所在文件夹（自动带图）"}
-            </button>
-            <button
-              type="button"
+            <div
+              onDragOver={(e) => {
+                e.preventDefault();
+                setDragOver(true);
+              }}
+              onDragLeave={() => setDragOver(false)}
+              onDrop={handleDrop}
               onClick={() => htmlInputRef.current?.click()}
-              disabled={uploadingHtml || extracting}
-              className="border border-ink/40 px-4 py-2 hover:bg-paper-deep transition-colors disabled:opacity-60 text-sm ml-2"
+              className={`border-2 border-dashed rounded-lg p-8 text-center cursor-pointer transition-all ${
+                dragOver
+                  ? "border-vermilion bg-vermilion/5 text-vermilion"
+                  : "border-rule hover:border-ink bg-paper-deep/10 text-ink"
+              }`}
             >
-              单个 HTML（无本地图）
-            </button>
+              <div className="flex flex-col items-center justify-center gap-2">
+                <UploadCloud className={`w-8 h-8 ${dragOver ? "text-vermilion animate-bounce" : "text-ink-faint"}`} />
+                <p className="text-sm font-semibold">
+                  {uploadingHtml ? "正在上传中…" : extracting ? "AI 正在识别中…" : "选择或拖入 HTML 文件/文件夹"}
+                </p>
+                <p className="text-xs text-ink-faint max-w-md mx-auto leading-relaxed">
+                  当你的页面有本地配图时，使用这个功能把包含图片和html的文件夹拖进这里
+                </p>
+              </div>
+            </div>
             {htmlUrl && (
               <>
                 <p className="text-xs text-ink-faint break-all">
@@ -930,7 +999,7 @@ export function PlantEditor({ initial }: Props) {
             <p className="text-xs text-ink-faint">
               提示：上传后整页将以原样在 iframe 中渲染（保留你的字体与排版）。
               <br />
-              <strong>含本地图片的页面：</strong>选择 HTML 所在文件夹后，系统会自动按相对路径匹配图片、上传到站内并改写链接；不会再弹出二次选图窗口。
+              <strong>含本地图片的页面：</strong>请在命令行使用 publish.py 脚本一键发布（推荐，可全自动解析并上传本地图片），或选择文件时将 HTML 和图片一起选中上传。
             </p>
             {htmlUrl && (
               <div className="mt-5 pt-5 border-t border-rule">

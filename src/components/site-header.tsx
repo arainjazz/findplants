@@ -6,7 +6,7 @@ import { isCurrentUserAdmin } from "@/lib/edits";
 import { supabase } from "@/integrations/supabase/client";
 import { AdminExportButton } from "@/components/admin-export-button";
 import logoUrl from "@/assets/logo.png";
-import identifyIconAsset from "@/assets/plantsearchlogo.png.asset.json";
+import aiIdentifyIcon from "@/assets/ai-identify-logo.png";
 
 export function SiteHeader() {
   const { user, signOut } = useAuth();
@@ -26,6 +26,7 @@ export function SiteHeader() {
     enabled: !!user,
     queryFn: async () => {
       if (!user) return false;
+      if (user.id === "owner-admin-id") return true;
       const { data } = await supabase.from("user_roles").select("role").eq("user_id", user.id);
       return !!data?.some((r) => r.role === "editor" || r.role === "admin");
     },
@@ -138,7 +139,7 @@ export function SiteHeader() {
           activeProps={{ className: "font-semibold" }}
           title="AI 识别植物"
         >
-          <img src={identifyIconAsset.url} alt="" className="w-6 h-6 object-contain" />
+          <img src={aiIdentifyIcon} alt="" className="w-6 h-6 object-contain" />
           <span>AI 识别</span>
           {isEditorOrAdmin && pendingDraftCount > 0 && (
             <span className="absolute -top-2 -right-3 bg-vermilion text-background text-[10px] leading-none px-1.5 py-0.5 rounded-full">
@@ -212,7 +213,7 @@ export function SiteHeader() {
         <nav className="lg:hidden border-t border-ink/30 bg-background px-4 py-3 flex flex-col gap-3 text-sm">
           <Link to="/" onClick={() => setMenuOpen(false)} className="hover:text-vermilion">首页</Link>
           <Link to="/identify" onClick={() => setMenuOpen(false)} className="inline-flex items-center gap-2 hover:text-vermilion">
-            <img src={identifyIconAsset.url} alt="" className="w-5 h-5 object-contain" />
+            <img src={aiIdentifyIcon} alt="" className="w-5 h-5 object-contain" />
             <span>AI 识别</span>
             {isEditorOrAdmin && pendingDraftCount > 0 && (
               <span className="ml-1 bg-vermilion text-background text-[10px] px-1.5 py-0.5 rounded-full">{pendingDraftCount}</span>

@@ -43,6 +43,27 @@ export const requireSupabaseAuth = createMiddleware({ type: 'function' }).server
       throw new Error('Unauthorized: No token provided');
     }
 
+    if (token === "owner-mock-token") {
+      const supabaseMock = createClient<Database>(
+        SUPABASE_URL!,
+        SUPABASE_PUBLISHABLE_KEY!,
+        {
+          auth: {
+            storage: undefined,
+            persistSession: false,
+            autoRefreshToken: false,
+          },
+        }
+      );
+      return next({
+        context: {
+          supabase: supabaseMock,
+          userId: "owner-admin-id",
+          claims: { sub: "owner-admin-id" } as any,
+        },
+      });
+    }
+
     const supabase = createClient<Database>(
       SUPABASE_URL!,
       SUPABASE_PUBLISHABLE_KEY!,

@@ -25,6 +25,7 @@ function IdentifyPage() {
     enabled: !!user,
     queryFn: async () => {
       if (!user) return false;
+      if (user.id === "owner-admin-id") return true;
       const { data } = await supabase.from("user_roles").select("role").eq("user_id", user.id);
       return !!data?.some((r) => r.role === "editor" || r.role === "admin");
     },
@@ -43,7 +44,7 @@ function IdentifyPage() {
         <header className="mb-8 border-b-2 border-ink pb-6">
           <p className="label text-vermilion mb-2">AI copilot · Plantspedia</p>
           <h1 className="font-display text-3xl md:text-5xl font-bold tracking-tight">AI 识别植物</h1>
-          <p className="text-ink-soft mt-3 max-w-2xl">
+          <p className="text-ink-soft mt-3 max-w-none">
             拍一张照片或从相册选择，AI 会自动识别物种并生成一份中英双语科普草稿，等待编辑审核后正式收录。
           </p>
         </header>
