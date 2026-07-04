@@ -58,6 +58,21 @@ _Read this FIRST and update it LAST, every session._
   生效（旧草稿 html_content 已存，需重识别/编辑）。**USER**：`npm run build && wrangler deploy`(VPN)。可选：应用
   `20260703000000_invasive_species.sql`（加 is_invasive 列，点亮"只看入侵"的 GBIF 分布叠加层；地图打标不依赖它）。
 
+## 🆕 2026-07-04 (cont.) — 入侵/重点保护卡片重做 + 国家名单 + 筛选计数 (DONE, tsc+build OK, 已真机截图验证; NOT deployed)
+三块，均已提交：
+1. `dd9db80` **入侵卡片加国家名单**：新增静态数据 `src/lib/china-invasive-list.ts`（环保部《中国外来入侵物种名单》
+   四批共 40 种 + 是否《重点管理外来入侵物种名录》农业农村部567号2022）。identify 管线 lookupChinaInvasive → 命中即
+   判为入侵 + 卡片渲染「📋 国家名录：第X批（日期·发布单位）已/未纳入重点管理名录」（确定性、非 LLM）。截图验证 ✓。
+2. `cb554c3` **重点保护卡片重做**：原来只有 chips → 现在命中国家/省级重点保护名录时渲染**绿色渐变盾牌大卡**（对标橙色
+   入侵卡）：判定依据·收录名录(确定性)＋珍稀濒危·面临挑战＋生态价值＋保护建议(LLM 生成 `generateConservationCard`)＋
+   保护级别 head badge＋来源引用。CITES/GTS 仍作 chips 放卡内。截图验证 ✓（四合木示例）。
+3. `3a7224d` **/plants 筛选计数**：GRIIS 下拉只列**数据中真实存在的等级**（中国数据只有 Established/Invasive 两级，
+   自动去掉 Casual/Widespread 两级）＋每级追加（n）已收录数；国家和各省重点保护目录下拉每项也追加（n）。已验证
+   逻辑（present statuses = invasive/established）+ 截图（国家2021(1)/内蒙古2009(3)）✓。
+- **USER 需部署**：`npm run build && wrangler deploy`(VPN)。注意：**已存在的旧草稿不会自动套用新卡片**（需重新识别生成）；
+  新识别的草稿才有新卡片。筛选计数部署后立即生效。
+- 说明：入侵卡片的 status/harm/control 仍 LLM 生成；批次/管理名录/判定依据 为确定性注入（不会幻觉）。
+
 ## 🎯 Current goal
 Fix **observation/activity location recognition** (`capture_place`) + assorted UI
 details. (Session title: "Fix activity location recognition and UI details".)
