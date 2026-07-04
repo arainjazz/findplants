@@ -91,6 +91,35 @@ function PlantsList() {
     [conservationData],
   );
 
+  // Count of the site's *identified* (published) species per protected list and per
+  // GRIIS degree — shown in the filter dropdowns as （n）.
+  const conservationCounts = useMemo(() => {
+    const protectedCount = new Map<string, number>();
+    const griisCount = new Map<string, number>();
+    for (const p of plantsMetadata) {
+      const hit = conservationMatcher(p.scientific_name, (p as { family?: string | null }).family);
+      for (const listId of hit.protectedLists.keys())
+        protectedCount.set(listId, (protectedCount.get(listId) ?? 0) + 1);
+      if (hit.griis) griisCount.set(hit.griis, (griisCount.get(hit.griis) ?? 0) + 1);
+    }
+    return { protectedCount, griisCount };
+  }, [plantsMetadata, conservationMatcher]);
+
+  // GRIIS degrees actually present in the loaded registry — the four-level scheme
+  // is collapsed to the levels China's data really uses (drops levels we can't flag).
+  const griisOptions = useMemo(() => {
+    const griisListIds = new Set(
+      (conservationData?.lists ?? []).filter((l) => l.kind === "griis").map((l) => l.id),
+    );
+    const present = new Set<string>();
+    for (const t of conservationData?.taxa ?? [])
+      if (griisListIds.has(t.list_id) && t.status) present.add(t.status);
+    return GRIIS_DEGREES.filter((o) => present.has(o.value)).map((o) => {
+      const n = conservationCounts.griisCount.get(o.value) ?? 0;
+      return { ...o, label: `${o.label}（${n}）` };
+    });
+  }, [conservationData, conservationCounts]);
+
   // ---- bottom directory sections (full 名录 listings) ----
   const taxaByList = useMemo(() => {
     const m = new Map<string, ConservationTaxon[]>();
@@ -210,12 +239,15 @@ function PlantsList() {
         protectedListRank(a.province ?? a.name) - protectedListRank(b.province ?? b.name) ||
         a.name.localeCompare(b.name, "zh"),
     );
-    return lists.map((l) => ({
-      value: l.id,
-      label: l.name,
-      hover: { text: l.source_note ?? `${l.name}·重点保护野生植物名录`, anchorId: `dir-${l.id}` },
-    }));
-  }, [protectedLists]);
+    return lists.map((l) => {
+      const n = conservationCounts.protectedCount.get(l.id) ?? 0;
+      return {
+        value: l.id,
+        label: `${l.name}（${n}）`,
+        hover: { text: l.source_note ?? `${l.name}·重点保护野生植物名录`, anchorId: `dir-${l.id}` },
+      };
+    });
+  }, [protectedLists, conservationCounts]);
 
   // 归类标签 — separate dropdown. Hover shows who added it, when, and the reference (description).
   const tagOptions = useMemo(
@@ -413,7 +445,7 @@ function PlantsList() {
             <FilterDropdown
               label="GRIIS全球入侵等级"
               value={griis}
-              options={GRIIS_DEGREES}
+              options={griisOptions}
               onChange={(v) => setParam("griis", v)}
             />
             <FilterDropdown
