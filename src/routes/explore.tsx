@@ -118,14 +118,14 @@ function speciesKey(s: GeoSighting) {
 const PLANT_MARKER_HTML =
   '<div style="width:32px;height:32px;border-radius:9999px;background:rgba(16,185,129,0.3);border:1px solid #10b981;display:flex;align-items:center;justify-content:center;font-size:18px;cursor:pointer;box-shadow:0 1px 4px rgba(0,0,0,0.25);">🌱</div>';
 
-// Invasive alien species (GBIF/GRIIS China) — a solid red danger triangle with a
-// white "!", replacing the green dot so an invasive sighting reads as a warning.
+// Invasive alien species (GBIF/GRIIS China) — a YELLOW hazard triangle with a RED
+// "!", replacing the green dot so an invasive sighting reads as a warning.
 const INVASIVE_MARKER_HTML =
-  '<div style="cursor:pointer;filter:drop-shadow(0 1px 3px rgba(0,0,0,0.4));line-height:0;">' +
+  '<div style="cursor:pointer;filter:drop-shadow(0 1px 3px rgba(0,0,0,0.45));line-height:0;">' +
   '<svg width="30" height="28" viewBox="0 0 30 28" xmlns="http://www.w3.org/2000/svg">' +
-  '<path d="M15 2 L28.5 26 L1.5 26 Z" fill="rgba(220,38,38,0.95)" stroke="#fff" stroke-width="2" stroke-linejoin="round"/>' +
-  '<rect x="13.6" y="10" width="2.8" height="8" rx="1.4" fill="#fff"/>' +
-  '<circle cx="15" cy="22" r="1.6" fill="#fff"/></svg></div>';
+  '<path d="M15 2 L28.5 26 L1.5 26 Z" fill="#facc15" stroke="#ffffff" stroke-width="2" stroke-linejoin="round"/>' +
+  '<rect x="13.4" y="9.5" width="3.2" height="9" rx="1.6" fill="#dc2626"/>' +
+  '<circle cx="15" cy="22.6" r="1.9" fill="#dc2626"/></svg></div>';
 
 // GBIF China occurrence overlay point — a small, faded HOLLOW triangle, visually
 // subordinate to our own GPS sightings (these are reference distribution points,

@@ -9,6 +9,33 @@ cross-province split (Version `36a58ebd`). 06-14: diagnosed "session 一直报�
 long-lived API streams, not Anthropic/code; see Blockers._
 _Read this FIRST and update it LAST, every session._
 
+## 🆕 2026-07-04 — 项目驱动调研成果 + BlockNote 编辑器 + 地图入侵标记 (DONE code, tsc EXIT=0, build OK; NOT deployed, 未真机)
+安全善后完成后继续做功能。用户 6 项需求：
+1. **地图入侵标记改成黄三角+红!**（explore.tsx `INVASIVE_MARKER_HTML`）：fill `#facc15`、白描边、`!` 红 `#dc2626`。已改。
+   - **"识别不出入侵物种"诊断**：直连库确认 conservation_lists 有 griis + 2055 taxa（数据在），检测逻辑正确且空安全。
+     `is_invasive=true` 查询返回空 → 入侵迁移 `20260703000000_invasive_species.sql` 可能没应用（影响 GBIF 叠加+ingest 打标，
+     不影响 GRIIS 名录比对）。所以地图只给"学名对得上 GRIIS"的观测打三角；若某观测该标没标，多半 scientific_name 空/写法不符。
+     **待用户**：给出该被标却没标的观测学名，我再精确查匹配；并建议应用那条入侵迁移点亮 GBIF 叠加层。
+2-6. **项目驱动调研成果（大功能，用 BlockNote＝Notion 式）**：
+   - 装了 `@blocknote/core/react/mantine@0.51.4`（React19 OK）。
+   - **新 `projects` 表**：`supabase/migrations/20260704120000_projects.sql`（title + **project_date/location/theme/initiator 必填**
+     + summary + content_html + cover + author + published；RLS：published 世界可读、作者/admin 读写、insert 限 approved editor）。
+     types.ts 手加 projects 类型。**⚠️ USER 必须在 Supabase 后台应用这条迁移**（否则 /projects 与编辑器查询报错）。
+   - **`src/lib/projects.ts`**：CRUD + projectCoverUrl/projectYear。
+   - **`src/components/block-editor.tsx`**：BlockNote 包装（client-only、mounted 后再挂载=SSR 安全；中文 dictionary=
+     `@blocknote/core/locales` 的 `zh`；HTML in/out：tryParseHTMLToBlocks / blocksToFullHTML；uploadFile 传图上传）。
+   - **`src/components/project-editor.tsx`**：新建/编辑，4 个必填字段 + 必填校验 + BlockEditor + 封面上传。
+   - **admin 路由** `admin.projects.new` / `admin.projects.edit.$id`；管理页「我的条目」加「+ 编辑项目」按钮。
+   - **公开页** `projects.index`（导航「项目驱动调研成果」→ 左侧 4 下拉筛选：时间范围[年]/地点/主题/发起人，右侧卡片）
+     + `projects.$id`（详情，prose-project 样式渲染 content_html）。导航桌面+移动都加了。
+   - **博客编辑器也换成 BlockNote**（blog-editor.tsx：RichEditor→BlockEditor + uploadFile）。
+- **验证**：`npm run build` 通过（BlockNote 不破 SSR、路由树已重生成）、`tsc --noEmit` EXIT=0。**未真机**（dev 端口 8080 被
+  用户的 llama-server 占用，沙箱起不了预览）。**USER VERIFY**：①Supabase 应用 `20260704120000_projects.sql`；②本地腾出
+  8080 或部署后：管理页「+编辑项目」→ 填必填+Notion 正文→发布→ /projects 出卡片、左侧筛选可用、详情正常；博客编辑也变
+  Notion 式。③`npm run build && wrangler deploy`(VPN)。
+- **注意/待办**：BlockNote 正文存的是 `blocksToFullHTML` 的 HTML（含 bn-* 包裹 div），公开页用 prose-project 基础样式渲染，
+  基本可读；若样式不够精细，后续可引 BlockNote 展示态 CSS 或改 blocksToHTMLLossy。旧 rich-editor.tsx 仍在（未删）。
+
 ## 🎯 Current goal
 Fix **observation/activity location recognition** (`capture_place`) + assorted UI
 details. (Session title: "Fix activity location recognition and UI details".)

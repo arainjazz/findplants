@@ -5,7 +5,7 @@ import { useNavigate } from "@tanstack/react-router";
 import { toast } from "sonner";
 import { useAuth } from "@/hooks/use-auth";
 import { supabase } from "@/integrations/supabase/client";
-import { RichEditor } from "@/components/rich-editor";
+import { BlockEditor } from "@/components/block-editor";
 import { createPost, updatePost, firstImageSrc, type BlogPost } from "@/lib/blog";
 
 export function BlogEditor({ initial }: { initial?: BlogPost }) {
@@ -178,7 +178,26 @@ export function BlogEditor({ initial }: { initial?: BlogPost }) {
         />
       </div>
 
-      <RichEditor value={html} onChange={setHtml} />
+      <BlockEditor
+        initialHTML={initial?.content_html ?? ""}
+        onChange={setHtml}
+        uploadFile={async (file) => {
+          let f: Blob | File = file;
+          try {
+            f = await compressImage(file);
+          } catch {
+            /* use original on compress failure */
+          }
+          const ext = file.name.split(".").pop() || "jpg";
+          const path = `${user!.id}/blog/${Date.now()}-${Math.random().toString(36).slice(2, 6)}.${ext}`;
+          const { error } = await supabase.storage
+            .from("plant-images")
+            .upload(path, f, { upsert: false, contentType: file.type });
+          if (error) throw error;
+          return supabase.storage.from("plant-images").getPublicUrl(path).data.publicUrl;
+        }}
+        placeholder="输入 / 唤出命令菜单，像 Notion 一样写作…"
+      />
 
       <div className="mt-6 flex items-center justify-end gap-3 sticky bottom-4 bg-background/90 backdrop-blur border border-rule p-3 z-10">
         <button

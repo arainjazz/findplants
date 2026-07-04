@@ -122,6 +122,7 @@ function AdminPage() {
             <Link to="/admin/batch-new" className="border border-ink px-5 py-2 hover:bg-ink hover:text-background transition-colors">+ 批量添加条目</Link>
             <Link to="/admin/new" className="bg-ink text-background px-5 py-2 hover:bg-vermilion transition-colors">+ 新建条目</Link>
             <Link to="/admin/blog/new" className="bg-emerald-700 text-background px-5 py-2 hover:bg-vermilion transition-colors">+ 编辑博客</Link>
+            <Link to="/admin/projects/new" className="bg-emerald-700 text-background px-5 py-2 hover:bg-vermilion transition-colors">+ 编辑项目</Link>
           </div>
         </div>
 

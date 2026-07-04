@@ -59,6 +59,60 @@ export type Database = {
         }
         Relationships: []
       }
+      projects: {
+        Row: {
+          author_id: string
+          author_name: string | null
+          content_html: string
+          cover_url: string | null
+          created_at: string
+          id: string
+          initiator: string
+          location: string
+          project_date: string
+          published: boolean
+          published_at: string | null
+          summary: string | null
+          theme: string
+          title: string
+          updated_at: string
+        }
+        Insert: {
+          author_id: string
+          author_name?: string | null
+          content_html?: string
+          cover_url?: string | null
+          created_at?: string
+          id?: string
+          initiator: string
+          location: string
+          project_date: string
+          published?: boolean
+          published_at?: string | null
+          summary?: string | null
+          theme: string
+          title: string
+          updated_at?: string
+        }
+        Update: {
+          author_id?: string
+          author_name?: string | null
+          content_html?: string
+          cover_url?: string | null
+          created_at?: string
+          id?: string
+          initiator?: string
+          location?: string
+          project_date?: string
+          published?: boolean
+          published_at?: string | null
+          summary?: string | null
+          theme?: string
+          title?: string
+          updated_at?: string
+        }
+        Relationships: []
+      }
       catalog_entries: {
         Row: {
           added_by: string

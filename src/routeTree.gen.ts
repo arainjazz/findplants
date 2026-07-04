@@ -18,9 +18,11 @@ import { Route as ExploreRouteImport } from './routes/explore'
 import { Route as EditsRouteImport } from './routes/edits'
 import { Route as AuthenticatedRouteImport } from './routes/_authenticated'
 import { Route as IndexRouteImport } from './routes/index'
+import { Route as ProjectsIndexRouteImport } from './routes/projects.index'
 import { Route as PlantsIndexRouteImport } from './routes/plants.index'
 import { Route as BlogIndexRouteImport } from './routes/blog.index'
 import { Route as TagsSlugRouteImport } from './routes/tags.$slug'
+import { Route as ProjectsIdRouteImport } from './routes/projects.$id'
 import { Route as PlantsSlugRouteImport } from './routes/plants.$slug'
 import { Route as EditorsIdRouteImport } from './routes/editors.$id'
 import { Route as DraftsIdRouteImport } from './routes/drafts.$id'
@@ -30,10 +32,12 @@ import { Route as AuthenticatedAdminTagsRouteImport } from './routes/_authentica
 import { Route as AuthenticatedAdminNewRouteImport } from './routes/_authenticated/admin.new'
 import { Route as AuthenticatedAdminBatchNewRouteImport } from './routes/_authenticated/admin.batch-new'
 import { Route as AuthenticatedAdminApplicationsRouteImport } from './routes/_authenticated/admin.applications'
+import { Route as AuthenticatedAdminProjectsNewRouteImport } from './routes/_authenticated/admin.projects.new'
 import { Route as AuthenticatedAdminEditIdRouteImport } from './routes/_authenticated/admin.edit.$id'
 import { Route as AuthenticatedAdminCatalogsNewRouteImport } from './routes/_authenticated/admin.catalogs.new'
 import { Route as AuthenticatedAdminCatalogsIdRouteImport } from './routes/_authenticated/admin.catalogs.$id'
 import { Route as AuthenticatedAdminBlogNewRouteImport } from './routes/_authenticated/admin.blog.new'
+import { Route as AuthenticatedAdminProjectsEditIdRouteImport } from './routes/_authenticated/admin.projects.edit.$id'
 import { Route as AuthenticatedAdminBlogEditIdRouteImport } from './routes/_authenticated/admin.blog.edit.$id'
 
 const SignupRoute = SignupRouteImport.update({
@@ -80,6 +84,11 @@ const IndexRoute = IndexRouteImport.update({
   path: '/',
   getParentRoute: () => rootRouteImport,
 } as any)
+const ProjectsIndexRoute = ProjectsIndexRouteImport.update({
+  id: '/projects/',
+  path: '/projects/',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const PlantsIndexRoute = PlantsIndexRouteImport.update({
   id: '/plants/',
   path: '/plants/',
@@ -93,6 +102,11 @@ const BlogIndexRoute = BlogIndexRouteImport.update({
 const TagsSlugRoute = TagsSlugRouteImport.update({
   id: '/tags/$slug',
   path: '/tags/$slug',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ProjectsIdRoute = ProjectsIdRouteImport.update({
+  id: '/projects/$id',
+  path: '/projects/$id',
   getParentRoute: () => rootRouteImport,
 } as any)
 const PlantsSlugRoute = PlantsSlugRouteImport.update({
@@ -142,6 +156,12 @@ const AuthenticatedAdminApplicationsRoute =
     path: '/admin/applications',
     getParentRoute: () => AuthenticatedRoute,
   } as any)
+const AuthenticatedAdminProjectsNewRoute =
+  AuthenticatedAdminProjectsNewRouteImport.update({
+    id: '/admin/projects/new',
+    path: '/admin/projects/new',
+    getParentRoute: () => AuthenticatedRoute,
+  } as any)
 const AuthenticatedAdminEditIdRoute =
   AuthenticatedAdminEditIdRouteImport.update({
     id: '/admin/edit/$id',
@@ -166,6 +186,12 @@ const AuthenticatedAdminBlogNewRoute =
     path: '/admin/blog/new',
     getParentRoute: () => AuthenticatedRoute,
   } as any)
+const AuthenticatedAdminProjectsEditIdRoute =
+  AuthenticatedAdminProjectsEditIdRouteImport.update({
+    id: '/admin/projects/edit/$id',
+    path: '/admin/projects/edit/$id',
+    getParentRoute: () => AuthenticatedRoute,
+  } as any)
 const AuthenticatedAdminBlogEditIdRoute =
   AuthenticatedAdminBlogEditIdRouteImport.update({
     id: '/admin/blog/edit/$id',
@@ -186,9 +212,11 @@ export interface FileRoutesByFullPath {
   '/drafts/$id': typeof DraftsIdRoute
   '/editors/$id': typeof EditorsIdRoute
   '/plants/$slug': typeof PlantsSlugRoute
+  '/projects/$id': typeof ProjectsIdRoute
   '/tags/$slug': typeof TagsSlugRoute
   '/blog/': typeof BlogIndexRoute
   '/plants/': typeof PlantsIndexRoute
+  '/projects/': typeof ProjectsIndexRoute
   '/admin/applications': typeof AuthenticatedAdminApplicationsRoute
   '/admin/batch-new': typeof AuthenticatedAdminBatchNewRoute
   '/admin/new': typeof AuthenticatedAdminNewRoute
@@ -198,7 +226,9 @@ export interface FileRoutesByFullPath {
   '/admin/catalogs/$id': typeof AuthenticatedAdminCatalogsIdRoute
   '/admin/catalogs/new': typeof AuthenticatedAdminCatalogsNewRoute
   '/admin/edit/$id': typeof AuthenticatedAdminEditIdRoute
+  '/admin/projects/new': typeof AuthenticatedAdminProjectsNewRoute
   '/admin/blog/edit/$id': typeof AuthenticatedAdminBlogEditIdRoute
+  '/admin/projects/edit/$id': typeof AuthenticatedAdminProjectsEditIdRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
@@ -213,9 +243,11 @@ export interface FileRoutesByTo {
   '/drafts/$id': typeof DraftsIdRoute
   '/editors/$id': typeof EditorsIdRoute
   '/plants/$slug': typeof PlantsSlugRoute
+  '/projects/$id': typeof ProjectsIdRoute
   '/tags/$slug': typeof TagsSlugRoute
   '/blog': typeof BlogIndexRoute
   '/plants': typeof PlantsIndexRoute
+  '/projects': typeof ProjectsIndexRoute
   '/admin/applications': typeof AuthenticatedAdminApplicationsRoute
   '/admin/batch-new': typeof AuthenticatedAdminBatchNewRoute
   '/admin/new': typeof AuthenticatedAdminNewRoute
@@ -225,7 +257,9 @@ export interface FileRoutesByTo {
   '/admin/catalogs/$id': typeof AuthenticatedAdminCatalogsIdRoute
   '/admin/catalogs/new': typeof AuthenticatedAdminCatalogsNewRoute
   '/admin/edit/$id': typeof AuthenticatedAdminEditIdRoute
+  '/admin/projects/new': typeof AuthenticatedAdminProjectsNewRoute
   '/admin/blog/edit/$id': typeof AuthenticatedAdminBlogEditIdRoute
+  '/admin/projects/edit/$id': typeof AuthenticatedAdminProjectsEditIdRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
@@ -242,9 +276,11 @@ export interface FileRoutesById {
   '/drafts/$id': typeof DraftsIdRoute
   '/editors/$id': typeof EditorsIdRoute
   '/plants/$slug': typeof PlantsSlugRoute
+  '/projects/$id': typeof ProjectsIdRoute
   '/tags/$slug': typeof TagsSlugRoute
   '/blog/': typeof BlogIndexRoute
   '/plants/': typeof PlantsIndexRoute
+  '/projects/': typeof ProjectsIndexRoute
   '/_authenticated/admin/applications': typeof AuthenticatedAdminApplicationsRoute
   '/_authenticated/admin/batch-new': typeof AuthenticatedAdminBatchNewRoute
   '/_authenticated/admin/new': typeof AuthenticatedAdminNewRoute
@@ -254,7 +290,9 @@ export interface FileRoutesById {
   '/_authenticated/admin/catalogs/$id': typeof AuthenticatedAdminCatalogsIdRoute
   '/_authenticated/admin/catalogs/new': typeof AuthenticatedAdminCatalogsNewRoute
   '/_authenticated/admin/edit/$id': typeof AuthenticatedAdminEditIdRoute
+  '/_authenticated/admin/projects/new': typeof AuthenticatedAdminProjectsNewRoute
   '/_authenticated/admin/blog/edit/$id': typeof AuthenticatedAdminBlogEditIdRoute
+  '/_authenticated/admin/projects/edit/$id': typeof AuthenticatedAdminProjectsEditIdRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
@@ -271,9 +309,11 @@ export interface FileRouteTypes {
     | '/drafts/$id'
     | '/editors/$id'
     | '/plants/$slug'
+    | '/projects/$id'
     | '/tags/$slug'
     | '/blog/'
     | '/plants/'
+    | '/projects/'
     | '/admin/applications'
     | '/admin/batch-new'
     | '/admin/new'
@@ -283,7 +323,9 @@ export interface FileRouteTypes {
     | '/admin/catalogs/$id'
     | '/admin/catalogs/new'
     | '/admin/edit/$id'
+    | '/admin/projects/new'
     | '/admin/blog/edit/$id'
+    | '/admin/projects/edit/$id'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
@@ -298,9 +340,11 @@ export interface FileRouteTypes {
     | '/drafts/$id'
     | '/editors/$id'
     | '/plants/$slug'
+    | '/projects/$id'
     | '/tags/$slug'
     | '/blog'
     | '/plants'
+    | '/projects'
     | '/admin/applications'
     | '/admin/batch-new'
     | '/admin/new'
@@ -310,7 +354,9 @@ export interface FileRouteTypes {
     | '/admin/catalogs/$id'
     | '/admin/catalogs/new'
     | '/admin/edit/$id'
+    | '/admin/projects/new'
     | '/admin/blog/edit/$id'
+    | '/admin/projects/edit/$id'
   id:
     | '__root__'
     | '/'
@@ -326,9 +372,11 @@ export interface FileRouteTypes {
     | '/drafts/$id'
     | '/editors/$id'
     | '/plants/$slug'
+    | '/projects/$id'
     | '/tags/$slug'
     | '/blog/'
     | '/plants/'
+    | '/projects/'
     | '/_authenticated/admin/applications'
     | '/_authenticated/admin/batch-new'
     | '/_authenticated/admin/new'
@@ -338,7 +386,9 @@ export interface FileRouteTypes {
     | '/_authenticated/admin/catalogs/$id'
     | '/_authenticated/admin/catalogs/new'
     | '/_authenticated/admin/edit/$id'
+    | '/_authenticated/admin/projects/new'
     | '/_authenticated/admin/blog/edit/$id'
+    | '/_authenticated/admin/projects/edit/$id'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -355,9 +405,11 @@ export interface RootRouteChildren {
   DraftsIdRoute: typeof DraftsIdRoute
   EditorsIdRoute: typeof EditorsIdRoute
   PlantsSlugRoute: typeof PlantsSlugRoute
+  ProjectsIdRoute: typeof ProjectsIdRoute
   TagsSlugRoute: typeof TagsSlugRoute
   BlogIndexRoute: typeof BlogIndexRoute
   PlantsIndexRoute: typeof PlantsIndexRoute
+  ProjectsIndexRoute: typeof ProjectsIndexRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -425,6 +477,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof IndexRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/projects/': {
+      id: '/projects/'
+      path: '/projects'
+      fullPath: '/projects/'
+      preLoaderRoute: typeof ProjectsIndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/plants/': {
       id: '/plants/'
       path: '/plants'
@@ -444,6 +503,13 @@ declare module '@tanstack/react-router' {
       path: '/tags/$slug'
       fullPath: '/tags/$slug'
       preLoaderRoute: typeof TagsSlugRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/projects/$id': {
+      id: '/projects/$id'
+      path: '/projects/$id'
+      fullPath: '/projects/$id'
+      preLoaderRoute: typeof ProjectsIdRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/plants/$slug': {
@@ -509,6 +575,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AuthenticatedAdminApplicationsRouteImport
       parentRoute: typeof AuthenticatedRoute
     }
+    '/_authenticated/admin/projects/new': {
+      id: '/_authenticated/admin/projects/new'
+      path: '/admin/projects/new'
+      fullPath: '/admin/projects/new'
+      preLoaderRoute: typeof AuthenticatedAdminProjectsNewRouteImport
+      parentRoute: typeof AuthenticatedRoute
+    }
     '/_authenticated/admin/edit/$id': {
       id: '/_authenticated/admin/edit/$id'
       path: '/admin/edit/$id'
@@ -537,6 +610,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AuthenticatedAdminBlogNewRouteImport
       parentRoute: typeof AuthenticatedRoute
     }
+    '/_authenticated/admin/projects/edit/$id': {
+      id: '/_authenticated/admin/projects/edit/$id'
+      path: '/admin/projects/edit/$id'
+      fullPath: '/admin/projects/edit/$id'
+      preLoaderRoute: typeof AuthenticatedAdminProjectsEditIdRouteImport
+      parentRoute: typeof AuthenticatedRoute
+    }
     '/_authenticated/admin/blog/edit/$id': {
       id: '/_authenticated/admin/blog/edit/$id'
       path: '/admin/blog/edit/$id'
@@ -557,7 +637,9 @@ interface AuthenticatedRouteChildren {
   AuthenticatedAdminCatalogsIdRoute: typeof AuthenticatedAdminCatalogsIdRoute
   AuthenticatedAdminCatalogsNewRoute: typeof AuthenticatedAdminCatalogsNewRoute
   AuthenticatedAdminEditIdRoute: typeof AuthenticatedAdminEditIdRoute
+  AuthenticatedAdminProjectsNewRoute: typeof AuthenticatedAdminProjectsNewRoute
   AuthenticatedAdminBlogEditIdRoute: typeof AuthenticatedAdminBlogEditIdRoute
+  AuthenticatedAdminProjectsEditIdRoute: typeof AuthenticatedAdminProjectsEditIdRoute
 }
 
 const AuthenticatedRouteChildren: AuthenticatedRouteChildren = {
@@ -570,7 +652,9 @@ const AuthenticatedRouteChildren: AuthenticatedRouteChildren = {
   AuthenticatedAdminCatalogsIdRoute: AuthenticatedAdminCatalogsIdRoute,
   AuthenticatedAdminCatalogsNewRoute: AuthenticatedAdminCatalogsNewRoute,
   AuthenticatedAdminEditIdRoute: AuthenticatedAdminEditIdRoute,
+  AuthenticatedAdminProjectsNewRoute: AuthenticatedAdminProjectsNewRoute,
   AuthenticatedAdminBlogEditIdRoute: AuthenticatedAdminBlogEditIdRoute,
+  AuthenticatedAdminProjectsEditIdRoute: AuthenticatedAdminProjectsEditIdRoute,
 }
 
 const AuthenticatedRouteWithChildren = AuthenticatedRoute._addFileChildren(
@@ -591,9 +675,11 @@ const rootRouteChildren: RootRouteChildren = {
   DraftsIdRoute: DraftsIdRoute,
   EditorsIdRoute: EditorsIdRoute,
   PlantsSlugRoute: PlantsSlugRoute,
+  ProjectsIdRoute: ProjectsIdRoute,
   TagsSlugRoute: TagsSlugRoute,
   BlogIndexRoute: BlogIndexRoute,
   PlantsIndexRoute: PlantsIndexRoute,
+  ProjectsIndexRoute: ProjectsIndexRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

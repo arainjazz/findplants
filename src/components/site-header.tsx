@@ -200,6 +200,7 @@ export function SiteHeader() {
           <Link to="/explore" className="hover:text-vermilion transition-colors" activeProps={{ className: "font-semibold" }}>身边物种地图</Link>
           <a href="/plant-image-search.html" className="hover:text-vermilion transition-colors">植物搜图</a>
           <Link to="/blog" className="hover:text-vermilion transition-colors" activeProps={{ className: "font-semibold" }}>编辑博客</Link>
+          <Link to="/projects" className="hover:text-vermilion transition-colors" activeProps={{ className: "font-semibold" }}>项目驱动调研成果</Link>
           <Link to="/edits" className="hover:text-vermilion transition-colors" activeProps={{ className: "font-semibold" }}>修改记录</Link>
           {user && isAdmin && (
             <Link to="/admin/applications" className="relative hover:text-vermilion transition-colors" title="编辑申请审核">
@@ -272,6 +273,7 @@ export function SiteHeader() {
           <Link to="/explore" onClick={() => setMenuOpen(false)} className="hover:text-vermilion">身边物种地图</Link>
           <a href="/plant-image-search.html" onClick={() => setMenuOpen(false)} className="hover:text-vermilion">植物搜图</a>
           <Link to="/blog" onClick={() => setMenuOpen(false)} className="hover:text-vermilion">编辑博客</Link>
+          <Link to="/projects" onClick={() => setMenuOpen(false)} className="hover:text-vermilion">项目驱动调研成果</Link>
           <Link to="/edits" onClick={() => setMenuOpen(false)} className="hover:text-vermilion">修改记录</Link>
           {user && isAdmin && (
             <Link to="/admin/applications" onClick={() => setMenuOpen(false)} className="hover:text-vermilion">
