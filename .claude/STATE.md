@@ -29,8 +29,10 @@ _Read this FIRST and update it LAST, every session._
    - **公开页** `projects.index`（导航「项目驱动调研成果」→ 左侧 4 下拉筛选：时间范围[年]/地点/主题/发起人，右侧卡片）
      + `projects.$id`（详情，prose-project 样式渲染 content_html）。导航桌面+移动都加了。
    - **博客编辑器也换成 BlockNote**（blog-editor.tsx：RichEditor→BlockEditor + uploadFile）。
-- **验证**：`npm run build` 通过（BlockNote 不破 SSR、路由树已重生成）、`tsc --noEmit` EXIT=0。**未真机**（dev 端口 8080 被
-  用户的 llama-server 占用，沙箱起不了预览）。**USER VERIFY**：①Supabase 应用 `20260704120000_projects.sql`；②本地腾出
+- **验证**：`npm run build` 通过、`tsc --noEmit` EXIT=0。**已 preview 实测**（把 dev 端口从 8080 移到 5199 避开 llama-server，
+  见 .claude/launch.json）：/projects 正常渲染（标题+4 个筛选下拉+空态+导航链接，0 console error）；用临时 /bntest 路由验证
+  BlockNote 挂载成功、初始 HTML 正确解析、onChange 回吐 HTML（round-trip OK），验证后已删该临时路由。编辑器全流程（登录建项目
+  →发布→筛选）仍需用户应用迁移 + 登录后真机走一遍。**USER VERIFY**：①Supabase 应用 `20260704120000_projects.sql`；②本地腾出
   8080 或部署后：管理页「+编辑项目」→ 填必填+Notion 正文→发布→ /projects 出卡片、左侧筛选可用、详情正常；博客编辑也变
   Notion 式。③`npm run build && wrangler deploy`(VPN)。
 - **注意/待办**：BlockNote 正文存的是 `blocksToFullHTML` 的 HTML（含 bn-* 包裹 div），公开页用 prose-project 基础样式渲染，
