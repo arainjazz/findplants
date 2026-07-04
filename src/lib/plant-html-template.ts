@@ -57,6 +57,23 @@ export type PlantDraftFields = {
    *  matched (国家/省级重点保护, CITES, GTS, GRIIS). Renders a status card after
    *  the invasive card. Empty/absent → no card. See conservationBadges(). */
   conservation?: { kind: string; label: string }[] | null;
+  /** Populated when the species matched a 国家/省级重点保护 list — renders a full
+   *  green shield card (判断依据 deterministic; the three narrative sections via LLM). */
+  conservation_card?: {
+    /** 判断依据: which 名录 matched, with level (deterministic). */
+    basis_zh: string;
+    /** 当前珍稀濒危 / 面临挑战 (LLM). */
+    status_zh: string;
+    /** 生态价值 (LLM). */
+    value_zh: string;
+    /** 保护建议 (LLM). */
+    advice_zh: string;
+    /** Protection level label (e.g. 一级/二级) for the head badge. */
+    level?: string | null;
+    /** True if a national (非省级) list matched — sets the card title. */
+    national?: boolean;
+    sources?: { name: string; url: string | null }[];
+  } | null;
   capture_place: string;
   capture_lat: string;
   capture_lng: string;
@@ -196,8 +213,28 @@ i,em{color:var(--gold);}
 .conservation-card .cc-cites{color:#215a6b;background:rgba(64,128,176,.12);border-color:rgba(64,128,176,.4);}
 .conservation-card .cc-gts{color:#7a5010;background:rgba(122,80,16,.12);border-color:rgba(122,80,16,.4);}
 .conservation-card .cc-griis{color:#9a3512;background:rgba(192,57,43,.1);border-color:rgba(192,57,43,.38);}
+/* Full 重点保护 card (green counterpart of the invasive card). */
+.conservation-card.cc-full{border:2px solid #4c8a3f;border-left:8px solid #4c8a3f;background:#eef5ea;background-image:repeating-linear-gradient(135deg,rgba(76,138,63,0.05) 0,rgba(76,138,63,0.05) 12px,transparent 12px,transparent 24px);box-shadow:0 10px 26px -14px rgba(76,138,63,.5);}
+.conservation-card.cc-full .cc-head{background:#4c8a3f;color:#fff;border-bottom:none;padding:16px 20px;gap:14px;}
+.conservation-card.cc-full .cc-icon{font-size:30px;filter:drop-shadow(0 1px 1px rgba(0,0,0,.3));}
+.conservation-card.cc-full .cc-kicker{color:rgba(255,255,255,.92);letter-spacing:.26em;}
+.conservation-card.cc-full .cc-head h2{color:#fff;font-size:22px;}
+.conservation-card.cc-full .cc-badge{margin-left:auto;font-family:'Cormorant Garamond',serif;font-size:12px;letter-spacing:.06em;background:rgba(255,255,255,.18);border:1px solid rgba(255,255,255,.5);border-radius:999px;padding:3px 12px;white-space:nowrap;}
+.conservation-card.cc-full .cc-grid{display:grid;grid-template-columns:1fr;gap:16px;padding:20px 22px;}
+@media(min-width:768px){.conservation-card.cc-full .cc-grid{grid-template-columns:1fr 1fr;}}
+.conservation-card.cc-full .cc-block .cc-label{display:block;font-family:'Noto Serif SC',serif;font-weight:600;font-size:14px;color:#2f5c26;margin-bottom:6px;padding-bottom:5px;border-bottom:1px solid rgba(76,138,63,.3);}
+.conservation-card.cc-full .cc-block p{font-size:14px;line-height:1.66;color:#233c1c;margin:0;}
+.conservation-card.cc-full .cc-chips{display:flex;flex-wrap:wrap;gap:10px;padding:0 22px 4px;}
+.conservation-card.cc-full .cc-cite{margin:14px 22px 20px;padding-top:12px;border-top:1px solid rgba(76,138,63,.26);font-family:'Cormorant Garamond',serif;font-size:12.5px;letter-spacing:.04em;color:#3f6f34;}
+.conservation-card.cc-full .cc-cite a{color:#3f6f34;text-decoration:underline;}
 @media(prefers-color-scheme:dark){
   .conservation-card{background:linear-gradient(180deg,rgba(76,138,63,0.12),rgba(122,80,16,0.06));border-color:var(--rule-soft);border-left-color:#6fae5f;}
+  .conservation-card.cc-full{background:#12200f;border-color:#6fae5f;border-left-color:#6fae5f;background-image:repeating-linear-gradient(135deg,rgba(111,174,95,0.06) 0,rgba(111,174,95,0.06) 12px,transparent 12px,transparent 24px);}
+  .conservation-card.cc-full .cc-head{background:#345f2a;}
+  .conservation-card.cc-full .cc-block .cc-label{color:#bfe6b2;border-bottom-color:rgba(111,174,95,.35);}
+  .conservation-card.cc-full .cc-block p{color:#dbe9d4;}
+  .conservation-card.cc-full .cc-cite{color:#8fd07e;}
+  .conservation-card.cc-full .cc-cite a{color:#8fd07e;}
   .conservation-card .cc-head h2{color:#8fd07e;}
   .conservation-card .cc-protected{color:#bfe6b2;background:rgba(76,138,63,.2);border-color:rgba(111,174,95,.5);}
   .conservation-card .cc-cites{color:#a8d8ea;background:rgba(56,189,248,.14);border-color:rgba(56,189,248,.45);}
@@ -379,19 +416,63 @@ export function renderDraftHtml(fields: PlantDraftFields): string {
         `<div class="ic-cite">判定依据 · Source：${invCitation}</div>` +
         `</section>`
       : "";
-  // Conservation / registry status card (only when the species matched a registry).
+  // Conservation status card. When a 重点保护 list matched → full green shield card
+  // (判断依据 + 珍稀濒危/挑战 + 生态价值 + 保护建议). Any other registry matches
+  // (CITES/GTS/GRIIS) still show as chips — inside the full card, or on their own.
+  const cc = fields.conservation_card;
   const consBadges = (fields.conservation ?? []).filter((b) => b && b.label);
-  const conservationCard = consBadges.length
-    ? `<section class="conservation-card">` +
+  const nonProtChips = consBadges.filter((b) => b.kind !== "protected");
+  const ccCite = (cc?.sources ?? []).filter((s) => s && s.name);
+  const ccCiteHtml = ccCite.length
+    ? ccCite
+        .map((s) =>
+          s.url
+            ? `<a href="${(s.url || "").replace(/"/g, "&quot;")}" target="_blank" rel="noopener">${esc(s.name)}</a>`
+            : esc(s.name),
+        )
+        .join(" · ")
+    : esc(cc?.basis_zh || "国家/省级重点保护野生植物名录");
+  const chipsRow = nonProtChips.length
+    ? `<div class="cc-chips">` +
+      nonProtChips.map((b) => `<span class="cc-chip cc-${esc(b.kind)}">${esc(b.label)}</span>`).join("") +
+      `</div>`
+    : "";
+  let conservationCard = "";
+  if (cc && (cc.status_zh || cc.value_zh || cc.advice_zh || cc.basis_zh)) {
+    conservationCard =
+      `<section class="conservation-card cc-full">` +
+      `<div class="cc-head"><span class="cc-icon">🛡️</span>` +
+      `<div><span class="cc-kicker">Conservation Status · 重点保护物种</span>` +
+      `<h2>${cc.national ? "国家" : "省级"}重点保护野生植物</h2></div>` +
+      (cc.level ? `<span class="cc-badge">保护级别：${esc(cc.level)}</span>` : "") +
+      `</div>` +
+      `<div class="cc-grid">` +
+      (cc.basis_zh
+        ? `<div class="cc-block"><span class="cc-label">判定依据 · 收录名录</span><p>${esc(cc.basis_zh)}</p></div>`
+        : "") +
+      (cc.status_zh
+        ? `<div class="cc-block"><span class="cc-label">珍稀濒危 · 面临挑战</span><p>${esc(cc.status_zh)}</p></div>`
+        : "") +
+      (cc.value_zh
+        ? `<div class="cc-block"><span class="cc-label">生态价值</span><p>${esc(cc.value_zh)}</p></div>`
+        : "") +
+      (cc.advice_zh
+        ? `<div class="cc-block"><span class="cc-label">保护建议</span><p>${esc(cc.advice_zh)}</p></div>`
+        : "") +
+      `</div>` +
+      chipsRow +
+      `<div class="cc-cite">判定依据 · Source：${ccCiteHtml}</div>` +
+      `</section>`;
+  } else if (consBadges.length) {
+    conservationCard =
+      `<section class="conservation-card">` +
       `<div class="cc-head"><span class="cc-icon">🛡️</span>` +
       `<div><span class="cc-kicker">Conservation &amp; Registry Status · 保护与名录状态</span>` +
       `<h2>保护与名录收录</h2></div></div>` +
       `<div class="cc-body">` +
-      consBadges
-        .map((b) => `<span class="cc-chip cc-${esc(b.kind)}">${esc(b.label)}</span>`)
-        .join("") +
-      `</div></section>`
-    : "";
+      consBadges.map((b) => `<span class="cc-chip cc-${esc(b.kind)}">${esc(b.label)}</span>`).join("") +
+      `</div></section>`;
+  }
   // Field-capture notes (拍摄记录): analysis of the user's photo + the basis for
   // the identification — deliberately distinct from summary_zh (the narrative
   // lead). Older drafts have no field_notes → fall back to the summary so the

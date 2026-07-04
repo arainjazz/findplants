@@ -1202,6 +1202,48 @@ async function generateInvasiveCard(
   }
 }
 
+async function generateConservationCard(
+  title: string,
+  scientificName: string,
+): Promise<{ status_zh: string; value_zh: string; advice_zh: string } | null> {
+  const system =
+    "你是中国野生植物保护领域的专家。给定一个已被国家/省级重点保护名录收录的植物，" +
+    "请用严谨、准确的中文生成一张保护卡片的三段内容。只依据可靠的植物学与保护生物学常识，" +
+    "不编造具体数据、年份、地名或事件；不确定处用审慎措辞（如「据记载」「通常」）。";
+  const userText =
+    `物种：${title}（学名 ${scientificName}）。请生成三段内容：\n` +
+    "1) status_zh：该物种当前的珍稀濒危状况或所面临的主要威胁挑战——如种群规模、分布狭窄、生境退化、人为采挖等，约 80–140 字。\n" +
+    "2) value_zh：该物种的生态价值——在生态系统、生物多样性、科研或遗传资源等方面的意义，约 80–140 字。\n" +
+    "3) advice_zh：保护建议——就地/迁地保护、生境恢复、公众参与、禁止采挖等可操作措施，约 80–140 字。\n" +
+    '只返回 JSON：{"status_zh":"...","value_zh":"...","advice_zh":"..."}';
+  const schema = {
+    type: "object",
+    properties: {
+      status_zh: { type: "string" },
+      value_zh: { type: "string" },
+      advice_zh: { type: "string" },
+    },
+    required: ["status_zh", "value_zh", "advice_zh"],
+  };
+  try {
+    const txt = await xiaopTextCall({
+      contents: [{ role: "user", parts: [{ text: userText }] }],
+      system,
+      schema,
+      maxRetry: 2,
+    });
+    const obj = JSON.parse(cleanJson(txt));
+    const status_zh = String(obj?.status_zh || "").trim();
+    const value_zh = String(obj?.value_zh || "").trim();
+    const advice_zh = String(obj?.advice_zh || "").trim();
+    if (!status_zh && !value_zh && !advice_zh) return null;
+    return { status_zh, value_zh, advice_zh };
+  } catch (e) {
+    console.warn("[generateConservationCard] failed:", e);
+    return null;
+  }
+}
+
 const SubmitInput = z.object({
   photo_base64: z.string().min(100).max(8_000_000),
   photo_mime: z.string().regex(/^image\/(jpeg|jpg|png|webp)$/i).default("image/jpeg"),
@@ -1289,6 +1331,7 @@ export const submitPlantDraft = createServerFn({ method: "POST" })
     // The GRIIS hit feeds BOTH the invasive card (degree + precise citation) and the
     // status-badge card. Fully non-fatal — unseeded tables just skip the cards.
     let conservationBadgesList: PlantDraftFields["conservation"] = null;
+    let conservationCardObj: PlantDraftFields["conservation_card"] = null;
     let griisHit: { degreeLabel: string; source: string; source_url: string | null } | null = null;
     const sciFull = (meta.scientific_name || "").trim();
     try {
@@ -1312,6 +1355,32 @@ export const submitPlantDraft = createServerFn({ method: "POST" })
           const hit = buildConservationMatcher({ lists, taxa })(sciFull, meta.family || null);
           const badges = conservationBadges(hit, lists);
           if (badges.length) conservationBadgesList = badges;
+          // 重点保护 hit → full green card (判断依据 deterministic; narrative via LLM).
+          const protectedEntries = [...hit.protectedLists.entries()];
+          if (protectedEntries.length) {
+            const protLists = protectedEntries.map(([id, status]) => {
+              const l = lists.find((x) => x.id === id);
+              return {
+                name: (l?.name as string) ?? "重点保护名录",
+                version: (l?.version as string) ?? null,
+                status: (status as string) ?? null,
+                url: (l?.source_url as string) ?? null,
+                province: (l?.province as string) ?? null,
+              };
+            });
+            const card = await generateConservationCard(meta.title || sciFull, meta.scientific_name || sciFull);
+            conservationCardObj = {
+              basis_zh: protLists
+                .map((p) => `${p.name}${p.version ? "（" + p.version + "）" : ""}${p.status ? " · " + p.status : ""}`)
+                .join("；"),
+              status_zh: card?.status_zh ?? "",
+              value_zh: card?.value_zh ?? "",
+              advice_zh: card?.advice_zh ?? "",
+              level: protLists.map((p) => p.status).find(Boolean) ?? null,
+              national: protLists.some((p) => !p.province),
+              sources: protLists.map((p) => ({ name: p.name, url: p.url })),
+            };
+          }
           if (hit.griis) {
             const gl = lists.find((l) => l.kind === "griis");
             const deg = GRIIS_DEGREES.find((d) => d.value === hit.griis);
@@ -1372,6 +1441,7 @@ export const submitPlantDraft = createServerFn({ method: "POST" })
       section_images: sectionImages,
       invasive: invasiveCard,
       conservation: conservationBadgesList,
+      conservation_card: conservationCardObj,
       capture_place: place || "未知地点",
       capture_lat: lat != null ? lat.toFixed(5) : "",
       capture_lng: lng != null ? lng.toFixed(5) : "",
