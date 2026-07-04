@@ -1,19 +1,37 @@
 import { createFileRoute, Link, notFound, useNavigate } from "@tanstack/react-router";
+import { compressImage } from "@/lib/image-compress";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useServerFn } from "@tanstack/react-start";
 import { useEffect, useState } from "react";
 import { toast } from "sonner";
 import { SiteHeader, SiteFooter } from "@/components/site-header";
+import { XiaoPAgentPanel } from "@/components/draft-agent-panel";
+import { askPlantAgentFn, applyPlantAgentEditFn } from "@/lib/identify-plant.functions";
+import { userModelArg } from "@/lib/xiaop-user-model";
 import { fetchPlantBySlug, fetchAuthor } from "@/lib/plants";
 import { useAuth } from "@/hooks/use-auth";
-import { fetchEditById, isCurrentUserAdmin, revertEdit } from "@/lib/edits";
+import { fetchEditById, isCurrentUserAdmin, revertEdit, fetchEditsForPlant, type PlantEdit } from "@/lib/edits";
+import { EditLogSection } from "@/components/edit-log-section";
 import { PlantComments } from "@/components/plant-comments";
 import { embedVideosInHtml } from "@/lib/embed";
 import { ImageSearchDialog } from "@/components/html-doc-editor";
+import { ReplaceImageFlow } from "@/components/replace-image-flow";
 import { ShareButton } from "@/components/share-button";
 import { supabase } from "@/integrations/supabase/client";
 import { FolderOpen, Link2, Image as ImageIcon, Globe } from "lucide-react";
 
 export const Route = createFileRoute("/plants/$slug")({
+  loader: async ({ params }) => {
+    return fetchPlantBySlug(params.slug);
+  },
+  head: ({ loaderData }) => ({
+    meta: [
+      { title: loaderData ? `${loaderData.title} (${loaderData.scientific_name || ""}) · Plantspedia` : "Plantspedia · 全民植物志" },
+      { name: "description", content: loaderData?.summary || "查看该植物的详细特征、分布与科普信息。" },
+      { property: "og:image", content: loaderData?.cover_url || "/default-og-image.jpg" },
+      { property: "og:type", content: "article" },
+    ],
+  }),
   component: PlantDetail,
 });
 
@@ -22,9 +40,11 @@ function PlantDetail() {
   const { user } = useAuth();
   const qc = useQueryClient();
   const navigate = useNavigate();
+  const loaderData = Route.useLoaderData();
   const { data: plant, isLoading } = useQuery({
     queryKey: ["plant", slug],
     queryFn: () => fetchPlantBySlug(slug),
+    initialData: loaderData,
   });
   const { data: isAdmin = false } = useQuery({
     queryKey: ["is-admin", user?.id],
@@ -36,12 +56,25 @@ function PlantDetail() {
   const [coverSearch, setCoverSearch] = useState(false);
   const [coverPagePicker, setCoverPagePicker] = useState(false);
   const [pageImages, setPageImages] = useState<string[]>([]);
+  const [pageSections, setPageSections] = useState<{ label: string; value: string }[]>([]);
+  // 小P蛙 image-replace: holds the search query + the edit instruction while the
+  // online image-search dialog is open; on pick we rewrite that <img> and save.
+  const [xiaopImg, setXiaopImg] = useState<{ query: string; instruction: string } | null>(null);
+  const [revertingId, setRevertingId] = useState<string | null>(null);
   const coverFileRef = (typeof window !== "undefined" ? { current: null as HTMLInputElement | null } : { current: null });
+  const askPlantAgent = useServerFn(askPlantAgentFn);
+  const applyPlantAgent = useServerFn(applyPlantAgentEditFn);
 
   const { data: author } = useQuery({
     queryKey: ["author", plant?.author_id],
     queryFn: () => fetchAuthor(plant!.author_id),
     enabled: !!plant?.author_id,
+  });
+
+  const { data: plantEdits = [] } = useQuery({
+    queryKey: ["plant-edits", plant?.id],
+    queryFn: () => fetchEditsForPlant(plant!.id),
+    enabled: !!plant?.id,
   });
 
   // Fetch HTML content for srcdoc rendering (so relative refs / fonts work without host CORS issues)
@@ -75,10 +108,12 @@ function PlantDetail() {
     }
   }, [plant?.html_url, plant?.content_type]);
 
-  // Collect images from the HTML page (for "select existing image" cover picker).
+  // Collect images + section headings from the HTML page (cover picker + 小P蛙标注范围).
+  const [rawHtml, setRawHtml] = useState<string | null>(null);
   useEffect(() => {
-    if (!plant?.html_url) { setPageImages([]); return; }
+    if (!plant?.html_url) { setPageImages([]); setPageSections([]); setRawHtml(null); return; }
     fetch(plant.html_url).then((r) => r.text()).then((text) => {
+      setRawHtml(text);
       const doc = new DOMParser().parseFromString(text, "text/html");
       const srcs: string[] = [];
       doc.querySelectorAll("img").forEach((img) => {
@@ -87,7 +122,14 @@ function PlantDetail() {
         try { srcs.push(new URL(s, plant.html_url!).href); } catch { srcs.push(s); }
       });
       setPageImages(Array.from(new Set(srcs)));
-    }).catch(() => setPageImages([]));
+      const secs: { label: string; value: string }[] = [];
+      const seen = new Set<string>();
+      doc.querySelectorAll("h1, h2, h3").forEach((h) => {
+        const t = (h.textContent || "").replace(/\s+/g, " ").trim();
+        if (t && t.length <= 40 && !seen.has(t)) { seen.add(t); secs.push({ label: t, value: t }); }
+      });
+      setPageSections(secs.slice(0, 20));
+    }).catch(() => { setPageImages([]); setPageSections([]); });
   }, [plant?.html_url]);
 
   useEffect(() => {
@@ -111,9 +153,17 @@ function PlantDetail() {
 
   const onCoverLocal = async (file: File) => {
     if (!user) return toast.error("请先登录");
+
+    let fileToUpload: Blob | File = file;
+    try {
+      fileToUpload = await compressImage(file);
+    } catch (err) {
+      console.error("Image compression failed, using original:", err);
+    }
+
     const ext = file.name.split(".").pop() || "jpg";
     const path = `${user.id}/cover/${Date.now()}.${ext}`;
-    const { error } = await supabase.storage.from("plant-images").upload(path, file, {
+    const { error } = await supabase.storage.from("plant-images").upload(path, fileToUpload, {
       cacheControl: "3600", upsert: false, contentType: file.type,
     });
     if (error) return toast.error(error.message);
@@ -142,6 +192,108 @@ function PlantDetail() {
       window.removeEventListener("click", close);
     };
   }, []);
+
+  // 小P蛙: ask about this published page.
+  const askXiaoP = async (
+    question: string,
+    history: { role: "assistant" | "user"; text: string }[],
+    scope?: string,
+  ) => {
+    if (!plant) throw new Error("页面未加载");
+    return (await askPlantAgent({
+      data: { plantId: plant.id, question, scope, history, userModel: userModelArg() },
+    })) as { reply: string; canEdit: boolean; editInstruction: string };
+  };
+
+  // Persist a new page HTML: upload to the plant-html bucket, repoint the plant,
+  // and write a DETAILED plant_edits record so the change is auditable/revertible.
+  const persistPlantHtml = async (html: string, oldHtml: string, summary: string) => {
+    if (!plant || !user) throw new Error("请先登录");
+    const bucket = "plant-html";
+    const path = `${user.id}/xiaop-${Date.now()}.html`;
+    const blob = new Blob([html], { type: "text/html" });
+    const { error: upErr } = await supabase.storage
+      .from(bucket)
+      .upload(path, blob, { cacheControl: "3600", upsert: false, contentType: "text/html" });
+    if (upErr) throw upErr;
+    const newUrl = supabase.storage.from(bucket).getPublicUrl(path).data.publicUrl;
+
+    const { error: updErr } = await supabase.from("plants").update({ html_url: newUrl }).eq("id", plant.id);
+    if (updErr) throw updErr;
+
+    let editorName = "编辑";
+    try {
+      const { data: prof } = await supabase
+        .from("profiles")
+        .select("display_name")
+        .eq("id", user.id)
+        .maybeSingle();
+      if (prof?.display_name) editorName = prof.display_name;
+    } catch { /* fall back to 编辑 */ }
+
+    await supabase.from("plant_edits").insert({
+      plant_id: plant.id,
+      editor_id: user.id,
+      editor_name: editorName,
+      kind: "ai_page_edit",
+      marker_n: 0,
+      source: "xiaop_agent",
+      summary: summary.slice(0, 500),
+      before_html: oldHtml,
+      after_html: html,
+    });
+
+    qc.invalidateQueries({ queryKey: ["plant", slug] });
+    qc.invalidateQueries({ queryKey: ["plant-edits"] });
+    qc.invalidateQueries({ queryKey: ["plants"] });
+    qc.invalidateQueries({ queryKey: ["home"] });
+  };
+
+  // 小P蛙: apply an agreed TEXT edit — rewrite HTML (server LLM), then persist.
+  const applyXiaoP = async (instruction: string, scope?: string) => {
+    if (!plant || !user) throw new Error("请先登录");
+    const { html, oldHtml } = (await applyPlantAgent({
+      data: { plantId: plant.id, instruction, scope, userModel: userModelArg() },
+    })) as { html: string; oldHtml: string };
+    await persistPlantHtml(html, oldHtml, `小P蛙改写${scope ? `（${scope}）` : "（整页）"}：${instruction}`);
+  };
+
+  // Revert one change from the bottom log. 小P蛙 full-page rewrites (ai_page_edit)
+  // store a full before_html snapshot → restore it as a new file + repoint. Other
+  // (block-marker) edits go through the existing revertEdit machinery.
+  const onRevertPlantEdit = async (edit: PlantEdit) => {
+    if (!plant || !user) return;
+    if (!confirm("确定撤销这条修改吗？")) return;
+    setRevertingId(edit.id);
+    try {
+      if (edit.kind === "ai_page_edit" && edit.before_html) {
+        const bucket = "plant-html";
+        const path = `${user.id}/revert-${Date.now()}.html`;
+        const blob = new Blob([edit.before_html], { type: "text/html" });
+        const { error: upErr } = await supabase.storage
+          .from(bucket)
+          .upload(path, blob, { cacheControl: "3600", upsert: false, contentType: "text/html" });
+        if (upErr) throw upErr;
+        const newUrl = supabase.storage.from(bucket).getPublicUrl(path).data.publicUrl;
+        const { error: updErr } = await supabase.from("plants").update({ html_url: newUrl }).eq("id", plant.id);
+        if (updErr) throw updErr;
+        await supabase
+          .from("plant_edits")
+          .update({ reverted: true, reverted_by: user.id, reverted_at: new Date().toISOString() })
+          .eq("id", edit.id);
+      } else {
+        await revertEdit(edit, user.id);
+      }
+      toast.success("已撤销该修改");
+      qc.invalidateQueries({ queryKey: ["plant", slug] });
+      qc.invalidateQueries({ queryKey: ["plant-edits", plant.id] });
+      navigate({ to: "/plants/$slug", params: { slug: plant.slug } });
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "撤销失败");
+    } finally {
+      setRevertingId(null);
+    }
+  };
 
   const onRevertFromMenu = async () => {
     if (!editMenu || !user) return;
@@ -302,9 +454,52 @@ function PlantDetail() {
             </figure>
           )}
           {attributionFooter}
+          <EditLogSection
+            edits={plantEdits}
+            isEditor={canEdit}
+            reverting={revertingId}
+            onRevert={onRevertPlantEdit}
+          />
           <PlantComments plantId={plant.id} />
         </div>
         {renderCoverMenu()}
+        {/* 小P蛙 — 编辑登录后可对该已发布页提问并改写（标注范围或整页），保存上线并记入修改记录 */}
+        {canEdit && (
+          <XiaoPAgentPanel
+            storageKey={`plant:${plant.id}`}
+            greetingTitle={plant.title}
+            canApply={true}
+            scopes={pageSections}
+            ask={askXiaoP}
+            apply={applyXiaoP}
+            onImageReplace={(query, instruction) =>
+              setXiaopImg({ query: query || plant.scientific_name || plant.title, instruction })
+            }
+          />
+        )}
+        {xiaopImg && rawHtml && (
+          <ReplaceImageFlow
+            html={rawHtml}
+            initialQuery={xiaopImg.query}
+            uploadPathPrefix={`plants/xiaop/${plant.id}`}
+            onClose={() => setXiaopImg(null)}
+            onDone={async (newHtml, oldUrl, newUrl) => {
+              const ctx = xiaopImg;
+              setXiaopImg(null);
+              try {
+                await persistPlantHtml(
+                  newHtml,
+                  rawHtml,
+                  `小P蛙换图（${ctx?.instruction || "手动"}）：${oldUrl} → ${newUrl}`,
+                );
+                toast.success("配图已替换并保存");
+                navigate({ to: "/plants/$slug", params: { slug: plant.slug } });
+              } catch (e) {
+                toast.error(e instanceof Error ? e.message : "替换失败，请重试");
+              }
+            }}
+          />
+        )}
         {editMenu && isAdmin && (
           <div
             onClick={(e) => e.stopPropagation()}
@@ -410,6 +605,12 @@ function PlantDetail() {
             </div>
           )}
           {attributionFooter}
+          <EditLogSection
+            edits={plantEdits}
+            isEditor={canEdit}
+            reverting={revertingId}
+            onRevert={onRevertPlantEdit}
+          />
         </article>
         <PlantComments plantId={plant.id} />
         {renderCoverMenu()}

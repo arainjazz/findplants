@@ -5,6 +5,8 @@ import { SiteHeader, SiteFooter } from "@/components/site-header";
 import { useAuth } from "@/hooks/use-auth";
 import { isCurrentUserAdmin } from "@/lib/edits";
 import { fetchAllPlants, fetchMyPlants, type Plant } from "@/lib/plants";
+import { EntryTypeBadge } from "@/components/entry-type-badge";
+import { XiaoPModelPanel } from "@/components/xiaop-model-panel";
 import { supabase } from "@/integrations/supabase/client";
 import { toast } from "sonner";
 import {
@@ -123,6 +125,8 @@ function AdminPage() {
           </div>
         </div>
 
+        {isAdmin && <XiaoPModelPanel />}
+
         {myCatalogs.length > 0 && (
           <section className="mb-10">
             <h2 className="font-display text-2xl font-bold border-b-2 border-ink pb-2 mb-4">
@@ -187,7 +191,7 @@ function AdminPage() {
                     <Link to="/plants/$slug" params={{ slug: p.slug }} className="font-display text-lg font-semibold hover:text-vermilion">{p.title}</Link>
                     {p.scientific_name && <p className="italic text-xs text-ink-faint">{p.scientific_name}</p>}
                   </td>
-                  <td className="py-4 text-sm">{p.content_type === "html" ? "HTML 上传" : "富文本"}</td>
+                  <td className="py-4 text-sm"><EntryTypeBadge plant={p} /></td>
                   <td className="py-4 text-sm text-ink-faint">{new Date(p.updated_at).toLocaleString("zh-CN")}</td>
                   <td className="py-4 text-right space-x-3 text-sm">
                     <Link to="/admin/edit/$id" params={{ id: p.id }} className="hover:text-vermilion">编辑</Link>

@@ -81,7 +81,13 @@ export type PlantEdit = {
     | "tag_create"
     | "html_save"
     | "branch"
-    | "merge";
+    | "merge"
+    | "draft_image"
+    | "draft_text"
+    | "draft_approve"
+    | "draft_reject"
+    | "ai_page_edit"
+    | "blog_publish";
   marker_n: number;
   block_path: string | null;
   before_html: string | null;
@@ -93,6 +99,9 @@ export type PlantEdit = {
   reverted: boolean;
   reverted_by: string | null;
   reverted_at: string | null;
+  adopted?: boolean;
+  adopted_by?: string | null;
+  adopted_at?: string | null;
   created_at: string;
 };
 
@@ -192,11 +201,40 @@ async function recoverMissingHtmlMarkerEdits(existingIds: Set<string>): Promise<
   return out;
 }
 
+/**
+ * Edits authored by a single user — used to scope the 修改记录 page so a
+ * non-owner editor only sees their OWN history (including entries an admin has
+ * reverted/rejected, which keep editor_id = the original author). Owner (admin)
+ * still uses fetchAllEdits. NOTE: this is UI scoping; DB-level enforcement needs
+ * the plant_edits SELECT RLS to be tightened (see plan — requires a migration).
+ */
+export async function fetchEditsForUser(userId: string) {
+  const { data, error } = await supabase
+    .from("plant_edits")
+    .select("*")
+    .eq("editor_id", userId)
+    .order("created_at", { ascending: false });
+  if (error) throw error;
+  return (data ?? []) as PlantEdit[];
+}
+
 export async function fetchEditsForPlant(plantId: string) {
   const { data, error } = await supabase
     .from("plant_edits")
     .select("*")
     .eq("plant_id", plantId)
+    .order("created_at", { ascending: false });
+  if (error) throw error;
+  return (data ?? []) as PlantEdit[];
+}
+
+/** Change log for a draft. Draft edit rows are tagged `block_path = draft:<id>`
+ *  (see logDraftEditFn) so they can be listed without a schema change. */
+export async function fetchEditsForDraft(draftId: string) {
+  const { data, error } = await supabase
+    .from("plant_edits")
+    .select("*")
+    .eq("block_path", `draft:${draftId}`)
     .order("created_at", { ascending: false });
   if (error) throw error;
   return (data ?? []) as PlantEdit[];

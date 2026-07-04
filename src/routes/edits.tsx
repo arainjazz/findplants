@@ -3,12 +3,13 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useState } from "react";
 import { supabase } from "@/integrations/supabase/client";
 import { SiteHeader, SiteFooter } from "@/components/site-header";
-import { fetchAllEdits, isCurrentUserAdmin, revertEdit, type PlantEdit } from "@/lib/edits";
+import { fetchAllEdits, fetchEditsForUser, isCurrentUserAdmin, revertEdit, type PlantEdit } from "@/lib/edits";
 import { revertCatalogEdit } from "@/lib/catalogs";
 import { fetchAllPlants, type Plant } from "@/lib/plants";
 import { useAuth } from "@/hooks/use-auth";
 import { toast } from "sonner";
 import { sourceLabel, sourceIsAI } from "@/lib/edit-source";
+import { isOwnerEmail, setAdopted } from "@/lib/leaves";
 
 export const Route = createFileRoute("/edits")({
   head: () => ({
@@ -28,9 +29,24 @@ function EditsPage() {
   const [groupBy, setGroupBy] = useState<GroupBy>("time");
   const [filter, setFilter] = useState("");
 
+  const { data: isAdmin = false } = useQuery({
+    queryKey: ["is-admin", user?.id],
+    queryFn: () => isCurrentUserAdmin(user?.id),
+    enabled: !!user,
+  });
+  // 采纳 (adopt) is owner-only, per product decision (资深编辑 = 仅所有者).
+  const isOwner = isOwnerEmail(user?.email);
+
+  // Owner (admin) sees every editor's history; a normal editor sees only their
+  // own (including entries reverted/rejected by the owner); anon sees nothing.
   const { data: edits = [], isLoading } = useQuery({
-    queryKey: ["plant-edits"],
-    queryFn: fetchAllEdits,
+    queryKey: ["plant-edits", isAdmin, user?.id ?? "anon"],
+    queryFn: () =>
+      isAdmin
+        ? fetchAllEdits()
+        : user
+          ? fetchEditsForUser(user.id)
+          : Promise.resolve([] as PlantEdit[]),
     staleTime: 0,
     refetchOnMount: "always",
     refetchOnWindowFocus: true,
@@ -51,11 +67,6 @@ function EditsPage() {
     };
   }, [qc]);
   const { data: plants = [] } = useQuery({ queryKey: ["plants"], queryFn: fetchAllPlants });
-  const { data: isAdmin = false } = useQuery({
-    queryKey: ["is-admin", user?.id],
-    queryFn: () => isCurrentUserAdmin(user?.id),
-    enabled: !!user,
-  });
 
   const plantById = useMemo(() => {
     const m = new Map<string, Plant>();
@@ -151,8 +162,55 @@ function EditsPage() {
       return next;
     });
 
+  const markReverted = (id: string) =>
+    supabase
+      .from("plant_edits")
+      .update({ reverted: true, reverted_by: user!.id, reverted_at: new Date().toISOString() })
+      .eq("id", id);
+
+  const onAdopt = async (e: PlantEdit) => {
+    if (!user) return;
+    try {
+      await setAdopted("plant_edits", e.id, !e.adopted, user.id);
+      toast.success(e.adopted ? "已取消采纳" : "已采纳 · 作者该枚铜叶 ×2");
+      qc.invalidateQueries({ queryKey: ["plant-edits"] });
+      qc.invalidateQueries({ queryKey: ["my-leaves"] });
+    } catch (err) {
+      toast.error("操作失败：" + (err as Error).message);
+    }
+  };
+
   const onRevert = async (e: PlantEdit) => {
     if (!user) return;
+    if (e.kind === "draft_image" || e.kind === "draft_text") {
+      toast.message("这是草稿编辑记录，无需撤销。");
+      return;
+    }
+    if (e.kind === "draft_reject") {
+      if (!confirm("撤销驳回：将该 AI 草稿恢复为「待审核」？")) return;
+      const { error } = await supabase.from("plant_drafts").update({ status: "pending" }).eq("id", e.block_path ?? "");
+      if (error) return toast.error(error.message);
+      await markReverted(e.id);
+      toast.success("已撤销驳回，草稿恢复为待审核");
+      qc.invalidateQueries({ queryKey: ["plant-edits"] });
+      qc.invalidateQueries({ queryKey: ["home-drafts"] });
+      return;
+    }
+    if (e.kind === "blog_publish") {
+      if (!confirm("撤回该博文的发布（设为未发布草稿）？")) return;
+      const { error } = await supabase.from("blog_posts").update({ published: false }).eq("id", e.block_path ?? "");
+      if (error) return toast.error(error.message);
+      await markReverted(e.id);
+      toast.success("已撤回博文发布");
+      qc.invalidateQueries({ queryKey: ["plant-edits"] });
+      qc.invalidateQueries({ queryKey: ["blog-posts"] });
+      qc.invalidateQueries({ queryKey: ["home-blog"] });
+      return;
+    }
+    if (e.kind === "draft_approve") {
+      toast.message("撤销收录较复杂：请到对应条目页逐条「撤销」内容，或直接删除该条目。");
+      return;
+    }
     if (e.kind === "catalog_create" || e.kind === "catalog_append") {
       const label = e.kind === "catalog_create" ? "整个目录及其条目" : "该次追加的全部条目";
       if (!confirm(`确定撤销该${e.kind === "catalog_create" ? "新目录" : "目录补充"}？将删除${label}。`)) return;
@@ -198,8 +256,11 @@ function EditsPage() {
           <p className="label text-vermilion mb-2">Community Log · 社区编辑日志</p>
           <h1 className="font-display text-5xl font-bold">修改记录</h1>
           <p className="text-ink-faint mt-2">
-            所有编辑者对条目所做的修改都会在此存档。
-            {isAdmin ? " 你以管理员身份登录，可撤销任意一条修改。" : " 仅管理员可撤销修改。"}
+            {isAdmin
+              ? "你以网站所有者身份登录，可查看全部编辑者的修改，并撤销任意一条。"
+              : user
+                ? "这里是你本人的修改记录，包含被所有者撤销或驳回的条目。"
+                : "登录后可查看你本人的修改记录。"}
           </p>
         </div>
 
@@ -233,7 +294,12 @@ function EditsPage() {
           )}
         </div>
 
-        {isLoading ? (
+        {!user ? (
+          <div className="py-12 text-center">
+            <p className="text-ink-faint mb-3">登录后可查看你本人的修改记录。</p>
+            <Link to="/login" className="inline-block border border-ink px-4 py-2 hover:bg-ink hover:text-background transition-colors">去登录</Link>
+          </div>
+        ) : isLoading ? (
           <p className="text-ink-faint">载入中…</p>
         ) : filtered.length === 0 ? (
           <p className="text-ink-faint py-12 text-center">还没有任何修改记录。</p>
@@ -271,7 +337,9 @@ function EditsPage() {
                           edit={e}
                           plant={plantById.get(e.plant_id)}
                           isAdmin={isAdmin}
+                          isOwner={isOwner}
                           onRevert={() => onRevert(e)}
+                          onAdopt={() => onAdopt(e)}
                           selected={selected.has(e.id)}
                           onToggleSelect={() => toggleSelect(e.id)}
                         />
@@ -293,17 +361,22 @@ function EditRow({
   edit,
   plant,
   isAdmin,
+  isOwner,
   onRevert,
+  onAdopt,
   selected,
   onToggleSelect,
 }: {
   edit: PlantEdit;
   plant: Plant | undefined;
   isAdmin: boolean;
+  isOwner: boolean;
   onRevert: () => void;
+  onAdopt: () => void;
   selected: boolean;
   onToggleSelect: () => void;
 }) {
+  const [showDiff, setShowDiff] = useState(false);
   const kindLabel: Record<string, string> = {
     text: "文字",
     image: "图片",
@@ -315,6 +388,11 @@ function EditRow({
     html_save: "HTML 保存",
     branch: "分支创建",
     merge: "合并共建",
+    draft_image: "草稿配图",
+    draft_text: "草稿文字",
+    draft_approve: "草稿通过收录",
+    draft_reject: "草稿驳回",
+    blog_publish: "博文发布",
   };
   const kindColor: Record<string, string> = {
     text: "bg-leaf/15 text-leaf-deep",
@@ -327,6 +405,11 @@ function EditRow({
     html_save: "bg-leaf/10 text-leaf-deep",
     branch: "bg-vermilion/15 text-vermilion",
     merge: "bg-leaf/15 text-leaf-deep",
+    draft_image: "bg-[oklch(0.55_0.18_240)]/15 text-[oklch(0.45_0.18_240)]",
+    draft_text: "bg-[oklch(0.55_0.18_240)]/10 text-[oklch(0.45_0.18_240)]",
+    draft_approve: "bg-leaf/15 text-leaf-deep",
+    draft_reject: "bg-destructive/15 text-destructive",
+    blog_publish: "bg-emerald-100 text-emerald-700",
   };
 
   const isCatalog =
@@ -335,7 +418,12 @@ function EditRow({
     edit.kind === "tag_create" ||
     edit.kind === "html_save" ||
     edit.kind === "branch" ||
-    edit.kind === "merge";
+    edit.kind === "merge" ||
+    edit.kind === "draft_image" ||
+    edit.kind === "draft_text" ||
+    edit.kind === "draft_approve" ||
+    edit.kind === "draft_reject" ||
+    edit.kind === "blog_publish";
 
   const srcLabel = sourceLabel(edit.source);
   const isAI = sourceIsAI(edit.source);
@@ -429,7 +517,34 @@ function EditRow({
             <EditSnapshotPreview html={edit.after_html} kind={edit.kind} />
           </div>
         </div>
+        {edit.kind !== "revert" && (edit.before_html || edit.after_html) && (
+          <div className="mt-2">
+            <button
+              type="button"
+              onClick={() => setShowDiff(!showDiff)}
+              className="text-[10px] uppercase tracking-wider text-vermilion hover:underline font-semibold"
+            >
+              {showDiff ? "隐藏对比" : "显示 Git 格式差异对比 (Diff)"}
+            </button>
+            {showDiff && (
+              <GitDiffViewer beforeHtml={edit.before_html} afterHtml={edit.after_html} />
+            )}
+          </div>
+        )}
       </div>
+      {isOwner && (edit.kind === "text" || edit.kind === "image") && !edit.reverted && (
+        <button
+          onClick={onAdopt}
+          title={edit.adopted ? "取消采纳（撤销该枚铜叶翻倍）" : "采纳此修改 · 作者该枚铜叶 ×2"}
+          className={`shrink-0 text-[11px] border px-1.5 py-0.5 transition-colors ${
+            edit.adopted
+              ? "border-leaf bg-leaf/20 text-leaf-deep"
+              : "border-leaf text-leaf-deep hover:bg-leaf hover:text-background"
+          }`}
+        >
+          {edit.adopted ? "已采纳 ✓" : "采纳"}
+        </button>
+      )}
       {isAdmin && edit.kind !== "revert" && (() => {
         const restoring = edit.reverted;
         return (
@@ -488,3 +603,112 @@ function textPreview(html: string | null, max = 20): string {
   if (!text) return "（空）";
   return text.length > max ? `${text.slice(0, max)}…` : text;
 }
+
+/* ---------------- LCS DP Line-by-line Diff Engine ---------------- */
+
+type DiffLine = {
+  type: "added" | "removed" | "unchanged";
+  text: string;
+  lineNumberOld?: number;
+  lineNumberNew?: number;
+};
+
+function diffLines(oldStr: string, newStr: string): DiffLine[] {
+  const oldLines = oldStr ? oldStr.split(/\r?\n/) : [];
+  const newLines = newStr ? newStr.split(/\r?\n/) : [];
+
+  const m = oldLines.length;
+  const n = newLines.length;
+
+  const dp: number[][] = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      if (oldLines[i - 1] === newLines[j - 1]) {
+        dp[i][j] = dp[i - 1][j - 1] + 1;
+      } else {
+        dp[i][j] = Math.max(dp[i - 1][j], dp[i][j - 1]);
+      }
+    }
+  }
+
+  const diff: DiffLine[] = [];
+  let i = m;
+  let j = n;
+
+  while (i > 0 || j > 0) {
+    if (i > 0 && j > 0 && oldLines[i - 1] === newLines[j - 1]) {
+      diff.unshift({
+        type: "unchanged",
+        text: oldLines[i - 1],
+        lineNumberOld: i,
+        lineNumberNew: j,
+      });
+      i--;
+      j--;
+    } else if (j > 0 && (i === 0 || dp[i][j - 1] >= dp[i - 1][j])) {
+      diff.unshift({
+        type: "added",
+        text: newLines[j - 1],
+        lineNumberNew: j,
+      });
+      j--;
+    } else {
+      diff.unshift({
+        type: "removed",
+        text: oldLines[i - 1],
+        lineNumberOld: i,
+      });
+      i--;
+    }
+  }
+
+  return diff;
+}
+
+function GitDiffViewer({ beforeHtml, afterHtml }: { beforeHtml: string | null; afterHtml: string | null }) {
+  const diff = useMemo(() => {
+    return diffLines(beforeHtml || "", afterHtml || "");
+  }, [beforeHtml, afterHtml]);
+
+  return (
+    <div className="border border-rule bg-paper-deep/30 rounded overflow-hidden font-mono text-[11px] leading-relaxed mt-2 max-h-96 overflow-y-auto">
+      <table className="w-full border-collapse">
+        <tbody>
+          {diff.map((line, idx) => {
+            let rowClass = "text-ink-soft";
+            let codeClass = "";
+            let sign = " ";
+            if (line.type === "added") {
+              rowClass = "bg-emerald-950/20 text-emerald-400";
+              codeClass = "bg-emerald-950/40";
+              sign = "+";
+            } else if (line.type === "removed") {
+              rowClass = "bg-red-950/20 text-red-400 line-through";
+              codeClass = "bg-red-950/40";
+              sign = "-";
+            }
+
+            return (
+              <tr key={idx} className={`${rowClass} hover:bg-paper-deep/40 transition-colors`}>
+                <td className="w-10 text-right pr-2 text-ink-faint select-none border-r border-rule py-0.5 px-1 bg-paper-deep/20">
+                  {line.lineNumberOld || ""}
+                </td>
+                <td className="w-10 text-right pr-2 text-ink-faint select-none border-r border-rule py-0.5 px-1 bg-paper-deep/20">
+                  {line.lineNumberNew || ""}
+                </td>
+                <td className="w-6 text-center select-none font-bold text-xs py-0.5 px-1">
+                  {sign}
+                </td>
+                <td className={`pl-2 pr-4 py-0.5 whitespace-pre-wrap break-all ${codeClass}`}>
+                  {line.text}
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+

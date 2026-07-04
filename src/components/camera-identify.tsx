@@ -4,120 +4,149 @@ import { useNavigate } from "@tanstack/react-router";
 import { submitPlantDraft } from "@/lib/identify-plant.functions";
 import { toast } from "sonner";
 
-type Phase = "idle" | "permission" | "ready" | "captured" | "submitting";
+type Phase = "idle" | "captured" | "submitting";
+
+const LOADING_STEPS = [
+  "🔍 正在读取照片地理与环境数据...",
+  "🧠 正在提取花叶边缘与色彩形态特征...",
+  "📖 正在对比 Plantspedia 植物志库...",
+  "✍️ 正在整理并自动排版中英科普资料...",
+  "💾 正在写入云端，即将生成草稿..."
+];
 
 export function CameraIdentify() {
   const [phase, setPhase] = useState<Phase>("idle");
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  // Captured photo's natural aspect ratio (w/h). Drives the viewfinder frame so
+  // its border hugs the real image instead of letterboxing a fixed square.
+  const [imgAspect, setImgAspect] = useState<number | null>(null);
   const [coords, setCoords] = useState<{ lat: number; lng: number } | null>(null);
-  const [statusText, setStatusText] = useState<string>("");
-  const videoRef = useRef<HTMLVideoElement | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
+  const [stepIndex, setStepIndex] = useState(0);
+  const cameraInputRef = useRef<HTMLInputElement | null>(null);
+  const albumInputRef = useRef<HTMLInputElement | null>(null);
   const capturedBlobRef = useRef<Blob | null>(null);
   const navigate = useNavigate();
   const submit = useServerFn(submitPlantDraft);
 
   useEffect(() => {
     return () => {
-      streamRef.current?.getTracks().forEach((t) => t.stop());
+      if (previewUrl) URL.revokeObjectURL(previewUrl);
     };
-  }, []);
+  }, [previewUrl]);
 
-  const startCamera = async () => {
-    setPhase("permission");
-    setStatusText("正在请求摄像头权限…");
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 } },
-        audio: false,
-      });
-      streamRef.current = stream;
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        await videoRef.current.play();
-      }
-      setPhase("ready");
-      setStatusText("");
-      // Request geolocation in parallel (non-blocking)
-      if (navigator.geolocation) {
-        navigator.geolocation.getCurrentPosition(
-          (pos) => setCoords({ lat: pos.coords.latitude, lng: pos.coords.longitude }),
-          () => setCoords(null),
-          { timeout: 8000, maximumAge: 60_000 },
-        );
-      }
-    } catch (e) {
-      setPhase("idle");
-      toast.error(e instanceof Error ? e.message : "无法访问摄像头");
+  // Progressive loader steps animation
+  useEffect(() => {
+    if (phase !== "submitting") {
+      setStepIndex(0);
+      return;
     }
+
+    const interval = setInterval(() => {
+      setStepIndex((prev) => {
+        if (prev < LOADING_STEPS.length - 1) {
+          return prev + 1;
+        }
+        return prev;
+      });
+    }, 3500);
+
+    return () => clearInterval(interval);
+  }, [phase]);
+
+  // Shared pipeline: read location (EXIF for picked files, geolocation otherwise),
+  // compress, generate a preview, and move to the "captured" review state.
+  const ingestImage = async (file: File, { tryExif }: { tryExif: boolean }) => {
+    if (!file.type.startsWith("image/")) {
+      toast.error("请选择图片文件");
+      return;
+    }
+
+    const toastId = toast.loading("正在优化图片并读取地理位置...");
+
+    // 1) Try EXIF GPS from the original uploaded photo itself (most accurate).
+    let gotExif = false;
+    if (tryExif) {
+      try {
+        const exifr = (await import("exifr")).default;
+        const gps = await exifr.gps(file);
+        if (gps && typeof gps.latitude === "number" && typeof gps.longitude === "number") {
+          setCoords({ lat: gps.latitude, lng: gps.longitude });
+          gotExif = true;
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+
+    // 2) Fall back to current browser geolocation if EXIF missing. Native-camera
+    //    captures usually carry no GPS EXIF, so this is the common path.
+    if (!gotExif && navigator.geolocation) {
+      navigator.geolocation.getCurrentPosition(
+        (pos) => {
+          setCoords({ lat: pos.coords.latitude, lng: pos.coords.longitude });
+          toast.success("已获取当前位置 GPS 坐标");
+        },
+        () => setCoords(null),
+        { timeout: 8000, maximumAge: 60_000 },
+      );
+    }
+
+    // 3) Compress the image to save bandwidth and storage space
+    let url: string;
+    try {
+      const { compressImage } = await import("@/lib/image-compress");
+      const compressed = await compressImage(file, 1200, 1200, 0.75);
+      capturedBlobRef.current = compressed;
+      if (previewUrl) URL.revokeObjectURL(previewUrl);
+      url = URL.createObjectURL(compressed);
+      setPreviewUrl(url);
+    } catch {
+      // Fallback to original file if compression fails
+      capturedBlobRef.current = file;
+      if (previewUrl) URL.revokeObjectURL(previewUrl);
+      url = URL.createObjectURL(file);
+      setPreviewUrl(url);
+    }
+
+    // Measure the real aspect ratio so the frame can adapt to the画幅.
+    setImgAspect(await readAspect(url));
+
+    setPhase("captured");
+    toast.dismiss(toastId);
   };
 
-  const captureFrame = async () => {
-    const video = videoRef.current;
-    if (!video) return;
-    const canvas = document.createElement("canvas");
-    const w = video.videoWidth;
-    const h = video.videoHeight;
-    // Cap to ~1280 on the long side to keep payload reasonable.
-    const scale = Math.min(1, 1280 / Math.max(w, h));
-    canvas.width = Math.round(w * scale);
-    canvas.height = Math.round(h * scale);
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-    const blob: Blob | null = await new Promise((resolve) =>
-      canvas.toBlob((b) => resolve(b), "image/jpeg", 0.85),
-    );
-    if (!blob) return toast.error("拍照失败");
-    capturedBlobRef.current = blob;
-    setPreviewUrl(URL.createObjectURL(blob));
-    streamRef.current?.getTracks().forEach((t) => t.stop());
-    setPhase("captured");
+  const onUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    void ingestImage(file, { tryExif: true });
+  };
+
+  // Open the phone's NATIVE camera app (full focus/zoom/flash, real-framing viewfinder)
+  // via a file input with capture=environment. The photo it returns flows through the
+  // exact same pipeline as an album pick — so what you shoot is what gets identified.
+  const openCamera = () => {
+    if (cameraInputRef.current) {
+      cameraInputRef.current.value = ""; // allow re-taking the same shot
+      cameraInputRef.current.click();
+    }
   };
 
   const retake = () => {
     if (previewUrl) URL.revokeObjectURL(previewUrl);
     setPreviewUrl(null);
+    setImgAspect(null);
     capturedBlobRef.current = null;
-    startCamera();
-  };
-
-  const onUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    if (!file.type.startsWith("image/")) return toast.error("请选择图片文件");
-    capturedBlobRef.current = file;
-    if (previewUrl) URL.revokeObjectURL(previewUrl);
-    setPreviewUrl(URL.createObjectURL(file));
-    // 1) Try EXIF GPS from the uploaded photo itself (most accurate).
-    let gotExif = false;
-    try {
-      const exifr = (await import("exifr")).default;
-      const gps = await exifr.gps(file);
-      if (gps && typeof gps.latitude === "number" && typeof gps.longitude === "number") {
-        setCoords({ lat: gps.latitude, lng: gps.longitude });
-        gotExif = true;
-        toast.success("已从照片 EXIF 中读取拍摄地点");
-      }
-    } catch {
-      /* ignore */
-    }
-    // 2) Fall back to current browser geolocation if EXIF missing.
-    if (!gotExif && navigator.geolocation) {
-      navigator.geolocation.getCurrentPosition(
-        (pos) => setCoords({ lat: pos.coords.latitude, lng: pos.coords.longitude }),
-        () => setCoords(null),
-        { timeout: 8000, maximumAge: 60_000 },
-      );
-    }
-    setPhase("captured");
+    setCoords(null);
+    setPhase("idle");
+    // Reset inputs
+    if (cameraInputRef.current) cameraInputRef.current.value = "";
+    if (albumInputRef.current) albumInputRef.current.value = "";
   };
 
   const onSubmit = async () => {
     const blob = capturedBlobRef.current;
     if (!blob) return;
     setPhase("submitting");
-    setStatusText("AI 正在识别植物…");
     try {
       const base64 = await blobToBase64(blob);
       const res = await submit({
@@ -132,89 +161,201 @@ export function CameraIdentify() {
       navigate({ to: "/drafts/$id", params: { id: (res as { draftId: string }).draftId } });
     } catch (e) {
       setPhase("captured");
-      setStatusText("");
       toast.error(e instanceof Error ? e.message : "识别失败，请重试");
     }
   };
 
   return (
-    <section className="mb-12 border-2 border-ink bg-paper-deep/30 p-6 md:p-8">
-      <div className="flex items-start justify-between flex-wrap gap-4 mb-4">
-        <div className="min-w-0 flex-1">
-          <p className="label text-vermilion mb-1">AI copilot · Plantspedia</p>
-          <p className="text-sm text-ink font-bold">让 AI 识别植物身份，并介绍这位新遇见的朋友吧</p>
-          <p className="text-xs text-ink-faint mt-1 whitespace-nowrap overflow-hidden text-ellipsis">人工智能不能保证 100% 的正确率 · AI cannot guarantee 100% accuracy</p>
-        </div>
-        {coords && (
-          <p className="label text-xs text-ink-faint inline-flex items-center gap-1">
-            <MapPinIcon className="w-3.5 h-3.5" />
-            {coords.lat.toFixed(4)}, {coords.lng.toFixed(4)}
-          </p>
+    <div className="max-w-md mx-auto w-full bg-paper-deep/35 border border-rule/70 p-4 md:p-5 rounded-3xl shadow-lg mb-12 select-none animate-in fade-in slide-in-from-bottom-4 duration-500">
+
+      {/* 1. Viewfinder area — outer centers the frame so a portrait shot stays
+          centred; the inner frame's border hugs the real image 画幅. */}
+      <div className="w-full flex justify-center">
+      <div
+        className="scanner-view rounded-2xl relative overflow-hidden bg-background border border-rule/35 shadow-inner"
+        style={frameStyle(phase, imgAspect)}
+      >
+        {/* L-Corners */}
+        <div className="scan-corner scan-corner-tl" />
+        <div className="scan-corner scan-corner-tr" />
+        <div className="scan-corner scan-corner-bl" />
+        <div className="scan-corner scan-corner-br" />
+
+        {phase === "idle" ? (
+          <>
+            {/* Grid background & crosshair */}
+            <div className="scanner-grid scanner-grid-animated" />
+            <div className="scanner-focus-target" />
+
+            {/* Prompt information */}
+            <div className="absolute inset-0 flex flex-col items-center justify-center p-6 text-center z-10 pointer-events-none">
+              <div className="w-14 h-14 rounded-full bg-ink/5 flex items-center justify-center border border-rule/15 text-ink-soft mb-3 animate-pulse">
+                <CameraIcon className="w-7 h-7" />
+              </div>
+              <p className="text-sm font-bold text-ink-soft leading-snug">点击下方快门调用相机拍摄，或上传已有照片</p>
+              <p className="text-xs text-ink-faint leading-normal mt-2 max-w-[220px]">
+                建议尽量使照片清晰且主体突出，可在设置中开启位置授权获取分布地图。
+              </p>
+            </div>
+          </>
+        ) : (
+          <>
+            {/* Image display — the frame now matches the photo's真实画幅, so
+                object-cover fills it edge-to-edge with no crop and no letterbox. */}
+            <img
+              src={previewUrl!}
+              alt="captured plant"
+              className="w-full h-full object-cover transition-opacity duration-300"
+            />
+
+            {/* GPS Overlay Badge */}
+            {coords && (
+              <div className="absolute top-4 right-4 bg-background/85 backdrop-blur-md border border-rule/55 px-2.5 py-1 rounded-full text-[10px] font-semibold tracking-wider text-ink-soft inline-flex items-center gap-1 shadow-sm z-10 animate-in fade-in slide-in-from-top-2 duration-300">
+                <MapPinIcon className="w-3.5 h-3.5 text-vermilion" />
+                <span>{coords.lat.toFixed(4)}, {coords.lng.toFixed(4)}</span>
+              </div>
+            )}
+
+            {/* Laser scanning line */}
+            {phase === "submitting" && <div className="scan-laser-line" />}
+
+            {/* Progressive Loader Card Overlay */}
+            {phase === "submitting" && (
+              <div className="absolute inset-0 bg-background/45 backdrop-blur-xs flex items-center justify-center p-4 z-20 animate-in fade-in duration-300">
+                <div className="bg-background/95 border border-rule/80 p-5 rounded-2xl shadow-xl max-w-[280px] w-full text-center flex flex-col items-center gap-4 animate-in fade-in zoom-in-95 duration-200">
+                  <div className="relative w-10 h-10">
+                    <div className="w-10 h-10 rounded-full border-[3px] border-rule/20 border-t-vermilion animate-spin" />
+                  </div>
+                  <div className="space-y-1 w-full">
+                    <p className="text-xs font-bold text-vermilion tracking-widest uppercase">AI 深度分析中</p>
+                    <p className="text-xs text-ink-soft font-medium min-h-[36px] flex items-center justify-center px-2">
+                      {LOADING_STEPS[stepIndex]}
+                    </p>
+                  </div>
+                </div>
+              </div>
+            )}
+          </>
         )}
       </div>
+      </div>
 
-      {phase === "idle" && (
-        <div className="flex flex-col sm:flex-row gap-3">
-          <button
-            onClick={startCamera}
-            className="flex-1 bg-ink text-background px-6 py-3 hover:bg-vermilion transition-colors font-semibold inline-flex items-center justify-center gap-2"
-          >
-            <CameraIcon className="w-5 h-5" />
-            <span>打开摄像头拍照</span>
-          </button>
-          <label className="flex-1 border-2 border-ink px-6 py-3 hover:bg-ink hover:text-background transition-colors text-center cursor-pointer font-semibold inline-flex items-center justify-center gap-2">
-            <GalleryIcon className="w-5 h-5" />
-            <span>从相册选择</span>
-            <input type="file" accept="image/*" capture="environment" className="hidden" onChange={onUpload} />
-          </label>
-        </div>
-      )}
-
-
-      {(phase === "permission" || phase === "ready") && (
-        <div>
-          <div className="bg-black overflow-hidden mb-4 max-h-[60vh]">
-            <video ref={videoRef} playsInline muted className="w-full h-auto block" />
-          </div>
-          {phase === "ready" && (
+      {/* 2. Control bar */}
+      <div className="mt-4 pt-2">
+        {phase === "idle" ? (
+          <div className="flex items-center justify-between px-6">
+            {/* Gallery Upload Button */}
             <button
-              onClick={captureFrame}
-              className="w-full bg-vermilion text-background px-6 py-3 font-semibold hover:bg-ink transition-colors inline-flex items-center justify-center gap-2"
+              onClick={() => albumInputRef.current?.click()}
+              title="选择相册照片"
+              className="w-12 h-12 rounded-full border border-rule bg-background flex items-center justify-center text-ink hover:bg-ink hover:text-background transition-all cursor-pointer shadow-sm active:scale-90"
             >
-              <CameraIcon className="w-5 h-5" />
-              <span>拍摄</span>
+              <GalleryIcon className="w-5 h-5" />
             </button>
-          )}
-          {statusText && <p className="text-sm text-ink-faint mt-2">{statusText}</p>}
-        </div>
-      )}
 
-      {(phase === "captured" || phase === "submitting") && previewUrl && (
-        <div>
-          <div className="bg-paper-deep border border-rule overflow-hidden mb-4">
-            <img src={previewUrl} alt="captured" className="w-full h-auto max-h-[60vh] object-contain mx-auto block" />
-          </div>
-          <div className="flex flex-col sm:flex-row gap-3">
+            {/* Core Shutter Camera Button — opens the phone's native camera app */}
             <button
-              onClick={onSubmit}
-              disabled={phase === "submitting"}
-              className="flex-1 bg-ink text-background px-6 py-3 hover:bg-vermilion transition-colors font-semibold disabled:opacity-60 inline-flex items-center justify-center gap-2"
+              onClick={openCamera}
+              title="调用相机拍摄"
+              className="w-18 h-18 rounded-full border-2 border-ink flex items-center justify-center cursor-pointer shadow-md bg-paper active:scale-90 transition-all group"
             >
-              {phase === "submitting" ? <span>AI 识别中… 约需 10–30 秒</span> : (<><SparkleIcon className="w-5 h-5" /><span>让 AI 识别并生成草稿</span></>)}
+              <div className="w-14 h-14 bg-ink rounded-full group-hover:bg-vermilion transition-colors" />
             </button>
+
+            {/* Info / Tips Button */}
+            <button
+              onClick={() => toast.info("💡 拍照提示：对焦清晰、光线充足并尽量使单种植物居中，能显著提高 AI 识别准确率。")}
+              title="使用小贴士"
+              className="w-12 h-12 rounded-full border border-rule bg-background flex items-center justify-center text-ink-soft hover:bg-ink hover:text-background transition-all cursor-pointer shadow-sm active:scale-90"
+            >
+              <InfoIcon className="w-5 h-5" />
+            </button>
+          </div>
+        ) : (
+          <div className="flex items-center justify-between px-6 gap-4">
+            {/* Cancel / Retake Button */}
             <button
               onClick={retake}
               disabled={phase === "submitting"}
-              className="border border-ink px-6 py-3 hover:bg-ink hover:text-background transition-colors disabled:opacity-60"
+              title="重新拍摄"
+              className="w-12 h-12 rounded-full border border-rule bg-background flex items-center justify-center text-ink-soft hover:border-destructive hover:text-destructive hover:bg-destructive/5 transition-all cursor-pointer shadow-sm active:scale-90 disabled:opacity-50"
             >
-              重新拍摄
+              <RotateCcwIcon className="w-5 h-5" />
+            </button>
+
+            {/* AI identify — compact flat icon button (short label stays tidy on mobile) */}
+            <button
+              onClick={onSubmit}
+              disabled={phase === "submitting"}
+              title="让 AI 识别并生成草稿"
+              className="w-18 h-18 rounded-full border-2 border-ink bg-paper flex flex-col items-center justify-center gap-1 hover:bg-vermilion hover:border-vermilion hover:text-background active:scale-90 transition-all shadow-md cursor-pointer disabled:opacity-50"
+            >
+              {phase === "submitting" ? (
+                <span className="w-6 h-6 rounded-full border-[3px] border-ink/20 border-t-ink animate-spin" />
+              ) : (
+                <>
+                  <SparkleIcon className="w-5 h-5" />
+                  <span className="text-[11px] font-bold leading-none tracking-wide">AI识别</span>
+                </>
+              )}
+            </button>
+
+            {/* Info Button */}
+            <button
+              onClick={() => toast.info("💡 提示：照片已选择。点击中间的“AI识别”按钮即可触发大语言模型生成精美双语科普文案。")}
+              title="说明"
+              className="w-12 h-12 rounded-full border border-rule bg-background flex items-center justify-center text-ink-soft hover:bg-ink hover:text-background transition-all cursor-pointer shadow-sm active:scale-90"
+            >
+              <InfoIcon className="w-5 h-5" />
             </button>
           </div>
-          {statusText && <p className="text-sm text-ink-faint mt-2">{statusText}</p>}
-        </div>
-      )}
-    </section>
+        )}
+      </div>
+
+      {/* Hidden file inputs. The camera one uses capture=environment → native camera
+          app (rear lens) on phones; on desktop it falls back to a file picker. */}
+      <input
+        type="file"
+        ref={cameraInputRef}
+        accept="image/*"
+        capture="environment"
+        className="hidden"
+        onChange={onUpload}
+      />
+      <input
+        type="file"
+        ref={albumInputRef}
+        accept="image/*"
+        className="hidden"
+        onChange={onUpload}
+      />
+    </div>
   );
+}
+
+// Read an image's natural aspect ratio (width / height) from an object URL.
+// Resolves null if it can't be measured (caller then keeps the default frame).
+function readAspect(url: string): Promise<number | null> {
+  return new Promise((resolve) => {
+    const im = new Image();
+    im.onload = () =>
+      resolve(im.naturalWidth && im.naturalHeight ? im.naturalWidth / im.naturalHeight : null);
+    im.onerror = () => resolve(null);
+    im.src = url;
+  });
+}
+
+// Size the viewfinder frame. Idle (or unmeasured) → the original fixed scanner
+// box. Once a photo is captured, the frame takes the photo's真实画幅: landscape/
+// square drive off full width; portrait drives off height so it never overflows.
+function frameStyle(phase: Phase, aspect: number | null): React.CSSProperties {
+  if (phase === "idle" || !aspect) {
+    return { width: "100%", height: "40vh", minHeight: 280 };
+  }
+  if (aspect >= 1) {
+    return { width: "100%", aspectRatio: String(aspect), maxHeight: "62vh" };
+  }
+  return { height: "62vh", aspectRatio: String(aspect), maxWidth: "100%", minHeight: 280 };
 }
 
 function blobToBase64(blob: Blob): Promise<string> {
@@ -230,10 +371,10 @@ function blobToBase64(blob: Blob): Promise<string> {
   });
 }
 
-// Flat-style inline SVG icons (stroke = currentColor so they inherit theme).
+// Flat SVG icons
 function CameraIcon({ className }: { className?: string }) {
   return (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6"
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"
       strokeLinecap="round" strokeLinejoin="round" className={className} aria-hidden="true">
       <path d="M3 8.5A2.5 2.5 0 0 1 5.5 6h2l1.2-2h6.6L16.5 6h2A2.5 2.5 0 0 1 21 8.5v9A2.5 2.5 0 0 1 18.5 20h-13A2.5 2.5 0 0 1 3 17.5v-9Z"/>
       <circle cx="12" cy="13" r="3.6"/>
@@ -243,72 +384,51 @@ function CameraIcon({ className }: { className?: string }) {
 
 function GalleryIcon({ className }: { className?: string }) {
   return (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6"
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"
       strokeLinecap="round" strokeLinejoin="round" className={className} aria-hidden="true">
-      <rect x="3.5" y="4.5" width="17" height="13" rx="2"/>
-      <circle cx="8.5" cy="9" r="1.4"/>
-      <path d="m4 16 4.5-4.5 4 4 3-3L20 17"/>
+      <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
+      <circle cx="9.5" cy="9.5" r="1.5"/>
+      <path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/>
     </svg>
   );
 }
 
 function MapPinIcon({ className }: { className?: string }) {
   return (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6"
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"
       strokeLinecap="round" strokeLinejoin="round" className={className} aria-hidden="true">
-      <path d="M12 21s-7-6.2-7-11a7 7 0 0 1 14 0c0 4.8-7 11-7 11Z"/>
-      <circle cx="12" cy="10" r="2.6"/>
+      <path d="M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0Z"/>
+      <circle cx="12" cy="10" r="3"/>
     </svg>
   );
 }
 
 function SparkleIcon({ className }: { className?: string }) {
   return (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6"
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"
       strokeLinecap="round" strokeLinejoin="round" className={className} aria-hidden="true">
-      <path d="M12 3v4M12 17v4M3 12h4M17 12h4M5.5 5.5l2.8 2.8M15.7 15.7l2.8 2.8M5.5 18.5l2.8-2.8M15.7 8.3l2.8-2.8"/>
+      <path d="m12 3-1.912 5.813a2 2 0 0 1-1.275 1.275L3 12l5.813 1.912a2 2 0 0 1 1.275 1.275L12 21l1.912-5.813a2 2 0 0 1 1.275-1.275L21 12l-5.813-1.912a2 2 0 0 1-1.275-1.275Z"/>
     </svg>
   );
 }
 
-// Renders text as SVG that always fits the container width on a single line.
-// `aspect` controls the visual height: rendered height = containerWidth * aspect.
-function FitOneLine({
-  children,
-  className,
-  weight = 700,
-  aspect = 0.11,
-  family,
-}: {
-  children: string;
-  className?: string;
-  weight?: number;
-  aspect?: number;
-  family?: string;
-}) {
-  const H = Math.round(1000 * aspect);
+function RotateCcwIcon({ className }: { className?: string }) {
   return (
-    <svg
-      viewBox={`0 0 1000 ${H}`}
-      preserveAspectRatio="xMidYMid meet"
-      className={className}
-      role="img"
-      aria-label={children}
-    >
-      <text
-        x="0"
-        y={H * 0.8}
-        fontSize={H * 0.85}
-        fontWeight={weight}
-        fill="currentColor"
-        textLength="1000"
-        lengthAdjust="spacingAndGlyphs"
-        style={{ fontFamily: family ?? "inherit" }}
-      >
-        {children}
-      </text>
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"
+      strokeLinecap="round" strokeLinejoin="round" className={className} aria-hidden="true">
+      <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/>
+      <path d="M3 3v5h5"/>
     </svg>
   );
 }
 
-
+function InfoIcon({ className }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"
+      strokeLinecap="round" strokeLinejoin="round" className={className} aria-hidden="true">
+      <circle cx="12" cy="12" r="10"/>
+      <path d="M12 16v-4"/>
+      <path d="M12 8h.01"/>
+    </svg>
+  );
+}

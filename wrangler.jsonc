@@ -10,5 +10,10 @@
   "routes": [
     { "pattern": "plantspedia.club", "custom_domain": true },
     { "pattern": "www.plantspedia.club", "custom_domain": true }
-  ]
+  ],
+  "vars": {
+    "SUPABASE_URL": "https://ianlasfsfuaibqldkfyb.supabase.co",
+    "SUPABASE_PUBLISHABLE_KEY": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imlhbmxhc2ZzZnVhaWJxbGRrZnliIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODA2Mzc4OTcsImV4cCI6MjA5NjIxMzg5N30.Nb7kK0ycvmfnHdwdEOdhMuS4c1WGTRQdUPaqz_VNp-o",
+    "AI_MODEL": "gemini-2.5-flash"
+  }
 }

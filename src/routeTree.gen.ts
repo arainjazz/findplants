@@ -11,8 +11,10 @@
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as SignupRouteImport } from './routes/signup'
 import { Route as SearchRouteImport } from './routes/search'
+import { Route as ProfileRouteImport } from './routes/profile'
 import { Route as LoginRouteImport } from './routes/login'
 import { Route as IdentifyRouteImport } from './routes/identify'
+import { Route as ExploreRouteImport } from './routes/explore'
 import { Route as EditsRouteImport } from './routes/edits'
 import { Route as AuthenticatedRouteImport } from './routes/_authenticated'
 import { Route as IndexRouteImport } from './routes/index'
@@ -20,6 +22,7 @@ import { Route as PlantsIndexRouteImport } from './routes/plants.index'
 import { Route as BlogIndexRouteImport } from './routes/blog.index'
 import { Route as TagsSlugRouteImport } from './routes/tags.$slug'
 import { Route as PlantsSlugRouteImport } from './routes/plants.$slug'
+import { Route as EditorsIdRouteImport } from './routes/editors.$id'
 import { Route as DraftsIdRouteImport } from './routes/drafts.$id'
 import { Route as BlogSlugRouteImport } from './routes/blog.$slug'
 import { Route as AuthenticatedAdminIndexRouteImport } from './routes/_authenticated/admin.index'
@@ -43,6 +46,11 @@ const SearchRoute = SearchRouteImport.update({
   path: '/search',
   getParentRoute: () => rootRouteImport,
 } as any)
+const ProfileRoute = ProfileRouteImport.update({
+  id: '/profile',
+  path: '/profile',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const LoginRoute = LoginRouteImport.update({
   id: '/login',
   path: '/login',
@@ -51,6 +59,11 @@ const LoginRoute = LoginRouteImport.update({
 const IdentifyRoute = IdentifyRouteImport.update({
   id: '/identify',
   path: '/identify',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ExploreRoute = ExploreRouteImport.update({
+  id: '/explore',
+  path: '/explore',
   getParentRoute: () => rootRouteImport,
 } as any)
 const EditsRoute = EditsRouteImport.update({
@@ -85,6 +98,11 @@ const TagsSlugRoute = TagsSlugRouteImport.update({
 const PlantsSlugRoute = PlantsSlugRouteImport.update({
   id: '/plants/$slug',
   path: '/plants/$slug',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const EditorsIdRoute = EditorsIdRouteImport.update({
+  id: '/editors/$id',
+  path: '/editors/$id',
   getParentRoute: () => rootRouteImport,
 } as any)
 const DraftsIdRoute = DraftsIdRouteImport.update({
@@ -158,12 +176,15 @@ const AuthenticatedAdminBlogEditIdRoute =
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/edits': typeof EditsRoute
+  '/explore': typeof ExploreRoute
   '/identify': typeof IdentifyRoute
   '/login': typeof LoginRoute
+  '/profile': typeof ProfileRoute
   '/search': typeof SearchRoute
   '/signup': typeof SignupRoute
   '/blog/$slug': typeof BlogSlugRoute
   '/drafts/$id': typeof DraftsIdRoute
+  '/editors/$id': typeof EditorsIdRoute
   '/plants/$slug': typeof PlantsSlugRoute
   '/tags/$slug': typeof TagsSlugRoute
   '/blog/': typeof BlogIndexRoute
@@ -182,12 +203,15 @@ export interface FileRoutesByFullPath {
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/edits': typeof EditsRoute
+  '/explore': typeof ExploreRoute
   '/identify': typeof IdentifyRoute
   '/login': typeof LoginRoute
+  '/profile': typeof ProfileRoute
   '/search': typeof SearchRoute
   '/signup': typeof SignupRoute
   '/blog/$slug': typeof BlogSlugRoute
   '/drafts/$id': typeof DraftsIdRoute
+  '/editors/$id': typeof EditorsIdRoute
   '/plants/$slug': typeof PlantsSlugRoute
   '/tags/$slug': typeof TagsSlugRoute
   '/blog': typeof BlogIndexRoute
@@ -208,12 +232,15 @@ export interface FileRoutesById {
   '/': typeof IndexRoute
   '/_authenticated': typeof AuthenticatedRouteWithChildren
   '/edits': typeof EditsRoute
+  '/explore': typeof ExploreRoute
   '/identify': typeof IdentifyRoute
   '/login': typeof LoginRoute
+  '/profile': typeof ProfileRoute
   '/search': typeof SearchRoute
   '/signup': typeof SignupRoute
   '/blog/$slug': typeof BlogSlugRoute
   '/drafts/$id': typeof DraftsIdRoute
+  '/editors/$id': typeof EditorsIdRoute
   '/plants/$slug': typeof PlantsSlugRoute
   '/tags/$slug': typeof TagsSlugRoute
   '/blog/': typeof BlogIndexRoute
@@ -234,12 +261,15 @@ export interface FileRouteTypes {
   fullPaths:
     | '/'
     | '/edits'
+    | '/explore'
     | '/identify'
     | '/login'
+    | '/profile'
     | '/search'
     | '/signup'
     | '/blog/$slug'
     | '/drafts/$id'
+    | '/editors/$id'
     | '/plants/$slug'
     | '/tags/$slug'
     | '/blog/'
@@ -258,12 +288,15 @@ export interface FileRouteTypes {
   to:
     | '/'
     | '/edits'
+    | '/explore'
     | '/identify'
     | '/login'
+    | '/profile'
     | '/search'
     | '/signup'
     | '/blog/$slug'
     | '/drafts/$id'
+    | '/editors/$id'
     | '/plants/$slug'
     | '/tags/$slug'
     | '/blog'
@@ -283,12 +316,15 @@ export interface FileRouteTypes {
     | '/'
     | '/_authenticated'
     | '/edits'
+    | '/explore'
     | '/identify'
     | '/login'
+    | '/profile'
     | '/search'
     | '/signup'
     | '/blog/$slug'
     | '/drafts/$id'
+    | '/editors/$id'
     | '/plants/$slug'
     | '/tags/$slug'
     | '/blog/'
@@ -309,12 +345,15 @@ export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   AuthenticatedRoute: typeof AuthenticatedRouteWithChildren
   EditsRoute: typeof EditsRoute
+  ExploreRoute: typeof ExploreRoute
   IdentifyRoute: typeof IdentifyRoute
   LoginRoute: typeof LoginRoute
+  ProfileRoute: typeof ProfileRoute
   SearchRoute: typeof SearchRoute
   SignupRoute: typeof SignupRoute
   BlogSlugRoute: typeof BlogSlugRoute
   DraftsIdRoute: typeof DraftsIdRoute
+  EditorsIdRoute: typeof EditorsIdRoute
   PlantsSlugRoute: typeof PlantsSlugRoute
   TagsSlugRoute: typeof TagsSlugRoute
   BlogIndexRoute: typeof BlogIndexRoute
@@ -337,6 +376,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof SearchRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/profile': {
+      id: '/profile'
+      path: '/profile'
+      fullPath: '/profile'
+      preLoaderRoute: typeof ProfileRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/login': {
       id: '/login'
       path: '/login'
@@ -349,6 +395,13 @@ declare module '@tanstack/react-router' {
       path: '/identify'
       fullPath: '/identify'
       preLoaderRoute: typeof IdentifyRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/explore': {
+      id: '/explore'
+      path: '/explore'
+      fullPath: '/explore'
+      preLoaderRoute: typeof ExploreRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/edits': {
@@ -398,6 +451,13 @@ declare module '@tanstack/react-router' {
       path: '/plants/$slug'
       fullPath: '/plants/$slug'
       preLoaderRoute: typeof PlantsSlugRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/editors/$id': {
+      id: '/editors/$id'
+      path: '/editors/$id'
+      fullPath: '/editors/$id'
+      preLoaderRoute: typeof EditorsIdRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/drafts/$id': {
@@ -521,12 +581,15 @@ const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   AuthenticatedRoute: AuthenticatedRouteWithChildren,
   EditsRoute: EditsRoute,
+  ExploreRoute: ExploreRoute,
   IdentifyRoute: IdentifyRoute,
   LoginRoute: LoginRoute,
+  ProfileRoute: ProfileRoute,
   SearchRoute: SearchRoute,
   SignupRoute: SignupRoute,
   BlogSlugRoute: BlogSlugRoute,
   DraftsIdRoute: DraftsIdRoute,
+  EditorsIdRoute: EditorsIdRoute,
   PlantsSlugRoute: PlantsSlugRoute,
   TagsSlugRoute: TagsSlugRoute,
   BlogIndexRoute: BlogIndexRoute,

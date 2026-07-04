@@ -166,6 +166,86 @@ export type Database = {
           },
         ]
       }
+      conservation_lists: {
+        Row: {
+          created_at: string
+          effective_date: string | null
+          id: string
+          kind: string
+          name: string
+          province: string | null
+          source_note: string | null
+          source_url: string | null
+          version: string | null
+        }
+        Insert: {
+          created_at?: string
+          effective_date?: string | null
+          id?: string
+          kind: string
+          name: string
+          province?: string | null
+          source_note?: string | null
+          source_url?: string | null
+          version?: string | null
+        }
+        Update: {
+          created_at?: string
+          effective_date?: string | null
+          id?: string
+          kind?: string
+          name?: string
+          province?: string | null
+          source_note?: string | null
+          source_url?: string | null
+          version?: string | null
+        }
+        Relationships: []
+      }
+      conservation_taxa: {
+        Row: {
+          chinese_name: string | null
+          created_at: string
+          excluded_names: string[] | null
+          id: string
+          list_id: string
+          normalized_name: string
+          rank: string
+          scientific_name: string
+          status: string
+        }
+        Insert: {
+          chinese_name?: string | null
+          created_at?: string
+          excluded_names?: string[] | null
+          id?: string
+          list_id: string
+          normalized_name: string
+          rank?: string
+          scientific_name: string
+          status: string
+        }
+        Update: {
+          chinese_name?: string | null
+          created_at?: string
+          excluded_names?: string[] | null
+          id?: string
+          list_id?: string
+          normalized_name?: string
+          rank?: string
+          scientific_name?: string
+          status?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "conservation_taxa_list_id_fkey"
+            columns: ["list_id"]
+            isOneToOne: false
+            referencedRelation: "conservation_lists"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
       editor_applications: {
         Row: {
           bio: string
@@ -242,19 +322,25 @@ export type Database = {
       }
       plant_drafts: {
         Row: {
+          adopted: boolean
+          adopted_at: string | null
+          adopted_by: string | null
           ai_model: string | null
           ai_payload: Json | null
           capture_lat: number | null
           capture_lng: number | null
           capture_place: string | null
           common_name_en: string | null
+          common_names_zh: string | null
           created_at: string
           created_by: string | null
           creator_label: string
           family: string | null
+          gbif_taxon_key: number | null
           genus: string | null
           html_content: string
           id: string
+          is_invasive: boolean
           iucn_status: string | null
           photo_url: string
           published_plant_id: string | null
@@ -266,19 +352,25 @@ export type Database = {
           updated_at: string
         }
         Insert: {
+          adopted?: boolean
+          adopted_at?: string | null
+          adopted_by?: string | null
           ai_model?: string | null
           ai_payload?: Json | null
           capture_lat?: number | null
           capture_lng?: number | null
           capture_place?: string | null
           common_name_en?: string | null
+          common_names_zh?: string | null
           created_at?: string
           created_by?: string | null
           creator_label?: string
           family?: string | null
+          gbif_taxon_key?: number | null
           genus?: string | null
           html_content: string
           id?: string
+          is_invasive?: boolean
           iucn_status?: string | null
           photo_url: string
           published_plant_id?: string | null
@@ -290,19 +382,25 @@ export type Database = {
           updated_at?: string
         }
         Update: {
+          adopted?: boolean
+          adopted_at?: string | null
+          adopted_by?: string | null
           ai_model?: string | null
           ai_payload?: Json | null
           capture_lat?: number | null
           capture_lng?: number | null
           capture_place?: string | null
           common_name_en?: string | null
+          common_names_zh?: string | null
           created_at?: string
           created_by?: string | null
           creator_label?: string
           family?: string | null
+          gbif_taxon_key?: number | null
           genus?: string | null
           html_content?: string
           id?: string
+          is_invasive?: boolean
           iucn_status?: string | null
           photo_url?: string
           published_plant_id?: string | null
@@ -325,6 +423,9 @@ export type Database = {
       }
       plant_edits: {
         Row: {
+          adopted: boolean
+          adopted_at: string | null
+          adopted_by: string | null
           after_html: string | null
           before_html: string | null
           block_path: string | null
@@ -344,6 +445,9 @@ export type Database = {
           summary: string | null
         }
         Insert: {
+          adopted?: boolean
+          adopted_at?: string | null
+          adopted_by?: string | null
           after_html?: string | null
           before_html?: string | null
           block_path?: string | null
@@ -363,6 +467,9 @@ export type Database = {
           summary?: string | null
         }
         Update: {
+          adopted?: boolean
+          adopted_at?: string | null
+          adopted_by?: string | null
           after_html?: string | null
           before_html?: string | null
           block_path?: string | null
@@ -380,6 +487,48 @@ export type Database = {
           reverted_by?: string | null
           source?: string | null
           summary?: string | null
+        }
+        Relationships: []
+      }
+      plant_observations: {
+        Row: {
+          capture_lat: number | null
+          capture_lng: number | null
+          capture_place: string | null
+          created_at: string
+          id: string
+          note: string | null
+          observer_id: string | null
+          observer_label: string
+          photo_url: string
+          plant_id: string
+          status: string
+        }
+        Insert: {
+          capture_lat?: number | null
+          capture_lng?: number | null
+          capture_place?: string | null
+          created_at?: string
+          id?: string
+          note?: string | null
+          observer_id?: string | null
+          observer_label?: string
+          photo_url: string
+          plant_id: string
+          status?: string
+        }
+        Update: {
+          capture_lat?: number | null
+          capture_lng?: number | null
+          capture_place?: string | null
+          created_at?: string
+          id?: string
+          note?: string | null
+          observer_id?: string | null
+          observer_label?: string
+          photo_url?: string
+          plant_id?: string
+          status?: string
         }
         Relationships: []
       }
@@ -426,6 +575,7 @@ export type Database = {
           co_author_names: string[]
           comments_count: number
           common_name_en: string | null
+          common_names_zh: string | null
           content_type: Database["public"]["Enums"]["plant_content_type"]
           cover_url: string | null
           created_at: string
@@ -440,6 +590,7 @@ export type Database = {
           rich_content: string | null
           scientific_name: string | null
           slug: string
+          source: string | null
           summary: string | null
           tags: string[]
           title: string
@@ -451,6 +602,7 @@ export type Database = {
           co_author_names?: string[]
           comments_count?: number
           common_name_en?: string | null
+          common_names_zh?: string | null
           content_type?: Database["public"]["Enums"]["plant_content_type"]
           cover_url?: string | null
           created_at?: string
@@ -465,6 +617,7 @@ export type Database = {
           rich_content?: string | null
           scientific_name?: string | null
           slug: string
+          source?: string | null
           summary?: string | null
           tags?: string[]
           title: string
@@ -476,6 +629,7 @@ export type Database = {
           co_author_names?: string[]
           comments_count?: number
           common_name_en?: string | null
+          common_names_zh?: string | null
           content_type?: Database["public"]["Enums"]["plant_content_type"]
           cover_url?: string | null
           created_at?: string
@@ -490,6 +644,7 @@ export type Database = {
           rich_content?: string | null
           scientific_name?: string | null
           slug?: string
+          source?: string | null
           summary?: string | null
           tags?: string[]
           title?: string
@@ -508,22 +663,28 @@ export type Database = {
       profiles: {
         Row: {
           avatar_url: string | null
+          bio: string | null
           created_at: string
           display_name: string | null
+          gold_used: number
           id: string
           updated_at: string
         }
         Insert: {
           avatar_url?: string | null
+          bio?: string | null
           created_at?: string
           display_name?: string | null
+          gold_used?: number
           id: string
           updated_at?: string
         }
         Update: {
           avatar_url?: string | null
+          bio?: string | null
           created_at?: string
           display_name?: string | null
+          gold_used?: number
           id?: string
           updated_at?: string
         }

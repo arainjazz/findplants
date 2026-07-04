@@ -1,4 +1,7 @@
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
+import { compressImage } from "@/lib/image-compress";
+import { useServerFn } from "@tanstack/react-start";
+import { extractPlantMetaFn, savePlantFn, uploadAssetFn } from "@/lib/identify-plant.functions";
 import { useEffect, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
@@ -39,7 +42,11 @@ function BatchNewPage() {
   const { user } = useAuth();
   const navigate = useNavigate();
   const qc = useQueryClient();
+  const extractMeta = useServerFn(extractPlantMetaFn);
+  const savePlant = useServerFn(savePlantFn);
+  const uploadAsset = useServerFn(uploadAssetFn);
   const fileRef = useRef<HTMLInputElement>(null);
+  const folderRef = useRef<HTMLInputElement>(null);
   const [items, setItems] = useState<Item[]>([]);
   const [uploading, setUploading] = useState(false);
   const [dragOver, setDragOver] = useState(false);
@@ -51,6 +58,18 @@ function BatchNewPage() {
   // Build a normalized lookup of image files by name + relative path suffixes.
   const isImageFile = (file: File) =>
     file.type.startsWith("image/") || /\.(png|jpe?g|webp|gif|svg|avif|bmp|tiff?)$/i.test(file.name);
+
+  // Non-standard = files inside a picked folder that are neither HTML nor image
+  // (OS junk / hidden files ignored). Used to warn before a messy folder upload.
+  const findNonStandardFiles = (files: File[]) =>
+    files.filter((f) => {
+      const rel = (f as File & { webkitRelativePath?: string }).webkitRelativePath || f.name;
+      const base = rel.split("/").pop() || f.name;
+      if (base.startsWith(".")) return false; // .DS_Store and other dotfiles
+      if (/^(Thumbs\.db|desktop\.ini)$/i.test(base)) return false;
+      if (/\.html?$/i.test(base) || f.type === "text/html") return false;
+      return !isImageFile(f);
+    });
 
   const assetLookupKeys = (value: string) => buildAssetLookupKeys(value);
 
@@ -79,13 +98,38 @@ function BatchNewPage() {
 
   const uploadOneImage = async (img: File) => {
     if (!user) throw new Error("未登录");
+
+    let fileToUpload: Blob | File = img;
+    try {
+      fileToUpload = await compressImage(img);
+    } catch (err) {
+      console.error("Image compression failed, using original:", err);
+    }
+
     const ext = img.name.split(".").pop() || "bin";
     const path = `${user.id}/batch-img/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
-    const { error } = await supabase.storage.from("plant-images").upload(path, img, {
-      cacheControl: "3600", upsert: false, contentType: img.type || undefined,
+
+    const reader = new FileReader();
+    const base64Promise = new Promise<string>((resolve, reject) => {
+      reader.onload = () => {
+        const result = reader.result as string;
+        const base64 = result.split(",")[1];
+        resolve(base64);
+      };
+      reader.onerror = (err) => reject(err);
     });
-    if (error) throw error;
-    return supabase.storage.from("plant-images").getPublicUrl(path).data.publicUrl;
+    reader.readAsDataURL(fileToUpload);
+    const file_base64 = await base64Promise;
+
+    const res = await uploadAsset({
+      data: {
+        bucket: "plant-images",
+        path,
+        file_base64,
+        content_type: fileToUpload.type || undefined,
+      }
+    });
+    return res.url;
   };
 
   // For a single HTML, given matched image files, upload them, rewrite the HTML, then upload the HTML.
@@ -117,11 +161,28 @@ function BatchNewPage() {
     const blob = new Blob([finalText], { type: "text/html" });
     const ext = htmlFile.name.split(".").pop() || "html";
     const path = `${user.id}/batch/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
-    const { error } = await supabase.storage.from("plant-html").upload(path, blob, {
-      cacheControl: "3600", upsert: false, contentType: "text/html",
+
+    const reader = new FileReader();
+    const base64Promise = new Promise<string>((resolve, reject) => {
+      reader.onload = () => {
+        const result = reader.result as string;
+        const base64 = result.split(",")[1];
+        resolve(base64);
+      };
+      reader.onerror = (err) => reject(err);
     });
-    if (error) throw error;
-    return supabase.storage.from("plant-html").getPublicUrl(path).data.publicUrl;
+    reader.readAsDataURL(blob);
+    const file_base64 = await base64Promise;
+
+    const res = await uploadAsset({
+      data: {
+        bucket: "plant-html",
+        path,
+        file_base64,
+        content_type: "text/html",
+      }
+    });
+    return res.url;
   };
 
   const finalizeBatch = async (
@@ -161,6 +222,22 @@ function BatchNewPage() {
 
   const processPickedFiles = async (files: File[]) => {
     if (!files.length || !user) return;
+    // Folder uploads should follow the "one HTML + one image folder" shape. If the
+    // folder carries other file types, warn before continuing (content may break).
+    const fromFolder = files.some((f) => !!(f as File & { webkitRelativePath?: string }).webkitRelativePath);
+    if (fromFolder) {
+      const nonStd = findNonStandardFiles(files);
+      if (nonStd.length > 0) {
+        const sample = nonStd
+          .slice(0, 5)
+          .map((f) => (f as File & { webkitRelativePath?: string }).webkitRelativePath || f.name)
+          .join("、");
+        const ok = window.confirm(
+          `该文件夹包含多种非标文件（${nonStd.length} 个非 HTML/图片文件，例如：${sample}${nonStd.length > 5 ? " 等" : ""}），继续上传可能会导致内容错乱。是否仍要继续？`,
+        );
+        if (!ok) return;
+      }
+    }
     setUploading(true);
     try {
       const htmlFiles = files.filter((f) => /\.html?$/i.test(f.name) || f.type === "text/html");
@@ -181,11 +258,19 @@ function BatchNewPage() {
       const totalMissing = parsed.reduce((n, p) => n + p.missing.length, 0);
       if (totalMissing > 0) {
         const matchedCount = parsed.reduce((n, p) => n + p.matched.size, 0);
-        toast.error(
-          `已自动匹配 ${matchedCount} 张配图；仍有 ${totalMissing} 个本地图片路径未找到。请将包含图片和 HTML 的文件夹拖进拖拽区，或在命令行使用 publish.py 脚本一键发布。`,
-          { duration: 8000 },
+        if (fromFolder) {
+          // Folder uploads are meant to carry their images — keep guiding the user.
+          toast.error(
+            `已自动匹配 ${matchedCount} 张配图；仍有 ${totalMissing} 个本地图片路径未找到。请将包含图片和 HTML 的文件夹拖进拖拽区，或在命令行使用 publish.py 脚本一键发布。`,
+            { duration: 8000 },
+          );
+          return;
+        }
+        // HTML-only upload: let them proceed, but warn the local images won't load.
+        const ok = window.confirm(
+          `已自动匹配 ${matchedCount} 张配图；仍有 ${totalMissing} 个本地图片路径未找到。如果你点击上传，本地配图在网站中将无法加载，是否继续？`,
         );
-        return;
+        if (!ok) return;
       }
       await finalizeBatch(parsed.map(({ file, text, matched }) => ({ file, text, matched })));
     } catch (err) {
@@ -271,11 +356,7 @@ function BatchNewPage() {
 
   const runExtract = async (key: string, htmlUrl: string) => {
     try {
-      const { data, error } = await supabase.functions.invoke("extract-plant-meta", {
-        body: { htmlUrl },
-      });
-      if (error) throw error;
-      if (data?.error) throw new Error(data.error);
+      const data = await extractMeta({ data: { htmlUrl } });
       const meta = data as Record<string, unknown>;
       let rawFamily = typeof meta.family === "string" ? meta.family.trim() : "";
       let rawGenus = typeof meta.genus === "string" ? meta.genus.trim() : "";
@@ -367,53 +448,42 @@ function BatchNewPage() {
     if (!it.title.trim()) return { ok: false, msg: `${it.fileName}: 缺少标题` };
     let cover = it.coverUrl;
     if (!cover) cover = (await firstImageFromHtml(it.htmlUrl)) ?? "";
-    const payload = {
-      title: it.title.trim(),
-      slug: it.slug.trim() || slugify(it.title) || `p-${Date.now()}`,
-      scientific_name: it.scientificName.trim() || null,
-      common_name_en: it.commonNameEn.trim() || null,
-      family: it.family.trim() || null,
-      genus: it.genus.trim() || null,
-      iucn_status: it.iucnStatus || null,
-      habitat: it.habitat.trim() || null,
-      summary: it.summary.trim() || null,
-      cover_url: cover || null,
-      content_type: "html" as const,
-      rich_content: null,
-      html_url: it.htmlUrl,
-      tags: it.tags.split(",").map((t) => t.trim()).filter(Boolean),
-      is_featured: false,
-      author_id: user.id,
-    };
-    const { data, error } = await supabase.from("plants").insert(payload).select("id").single();
-    if (error) return { ok: false, msg: `${it.title}: ${error.message}` };
-    const newId = data?.id as string | undefined;
-    if (newId) {
-      const editorName =
-        (user.user_metadata?.full_name as string | undefined) ||
-        (user.user_metadata?.name as string | undefined) ||
-        user.email ||
-        "编辑者";
-      await supabase.from("plant_edits").insert({
-        plant_id: newId,
-        editor_id: user.id,
-        editor_name: editorName,
-        kind: "create",
-        marker_n: 0,
-        source: "batch_upload",
-        summary: `${editorName} 通过批量上传创建条目「${payload.title}」（HTML）`,
+
+    const editorName =
+      (user.user_metadata?.full_name as string | undefined) ||
+      (user.user_metadata?.name as string | undefined) ||
+      user.email ||
+      "编辑者";
+
+    try {
+      const saveRes = await savePlant({
+        data: {
+          payload: {
+            title: it.title.trim(),
+            slug: it.slug.trim() || slugify(it.title) || `p-${Date.now()}`,
+            scientific_name: it.scientificName.trim() || null,
+            common_name_en: it.commonNameEn.trim() || null,
+            family: it.family.trim() || null,
+            genus: it.genus.trim() || null,
+            iucn_status: it.iucnStatus || null,
+            habitat: it.habitat.trim() || null,
+            summary: it.summary.trim() || null,
+            cover_url: cover || null,
+            content_type: "html" as const,
+            rich_content: null,
+            html_url: it.htmlUrl,
+            tags: it.tags.split(",").map((t) => t.trim()).filter(Boolean),
+            is_featured: false,
+            author_id: user.id,
+          },
+          editorName,
+          editSummary: `${editorName} 通过批量上传创建条目「${it.title.trim()}」（HTML）`,
+        }
       });
-      await supabase.from("plant_edits").insert({
-        plant_id: newId,
-        editor_id: user.id,
-        editor_name: editorName,
-        kind: "html_save",
-        marker_n: 0,
-        source: "batch_upload",
-        summary: `${editorName} 批量上传并保存 HTML 文件「${it.fileName}」`,
-      });
+      return { ok: true, msg: saveRes.plantId };
+    } catch (err) {
+      return { ok: false, msg: (err as Error).message };
     }
-    return { ok: true, msg: data?.id };
   };
 
   const onCreateAll = async () => {
@@ -463,20 +533,35 @@ function BatchNewPage() {
             <h1 className="font-display text-4xl font-bold">批量添加条目</h1>
             <p className="text-ink-faint mt-2 text-sm">一次上传多个 HTML，AI 自动识别并分别填充字段。</p>
           </div>
-          <div className="flex gap-2">
+          <div className="flex gap-2 flex-wrap">
             <button
               type="button"
               onClick={() => fileRef.current?.click()}
               disabled={uploading}
-              className="bg-ink text-background px-5 py-2 hover:bg-vermilion transition-colors disabled:opacity-60"
+              className="bg-ink text-background px-4 py-2 hover:bg-vermilion transition-colors disabled:opacity-60 text-sm"
             >
-              {uploading ? "上传中…" : "+ 选择并上传 HTML 文件"}
+              {uploading ? "上传中…" : "+ 选择 HTML 文件"}
+            </button>
+            <button
+              type="button"
+              onClick={() => folderRef.current?.click()}
+              disabled={uploading}
+              className="border border-ink px-4 py-2 hover:bg-ink hover:text-background transition-colors disabled:opacity-60 text-sm bg-transparent text-ink"
+            >
+              {uploading ? "上传中…" : "+ 选择包含图片的文件夹"}
             </button>
             <input
               ref={fileRef}
               type="file"
-              accept=".html,.htm,text/html,image/*"
+              accept=".html,.htm,text/html"
               multiple
+              className="sr-only"
+              onChange={onPickFiles}
+            />
+            <input
+              ref={folderRef}
+              type="file"
+              webkitdirectory=""
               className="sr-only"
               onChange={onPickFiles}
             />
@@ -491,8 +576,8 @@ function BatchNewPage() {
             }}
             onDragLeave={() => setDragOver(false)}
             onDrop={handleDrop}
-            onClick={() => fileRef.current?.click()}
-            className={`border-2 border-dashed rounded-lg py-20 text-center cursor-pointer transition-all ${
+            onClick={() => { if (!uploading) folderRef.current?.click(); }}
+            className={`border-2 border-dashed rounded-lg py-20 text-center transition-all cursor-pointer ${
               dragOver
                 ? "border-vermilion bg-vermilion/5 text-vermilion"
                 : "border-rule hover:border-ink bg-paper-deep/10 text-ink-faint"
@@ -503,15 +588,27 @@ function BatchNewPage() {
               <p className="font-semibold text-lg text-ink">
                 {uploading ? "正在上传中…" : "选择或拖入 HTML 文件/文件夹进行批量录入"}
               </p>
-              <p className="text-sm max-w-xl mx-auto leading-relaxed px-4">
-                当你的页面有本地配图时，使用这个功能把包含图片和html的文件夹拖进这里
+              <p className="text-sm max-w-xl mx-auto leading-relaxed px-4 text-ink-faint">
+                当你的页面有本地配图时，请拖入文件夹；或通过下方按钮点击选择上传。
               </p>
-              <button
-                type="button"
-                className="mt-2 border border-ink px-5 py-2 hover:bg-ink hover:text-background transition-colors text-sm font-medium"
-              >
-                + 选择并上传 HTML 文件
-              </button>
+              <div className="flex flex-wrap justify-center gap-3 mt-3">
+                <button
+                  type="button"
+                  onClick={(e) => { e.stopPropagation(); fileRef.current?.click(); }}
+                  disabled={uploading}
+                  className="border border-ink px-5 py-2 hover:bg-ink hover:text-background transition-colors text-sm font-medium bg-background text-ink"
+                >
+                  + 选择 HTML 文件
+                </button>
+                <button
+                  type="button"
+                  onClick={(e) => { e.stopPropagation(); folderRef.current?.click(); }}
+                  disabled={uploading}
+                  className="border border-ink px-5 py-2 hover:bg-ink hover:text-background transition-colors text-sm font-medium bg-background text-ink"
+                >
+                  + 选择包含图片的文件夹
+                </button>
+              </div>
             </div>
           </div>
         ) : (
@@ -685,17 +782,47 @@ function BatchCard({
     return () => window.removeEventListener("click", close);
   }, [menu]);
 
+  const uploadAsset = useServerFn(uploadAssetFn);
+
   const uploadCoverLocal = async (file: File) => {
     if (!user) return toast.error("请先登录");
+
+    let fileToUpload: Blob | File = file;
+    try {
+      fileToUpload = await compressImage(file);
+    } catch (err) {
+      console.error("Image compression failed, using original:", err);
+    }
+
     const ext = file.name.split(".").pop() || "jpg";
     const path = `${user.id}/cover/${Date.now()}.${ext}`;
-    const { error } = await supabase.storage.from("plant-images").upload(path, file, {
-      cacheControl: "3600", upsert: false, contentType: file.type,
+
+    const reader = new FileReader();
+    const base64Promise = new Promise<string>((resolve, reject) => {
+      reader.onload = () => {
+        const result = reader.result as string;
+        const base64 = result.split(",")[1];
+        resolve(base64);
+      };
+      reader.onerror = (err) => reject(err);
     });
-    if (error) return toast.error(error.message);
-    const url = supabase.storage.from("plant-images").getPublicUrl(path).data.publicUrl;
-    onUpdate({ coverUrl: url });
-    toast.success("封面已更新");
+    reader.readAsDataURL(fileToUpload);
+    const file_base64 = await base64Promise;
+
+    try {
+      const res = await uploadAsset({
+        data: {
+          bucket: "plant-images",
+          path,
+          file_base64,
+          content_type: fileToUpload.type || undefined,
+        }
+      });
+      onUpdate({ coverUrl: res.url });
+      toast.success("封面已更新");
+    } catch (err) {
+      toast.error("封面上传失败：" + (err as Error).message);
+    }
   };
 
   const pickFirstFromHtml = async () => {

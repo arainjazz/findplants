@@ -1,5 +1,8 @@
 import { useState, useEffect, useRef } from "react";
+import { compressImage } from "@/lib/image-compress";
 import { useNavigate } from "@tanstack/react-router";
+import { useServerFn } from "@tanstack/react-start";
+import { extractPlantMetaFn, savePlantFn, uploadAssetFn } from "@/lib/identify-plant.functions";
 import { useQueryClient } from "@tanstack/react-query";
 import {
   FolderOpen,
@@ -31,7 +34,11 @@ export function PlantEditor({ initial }: Props) {
   const { user } = useAuth();
   const navigate = useNavigate();
   const qc = useQueryClient();
+  const extractMeta = useServerFn(extractPlantMetaFn);
+  const savePlant = useServerFn(savePlantFn);
+  const uploadAsset = useServerFn(uploadAssetFn);
   const htmlInputRef = useRef<HTMLInputElement>(null);
+  const htmlFolderInputRef = useRef<HTMLInputElement>(null);
   const hydratedDraftRef = useRef(false);
   const draftKey = `plant-editor-draft:${initial?.id ?? "new"}`;
 
@@ -39,6 +46,7 @@ export function PlantEditor({ initial }: Props) {
   const [slug, setSlug] = useState(initial?.slug ?? "");
   const [scientificName, setScientificName] = useState(initial?.scientific_name ?? "");
   const [commonNameEn, setCommonNameEn] = useState(initial?.common_name_en ?? "");
+  const [commonNamesZh, setCommonNamesZh] = useState(initial?.common_names_zh ?? "");
   const [family, setFamily] = useState(initial?.family ?? "");
   const [genus, setGenus] = useState(initial?.genus ?? "");
   const [iucnStatus, setIucnStatus] = useState(initial?.iucn_status ?? "");
@@ -124,6 +132,7 @@ export function PlantEditor({ initial }: Props) {
       setSlug(draft.slug ?? "");
       setScientificName(draft.scientificName ?? "");
       setCommonNameEn(draft.commonNameEn ?? "");
+      setCommonNamesZh(draft.commonNamesZh ?? "");
       setFamily(draft.family ?? "");
       setGenus(draft.genus ?? "");
       setIucnStatus(draft.iucnStatus ?? "");
@@ -149,6 +158,7 @@ export function PlantEditor({ initial }: Props) {
       slug,
       scientificName,
       commonNameEn,
+      commonNamesZh,
       family,
       genus,
       iucnStatus,
@@ -175,6 +185,7 @@ export function PlantEditor({ initial }: Props) {
     richContent,
     scientificName,
     commonNameEn,
+    commonNamesZh,
     slug,
     summary,
     tags,
@@ -183,15 +194,57 @@ export function PlantEditor({ initial }: Props) {
 
   const uploadFile = async (file: File, bucket: "plant-images" | "plant-html") => {
     if (!user) throw new Error("未登录");
+
+    let fileToUpload: Blob | File = file;
+    if (bucket === "plant-images") {
+      try {
+        fileToUpload = await compressImage(file);
+      } catch (err) {
+        console.error("Image compression failed, using original:", err);
+      }
+    }
+
     const ext = file.name.split(".").pop() || "bin";
     const path = `${user.id}/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
-    const { error } = await supabase.storage.from(bucket).upload(path, file, {
-      cacheControl: "3600",
-      upsert: false,
-      contentType: file.type || (bucket === "plant-html" ? "text/html" : undefined),
+
+    const reader = new FileReader();
+    const base64Promise = new Promise<string>((resolve, reject) => {
+      reader.onload = () => {
+        const result = reader.result as string;
+        const base64 = result.split(",")[1];
+        resolve(base64);
+      };
+      reader.onerror = (err) => reject(err);
     });
-    if (error) throw error;
-    return supabase.storage.from(bucket).getPublicUrl(path).data.publicUrl;
+    reader.readAsDataURL(fileToUpload);
+    const file_base64 = await base64Promise;
+
+    // China→Cloudflare uploads can be reset mid-flight ("failed to fetch"); retry a
+    // couple times before giving the user an actionable message.
+    let lastErr: unknown = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const res = await uploadAsset({
+          data: {
+            bucket,
+            path,
+            file_base64,
+            content_type: fileToUpload.type || (bucket === "plant-html" ? "text/html" : undefined),
+          },
+        });
+        return res.url;
+      } catch (err) {
+        lastErr = err;
+        await new Promise((r) => setTimeout(r, 1500 * (attempt + 1)));
+      }
+    }
+    const msg = lastErr instanceof Error ? lastErr.message : String(lastErr);
+    if (/failed to fetch|fetch failed|network|load failed/i.test(msg)) {
+      throw new Error(
+        "上传中断（failed to fetch）：从国内网络上传到 Cloudflare 易被重置。请挂 VPN 后重试，或改用命令行 publish.py 上传。",
+      );
+    }
+    throw new Error(`上传失败：${msg}`);
   };
 
   const onCoverUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -261,6 +314,8 @@ export function PlantEditor({ initial }: Props) {
       setScientificName(data.scientific_name.trim());
     if (typeof data.common_name_en === "string" && data.common_name_en.trim())
       setCommonNameEn(data.common_name_en.trim());
+    if (typeof data.common_names_zh === "string" && data.common_names_zh.trim())
+      setCommonNamesZh(data.common_names_zh.trim());
     if (rawFamily) setFamily(rawFamily);
     if (rawGenus) setGenus(rawGenus);
     else if (!rawGenus && typeof data.scientific_name === "string") {
@@ -296,11 +351,7 @@ export function PlantEditor({ initial }: Props) {
   const extractMetaFromUrl = async (url: string, successMessage: string) => {
     setExtracting(true);
     try {
-      const { data, error } = await supabase.functions.invoke("extract-plant-meta", {
-        body: { htmlUrl: url },
-      });
-      if (error) throw error;
-      if (data?.error) throw new Error(data.error);
+      const data = await extractMeta({ data: { htmlUrl: url } });
       applyExtractedMeta(data);
       toast.success(successMessage);
       // After AI extraction, check for duplicate scientific name (new entries only).
@@ -577,91 +628,61 @@ export function PlantEditor({ initial }: Props) {
     }
 
     setSaving(true);
-    const payload = {
-      title: title.trim(),
-      slug: finalSlug,
-      scientific_name: scientificName.trim() || null,
-      common_name_en: commonNameEn.trim() || null,
-      family: family.trim() || null,
-      genus: genus.trim() || null,
-      iucn_status: iucnStatus || null,
-      habitat: habitat.trim() || null,
-      summary: summary.trim() || null,
-      cover_url: resolvedCover || null,
-      content_type: contentType,
-      rich_content: contentType === "rich" ? richContent : null,
-      html_url: contentType === "html" ? htmlUrl : null,
-      tags: tags
-        .split(",")
-        .map((t) => t.trim())
-        .filter(Boolean),
-      is_featured: isFeatured,
-      author_id: user.id,
-    };
 
-    let newPlantId: string | null = null;
-    let error;
-    if (initial) {
-      ({ error } = await supabase.from("plants").update(payload).eq("id", initial.id));
-    } else {
-      const insertPayload = branchParentId
-        ? { ...payload, parent_id: branchParentId }
-        : payload;
-      const res = await supabase.from("plants").insert(insertPayload).select("id").single();
-      error = res.error;
-      newPlantId = (res.data?.id as string) ?? null;
-    }
+    const editorName =
+      (user.user_metadata?.full_name as string | undefined) ||
+      (user.user_metadata?.name as string | undefined) ||
+      user.email ||
+      "编辑者";
 
-    setSaving(false);
-    if (error) return toast.error(error.message);
+    const toAdd = [...selectedTagIds].filter((id) => !originalTagIds.has(id));
+    const toRemove = [...originalTagIds].filter((id) => !selectedTagIds.has(id));
 
-    if (newPlantId) {
-      const editorName =
-        (user.user_metadata?.full_name as string | undefined) ||
-        (user.user_metadata?.name as string | undefined) ||
-        user.email ||
-        "编辑者";
-      await supabase.from("plant_edits").insert({
-        plant_id: newPlantId,
-        editor_id: user.id,
-        editor_name: editorName,
-        kind: "create",
-        marker_n: 0,
-        source: "plant_editor",
-        summary: `${editorName} 新建了条目「${payload.title}」${payload.content_type === "html" ? "（HTML）" : ""}`,
+    try {
+      await savePlant({
+        data: {
+          id: initial?.id,
+          payload: {
+            title: title.trim(),
+            slug: finalSlug,
+            scientific_name: scientificName.trim() || null,
+            common_name_en: commonNameEn.trim() || null,
+            common_names_zh: commonNamesZh.trim() || null,
+            family: family.trim() || null,
+            genus: genus.trim() || null,
+            iucn_status: iucnStatus || null,
+            habitat: habitat.trim() || null,
+            summary: summary.trim() || null,
+            cover_url: resolvedCover || null,
+            content_type: contentType,
+            rich_content: contentType === "rich" ? richContent : null,
+            html_url: contentType === "html" ? htmlUrl : null,
+            tags: tags
+              .split(",")
+              .map((t) => t.trim())
+              .filter(Boolean),
+            is_featured: isFeatured,
+            author_id: user.id,
+            parent_id: branchParentId || null,
+          },
+          editorName,
+          editSummary: initial ? `${editorName} 编辑修改了条目「${title.trim()}」` : undefined,
+          tagIdsToAdd: toAdd,
+          tagIdsToRemove: toRemove,
+        }
       });
-      if (branchParentId) {
-        await supabase.from("plant_edits").insert({
-          plant_id: newPlantId,
-          editor_id: user.id,
-          editor_name: editorName,
-          kind: "branch",
-          marker_n: 0,
-          source: "plant_editor",
-          summary: `${editorName} 创建了同名分支条目（保留各自详情页，原条目 id=${branchParentId}）`,
-        });
-      }
-    }
 
-    // Sync plant_tags (only for editors — RLS will reject otherwise; ignore errors silently)
-    const targetId = initial?.id ?? newPlantId;
-    if (targetId) {
-      const toAdd = [...selectedTagIds].filter((id) => !originalTagIds.has(id));
-      const toRemove = [...originalTagIds].filter((id) => !selectedTagIds.has(id));
-      for (const tid of toAdd) {
-        await attachPlantsToTag(tid, [targetId], user.id).catch(() => {});
-      }
-      for (const tid of toRemove) {
-        await detachPlantFromTag(tid, targetId).catch(() => {});
-      }
+      setSaving(false);
+      localStorage.removeItem(draftKey);
+      toast.success(initial ? "已更新" : "已创建");
+      qc.invalidateQueries({ queryKey: ["my-plants"] });
+      qc.invalidateQueries({ queryKey: ["plants"] });
+      qc.invalidateQueries({ queryKey: ["home"] });
+      navigate({ to: "/admin" });
+    } catch (err) {
+      setSaving(false);
+      toast.error("保存失败：" + (err as Error).message);
     }
-
-    localStorage.removeItem(draftKey);
-    toast.success(initial ? "已更新" : "已创建");
-    qc.invalidateQueries({ queryKey: ["my-plants"] });
-    qc.invalidateQueries({ queryKey: ["plants"] });
-    qc.invalidateQueries({ queryKey: ["home"] });
-    navigate({ to: "/admin" });
   };
 
   return (
@@ -680,6 +701,15 @@ export function PlantEditor({ initial }: Props) {
         type="file"
         accept=".html,.htm,text/html,image/*"
         multiple
+        onChange={onHtmlUpload}
+        disabled={uploadingHtml || extracting}
+        className="sr-only"
+        tabIndex={-1}
+      />
+      <input
+        ref={htmlFolderInputRef}
+        type="file"
+        webkitdirectory=""
         onChange={onHtmlUpload}
         disabled={uploadingHtml || extracting}
         className="sr-only"
@@ -715,6 +745,14 @@ export function PlantEditor({ initial }: Props) {
             onChange={(e) => setCommonNameEn(e.target.value)}
             className={inputCls}
             placeholder="Flowering rush"
+          />
+        </Field>
+        <Field label="中文俗名 / 别名 / 商品名">
+          <input
+            value={commonNamesZh}
+            onChange={(e) => setCommonNamesZh(e.target.value)}
+            className={inputCls}
+            placeholder="如：发财树, 瓜栗, 招财树（半角逗号分隔）"
           />
         </Field>
         <Field label="科 Family">
@@ -916,8 +954,7 @@ export function PlantEditor({ initial }: Props) {
               }}
               onDragLeave={() => setDragOver(false)}
               onDrop={handleDrop}
-              onClick={() => htmlInputRef.current?.click()}
-              className={`border-2 border-dashed rounded-lg p-8 text-center cursor-pointer transition-all ${
+              className={`border-2 border-dashed rounded-lg p-8 text-center transition-all ${
                 dragOver
                   ? "border-vermilion bg-vermilion/5 text-vermilion"
                   : "border-rule hover:border-ink bg-paper-deep/10 text-ink"
@@ -926,11 +963,29 @@ export function PlantEditor({ initial }: Props) {
               <div className="flex flex-col items-center justify-center gap-2">
                 <UploadCloud className={`w-8 h-8 ${dragOver ? "text-vermilion animate-bounce" : "text-ink-faint"}`} />
                 <p className="text-sm font-semibold">
-                  {uploadingHtml ? "正在上传中…" : extracting ? "AI 正在识别中…" : "选择或拖入 HTML 文件/文件夹"}
+                  {uploadingHtml ? "正在上传中…" : extracting ? "AI 正在识别中…" : "拖入 HTML 文件或包含图片的文件夹"}
                 </p>
                 <p className="text-xs text-ink-faint max-w-md mx-auto leading-relaxed">
-                  当你的页面有本地配图时，使用这个功能把包含图片和html的文件夹拖进这里
+                  当你的页面有本地配图时，请拖入文件夹；或使用下方按钮点击上传。
                 </p>
+                <div className="flex flex-wrap justify-center gap-3 mt-3">
+                  <button
+                    type="button"
+                    onClick={() => htmlInputRef.current?.click()}
+                    disabled={uploadingHtml || extracting}
+                    className="px-4 py-2 text-xs bg-ink text-background hover:bg-vermilion hover:text-white transition-colors"
+                  >
+                    选择文件
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => htmlFolderInputRef.current?.click()}
+                    disabled={uploadingHtml || extracting}
+                    className="px-4 py-2 text-xs border border-ink hover:bg-ink hover:text-background transition-colors"
+                  >
+                    选择文件夹
+                  </button>
+                </div>
               </div>
             </div>
             {htmlUrl && (

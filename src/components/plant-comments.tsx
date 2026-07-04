@@ -12,6 +12,7 @@ type Comment = {
   author_name: string | null;
   body: string;
   created_at: string;
+  parent_id?: string | null;
 };
 
 export function PlantComments({ plantId }: { plantId: string }) {
@@ -20,6 +21,7 @@ export function PlantComments({ plantId }: { plantId: string }) {
   const [name, setName] = useState("");
   const [body, setBody] = useState("");
   const [posting, setPosting] = useState(false);
+  const [replyTo, setReplyTo] = useState<string | null>(null);
 
   const { data: comments = [], isLoading } = useQuery({
     queryKey: ["plant-comments", plantId],
@@ -34,29 +36,60 @@ export function PlantComments({ plantId }: { plantId: string }) {
     },
   });
 
-  const onPost = async () => {
+  const resolveName = () =>
+    (user?.user_metadata?.full_name as string) ||
+    (user?.user_metadata?.name as string) ||
+    user?.email ||
+    name.trim() ||
+    null;
+
+  // Insert a comment or reply. Replies set parent_id; if that column doesn't
+  // exist yet, fall back to a flat comment that @-mentions the parent author.
+  const postComment = async (
+    text: string,
+    parentId: string | null,
+    parentAuthor?: string | null,
+  ): Promise<string | null> => {
+    const base = { plant_id: plantId, author_id: user?.id ?? null, author_name: resolveName() };
+    if (parentId) {
+      const res = await (supabase.from("plant_comments") as unknown as {
+        insert: (v: Record<string, unknown>) => Promise<{ error: { message: string } | null }>;
+      }).insert({ ...base, body: text, parent_id: parentId });
+      if (!res.error) return null;
+      // Fallback: parent_id column missing → post flat with @mention.
+      const { error } = await supabase
+        .from("plant_comments")
+        .insert({ ...base, body: parentAuthor ? `回复 @${parentAuthor}：${text}` : text });
+      return error ? error.message : null;
+    }
+    const { error } = await supabase.from("plant_comments").insert({ ...base, body: text });
+    return error ? error.message : null;
+  };
+
+  const onPostTop = async () => {
     const text = body.trim();
     if (!text) return toast.error("请填写评论内容");
     if (text.length > 4000) return toast.error("评论过长（4000 字以内）");
     setPosting(true);
-    const authorName =
-      (user?.user_metadata?.full_name as string) ||
-      (user?.user_metadata?.name as string) ||
-      user?.email ||
-      name.trim() ||
-      null;
-    const { error } = await supabase.from("plant_comments").insert({
-      plant_id: plantId,
-      author_id: user?.id ?? null,
-      author_name: authorName,
-      body: text,
-    });
+    const err = await postComment(text, null);
     setPosting(false);
-    if (error) return toast.error(error.message);
+    if (err) return toast.error(err);
     setBody("");
     setName("");
     toast.success("评论已发布");
     qc.invalidateQueries({ queryKey: ["plant-comments", plantId] });
+  };
+
+  const onReplySubmit = async (parent: Comment, text: string): Promise<boolean> => {
+    const err = await postComment(text, parent.id, parent.author_name);
+    if (err) {
+      toast.error(err);
+      return false;
+    }
+    toast.success("回复已发布");
+    setReplyTo(null);
+    qc.invalidateQueries({ queryKey: ["plant-comments", plantId] });
+    return true;
   };
 
   const onDelete = async (c: Comment) => {
@@ -66,6 +99,16 @@ export function PlantComments({ plantId }: { plantId: string }) {
     toast.success("已删除");
     qc.invalidateQueries({ queryKey: ["plant-comments", plantId] });
   };
+
+  const topLevel = comments.filter((c) => !c.parent_id);
+  const repliesByParent = new Map<string, Comment[]>();
+  for (const c of comments) {
+    if (!c.parent_id) continue;
+    if (!repliesByParent.has(c.parent_id)) repliesByParent.set(c.parent_id, []);
+    repliesByParent.get(c.parent_id)!.push(c);
+  }
+  for (const list of repliesByParent.values())
+    list.sort((a, b) => +new Date(a.created_at) - +new Date(b.created_at));
 
   return (
     <section className="mt-12 border-t-2 border-ink pt-8">
@@ -93,7 +136,7 @@ export function PlantComments({ plantId }: { plantId: string }) {
         <div className="flex justify-end">
           <button
             type="button"
-            onClick={onPost}
+            onClick={onPostTop}
             disabled={posting}
             className="bg-ink text-background px-5 py-2 hover:bg-vermilion transition-colors disabled:opacity-60"
           >
@@ -107,8 +150,34 @@ export function PlantComments({ plantId }: { plantId: string }) {
         {!isLoading && comments.length === 0 && (
           <p className="text-ink-faint text-sm italic">No comment yet</p>
         )}
-        {comments.map((c) => (
-          <CommentItem key={c.id} comment={c} canDelete={!!user && (user.id === c.author_id)} onDelete={() => onDelete(c)} />
+        {topLevel.map((c) => (
+          <div key={c.id}>
+            <CommentItem
+              comment={c}
+              canDelete={!!user && user.id === c.author_id}
+              onDelete={() => onDelete(c)}
+              canReply={!!user}
+              onReplyClick={() => setReplyTo(replyTo === c.id ? null : c.id)}
+            />
+            {replyTo === c.id && (
+              <ReplyForm
+                onCancel={() => setReplyTo(null)}
+                onSubmit={(text) => onReplySubmit(c, text)}
+              />
+            )}
+            {(repliesByParent.get(c.id) ?? []).length > 0 && (
+              <div className="ml-6 mt-3 space-y-3 border-l-2 border-rule-soft pl-4">
+                {(repliesByParent.get(c.id) ?? []).map((r) => (
+                  <CommentItem
+                    key={r.id}
+                    comment={r}
+                    canDelete={!!user && user.id === r.author_id}
+                    onDelete={() => onDelete(r)}
+                  />
+                ))}
+              </div>
+            )}
+          </div>
         ))}
       </div>
     </section>
@@ -119,10 +188,14 @@ function CommentItem({
   comment,
   canDelete,
   onDelete,
+  canReply,
+  onReplyClick,
 }: {
   comment: Comment;
   canDelete: boolean;
   onDelete: () => void;
+  canReply?: boolean;
+  onReplyClick?: () => void;
 }) {
   return (
     <article className="border-b border-rule-soft pb-4">
@@ -131,14 +204,60 @@ function CommentItem({
         <span>{new Date(comment.created_at).toLocaleString("zh-CN")}</span>
       </header>
       <CommentBody body={comment.body} />
-      {canDelete && (
-        <div className="mt-1 text-right">
+      <div className="mt-1 flex justify-end gap-3">
+        {canReply && onReplyClick && (
+          <button onClick={onReplyClick} className="text-xs text-ink-faint hover:text-vermilion">
+            回复
+          </button>
+        )}
+        {canDelete && (
           <button onClick={onDelete} className="text-xs text-destructive hover:underline">
             删除
           </button>
-        </div>
-      )}
+        )}
+      </div>
     </article>
+  );
+}
+
+function ReplyForm({
+  onSubmit,
+  onCancel,
+}: {
+  onSubmit: (text: string) => Promise<boolean>;
+  onCancel: () => void;
+}) {
+  const [text, setText] = useState("");
+  const [busy, setBusy] = useState(false);
+  return (
+    <div className="ml-6 mt-2 border border-rule bg-paper-deep/20 p-3 space-y-2">
+      <textarea
+        rows={3}
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        placeholder="写下你的回复…"
+        className="w-full border border-ink/40 bg-background px-3 py-2 text-sm focus:outline-none focus:border-vermilion"
+      />
+      <div className="flex justify-end gap-2">
+        <button onClick={onCancel} className="text-xs border border-rule px-3 py-1 hover:border-ink">
+          取消
+        </button>
+        <button
+          disabled={busy}
+          onClick={async () => {
+            const t = text.trim();
+            if (!t) return toast.error("请填写回复内容");
+            setBusy(true);
+            const ok = await onSubmit(t);
+            setBusy(false);
+            if (ok) setText("");
+          }}
+          className="text-xs bg-ink text-background px-3 py-1 hover:bg-vermilion transition-colors disabled:opacity-60"
+        >
+          {busy ? "发布中…" : "发布回复"}
+        </button>
+      </div>
+    </div>
   );
 }
 

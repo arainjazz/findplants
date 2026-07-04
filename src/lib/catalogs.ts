@@ -9,6 +9,7 @@ export const IUCN_CATEGORIES: { code: string; zh: string }[] = [
   { code: "VU", zh: "易危" },
   { code: "NT", zh: "近危" },
   { code: "LC", zh: "无危" },
+  { code: "DD", zh: "数据缺乏" },
 ];
 
 export type RegionalCatalog = {
@@ -59,6 +60,8 @@ export type CatalogSuggestion = {
 export function normalizeSciName(s: string | null | undefined): string {
   if (!s) return "";
   let v = s
+    .normalize("NFKD") // fold diacritics: Isoëtes -> Isoetes, Houpoëa -> Houpoea
+    .replace(/[̀-ͯ]/g, "")
     .replace(/\([^)]*\)/g, " ") // remove parenthesised authorities
     .replace(/[×]/g, "x")
     .replace(/\s+/g, " ")

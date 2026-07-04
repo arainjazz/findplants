@@ -1,5 +1,6 @@
 import { Link } from "@tanstack/react-router";
 import type { PlantDraft } from "@/lib/drafts";
+import { displayPlace } from "@/lib/editor-stats";
 
 export function DraftCard({ draft: d, showPendingBadge = false }: { draft: PlantDraft; showPendingBadge?: boolean }) {
   return (
@@ -29,12 +30,12 @@ export function DraftCard({ draft: d, showPendingBadge = false }: { draft: Plant
           {d.summary && (
             <p className="text-[12px] text-ink-soft mt-1 line-clamp-3 leading-snug">{d.summary}</p>
           )}
-          <p className="text-[11px] text-ink-faint mt-1.5 truncate inline-flex items-center gap-1">
+          <p className="text-[11px] text-ink-faint mt-1.5 truncate inline-flex items-center gap-1" title={d.capture_place || undefined}>
             <svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
               <path d="M12 21s-7-6.2-7-11a7 7 0 0 1 14 0c0 4.8-7 11-7 11Z"/>
               <circle cx="12" cy="10" r="2.6"/>
             </svg>
-            {d.capture_place || "未知地点"}
+            {displayPlace(d.capture_place) || "未知地点"}
           </p>
         </div>
       </Link>

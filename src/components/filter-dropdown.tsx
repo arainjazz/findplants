@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 
-type Option = { value: string; label: string };
+export type OptionHover = { text: string; anchorId: string };
+type Option = { value: string; label: string; hover?: OptionHover };
 
 type Props = {
   label: string;
@@ -8,10 +9,12 @@ type Props = {
   options: Option[];
   onChange: (v: string) => void;
   emptyLabel?: string;
+  /** Fired when the pointer enters an option that carries hover info (or null on leave). */
+  onOptionHover?: (hover: OptionHover | null) => void;
 };
 
 /** Hover-to-open dropdown with click-to-select; sticky once opened by click. */
-export function FilterDropdown({ label, value, options, onChange, emptyLabel = "全部" }: Props) {
+export function FilterDropdown({ label, value, options, onChange, emptyLabel = "全部", onOptionHover }: Props) {
   const [open, setOpen] = useState(false);
   const wrapRef = useRef<HTMLDivElement>(null);
   const closeTimer = useRef<number | null>(null);
@@ -80,6 +83,7 @@ export function FilterDropdown({ label, value, options, onChange, emptyLabel = "
               <button
                 key={o.value}
                 type="button"
+                onMouseEnter={() => onOptionHover?.(o.hover ?? null)}
                 onClick={() => {
                   onChange(o.value);
                   setOpen(false);

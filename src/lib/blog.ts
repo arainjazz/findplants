@@ -15,6 +15,18 @@ export type BlogPost = {
   updated_at: string;
 };
 
+/** First <img> src found in the post body (used as a default cover). */
+export function firstImageSrc(html: string | null | undefined): string | null {
+  if (!html) return null;
+  const m = html.match(/<img\b[^>]*\bsrc\s*=\s*["']([^"']+)["']/i);
+  return m ? m[1] : null;
+}
+
+/** Effective cover: explicit cover_url, else the first image in the body. */
+export function blogCoverUrl(post: Pick<BlogPost, "cover_url" | "content_html">): string | null {
+  return post.cover_url || firstImageSrc(post.content_html);
+}
+
 export function slugifyBlog(title: string) {
   const base = title
     .toLowerCase()

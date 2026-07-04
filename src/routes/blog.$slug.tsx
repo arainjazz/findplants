@@ -1,20 +1,34 @@
 import { createFileRoute, Link, notFound } from "@tanstack/react-router";
 import { useQuery } from "@tanstack/react-query";
 import { SiteHeader, SiteFooter } from "@/components/site-header";
-import { fetchPostBySlug } from "@/lib/blog";
+import { fetchPostBySlug, blogCoverUrl } from "@/lib/blog";
 import { ShareButton } from "@/components/share-button";
+import { BlogComments } from "@/components/blog-comments";
 import { useAuth } from "@/hooks/use-auth";
 
 export const Route = createFileRoute("/blog/$slug")({
+  loader: async ({ params }) => {
+    return fetchPostBySlug(params.slug);
+  },
+  head: ({ loaderData }) => ({
+    meta: [
+      { title: loaderData ? `${loaderData.title} · Plantspedia` : "Plantspedia · 全民植物志" },
+      { name: "description", content: loaderData?.subtitle || "阅读植物科普文章、社区动态与科学探索。" },
+      { property: "og:image", content: loaderData?.cover_url || "/default-og-image.jpg" },
+      { property: "og:type", content: "article" },
+    ],
+  }),
   component: BlogDetail,
 });
 
 function BlogDetail() {
   const { slug } = Route.useParams();
   const { user } = useAuth();
+  const loaderData = Route.useLoaderData();
   const { data: post, isLoading } = useQuery({
     queryKey: ["blog-post-slug", slug],
     queryFn: () => fetchPostBySlug(slug),
+    initialData: loaderData,
   });
 
   if (isLoading)
@@ -49,9 +63,9 @@ function BlogDetail() {
           </div>
         </div>
 
-        {post.cover_url && (
+        {blogCoverUrl(post) && (
           <img
-            src={post.cover_url}
+            src={blogCoverUrl(post)!}
             alt=""
             className="w-full max-h-[420px] object-cover mb-8 border border-rule"
           />
@@ -87,6 +101,8 @@ function BlogDetail() {
           .prose-plant img { display: block; max-width: 100%; margin: 1.2em auto; }
           .prose-plant a { color: var(--vermilion); text-decoration: underline; }
         `}</style>
+
+        <BlogComments postId={post.id} postAuthorId={post.author_id} />
       </main>
       <SiteFooter />
     </div>

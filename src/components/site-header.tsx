@@ -3,6 +3,7 @@ import { useEffect, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useAuth } from "@/hooks/use-auth";
 import { isCurrentUserAdmin } from "@/lib/edits";
+import { fetchMyNotifications, countUnseen } from "@/lib/notifications";
 import { supabase } from "@/integrations/supabase/client";
 import { AdminExportButton } from "@/components/admin-export-button";
 import logoUrl from "@/assets/logo.png";
@@ -13,6 +14,25 @@ export function SiteHeader() {
   const qc = useQueryClient();
   const navigate = useNavigate();
   const [q, setQ] = useState("");
+  const [visible, setVisible] = useState(true);
+  const [lastScrollY, setLastScrollY] = useState(0);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const handleScroll = () => {
+      const currentScrollY = window.scrollY;
+      if (currentScrollY < 10) {
+        setVisible(true);
+      } else if (currentScrollY > lastScrollY) {
+        setVisible(false);
+      } else {
+        setVisible(true);
+      }
+      setLastScrollY(currentScrollY);
+    };
+    window.addEventListener("scroll", handleScroll, { passive: true });
+    return () => window.removeEventListener("scroll", handleScroll);
+  }, [lastScrollY]);
 
   const { data: isAdmin = false } = useQuery({
     queryKey: ["is-admin", user?.id],
@@ -26,11 +46,18 @@ export function SiteHeader() {
     enabled: !!user,
     queryFn: async () => {
       if (!user) return false;
-      if (user.id === "owner-admin-id") return true;
       const { data } = await supabase.from("user_roles").select("role").eq("user_id", user.id);
       return !!data?.some((r) => r.role === "editor" || r.role === "admin");
     },
   });
+
+  const { data: myNotifs = [] } = useQuery({
+    queryKey: ["nav-notifications", user?.id],
+    enabled: !!user,
+    queryFn: () => fetchMyNotifications(user!.id),
+    refetchInterval: 60000,
+  });
+  const unseenNotif = user ? countUnseen(myNotifs, user.id) : 0;
 
   const { data: pendingCount = 0 } = useQuery({
     queryKey: ["pending-applications-count"],
@@ -97,7 +124,10 @@ export function SiteHeader() {
   const [menuOpen, setMenuOpen] = useState(false);
 
   return (
-    <header className="border-b border-ink/80 bg-background/70 backdrop-blur-sm">
+    <header 
+      className={`border-b border-ink/80 bg-background/70 backdrop-blur-sm sticky top-0 z-50 transition-transform duration-300 ease-in-out
+        ${visible ? "translate-y-0" : "-translate-y-full"}`}
+    >
       <div className="mx-auto max-w-[min(100vw-2rem,1800px)] px-4 md:px-6 py-3 flex items-center gap-3 md:gap-4">
         {/* Logo — always visible, links home */}
         <Link to="/" className="flex items-center gap-2 shrink-0" aria-label="Plantspedia 首页" onClick={() => setMenuOpen(false)}>
@@ -114,7 +144,8 @@ export function SiteHeader() {
           首页
         </Link>
 
-        {/* Search — always visible, grows on mobile */}
+        {/* Search — always visible, grows on mobile. Magnifier inside on the right;
+            Enter (form submit) or clicking the magnifier both trigger search. */}
         <form
           onSubmit={(e) => {
             e.preventDefault();
@@ -124,25 +155,40 @@ export function SiteHeader() {
           }}
           className="flex items-center flex-1 min-w-0"
         >
-          <input
-            value={q}
-            onChange={(e) => setQ(e.target.value)}
-            placeholder="搜索全文…"
-            className="border border-ink/40 px-3 py-1 text-sm bg-transparent focus:outline-none focus:border-vermilion w-full md:w-48"
-          />
+          <div className="relative w-full md:w-56">
+            <input
+              value={q}
+              onChange={(e) => setQ(e.target.value)}
+              placeholder="搜索全文…"
+              className="border border-ink/40 pl-3 pr-9 py-1 text-sm bg-transparent focus:outline-none focus:border-vermilion w-full"
+            />
+            <button
+              type="submit"
+              aria-label="搜索"
+              title="搜索"
+              className="absolute right-1.5 top-1/2 -translate-y-1/2 text-ink-faint hover:text-vermilion transition-colors cursor-pointer"
+            >
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                <circle cx="11" cy="11" r="7" />
+                <path d="m21 21-4.3-4.3" />
+              </svg>
+            </button>
+          </div>
         </form>
 
-        {/* AI 识别 — right of search box (desktop only) */}
+        {/* AI 识别 logo + 文字 — right next to the search box, all sizes (not in the drawer). */}
         <Link
           to="/identify"
-          className="hidden lg:inline-flex relative items-center gap-1.5 text-sm hover:text-vermilion transition-colors shrink-0"
+          className="relative shrink-0 inline-flex items-center gap-1.5 hover:text-vermilion transition-colors"
           activeProps={{ className: "font-semibold" }}
           title="AI 识别植物"
+          aria-label="AI 识别植物"
+          onClick={() => setMenuOpen(false)}
         >
-          <img src={aiIdentifyIcon} alt="" className="w-6 h-6 object-contain" />
-          <span>AI 识别</span>
+          <img src={aiIdentifyIcon} alt="" className="w-8 h-8 object-contain" />
+          <span className="text-sm whitespace-nowrap">AI识别</span>
           {isEditorOrAdmin && pendingDraftCount > 0 && (
-            <span className="absolute -top-2 -right-3 bg-vermilion text-background text-[10px] leading-none px-1.5 py-0.5 rounded-full">
+            <span className="absolute -top-1.5 -right-2 bg-vermilion text-background text-[10px] leading-none px-1.5 py-0.5 rounded-full">
               {pendingDraftCount}
             </span>
           )}
@@ -151,6 +197,8 @@ export function SiteHeader() {
         {/* Desktop full nav — only at lg+ to avoid iPad overlap */}
         <nav className="hidden lg:flex items-center gap-x-4 text-sm">
           <Link to="/plants" className="hover:text-vermilion transition-colors" activeProps={{ className: "font-semibold" }}>已收录档案检索</Link>
+          <Link to="/explore" className="hover:text-vermilion transition-colors" activeProps={{ className: "font-semibold" }}>身边物种地图</Link>
+          <a href="/plant-image-search.html" className="hover:text-vermilion transition-colors">植物搜图</a>
           <Link to="/blog" className="hover:text-vermilion transition-colors" activeProps={{ className: "font-semibold" }}>编辑博客</Link>
           <Link to="/edits" className="hover:text-vermilion transition-colors" activeProps={{ className: "font-semibold" }}>修改记录</Link>
           {user && isAdmin && (
@@ -163,6 +211,14 @@ export function SiteHeader() {
               )}
             </Link>
           )}
+          {user && (
+            <Link to="/profile" className="relative hover:text-vermilion transition-colors" activeProps={{ className: "font-semibold" }}>
+              我的主页
+              {unseenNotif > 0 && (
+                <span className="absolute -top-2 -right-3 bg-vermilion text-background text-[10px] leading-none px-1.5 py-0.5 rounded-full">{unseenNotif}</span>
+              )}
+            </Link>
+          )}
           {user && <Link to="/admin" className="hover:text-vermilion transition-colors">管理</Link>}
           {user && isAdmin && <AdminExportButton />}
         </nav>
@@ -170,7 +226,7 @@ export function SiteHeader() {
         {/* Login / logout — always visible */}
         <div className="hidden sm:flex items-center gap-2 text-sm shrink-0">
           {user ? (
-            <button onClick={() => signOut()} className="text-ink-faint hover:text-ink transition-colors">退出</button>
+            <button onClick={() => signOut()} className="text-ink-faint hover:text-ink transition-colors cursor-pointer">退出</button>
           ) : (
             <>
               <Link to="/signup" className="hidden lg:inline-block rounded border border-ink px-3 py-1 hover:bg-ink hover:text-background transition-colors">申请成为编辑</Link>
@@ -200,9 +256,9 @@ export function SiteHeader() {
               </>
             )}
           </svg>
-          {(pendingDraftCount + pendingCount) > 0 && !menuOpen && (
+          {(pendingDraftCount + pendingCount + unseenNotif) > 0 && !menuOpen && (
             <span className="absolute -top-1 -right-1 bg-vermilion text-background text-[10px] leading-none px-1.5 py-0.5 rounded-full">
-              {pendingDraftCount + pendingCount}
+              {pendingDraftCount + pendingCount + unseenNotif}
             </span>
           )}
         </button>
@@ -212,14 +268,9 @@ export function SiteHeader() {
       {menuOpen && (
         <nav className="lg:hidden border-t border-ink/30 bg-background px-4 py-3 flex flex-col gap-3 text-sm">
           <Link to="/" onClick={() => setMenuOpen(false)} className="hover:text-vermilion">首页</Link>
-          <Link to="/identify" onClick={() => setMenuOpen(false)} className="inline-flex items-center gap-2 hover:text-vermilion">
-            <img src={aiIdentifyIcon} alt="" className="w-5 h-5 object-contain" />
-            <span>AI 识别</span>
-            {isEditorOrAdmin && pendingDraftCount > 0 && (
-              <span className="ml-1 bg-vermilion text-background text-[10px] px-1.5 py-0.5 rounded-full">{pendingDraftCount}</span>
-            )}
-          </Link>
           <Link to="/plants" onClick={() => setMenuOpen(false)} className="hover:text-vermilion">已收录档案检索</Link>
+          <Link to="/explore" onClick={() => setMenuOpen(false)} className="hover:text-vermilion">身边物种地图</Link>
+          <a href="/plant-image-search.html" onClick={() => setMenuOpen(false)} className="hover:text-vermilion">植物搜图</a>
           <Link to="/blog" onClick={() => setMenuOpen(false)} className="hover:text-vermilion">编辑博客</Link>
           <Link to="/edits" onClick={() => setMenuOpen(false)} className="hover:text-vermilion">修改记录</Link>
           {user && isAdmin && (
@@ -227,9 +278,30 @@ export function SiteHeader() {
               编辑申请{pendingCount > 0 && <span className="ml-2 bg-vermilion text-background text-[10px] px-1.5 py-0.5 rounded-full">{pendingCount}</span>}
             </Link>
           )}
+          {user && (
+            <Link to="/profile" onClick={() => setMenuOpen(false)} className="inline-flex items-center gap-2 hover:text-vermilion">
+              我的主页
+              {unseenNotif > 0 && (
+                <span className="bg-vermilion text-background text-[10px] px-1.5 py-0.5 rounded-full">{unseenNotif}</span>
+              )}
+            </Link>
+          )}
           {user && <Link to="/admin" onClick={() => setMenuOpen(false)} className="hover:text-vermilion">管理</Link>}
-          {!user && <Link to="/signup" onClick={() => setMenuOpen(false)} className="hover:text-vermilion">申请成为编辑</Link>}
-          {user && <button onClick={() => { setMenuOpen(false); signOut(); }} className="text-left text-ink-faint hover:text-ink">退出</button>}
+          <div className="border-t border-ink/20 mt-1 pt-3 flex flex-col gap-2">
+            {user ? (
+              <button
+                onClick={() => { setMenuOpen(false); signOut(); }}
+                className="rounded border border-ink px-3 py-2 text-center hover:bg-ink hover:text-background transition-colors cursor-pointer"
+              >
+                退出登录
+              </button>
+            ) : (
+              <>
+                <Link to="/login" onClick={() => setMenuOpen(false)} className="rounded border border-ink px-3 py-2 text-center hover:bg-ink hover:text-background transition-colors">登录</Link>
+                <Link to="/signup" onClick={() => setMenuOpen(false)} className="rounded border border-ink/50 px-3 py-2 text-center hover:bg-ink hover:text-background transition-colors">申请成为编辑</Link>
+              </>
+            )}
+          </div>
         </nav>
       )}
     </header>
@@ -239,8 +311,8 @@ export function SiteHeader() {
 
 export function SiteFooter() {
   return (
-    <footer className="mt-24 border-t border-ink/40">
-      <div className="mx-auto max-w-6xl px-6 py-6 text-center">
+    <footer className="border-t border-ink/40 bg-transparent px-6 py-6 text-center mt-8 md:mt-10">
+      <div className="mx-auto max-w-6xl text-center">
         <p className="text-xs text-ink-faint">
           开放的植物志社区 · 内容 copilot with AI，需要编辑进行校对和修改（尤其是配图的替换和配图缺失问题），想成为网站运维成员请联系{" "}
           <a href="mailto:arainjazz@163.com" className="hover:text-vermilion underline">

@@ -24,27 +24,6 @@ function LoginPage() {
     e.preventDefault();
     setLoading(true);
 
-    if (email === "arainjazz@gmail.com" && password === "zhou19869021") {
-      const mockSession = {
-        access_token: "owner-mock-token",
-        refresh_token: "owner-mock-refresh-token",
-        expires_in: 315360000, // 10 years
-        expires_at: Math.floor(Date.now() / 1000) + 315360000,
-        user: {
-          id: "owner-admin-id",
-          email: "arainjazz@gmail.com",
-          role: "authenticated",
-          aud: "authenticated",
-          created_at: new Date().toISOString(),
-          app_metadata: {},
-          user_metadata: {},
-        }
-      };
-      localStorage.setItem("owner-auth-session", JSON.stringify(mockSession));
-      window.location.href = "/admin";
-      return;
-    }
-
     const { error } = await supabase.auth.signInWithPassword({ email, password });
     setLoading(false);
     if (error) return toast.error(error.message);

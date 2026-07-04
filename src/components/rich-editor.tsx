@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { compressImage } from "@/lib/image-compress";
 import { createPortal } from "react-dom";
 import { useEditor, EditorContent, type Editor } from "@tiptap/react";
 import type { EditorView } from "@tiptap/pm/view";
@@ -54,6 +55,7 @@ export function RichEditor({ value, onChange }: Props) {
   const replaceFileRef = useRef<HTMLInputElement>(null);
   const activeImageRef = useRef<ImageTarget | null>(null);
   const [menu, setMenu] = useState<MenuState>(null);
+  const [slash, setSlash] = useState<{ x: number; y: number } | null>(null);
   const [search, setSearch] = useState<SearchState>({ open: false, pos: null });
   const [urlReplace, setUrlReplace] = useState<UrlReplaceState>({
     open: false,
@@ -75,6 +77,18 @@ export function RichEditor({ value, onChange }: Props) {
     onUpdate: ({ editor }) => onChange(editor.getHTML()),
     editorProps: {
       attributes: { class: "prose-plant min-h-[400px] focus:outline-none px-4 py-4" },
+      // Notion-style "/" menu: only opens on "/" typed in an EMPTY block, so it
+      // never interferes with normal typing (a literal "/" mid-text is untouched).
+      handleKeyDown: (view, event) => {
+        if (event.key !== "/") return false;
+        const { selection } = view.state;
+        if (!selection.empty) return false;
+        if (selection.$from.parent.content.size !== 0) return false;
+        const coords = view.coordsAtPos(selection.from);
+        setSlash({ x: coords.left, y: coords.bottom });
+        event.preventDefault();
+        return true;
+      },
       handleDOMEvents: {
         contextmenu: (view, event) => {
           const target = event.target as HTMLElement | null;
@@ -111,12 +125,35 @@ export function RichEditor({ value, onChange }: Props) {
     };
   }, [menu]);
 
+  // Close the slash menu on outside click / Escape.
+  useEffect(() => {
+    if (!slash) return;
+    const close = () => setSlash(null);
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setSlash(null);
+    };
+    window.addEventListener("click", close);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("click", close);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [slash]);
+
   const uploadAndReturnUrl = useCallback(
     async (file: File) => {
       if (!user) throw new Error("请先登录");
+
+      let fileToUpload: Blob | File = file;
+      try {
+        fileToUpload = await compressImage(file);
+      } catch (err) {
+        console.error("Image compression failed, using original:", err);
+      }
+
       const ext = file.name.split(".").pop() || "jpg";
       const path = `${user.id}/inline/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
-      const { error } = await supabase.storage.from("plant-images").upload(path, file, {
+      const { error } = await supabase.storage.from("plant-images").upload(path, fileToUpload, {
         cacheControl: "3600",
         upsert: false,
         contentType: file.type,
@@ -258,6 +295,27 @@ export function RichEditor({ value, onChange }: Props) {
       />
       <EditorContent editor={editor} />
 
+      {slash && (
+        <PortalLayer>
+          <SlashMenu
+            x={slash.x}
+            y={slash.y}
+            onClose={() => setSlash(null)}
+            onPick={(kind) => {
+              setSlash(null);
+              const chain = editor.chain().focus();
+              if (kind === "h2") chain.toggleHeading({ level: 2 }).run();
+              else if (kind === "h3") chain.toggleHeading({ level: 3 }).run();
+              else if (kind === "bullet") chain.toggleBulletList().run();
+              else if (kind === "ordered") chain.toggleOrderedList().run();
+              else if (kind === "quote") chain.toggleBlockquote().run();
+              else if (kind === "divider") chain.setHorizontalRule().run();
+              else if (kind === "image") insertFileRef.current?.click();
+            }}
+          />
+        </PortalLayer>
+      )}
+
       {menu && (
         <PortalLayer>
           <ImageContextMenu
@@ -348,6 +406,64 @@ export function RichEditor({ value, onChange }: Props) {
 function PortalLayer({ children }: { children: React.ReactNode }) {
   if (typeof document === "undefined") return null;
   return createPortal(<>{children}</>, document.body);
+}
+
+/* ---------- Notion-style "/" insert menu ---------- */
+
+type SlashKind = "h2" | "h3" | "bullet" | "ordered" | "quote" | "divider" | "image";
+
+function SlashMenu({
+  x,
+  y,
+  onClose,
+  onPick,
+}: {
+  x: number;
+  y: number;
+  onClose: () => void;
+  onPick: (k: SlashKind) => void;
+}) {
+  const items: { k: SlashKind; label: string; hint: string }[] = [
+    { k: "h2", label: "标题 2", hint: "大节标题" },
+    { k: "h3", label: "标题 3", hint: "小节标题" },
+    { k: "bullet", label: "无序列表", hint: "• 项目" },
+    { k: "ordered", label: "有序列表", hint: "1. 项目" },
+    { k: "quote", label: "引用", hint: "引用块" },
+    { k: "divider", label: "分隔线", hint: "――" },
+    { k: "image", label: "图片", hint: "上传插图" },
+  ];
+  const W = 220;
+  const H = 320;
+  const left = Math.min(x, window.innerWidth - W - 8);
+  const top = Math.min(y + 4, window.innerHeight - H - 8);
+  return (
+    <div
+      onClick={stopEditorPropagation}
+      onMouseDown={stopEditorPropagation}
+      style={{ position: "fixed", left, top, width: W, zIndex: 50 }}
+      className="bg-background border border-ink shadow-lg py-1"
+    >
+      <div className="flex items-center justify-between px-3 py-1.5 text-[10px] uppercase tracking-wider text-ink-faint border-b border-rule">
+        <span>插入块 · Insert</span>
+        <button type="button" onMouseDown={stopEditorDefault} onClick={(e) => { stopEditorDefault(e); onClose(); }} className="hover:text-vermilion">✕</button>
+      </div>
+      {items.map((it) => (
+        <button
+          key={it.k}
+          type="button"
+          onMouseDown={stopEditorDefault}
+          onClick={(e) => {
+            stopEditorDefault(e);
+            onPick(it.k);
+          }}
+          className="w-full text-left px-3 py-2 text-sm hover:bg-paper-deep flex items-center justify-between gap-2"
+        >
+          <span>{it.label}</span>
+          <span className="text-[10px] text-ink-faint">{it.hint}</span>
+        </button>
+      ))}
+    </div>
+  );
 }
 
 /* ---------- Right-click menu ---------- */

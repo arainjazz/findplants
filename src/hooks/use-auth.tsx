@@ -18,14 +18,6 @@ const AuthContext = createContext<AuthContextValue>({
 
 function readCachedSession(): Session | null {
   if (typeof window === "undefined") return null;
-  const ownerSessionRaw = window.localStorage.getItem("owner-auth-session");
-  if (ownerSessionRaw) {
-    try {
-      return JSON.parse(ownerSessionRaw);
-    } catch {
-      // ignore
-    }
-  }
   const url = import.meta.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL;
   if (!url) return null;
   try {
@@ -50,10 +42,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     if (cached) {
       setSession(cached);
       setLoading(false);
-      // If it's the custom owner session, bypass Supabase listener to prevent it being cleared
-      if (cached.user?.id === "owner-admin-id") {
-        return;
-      }
     }
     const { data: sub } = supabase.auth.onAuthStateChange((_event, s) => {
       setSession(s);
@@ -72,8 +60,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         user: session?.user ?? null,
         loading,
         signOut: async () => {
-          window.localStorage.removeItem("owner-auth-session");
-          await supabase.auth.signOut();
+          try {
+            await supabase.auth.signOut();
+          } catch {
+            // ignore
+          }
+          setSession(null);
+          window.location.href = "/";
         },
       }}
     >

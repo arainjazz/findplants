@@ -10,6 +10,10 @@ import { fetchAllCatalogs, fetchAllEntries, buildPlantMatcher, type RegionalCata
 import { fetchAllTags, fetchAllPlantTags, type TagWithCount } from "@/lib/tags";
 import { fetchPendingDrafts, type PlantDraft } from "@/lib/drafts";
 import { DraftCard } from "@/components/draft-card";
+import { useServerFn } from "@tanstack/react-start";
+import { fetchPublishedPosts, blogCoverUrl, type BlogPost } from "@/lib/blog";
+import { type EditorColumnEntry } from "@/lib/editor-stats";
+import { fetchEditorColumnFn } from "@/lib/identify-plant.functions";
 
 export const Route = createFileRoute("/")({
   head: () => ({
@@ -30,12 +34,17 @@ function HomePage() {
   });
   const { data: tags = [] } = useQuery({ queryKey: ["all-tags"], queryFn: fetchAllTags });
   const { data: plantTags = [] } = useQuery({ queryKey: ["all-plant-tags"], queryFn: fetchAllPlantTags });
+  const { data: blogPosts = [] } = useQuery({ queryKey: ["home-blog"], queryFn: fetchPublishedPosts });
+  const editorColumnFn = useServerFn(fetchEditorColumnFn);
+  const { data: editorColumn = [] } = useQuery({
+    queryKey: ["editor-column"],
+    queryFn: () => editorColumnFn() as Promise<EditorColumnEntry[]>,
+  });
   const { data: isEditorOrAdmin = false } = useQuery({
     queryKey: ["is-editor-or-admin", user?.id],
     enabled: !!user,
     queryFn: async () => {
       if (!user) return false;
-      if (user.id === "owner-admin-id") return true;
       const { data } = await supabase.from("user_roles").select("role").eq("user_id", user.id);
       return !!data?.some((r) => r.role === "editor" || r.role === "admin");
     },
@@ -221,9 +230,167 @@ function HomePage() {
             )}
           </>
         )}
+
+        {/* 编辑博文 · recent posts written by editors */}
+        <EditorsBlogStrip posts={blogPosts} />
+
+        {/* 编辑专栏 · contributor column (before footer) */}
+        <ContributorsColumn editors={editorColumn} />
+
+        {/* 植物搜图 · jumps to the standalone /plant-image-search.html sub-page */}
+        <PlantImageSearchBox />
       </main>
       <SiteFooter />
     </div>
+  );
+}
+
+function PlantImageSearchBox() {
+  const [q, setQ] = useState("");
+  const go = () => {
+    const term = q.trim();
+    // Standalone static sub-page lives outside the SPA → native navigation.
+    window.location.href = "/plant-image-search.html" + (term ? "?q=" + encodeURIComponent(term) : "");
+  };
+  return (
+    <section className="mt-16 border-t border-rule pt-10">
+      <div className="mb-5">
+        <p className="label text-vermilion">植物搜图 · Plant Image Search</p>
+        <p className="text-xs text-ink-faint mt-1">
+          输入植物名（中文 / 学名 / 英文俗名），从 iNaturalist · GBIF · Wikimedia 等全网图库以瀑布流检索图像。
+        </p>
+      </div>
+      <form
+        onSubmit={(e) => { e.preventDefault(); go(); }}
+        className="flex items-stretch gap-2 max-w-2xl"
+      >
+        <input
+          value={q}
+          onChange={(e) => setQ(e.target.value)}
+          placeholder="如：银杏 / Ginkgo biloba / 蒲公英…"
+          className="flex-1 border border-ink/40 px-4 py-3 text-sm bg-background focus:outline-none focus:border-vermilion"
+        />
+        <button type="submit" className="bg-ink text-background px-6 py-3 text-sm hover:bg-vermilion transition-colors shrink-0 whitespace-nowrap">
+          检索图像
+        </button>
+      </form>
+    </section>
+  );
+}
+
+function EditorsBlogStrip({ posts }: { posts: BlogPost[] }) {
+  if (!posts || posts.length === 0) return null;
+  const list = posts.slice(0, 6);
+  return (
+    <section className="mt-16 border-t border-rule pt-10">
+      <div className="flex items-baseline justify-between mb-6">
+        <div>
+          <p className="label text-vermilion">编辑博文 · From the Editors</p>
+          <p className="text-xs text-ink-faint mt-1">编辑们的最新随笔、考据与栏目更新</p>
+        </div>
+        <Link to="/blog" className="label hover:text-vermilion">全部博文 →</Link>
+      </div>
+      <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-8">
+        {list.map((p) => (
+          <Link key={p.id} to="/blog/$slug" params={{ slug: p.slug }} className="group block">
+            <div className="overflow-hidden border border-rule bg-paper-deep mb-3 aspect-[16/10]">
+              {blogCoverUrl(p) ? (
+                <img src={blogCoverUrl(p)!} alt={p.title} className="w-full h-full object-cover group-hover:scale-[1.03] transition-transform duration-500" />
+              ) : (
+                <PlantPattern />
+              )}
+            </div>
+            <h3 className="font-display text-xl font-semibold leading-snug group-hover:text-vermilion transition-colors line-clamp-2">{p.title}</h3>
+            {p.subtitle && <p className="text-sm text-ink-soft mt-1 line-clamp-2">{p.subtitle}</p>}
+            <p className="label text-[10px] mt-2 text-ink-faint">
+              {p.author_name || "编辑"} · {new Date(p.published_at || p.created_at).toLocaleDateString("zh-CN")}
+            </p>
+          </Link>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function StatBadge({ n, kind, caption }: { n: number; kind: "edit" | "identify" | "blog"; caption: string }) {
+  // Frames are black (ink); only the number is colored.
+  const numCls =
+    kind === "edit"
+      ? "text-vermilion" // 编辑量 → 红
+      : kind === "identify"
+        ? "text-[oklch(0.45_0.18_240)]" // 识别 → 蓝
+        : "text-emerald-700"; // 博文 → 绿
+  return (
+    <div className="flex flex-col items-center gap-1" title={caption}>
+      <span className="relative inline-flex items-center justify-center w-9 h-9">
+        {kind === "edit" && <span className="absolute inset-[5%] border-2 border-ink rounded-[2px]" aria-hidden="true" />}
+        {kind === "blog" && <span className="absolute inset-0 border-2 border-ink rounded-full" aria-hidden="true" />}
+        {kind === "identify" && <FlowerMark className="absolute inset-0 w-full h-full text-ink" />}
+        <span className={`relative text-sm font-bold tabular-nums ${numCls}`}>{n}</span>
+      </span>
+      <span className="text-[10px] text-ink-faint leading-none">{caption}</span>
+    </div>
+  );
+}
+
+// Flat black-line flower mark (no background) for the 识别 badge: 5 convex arcs
+// with gaps (a scalloped flower), matching the reference image. Sized to fill the
+// badge box like the square/circle beside it (radius near the viewBox edge).
+function FlowerMark({ className }: { className?: string }) {
+  // 5 plump petals (each a tightly-curved arc) with small gaps between them —
+  // matches the reference flower. rPos = where petal endpoints sit; rArc (< the
+  // chord-implied min would fail, so kept comfortably above) controls plumpness.
+  // rPos/rArc scaled ×1.1 vs the prior 18/12 to enlarge the bloom ~10%.
+  const cx = 24, cy = 24, rPos = 19.8, half = 29, rArc = 13.2;
+  const pt = (deg: number) => {
+    const a = (deg * Math.PI) / 180;
+    return `${(cx + rPos * Math.cos(a)).toFixed(2)} ${(cy + rPos * Math.sin(a)).toFixed(2)}`;
+  };
+  const d = Array.from({ length: 5 }, (_, k) => {
+    const c = -90 + k * 72; // first petal centered at the top
+    return `M ${pt(c - half)} A ${rArc} ${rArc} 0 0 1 ${pt(c + half)}`;
+  }).join(" ");
+  return (
+    <svg viewBox="0 0 48 48" fill="none" stroke="currentColor" strokeWidth="2.6" strokeLinecap="round" className={className} aria-hidden="true">
+      <path d={d} />
+    </svg>
+  );
+}
+
+function ContributorsColumn({ editors }: { editors: EditorColumnEntry[] }) {
+  if (!editors || editors.length === 0) return null;
+  return (
+    <section className="mt-16 border-t border-rule pt-10">
+      <div className="mb-6">
+        <p className="label text-vermilion">编辑专栏 · Contributors</p>
+        <p className="text-xs text-ink-faint mt-1">点击进入查看某位编辑贡献的全部内容</p>
+      </div>
+      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-5">
+        {editors.map((e) => (
+          <a key={e.id} href={`/editors/${e.id}`} className="p-4 flex flex-col items-center text-center hover:bg-paper-deep/40 transition-colors cursor-pointer group rounded-sm">
+            <div className="w-16 h-16 rounded-full overflow-hidden border border-rule bg-background flex items-center justify-center mb-2 group-hover:border-ink">
+              {e.avatar_url ? (
+                <img src={e.avatar_url} alt={e.display_name} className="w-full h-full object-cover" />
+              ) : (
+                <span className="font-display text-2xl text-ink-faint">{e.display_name.slice(0, 1)}</span>
+              )}
+            </div>
+            <h3 className="font-semibold text-sm truncate max-w-full">{e.display_name}</h3>
+            <p className="text-[10px] text-ink-faint mt-0.5">
+              {e.joined_at ? `${new Date(e.joined_at).toLocaleDateString("zh-CN")} 加入` : "—"}
+            </p>
+            <p className="text-[10px] text-ink-faint max-w-full text-balance">
+              {e.areas ? `活动于 ${e.areas}` : "活动区域未知"}
+            </p>
+            <div className="flex items-start justify-center gap-3 mt-3">
+              <StatBadge n={e.editScore} kind="edit" caption="编辑" />
+              <StatBadge n={e.identifyScore} kind="identify" caption="识别" />
+              <StatBadge n={e.blogScore} kind="blog" caption="博文" />
+            </div>
+          </a>
+        ))}
+      </div>
+    </section>
   );
 }
 

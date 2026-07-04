@@ -1,10 +1,12 @@
 import { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
+import { compressImage } from "@/lib/image-compress";
 import { useNavigate } from "@tanstack/react-router";
 import { toast } from "sonner";
 import { useAuth } from "@/hooks/use-auth";
 import { supabase } from "@/integrations/supabase/client";
 import { RichEditor } from "@/components/rich-editor";
-import { createPost, updatePost, type BlogPost } from "@/lib/blog";
+import { createPost, updatePost, firstImageSrc, type BlogPost } from "@/lib/blog";
 
 export function BlogEditor({ initial }: { initial?: BlogPost }) {
   const { user } = useAuth();
@@ -30,11 +32,18 @@ export function BlogEditor({ initial }: { initial?: BlogPost }) {
     if (!user) return;
     setBusy(true);
     try {
+      let fileToUpload: Blob | File = file;
+      try {
+        fileToUpload = await compressImage(file);
+      } catch (err) {
+        console.error("Image compression failed, using original:", err);
+      }
+
       const ext = file.name.split(".").pop() || "jpg";
       const path = `${user.id}/blog-cover/${Date.now()}.${ext}`;
       const { error } = await supabase.storage
         .from("plant-images")
-        .upload(path, file, { upsert: false, contentType: file.type });
+        .upload(path, fileToUpload, { upsert: false, contentType: file.type });
       if (error) throw error;
       const url = supabase.storage.from("plant-images").getPublicUrl(path).data
         .publicUrl;
@@ -44,6 +53,25 @@ export function BlogEditor({ initial }: { initial?: BlogPost }) {
       toast.error((err as Error).message);
     } finally {
       setBusy(false);
+    }
+  };
+
+  // Best-effort: record a publish in the edit log so the owner sees it.
+  const logBlogPublish = async (postId: string, t: string) => {
+    if (!user) return;
+    try {
+      await supabase.from("plant_edits").insert({
+        plant_id: null,
+        editor_id: user.id,
+        editor_name: (user.user_metadata?.full_name as string) || user.email || "编辑",
+        kind: "blog_publish",
+        marker_n: 0,
+        block_path: postId, // target id for revert (unpublish)
+        source: "blog",
+        summary: `发布博文：${t}`,
+      });
+    } catch {
+      /* logging is best-effort */
     }
   };
 
@@ -63,6 +91,7 @@ export function BlogEditor({ initial }: { initial?: BlogPost }) {
           published: publish || initial.published,
         });
         toast.success(publish ? "已发布" : "已保存");
+        if (publish && !initial.published) await logBlogPublish(next.id, next.title);
         if (publish) navigate({ to: "/blog/$slug", params: { slug: next.slug } });
       } else {
         const post = await createPost({
@@ -75,6 +104,7 @@ export function BlogEditor({ initial }: { initial?: BlogPost }) {
           authorName,
         });
         toast.success(publish ? "已发布" : "草稿已保存");
+        if (publish) await logBlogPublish(post.id, post.title);
         if (publish) navigate({ to: "/blog/$slug", params: { slug: post.slug } });
         else navigate({ to: "/admin/blog/edit/$id", params: { id: post.id } });
       }
@@ -111,15 +141,7 @@ export function BlogEditor({ initial }: { initial?: BlogPost }) {
               </button>
             </div>
           </div>
-        ) : (
-          <button
-            type="button"
-            onClick={() => coverInputRef.current?.click()}
-            className="text-xs text-ink-faint hover:text-vermilion mb-4"
-          >
-            + 添加封面图
-          </button>
-        )}
+        ) : null}
         <input
           ref={coverInputRef}
           type="file"
@@ -143,7 +165,16 @@ export function BlogEditor({ initial }: { initial?: BlogPost }) {
           value={subtitle}
           onChange={(e) => setSubtitle(e.target.value)}
           placeholder="副标题（可选）"
-          className="w-full text-lg text-ink-soft bg-transparent border-none outline-none placeholder:text-ink-faint/40 mb-6"
+          className="w-full text-lg text-ink-soft bg-transparent border-none outline-none placeholder:text-ink-faint/40 mb-3"
+        />
+        <CoverControl
+          coverUrl={coverUrl}
+          fallback={firstImageSrc(html)}
+          onUpload={() => coverInputRef.current?.click()}
+          onUseFirstImage={() => {
+            setCoverUrl("");
+            toast.success("封面将默认使用正文第一张图");
+          }}
         />
       </div>
 
@@ -165,6 +196,70 @@ export function BlogEditor({ initial }: { initial?: BlogPost }) {
           {initial?.published ? "更新发布" : "发布"}
         </button>
       </div>
+    </div>
+  );
+}
+
+function CoverControl({
+  coverUrl,
+  fallback,
+  onUpload,
+  onUseFirstImage,
+}: {
+  coverUrl: string;
+  fallback: string | null;
+  onUpload: () => void;
+  onUseFirstImage: () => void;
+}) {
+  const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
+  useEffect(() => {
+    if (!menu) return;
+    const close = () => setMenu(null);
+    window.addEventListener("click", close);
+    return () => window.removeEventListener("click", close);
+  }, [menu]);
+  const effective = coverUrl || fallback || null;
+  return (
+    <div className="mb-6">
+      <div
+        onClick={onUpload}
+        onContextMenu={(e) => {
+          e.preventDefault();
+          setMenu({ x: e.clientX, y: e.clientY });
+        }}
+        title="点击上传 / 替换封面；右键查看更多选项"
+        className="inline-flex items-center gap-3 border border-rule bg-paper-deep/30 px-3 py-2 cursor-pointer hover:border-ink transition-colors select-none"
+      >
+        <div className="w-16 h-11 border border-rule bg-background overflow-hidden flex items-center justify-center shrink-0">
+          {effective ? (
+            <img src={effective} alt="封面预览" className="w-full h-full object-cover" />
+          ) : (
+            <span className="text-ink-faint text-[10px]">无图</span>
+          )}
+        </div>
+        <div className="text-xs leading-tight">
+          <p className="font-semibold text-ink">封面图</p>
+          <p className="text-ink-faint mt-0.5">
+            {coverUrl ? "自定义封面（点击替换）" : fallback ? "默认：正文第一张图" : "点击选择，或右键更多"}
+          </p>
+        </div>
+      </div>
+      {menu &&
+        createPortal(
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{ position: "fixed", left: Math.min(menu.x, window.innerWidth - 200), top: menu.y, width: 188, zIndex: 60 }}
+            className="bg-background border border-ink shadow-lg py-1 text-sm"
+          >
+            <button type="button" onClick={() => { setMenu(null); onUpload(); }} className="w-full text-left px-3 py-2 hover:bg-paper-deep">
+              上传 / 替换封面
+            </button>
+            <button type="button" onClick={() => { setMenu(null); onUseFirstImage(); }} className="w-full text-left px-3 py-2 hover:bg-paper-deep">
+              用正文首图作封面
+            </button>
+          </div>,
+          document.body,
+        )}
     </div>
   );
 }

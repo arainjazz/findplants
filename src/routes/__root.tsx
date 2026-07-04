@@ -1,4 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { useEffect } from "react";
 import {
   Outlet,
   Link,
@@ -9,6 +10,7 @@ import {
 } from "@tanstack/react-router";
 import { Toaster } from "@/components/ui/sonner";
 import { AuthProvider } from "@/hooks/use-auth";
+import { OfflineStatus } from "@/components/offline-status";
 import appCss from "../styles.css?url";
 
 function NotFoundComponent() {
@@ -51,6 +53,7 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
       { charSet: "utf-8" },
       { name: "viewport", content: "width=device-width, initial-scale=1" },
       { title: "Plantspedia · 全民植物志" },
+      { name: "theme-color", content: "#2e7d32" },
       { name: "description", content: "Plantspedia 是一个由社区共同编纂的植物科普网站，收录每一种值得记住的草木。" },
       { property: "og:title", content: "Plantspedia · 全民植物志" },
       { property: "og:description", content: "Plantspedia 是一个由社区共同编纂的植物科普网站，收录每一种值得记住的草木。" },
@@ -62,6 +65,7 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
       { name: "twitter:card", content: "summary_large_image" },
     ],
     links: [
+      { rel: "manifest", href: "/manifest.json" },
       { rel: "stylesheet", href: appCss },
       { rel: "preconnect", href: "https://fonts.googleapis.com" },
       { rel: "preconnect", href: "https://fonts.gstatic.com", crossOrigin: "" },
@@ -90,11 +94,39 @@ function RootShell({ children }: { children: React.ReactNode }) {
 
 function RootComponent() {
   const { queryClient } = Route.useRouteContext();
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !("serviceWorker" in navigator)) return;
+
+    // If a SW already controls this page, a controllerchange means a *new* SW just
+    // took over (an update) — reload once so the freshly deployed UI shows up without
+    // the user having to manually clear their cache. Skipped on the very first install.
+    const hadController = !!navigator.serviceWorker.controller;
+    let reloaded = false;
+    const onControllerChange = () => {
+      if (reloaded || !hadController) return;
+      reloaded = true;
+      window.location.reload();
+    };
+    navigator.serviceWorker.addEventListener("controllerchange", onControllerChange);
+
+    navigator.serviceWorker
+      .register("/sw.js")
+      .then((reg) => {
+        reg.update();
+        console.log("Service Worker registered with scope:", reg.scope);
+      })
+      .catch((err) => console.error("Service Worker registration failed:", err));
+
+    return () => navigator.serviceWorker.removeEventListener("controllerchange", onControllerChange);
+  }, []);
+
   return (
     <QueryClientProvider client={queryClient}>
       <AuthProvider>
         <Outlet />
         <Toaster />
+        <OfflineStatus />
       </AuthProvider>
     </QueryClientProvider>
   );

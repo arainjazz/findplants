@@ -28,7 +28,7 @@ function SearchPage() {
   const plantHits = useMemo(() => {
     if (!term) return [];
     return plants.filter((p) => {
-      const hay = [p.title, p.scientific_name, p.common_name_en, p.family, p.genus, p.habitat, p.summary, ...(p.tags ?? [])]
+      const hay = [p.title, p.scientific_name, p.common_names_zh, p.common_name_en, p.family, p.genus, p.habitat, p.summary, ...(p.tags ?? [])]
         .filter(Boolean).join(" ").toLowerCase();
       return hay.includes(term);
     });

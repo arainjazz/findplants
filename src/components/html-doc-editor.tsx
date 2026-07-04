@@ -1,4 +1,5 @@
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
+import { compressImage } from "@/lib/image-compress";
 import { createPortal } from "react-dom";
 import { FolderOpen, Clipboard, Link2, Globe, Pencil, ExternalLink, Trash2 } from "lucide-react";
 import { supabase } from "@/integrations/supabase/client";
@@ -269,9 +270,17 @@ export const HtmlDocEditor = forwardRef<HtmlDocEditorHandle, Props>(function Htm
   // Image upload helper ------------------------------------------------------
   const uploadImageFile = async (file: File) => {
     if (!user) throw new Error("请先登录");
+
+    let fileToUpload: Blob | File = file;
+    try {
+      fileToUpload = await compressImage(file);
+    } catch (err) {
+      console.error("Image compression failed, using original:", err);
+    }
+
     const ext = file.name.split(".").pop() || "jpg";
     const path = `${user.id}/inline/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
-    const { error } = await supabase.storage.from("plant-images").upload(path, file, {
+    const { error } = await supabase.storage.from("plant-images").upload(path, fileToUpload, {
       cacheControl: "3600",
       upsert: false,
       contentType: file.type,
@@ -1130,21 +1139,60 @@ async function searchGBIF(term: string): Promise<ImgHit[]> {
   return out;
 }
 
+export type PlantImgHit = { title: string; thumb: string; full: string; credit?: string };
+
+/** Combined plant-image lookup for 小P蛙 reference photos: tries iNaturalist →
+ *  GBIF → Wikimedia Commons and returns the first source that yields results. */
+export async function searchPlantImages(term: string, limit = 3): Promise<PlantImgHit[]> {
+  const sources = [searchINaturalist, searchGBIF, searchWikimedia];
+  for (const fn of sources) {
+    try {
+      const out = await fn(term);
+      if (out && out.length) return out.slice(0, limit);
+    } catch {
+      /* try next source */
+    }
+  }
+  return [];
+}
+
 export function ImageSearchDialog({
   initialQuery,
   onClose,
   onPick,
+  nameChips,
+  onUploadFile,
 }: {
   initialQuery: string;
   onClose: () => void;
   onPick: (url: string, title: string, source: ImgSource) => void;
+  /** Optional one-tap quick-fill chips (e.g. Latin / English / Chinese names). */
+  nameChips?: { label: string; value: string }[];
+  /** When provided, shows a 本地上传 button: the file is uploaded via this
+   *  callback (returns the public URL), then flows through onPick like a hit. */
+  onUploadFile?: (file: File) => Promise<string>;
 }) {
   const [source, setSource] = useState<ImgSource>("iNaturalist");
   const [q, setQ] = useState(initialQuery);
   const [hits, setHits] = useState<ImgHit[]>([]);
   const [loading, setLoading] = useState(false);
+  const [uploading, setUploading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
+
+  const handleFile = async (f: File | undefined | null) => {
+    if (!f || !onUploadFile) return;
+    setUploading(true);
+    setErr(null);
+    try {
+      const url = await onUploadFile(f);
+      onPick(url, f.name, source);
+    } catch (e) {
+      setErr((e as Error).message || "上传失败，请重试");
+      setUploading(false);
+    }
+  };
 
   useEffect(() => {
     inputRef.current?.focus();
@@ -1206,7 +1254,7 @@ export function ImageSearchDialog({
           </button>
         </div>
         <div className="px-4 py-3 border-b border-rule space-y-2">
-          <div className="flex gap-1">
+          <div className="flex gap-1 flex-wrap">
             {(["iNaturalist", "Wikimedia Commons", "GBIF"] as ImgSource[]).map((s) => (
               <button
                 key={s}
@@ -1224,6 +1272,28 @@ export function ImageSearchDialog({
                 {s}
               </button>
             ))}
+            {onUploadFile && (
+              <>
+                <input
+                  ref={fileRef}
+                  type="file"
+                  accept="image/*"
+                  className="hidden"
+                  onChange={(e) => {
+                    void handleFile(e.target.files?.[0]);
+                    e.target.value = "";
+                  }}
+                />
+                <button
+                  type="button"
+                  onClick={() => fileRef.current?.click()}
+                  disabled={uploading}
+                  className="px-3 py-1.5 text-xs border border-leaf text-leaf-deep hover:bg-leaf hover:text-background transition-colors disabled:opacity-60"
+                >
+                  {uploading ? "上传中…" : "📁 本地上传"}
+                </button>
+              </>
+            )}
           </div>
           <div className="flex gap-2">
             <input
@@ -1243,8 +1313,27 @@ export function ImageSearchDialog({
               {loading ? "搜索中…" : "搜索"}
             </button>
           </div>
+          {nameChips && nameChips.length > 0 && (
+            <div className="flex flex-wrap items-center gap-1.5">
+              <span className="text-[11px] text-ink-faint">一键填入：</span>
+              {nameChips.map((c) => (
+                <button
+                  key={c.label}
+                  type="button"
+                  onClick={() => {
+                    setQ(c.value);
+                    search(c.value, source);
+                  }}
+                  title={c.value}
+                  className="text-[11px] border border-rule px-2 py-0.5 hover:border-ink hover:bg-paper-deep"
+                >
+                  {c.label}
+                </button>
+              ))}
+            </div>
+          )}
           <p className="text-[11px] text-ink-faint">
-            提示：iNaturalist 适合找物种照片（自动按学名匹配 taxon），Wikimedia Commons 适合插画 / 历史图谱。请遵循各自的版权与署名要求。
+            提示：建议一次只用<strong className="text-ink-soft">一类</strong>关键词（拉丁学名 / 英文俗名 / 中文常用名）命中率更高。iNaturalist 适合物种照片（自动按学名匹配 taxon），Wikimedia Commons 适合插画 / 历史图谱。请遵循各自的版权与署名要求。
           </p>
         </div>
         <div className="flex-1 overflow-auto p-4">

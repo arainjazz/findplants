@@ -1,10 +1,10 @@
-import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
+import { createFileRoute, Link } from "@tanstack/react-router";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { useMemo, useState } from "react";
+import { useMemo, useState, useEffect } from "react";
 import { zodValidator, fallback } from "@tanstack/zod-adapter";
 import { z } from "zod";
 import { SiteHeader, SiteFooter } from "@/components/site-header";
-import { fetchAllPlants, type Plant } from "@/lib/plants";
+import { fetchPaginatedPlants, fetchPlantsMetadata, type Plant } from "@/lib/plants";
 import { FilterDropdown } from "@/components/filter-dropdown";
 import {
   fetchAllCatalogs,
@@ -27,12 +27,30 @@ import { useServerFn } from "@tanstack/react-start";
 import { useAuth } from "@/hooks/use-auth";
 import { toast } from "sonner";
 import { fetchAllTags, fetchAllPlantTags, type TagWithCount } from "@/lib/tags";
+import { fetchAiPlantIds } from "@/lib/drafts";
+import {
+  CITES_APPENDICES,
+  GTS_CATEGORIES,
+  GRIIS_DEGREES,
+  protectedListRank,
+  fetchConservationData,
+  buildConservationMatcher,
+  type ConservationTaxon,
+} from "@/lib/conservation";
 
 const searchSchema = z.object({
   family: fallback(z.string(), "").default(""),
   genus: fallback(z.string(), "").default(""),
   iucn: fallback(z.string(), "").default(""),
-  region: fallback(z.string(), "").default(""),
+  region: fallback(z.string(), "").default(""), // 国家和各省重点保护目录: conservation list id
+  tag: fallback(z.string(), "").default(""), // 归类标签 slug
+  rcat: fallback(z.string(), "").default(""), // 地区名录（自建 regional_catalogs）region label
+  cites: fallback(z.string(), "").default(""), // 华盛顿贸易管制 appendix: "I" | "II"
+  gts: fallback(z.string(), "").default(""), // GTS 全球树木红色名录: "CR" | "EN" | "VU"
+  griis: fallback(z.string(), "").default(""), // GRIIS degreeOfEstablishment
+  type: fallback(z.string(), "").default(""), // "" | "ai" | "edited"
+  page: fallback(z.number(), 1).default(1),
+  q: fallback(z.string(), "").default(""),
 });
 
 export const Route = createFileRoute("/plants/")({
@@ -46,178 +64,413 @@ export const Route = createFileRoute("/plants/")({
   component: PlantsList,
 });
 
+const EMPTY_ID_SET = new Set<string>();
+
 function PlantsList() {
-  const { data: plants = [], isLoading } = useQuery({ queryKey: ["plants"], queryFn: fetchAllPlants });
+  const { family, genus, iucn, region, tag, rcat, cites, gts, griis, type, page, q: searchVal } = Route.useSearch();
+  const navigate = Route.useNavigate();
+
+  const { data: plantsMetadata = [], isLoading: isMetaLoading } = useQuery({
+    queryKey: ["plants-metadata"],
+    queryFn: fetchPlantsMetadata,
+  });
+
   const { data: catalogs = [] } = useQuery({ queryKey: ["all-catalogs"], queryFn: fetchAllCatalogs });
   const { data: catalogEntries = [] } = useQuery({ queryKey: ["all-catalog-entries"], queryFn: fetchAllEntries });
   const { data: allTags = [] } = useQuery<TagWithCount[]>({ queryKey: ["all-tags"], queryFn: fetchAllTags });
   const { data: allPlantTags = [] } = useQuery({ queryKey: ["all-plant-tags"], queryFn: fetchAllPlantTags });
-  const [q, setQ] = useState("");
-  const { family, genus, iucn, region } = Route.useSearch();
-  const navigate = useNavigate({ from: "/plants" });
+
+  // Conservation registries (国家/省级重点保护 + CITES/GTS/GRIIS). Matcher is rank-aware.
+  const { data: conservationData } = useQuery({ queryKey: ["conservation-data"], queryFn: fetchConservationData });
+  const conservationMatcher = useMemo(
+    () => buildConservationMatcher(conservationData ?? { lists: [], taxa: [] }),
+    [conservationData],
+  );
+  const protectedLists = useMemo(
+    () => (conservationData?.lists ?? []).filter((l) => l.kind === "protected"),
+    [conservationData],
+  );
+
+  // ---- bottom directory sections (full 名录 listings) ----
+  const taxaByList = useMemo(() => {
+    const m = new Map<string, ConservationTaxon[]>();
+    for (const t of conservationData?.taxa ?? []) {
+      const a = m.get(t.list_id);
+      if (a) a.push(t);
+      else m.set(t.list_id, [t]);
+    }
+    return m;
+  }, [conservationData]);
+
+  // Which taxa the site has actually published (for recorded vs unrecorded coloring).
+  const recorded = useMemo(() => {
+    const norms = new Set<string>();
+    const genera = new Set<string>();
+    for (const p of plantsMetadata) {
+      const n = normalizeSciName(p.scientific_name);
+      if (n) {
+        norms.add(n);
+        genera.add(n.split(" ")[0]);
+      }
+    }
+    return { norms, genera };
+  }, [plantsMetadata]);
+
+  const orderedProtectedLists = useMemo(() => {
+    const lists = [...protectedLists];
+    lists.sort(
+      (a, b) =>
+        protectedListRank(a.province ?? a.name) - protectedListRank(b.province ?? b.name) ||
+        a.name.localeCompare(b.name, "zh"),
+    );
+    return lists;
+  }, [protectedLists]);
+
+  const plantsByTag = useMemo(() => {
+    const m = new Map<string, string[]>();
+    for (const pt of allPlantTags) {
+      const a = m.get(pt.tag_id);
+      if (a) a.push(pt.plant_id);
+      else m.set(pt.tag_id, [pt.plant_id]);
+    }
+    return m;
+  }, [allPlantTags]);
+
+  const plantsById = useMemo(() => new Map(plantsMetadata.map((p) => [p.id, p])), [plantsMetadata]);
+
+  const plantByNorm = useMemo(() => {
+    const m = new Map<string, (typeof plantsMetadata)[number]>();
+    for (const p of plantsMetadata) {
+      const n = normalizeSciName(p.scientific_name);
+      if (n && !m.has(n)) m.set(n, p);
+    }
+    return m;
+  }, [plantsMetadata]);
+
+  const taxonRecorded = (t: ConservationTaxon) =>
+    t.rank === "genus"
+      ? recorded.genera.has(t.normalized_name)
+      : t.rank === "species"
+      ? recorded.norms.has(t.normalized_name)
+      : false;
+
+  const [qInput, setQInput] = useState(searchVal);
+
+  // 声明框: statement shown on dropdown-option hover (source for 保护目录, editor/time/ref for 标签).
+  // Persists until another filter is applied; clicking it scrolls to that directory's section.
+  const [statement, setStatement] = useState<{ text: string; anchorId: string } | null>(null);
+  const scrollToId = (id: string) => document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" });
+
+  useEffect(() => {
+    setQInput(searchVal);
+  }, [searchVal]);
 
   const familyOptions = useMemo(() => {
     const s = new Set<string>();
-    for (const p of plants) {
+    for (const p of plantsMetadata) {
       if (genus && p.genus?.trim() !== genus) continue;
       if (p.family?.trim()) s.add(p.family.trim());
     }
     return Array.from(s).sort().map((v) => ({ value: v, label: v }));
-  }, [plants, genus]);
+  }, [plantsMetadata, genus]);
+
   const genusOptions = useMemo(() => {
     const s = new Set<string>();
-    for (const p of plants) {
+    for (const p of plantsMetadata) {
       if (family && p.family?.trim() !== family) continue;
       if (p.genus?.trim()) s.add(p.genus.trim());
     }
     return Array.from(s).sort().map((v) => ({ value: v, label: v }));
-  }, [plants, family]);
+  }, [plantsMetadata, family]);
+
   const iucnCounts = useMemo(() => {
     const m: Record<string, number> = {};
     let unrated = 0;
-    for (const p of plants) {
+    for (const p of plantsMetadata) {
       if (family && p.family?.trim() !== family) continue;
       if (genus && p.genus?.trim() !== genus) continue;
       if (p.iucn_status) m[p.iucn_status] = (m[p.iucn_status] ?? 0) + 1;
       else unrated += 1;
     }
     return { m, unrated };
-  }, [plants, family, genus]);
-  const iucnOptions = [
+  }, [plantsMetadata, family, genus]);
+
+  const iucnOptions = useMemo(() => [
     ...IUCN_CATEGORIES.map((c) => ({
       value: c.code,
       label: `${c.code}·${c.zh}（${iucnCounts.m[c.code] ?? 0}）`,
     })),
-    { value: "__unrated__", label: `未填写（${iucnCounts.unrated}）` },
-  ];
-  // Combined region + tag dropdown. Values are prefixed:
-  //   r:<label>   → regional catalog
-  //   t:<slug>    → tag
+  ], [iucnCounts]);
+
+  // 国家和各省重点保护目录 — conservation_lists (kind=protected), ordered 国家 → 省级.
   const regionOptions = useMemo(() => {
-    const regionLabels = Array.from(new Set(catalogs.map((c) => regionLabel(c)))).sort();
-    const regionOpts = regionLabels.map((v) => ({ value: `r:${v}`, label: v }));
-    const tagOpts = allTags.map((t) => ({
-      value: `t:${t.slug}`,
-      label: `# ${t.name}（${t.plant_count}/${t.expected_count ?? t.plant_count}）`,
+    const lists = [...protectedLists];
+    lists.sort(
+      (a, b) =>
+        protectedListRank(a.province ?? a.name) - protectedListRank(b.province ?? b.name) ||
+        a.name.localeCompare(b.name, "zh"),
+    );
+    return lists.map((l) => ({
+      value: l.id,
+      label: l.name,
+      hover: { text: l.source_note ?? `${l.name}·重点保护野生植物名录`, anchorId: `dir-${l.id}` },
     }));
-    return [...regionOpts, ...tagOpts];
-  }, [catalogs, allTags]);
+  }, [protectedLists]);
 
-  const selectedRegion = region.startsWith("r:") ? region.slice(2) : "";
-  const selectedTagSlug = region.startsWith("t:") ? region.slice(2) : "";
+  // 归类标签 — separate dropdown. Hover shows who added it, when, and the reference (description).
+  const tagOptions = useMemo(
+    () =>
+      allTags.map((t) => {
+        const when = t.created_at ? new Date(t.created_at).toLocaleDateString("zh-CN") : "";
+        const ref = t.description ? `；参考资料：${t.description}` : "";
+        return {
+          value: t.slug,
+          label: `# ${t.name}（${t.plant_count}/${t.expected_count ?? t.plant_count}）`,
+          hover: {
+            text: `归类标签「${t.name}」：由 ${t.created_by_name ?? "编辑"} 于 ${when} 添加${ref}`,
+            anchorId: `tag-${t.slug}`,
+          },
+        };
+      }),
+    [allTags],
+  );
 
-  // For region/tag filter: build set of plant ids to retain.
+  const selectedRegion = region; // conservation protected list id
+  const selectedTagSlug = tag;
+  const selectedRcat = rcat; // user-curated regional_catalogs region label (browse panel)
+
   const regionPlantSlugs = useMemo(() => {
+    const sets: Set<string>[] = [];
+    // 重点保护目录 membership via the rank-aware conservation matcher.
     if (selectedRegion) {
-      const catIds = new Set(
-        catalogs.filter((c) => regionLabel(c) === selectedRegion).map((c) => c.id),
-      );
-      const match = buildPlantMatcher(plants);
-      const ids = new Set<string>();
+      const s = new Set<string>();
+      for (const p of plantsMetadata) {
+        if (conservationMatcher(p.scientific_name, (p as { family?: string | null }).family).protectedLists.has(selectedRegion))
+          s.add(p.id);
+      }
+      sets.push(s);
+    }
+    // 归类标签 membership.
+    if (selectedTagSlug) {
+      const s = new Set<string>();
+      const tagObj = allTags.find((t) => t.slug === selectedTagSlug);
+      if (tagObj) for (const pt of allPlantTags) if (pt.tag_id === tagObj.id) s.add(pt.plant_id);
+      sets.push(s);
+    }
+    // 地区名录（自建 regional_catalogs）membership.
+    if (selectedRcat) {
+      const catIds = new Set(catalogs.filter((c) => regionLabel(c) === selectedRcat).map((c) => c.id));
+      const match = buildPlantMatcher(plantsMetadata as any);
+      const s = new Set<string>();
       for (const e of catalogEntries) {
         if (!catIds.has(e.catalog_id)) continue;
         const hit = match(e);
-        if (hit) ids.add(hit.id);
+        if (hit) s.add(hit.id);
       }
-      return ids;
+      sets.push(s);
     }
-    if (selectedTagSlug) {
-      const tag = allTags.find((t) => t.slug === selectedTagSlug);
-      if (!tag) return new Set<string>();
-      const ids = new Set<string>();
-      for (const pt of allPlantTags) if (pt.tag_id === tag.id) ids.add(pt.plant_id);
-      return ids;
+    if (sets.length === 0) return null;
+    sets.sort((a, b) => a.size - b.size);
+    return new Set(Array.from(sets[0]).filter((id) => sets.every((s) => s.has(id))));
+  }, [
+    selectedRegion, selectedTagSlug, selectedRcat, conservationMatcher,
+    catalogs, catalogEntries, plantsMetadata, allTags, allPlantTags,
+  ]);
+
+  const filteredMetadataIds = useMemo(() => {
+    if (!family && !genus && !iucn) return null;
+    const ids = new Set<string>();
+    for (const p of plantsMetadata) {
+      if (family && p.family?.trim() !== family) continue;
+      if (genus && p.genus?.trim() !== genus) continue;
+      if (iucn && p.iucn_status !== iucn) continue;
+      ids.add(p.id);
     }
-    return null;
-  }, [selectedRegion, selectedTagSlug, catalogs, catalogEntries, plants, allTags, allPlantTags]);
+    return ids;
+  }, [plantsMetadata, family, genus, iucn]);
 
-  const filtered = useMemo(() => {
-    const t = q.trim().toLowerCase();
-    return plants.filter((p) => {
-      if (family && p.family?.trim() !== family) return false;
-      if (genus && p.genus?.trim() !== genus) return false;
-      if (iucn === "__unrated__") {
-        if (p.iucn_status) return false;
-      } else if (iucn && p.iucn_status !== iucn) return false;
-      if (regionPlantSlugs && !regionPlantSlugs.has(p.id)) return false;
-      if (t) {
-        const hay = [p.title, p.scientific_name, p.common_name_en, p.family, p.genus, p.habitat, p.summary, ...(p.tags ?? [])]
-          .filter(Boolean)
-          .some((s) => String(s).toLowerCase().includes(t));
-        if (!hay) return false;
-      }
-      return true;
-    });
-  }, [plants, q, family, genus, iucn, regionPlantSlugs]);
+  // Conservation-registry filters (CITES / GTS / GRIIS), matched via the shared rank-aware
+  // matcher. Empty-safe until each registry is seeded. Returns null when none is active.
+  const conservationIds = useMemo(() => {
+    if (!cites && !gts && !griis) return null;
+    const ids = new Set<string>();
+    for (const p of plantsMetadata) {
+      const hit = conservationMatcher(p.scientific_name, (p as { family?: string | null }).family);
+      if (cites && hit.cites !== cites) continue;
+      if (gts && hit.gts !== gts) continue;
+      if (griis && hit.griis !== griis) continue;
+      ids.add(p.id);
+    }
+    return ids;
+  }, [plantsMetadata, cites, gts, griis, conservationMatcher]);
 
-  const setParam = (key: "family" | "genus" | "iucn" | "region", value: string) => {
+  const PAGE_SIZE = 15;
+  const offset = (page - 1) * PAGE_SIZE;
+
+  const { data: aiIdsData } = useQuery({ queryKey: ["ai-plant-ids"], queryFn: fetchAiPlantIds });
+  const aiIds = aiIdsData ?? EMPTY_ID_SET;
+
+  // Combine the region/tag filter with the 条目类型 (AI vs edited) filter into a
+  // single inclusion id-list for the paginated query (null = no id constraint).
+  const plantIdsFilter = useMemo(() => {
+    let typeSet: Set<string> | null = null;
+    if (type === "ai") typeSet = aiIds;
+    else if (type === "edited")
+      typeSet = new Set(plantsMetadata.filter((p) => !aiIds.has(p.id)).map((p) => p.id));
+    // Intersect every active id-constraint (region/tag, 条目类型, conservation registries).
+    const sets = [regionPlantSlugs, typeSet, conservationIds].filter(
+      (s): s is Set<string> => s !== null,
+    );
+    if (sets.length === 0) return null;
+    sets.sort((a, b) => a.size - b.size);
+    return Array.from(sets[0]).filter((id) => sets.every((s) => s.has(id)));
+  }, [regionPlantSlugs, type, aiIds, plantsMetadata, conservationIds]);
+
+  const { data: paginatedData, isLoading: isListLoading } = useQuery({
+    queryKey: ["plants-paginated", { family, genus, iucn, q: searchVal, page, plantIds: plantIdsFilter }],
+    queryFn: () => fetchPaginatedPlants({
+      limit: PAGE_SIZE,
+      offset,
+      family,
+      genus,
+      iucn,
+      q: searchVal,
+      plantIds: plantIdsFilter,
+    }),
+  });
+
+  const paginatedPlants = paginatedData?.data ?? [];
+  const totalCount = paginatedData?.count ?? 0;
+  const totalPages = Math.ceil(totalCount / PAGE_SIZE) || 1;
+  const isLoading = isMetaLoading || isListLoading;
+
+  const setParam = (
+    key: "family" | "genus" | "iucn" | "region" | "tag" | "rcat" | "cites" | "gts" | "griis" | "type" | "page" | "q",
+    value: any,
+  ) => {
+    setStatement(null); // 点击其它筛选条件 → 声明框消失
     navigate({
-      search: (prev: Record<string, string>) => {
-        const next = { ...prev, [key]: value };
-        // Cascading rules:
-        // - Picking a genus auto-selects its family.
-        // - Picking a family that doesn't include the current genus clears genus.
+      search: (prev) => {
+        const next: Record<string, any> = { ...prev, [key]: value };
+        if (key !== "page") {
+          next.page = 1; // Reset to page 1 on any filter/search change
+        }
         if (key === "genus" && value) {
-          const hit = plants.find((p) => p.genus?.trim() === value && p.family?.trim());
+          const hit = plantsMetadata.find((p) => p.genus?.trim() === value && p.family?.trim());
           if (hit?.family) next.family = hit.family.trim();
         }
         if (key === "family" && value && prev.genus) {
-          const stillValid = plants.some(
+          const stillValid = plantsMetadata.some(
             (p) => p.family?.trim() === value && p.genus?.trim() === prev.genus,
           );
           if (!stillValid) next.genus = "";
         }
-        return next;
+        return next as typeof prev;
       },
     });
+  };
+
+  const handleSearchSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    setParam("q", qInput.trim());
   };
 
   return (
     <div className="min-h-screen flex flex-col">
       <SiteHeader />
       <main className="mx-auto max-w-5xl px-6 py-10 flex-1 w-full">
-        <div className="border-b-2 border-ink pb-6 mb-8 flex items-end justify-between gap-6 flex-wrap">
+        <div id="filter-bar" className="border-b-2 border-ink pb-6 mb-2 flex items-end justify-between gap-6 flex-wrap scroll-mt-20">
           <div>
             <p className="label text-vermilion mb-2">Index · 已收录档案</p>
             <h1 className="font-display text-5xl font-bold">全部条目</h1>
-            <p className="text-ink-faint mt-2">共 {plants.length} 条收录</p>
+            <p className="text-ink-faint mt-2">共 {plantsMetadata.length} 条收录</p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
+            <FilterDropdown
+              label="国家和各省重点保护目录"
+              value={region}
+              options={regionOptions}
+              onChange={(v) => setParam("region", v)}
+              onOptionHover={setStatement}
+            />
+            <FilterDropdown
+              label="归类标签"
+              value={tag}
+              options={tagOptions}
+              onChange={(v) => setParam("tag", v)}
+              onOptionHover={setStatement}
+            />
             <FilterDropdown label="科" value={family} options={familyOptions} onChange={(v) => setParam("family", v)} />
             <FilterDropdown label="属" value={genus} options={genusOptions} onChange={(v) => setParam("genus", v)} />
             <FilterDropdown label="IUCN" value={iucn} options={iucnOptions} onChange={(v) => setParam("iucn", v)} />
             <FilterDropdown
-              label="地区名录/归类标签"
-              value={region}
-              options={regionOptions}
-              onChange={(v) => setParam("region", v)}
+              label="国际贸易管制"
+              value={cites}
+              options={CITES_APPENDICES}
+              onChange={(v) => setParam("cites", v)}
             />
-            <input
-              value={q}
-              onChange={(e) => setQ(e.target.value)}
-              placeholder="搜索…"
-              className="border border-ink px-3 py-2 bg-transparent w-56 focus:outline-none focus:border-vermilion"
+            <FilterDropdown label="GTS" value={gts} options={GTS_CATEGORIES} onChange={(v) => setParam("gts", v)} />
+            <FilterDropdown
+              label="GRIIS全球入侵等级"
+              value={griis}
+              options={GRIIS_DEGREES}
+              onChange={(v) => setParam("griis", v)}
             />
+            <FilterDropdown
+              label="条目类型"
+              value={type}
+              options={[
+                { value: "ai", label: "AI 识别条目" },
+                { value: "edited", label: "编辑提交条目" },
+              ]}
+              emptyLabel="全部条目"
+              onChange={(v) => setParam("type", v)}
+            />
+            <form onSubmit={handleSearchSubmit} className="flex items-center">
+              <input
+                value={qInput}
+                onChange={(e) => setQInput(e.target.value)}
+                placeholder="回车搜索…"
+                className="border border-ink px-3 py-2 bg-transparent w-56 focus:outline-none focus:border-vermilion"
+              />
+            </form>
           </div>
+        </div>
+
+        {/* 声明框: appears on dropdown-option hover; click to jump to that directory. */}
+        <div className="mb-8 min-h-[1.5rem]">
+          {statement && (
+            <button
+              type="button"
+              onClick={() => {
+                scrollToId(statement.anchorId);
+                setStatement(null);
+              }}
+              className="w-full text-left border-l-4 border-vermilion bg-paper-deep/30 px-4 py-3 text-sm text-ink hover:bg-paper-deep/60 transition-colors"
+              title="点击查看完整目录"
+            >
+              <span className="label text-vermilion text-[10px] mr-2">资料来源 · 点击查看完整名录 ↓</span>
+              {statement.text}
+            </button>
+          )}
         </div>
 
         {isLoading ? (
           <p className="text-ink-faint">载入中…</p>
         ) : (
           <>
-            {/* Always-visible discovery panels: tags (collapsible like regions) + regional catalogs */}
             {allTags.length > 0 && (
-              <TagsBrowser tags={allTags} plants={plants} plantTags={allPlantTags} />
+              <TagsBrowser tags={allTags} plants={plantsMetadata as any} plantTags={allPlantTags} />
             )}
-            {!selectedRegion && !selectedTagSlug && catalogs.length > 0 && (
+            {!selectedRcat && catalogs.length > 0 && (
               <section className="mb-6 border border-rule p-4 bg-paper-deep/20">
-                <h2 className="font-display text-lg font-semibold mb-2">地区植物名录</h2>
+                <h2 className="font-display text-lg font-semibold mb-2">地区植物名录（自建）</h2>
                 <div className="flex flex-wrap gap-2">
                   {Array.from(new Set(catalogs.map((c) => regionLabel(c)))).sort().map((label) => (
                     <button
                       key={label}
                       type="button"
-                      onClick={() => setParam("region", `r:${label}`)}
+                      onClick={() => setParam("rcat", label)}
                       className="border border-ink/60 text-ink px-2.5 py-1 text-xs hover:bg-ink hover:text-background transition-colors"
                     >
                       {label}
@@ -226,35 +479,190 @@ function PlantsList() {
                 </div>
               </section>
             )}
-            {selectedRegion && (
+            {selectedRcat && (
               <RegionalCatalogPanel
-                region={selectedRegion}
+                region={selectedRcat}
                 catalogs={catalogs}
                 allEntries={catalogEntries}
-                plants={plants}
-                filteredPlantIds={
-                  family || genus || iucn
-                    ? new Set(filtered.map((p) => p.id))
-                    : null
-                }
+                plants={plantsMetadata as any}
+                filteredPlantIds={filteredMetadataIds}
               />
             )}
-            {filtered.length === 0 ? (
+            {paginatedPlants.length === 0 ? (
               <p className="text-ink-faint py-12 text-center">
                 {selectedRegion
+                  ? "该保护目录下暂无已收录档案匹配。"
+                  : selectedRcat
                   ? "该地区暂无已收录档案匹配。"
                   : selectedTagSlug
                   ? "该标签下还没有已收录条目。"
                   : "没有匹配的条目。"}
               </p>
             ) : (
-              <ul className="divide-y divide-rule border-y border-rule">
-                {filtered.map((p) => (
-                  <PlantRow key={p.id} plant={p} />
-                ))}
-              </ul>
+              <>
+                <ul className="divide-y divide-rule border-y border-rule">
+                  {paginatedPlants.map((p) => (
+                    <PlantRow key={p.id} plant={p} isAi={aiIds.has(p.id)} />
+                  ))}
+                </ul>
+
+                {totalPages > 1 && (
+                  <div className="flex items-center justify-between mt-8 border-t border-rule pt-6">
+                    <button
+                      disabled={page <= 1}
+                      onClick={() => setParam("page", page - 1)}
+                      className="px-4 py-2 border border-ink/40 text-sm font-semibold hover:bg-ink hover:text-background transition-colors disabled:opacity-30 disabled:hover:bg-transparent disabled:hover:text-ink shrink-0"
+                    >
+                      ← 上一页
+                    </button>
+                    <div className="flex items-center gap-1.5 overflow-x-auto px-4 max-w-[200px] sm:max-w-none no-scrollbar">
+                      {Array.from({ length: totalPages }).map((_, i) => {
+                        const pNum = i + 1;
+                        const isCurrent = pNum === page;
+                        return (
+                          <button
+                            key={pNum}
+                            onClick={() => setParam("page", pNum)}
+                            className={`w-9 h-9 flex items-center justify-center border text-xs font-bold transition-all ${
+                              isCurrent
+                                ? "bg-leaf border-leaf text-white"
+                                : "border-rule hover:border-ink"
+                            }`}
+                          >
+                            {pNum}
+                          </button>
+                        );
+                      })}
+                    </div>
+                    <button
+                      disabled={page >= totalPages}
+                      onClick={() => setParam("page", page + 1)}
+                      className="px-4 py-2 border border-ink/40 text-sm font-semibold hover:bg-ink hover:text-background transition-colors disabled:opacity-30 disabled:hover:bg-transparent disabled:hover:text-ink shrink-0"
+                    >
+                      下一页 →
+                    </button>
+                  </div>
+                )}
+              </>
             )}
           </>
+        )}
+
+        {/* ===== 名录目录（页末完整名单，收录/未收录着色）===== */}
+        {!isLoading && orderedProtectedLists.length > 0 && (
+          <section className="mt-20 pt-10 border-t-2 border-ink">
+            <div className="flex items-end justify-between gap-4 mb-2 flex-wrap">
+              <div>
+                <p className="label text-vermilion mb-2">Directories · 名录目录</p>
+                <h2 className="font-display text-3xl font-bold">国家和各省重点保护目录</h2>
+              </div>
+              <p className="text-xs text-ink-faint">
+                <span className="text-ink font-semibold">深色</span> = 本站已收录 ·{" "}
+                <span className="text-ink-faint/50">浅色</span> = 本站未收录
+              </p>
+            </div>
+
+            {orderedProtectedLists.map((list) => {
+              const taxa = taxaByList.get(list.id) ?? [];
+              const recCount = taxa.filter(taxonRecorded).length;
+              return (
+                <div key={list.id} id={`dir-${list.id}`} className="mt-10 scroll-mt-20">
+                  <div className="flex items-start justify-between gap-4 border-b border-rule pb-2 mb-3">
+                    <div>
+                      <h3 className="font-display text-xl font-semibold">{list.name}</h3>
+                      {list.source_note && (
+                        <p className="text-xs text-ink-faint mt-1 max-w-3xl leading-relaxed">{list.source_note}</p>
+                      )}
+                      <p className="text-[11px] text-ink-faint mt-1">
+                        共 {taxa.length} 条 · 本站已收录 {recCount} 条
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => scrollToId("filter-bar")}
+                      className="shrink-0 border border-ink/50 px-3 py-1.5 text-xs hover:bg-ink hover:text-background transition-colors"
+                    >
+                      ↑ 回到筛选栏
+                    </button>
+                  </div>
+                  <div className="flex flex-wrap gap-x-4 gap-y-1.5">
+                    {taxa.map((t, i) => {
+                      const rec = taxonRecorded(t);
+                      const p = t.rank === "species" ? plantByNorm.get(t.normalized_name) : undefined;
+                      const inner = (
+                        <>
+                          {t.chinese_name || t.scientific_name} <i className="opacity-80">{t.scientific_name}</i>
+                        </>
+                      );
+                      return p ? (
+                        <Link
+                          key={i}
+                          to="/plants/$slug"
+                          params={{ slug: p.slug }}
+                          className="text-sm text-ink hover:text-vermilion underline decoration-dotted"
+                        >
+                          {inner}
+                        </Link>
+                      ) : (
+                        <span key={i} className={`text-sm ${rec ? "text-ink" : "text-ink-faint/50"}`}>
+                          {inner}
+                        </span>
+                      );
+                    })}
+                  </div>
+                </div>
+              );
+            })}
+
+            {allTags.length > 0 && (
+              <div className="mt-16">
+                <h2 className="font-display text-2xl font-bold border-b border-ink pb-2 mb-2">
+                  归类标签名录（用户添加）
+                </h2>
+                {allTags.map((t) => {
+                  const pids = plantsByTag.get(t.id) ?? [];
+                  const when = t.created_at ? new Date(t.created_at).toLocaleDateString("zh-CN") : "";
+                  return (
+                    <div key={t.id} id={`tag-${t.slug}`} className="mt-8 scroll-mt-20">
+                      <div className="flex items-start justify-between gap-4 border-b border-rule pb-2 mb-3">
+                        <div>
+                          <h3 className="font-display text-lg font-semibold"># {t.name}</h3>
+                          <p className="text-xs text-ink-faint mt-1">
+                            由 {t.created_by_name ?? "编辑"} 于 {when} 添加
+                            {t.description ? ` · 参考资料：${t.description}` : ""}
+                          </p>
+                          <p className="text-[11px] text-ink-faint mt-1">共 {pids.length} 条收录</p>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => scrollToId("filter-bar")}
+                          className="shrink-0 border border-ink/50 px-3 py-1.5 text-xs hover:bg-ink hover:text-background transition-colors"
+                        >
+                          ↑ 回到筛选栏
+                        </button>
+                      </div>
+                      <div className="flex flex-wrap gap-x-4 gap-y-1.5">
+                        {pids.map((pid) => {
+                          const p = plantsById.get(pid);
+                          if (!p) return null;
+                          return (
+                            <Link
+                              key={pid}
+                              to="/plants/$slug"
+                              params={{ slug: p.slug }}
+                              className="text-sm text-ink hover:text-vermilion underline decoration-dotted"
+                            >
+                              {p.title} <i className="opacity-80">{p.scientific_name}</i>
+                            </Link>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </section>
         )}
       </main>
       <SiteFooter />
@@ -262,7 +670,7 @@ function PlantsList() {
   );
 }
 
-function PlantRow({ plant }: { plant: Plant }) {
+function PlantRow({ plant, isAi }: { plant: Plant; isAi?: boolean }) {
   return (
     <li>
       <Link
@@ -290,8 +698,11 @@ function PlantRow({ plant }: { plant: Plant }) {
         <div className="flex-1 min-w-0">
           <div className="flex items-baseline gap-2 flex-wrap">
             <h3 className="font-display text-xl font-semibold leading-tight group-hover:text-vermilion transition-colors">
-              {plant.title}
+              {isAi ? `[${plant.title}]` : plant.title}
             </h3>
+            {isAi && (
+              <span className="text-[10px] px-1.5 py-0.5 rounded bg-[oklch(0.45_0.18_240)]/12 text-[oklch(0.45_0.18_240)] shrink-0">AI 识别</span>
+            )}
             {plant.scientific_name && (
               <span className="italic text-sm text-ink-soft">{plant.scientific_name}</span>
             )}
@@ -299,8 +710,11 @@ function PlantRow({ plant }: { plant: Plant }) {
               <span className="text-sm text-ink-faint">· {plant.common_name_en}</span>
             )}
           </div>
+          {plant.common_names_zh && (
+            <p className="text-xs text-ink-soft mt-1">俗名/商品名：{plant.common_names_zh}</p>
+          )}
           {plant.family && (
-            <p className="text-xs text-ink-faint mt-1">{plant.family}</p>
+            <p className={`text-xs text-ink-faint ${plant.common_names_zh ? "mt-0.5" : "mt-1"}`}>{plant.family}</p>
           )}
         </div>
       </Link>

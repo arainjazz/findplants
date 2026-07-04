@@ -1,0 +1,17 @@
+{
+  "short_name": "Plantspedia",
+  "name": "Plantspedia · 全民植物志",
+  "description": "Plantspedia 是一个由社区共同编纂的植物科普网站，收录每一种值得记住的草木。",
+  "icons": [
+    {
+      "src": "/favicon.ico",
+      "sizes": "64x64 32x32 24x24 16x16",
+      "type": "image/x-icon"
+    }
+  ],
+  "start_url": "/",
+  "background_color": "#111111",
+  "theme_color": "#2e7d32",
+  "display": "standalone",
+  "orientation": "portrait"
+}

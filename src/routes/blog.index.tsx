@@ -1,7 +1,7 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { useQuery } from "@tanstack/react-query";
 import { SiteHeader, SiteFooter } from "@/components/site-header";
-import { fetchPublishedPosts } from "@/lib/blog";
+import { fetchPublishedPosts, blogCoverUrl } from "@/lib/blog";
 
 export const Route = createFileRoute("/blog/")({
   head: () => ({
@@ -43,9 +43,9 @@ function BlogList() {
                   params={{ slug: p.slug }}
                   className="grid md:grid-cols-[140px_1fr] gap-6 py-6 hover:bg-paper-deep/40 transition-colors group"
                 >
-                  {p.cover_url ? (
+                  {blogCoverUrl(p) ? (
                     <img
-                      src={p.cover_url}
+                      src={blogCoverUrl(p)!}
                       alt=""
                       className="w-full md:w-[140px] h-[100px] object-cover border border-rule"
                       loading="lazy"
