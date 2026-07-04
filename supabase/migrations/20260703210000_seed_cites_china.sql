@@ -1,0 +1,81 @@
+-- Seed: CITES 附录（中国相关） 国际贸易管制. kind=cites.
+-- Idempotent: clears all cites taxa/lists before re-inserting.
+-- China-relevant subset of stable whole-family/genus CITES plant listings + key species.
+DELETE FROM public.conservation_taxa t USING public.conservation_lists l
+  WHERE t.list_id = l.id AND l.kind = 'cites';
+DELETE FROM public.conservation_lists WHERE kind = 'cites';
+WITH new_list AS (
+  INSERT INTO public.conservation_lists (kind, name, province, version, source_url, source_note)
+  VALUES ('cites', 'CITES 附录（中国相关）', NULL, '2023',
+          'https://cites.org/eng/app/appendices.php',
+          '《濒危野生动植物种国际贸易公约》(CITES) 附录 I/II/III 植物条目（据 2023-02-23 生效版官方中文本整理）。附录 I/II 收录与中国相关的主要类群（整科/整属统一管制条目 + 中国分布的种级条目，如红景天属、甘松、云南火焰兰等）；附录 III 收录全部植物条目，其中蒙古栎、红松、水曲柳、买麻藤、百日青、水青树等为中国分布种（由俄罗斯/尼泊尔单方列入）。多肉大戟属（仅多肉种受管）、人参（仅俄罗斯种群受管）等无法按学名精确区分的条目未纳入。来源：CITES 附录 I、II 和 III（2023 年 2 月 23 日生效）中华人民共和国濒危物种进出口管理办公室编印。')
+  RETURNING id
+)
+INSERT INTO public.conservation_taxa (list_id, scientific_name, normalized_name, chinese_name, status, rank, excluded_names)
+SELECT nl.id, v.sci, v.norm, v.zh, v.status, v.rank, v.excl FROM new_list nl, (VALUES
+  ('Cactaceae', 'cactaceae', '仙人掌科', 'II', 'family', NULL::text[]),
+  ('Cyatheaceae', 'cyatheaceae', '桫椤科', 'II', 'family', NULL::text[]),
+  ('Alsophila', 'alsophila', '桫椤属', 'II', 'genus', NULL::text[]),
+  ('Gymnosphaera', 'gymnosphaera', '黑桫椤属', 'II', 'genus', NULL::text[]),
+  ('Sphaeropteris', 'sphaeropteris', '白桫椤属', 'II', 'genus', NULL::text[]),
+  ('Cyathea', 'cyathea', '桫椤属', 'II', 'genus', NULL::text[]),
+  ('Cycas', 'cycas', '苏铁属', 'II', 'genus', NULL::text[]),
+  ('Nepenthes', 'nepenthes', '猪笼草属', 'II', 'genus', NULL::text[]),
+  ('Aquilaria', 'aquilaria', '沉香属', 'II', 'genus', NULL::text[]),
+  ('Dalbergia', 'dalbergia', '黄檀属', 'II', 'genus', NULL::text[]),
+  ('Taxus', 'taxus', '红豆杉属', 'II', 'genus', NULL::text[]),
+  ('Aloe', 'aloe', '芦荟属', 'II', 'genus', ARRAY['aloe vera']::text[]),
+  ('Dendrobium', 'dendrobium', '石斛属', 'II', 'genus', NULL::text[]),
+  ('Cymbidium', 'cymbidium', '兰属', 'II', 'genus', NULL::text[]),
+  ('Bletilla', 'bletilla', '白及属', 'II', 'genus', NULL::text[]),
+  ('Bulbophyllum', 'bulbophyllum', '石豆兰属', 'II', 'genus', NULL::text[]),
+  ('Gastrodia', 'gastrodia', '天麻属', 'II', 'genus', NULL::text[]),
+  ('Pleione', 'pleione', '独蒜兰属', 'II', 'genus', NULL::text[]),
+  ('Cypripedium', 'cypripedium', '杓兰属', 'II', 'genus', NULL::text[]),
+  ('Calanthe', 'calanthe', '虾脊兰属', 'II', 'genus', NULL::text[]),
+  ('Habenaria', 'habenaria', '玉凤花属', 'II', 'genus', NULL::text[]),
+  ('Liparis', 'liparis', '羊耳蒜属', 'II', 'genus', NULL::text[]),
+  ('Goodyera', 'goodyera', '斑叶兰属', 'II', 'genus', NULL::text[]),
+  ('Spiranthes', 'spiranthes', '绶草属', 'II', 'genus', NULL::text[]),
+  ('Anoectochilus', 'anoectochilus', '开唇兰属', 'II', 'genus', NULL::text[]),
+  ('Phalaenopsis', 'phalaenopsis', '蝴蝶兰属', 'II', 'genus', NULL::text[]),
+  ('Vanda', 'vanda', '万代兰属', 'II', 'genus', NULL::text[]),
+  ('Paphiopedilum', 'paphiopedilum', '兜兰属', 'I', 'genus', NULL::text[]),
+  ('Cibotium barometz', 'cibotium barometz', '金毛狗', 'II', 'species', NULL::text[]),
+  ('Cistanche deserticola', 'cistanche deserticola', '肉苁蓉', 'II', 'species', NULL::text[]),
+  ('Dioscorea deltoidea', 'dioscorea deltoidea', '三角叶薯蓣', 'II', 'species', NULL::text[]),
+  ('Podophyllum hexandrum', 'podophyllum hexandrum', '桃儿七', 'II', 'species', NULL::text[]),
+  ('Sinopodophyllum hexandrum', 'sinopodophyllum hexandrum', '桃儿七', 'II', 'species', NULL::text[]),
+  ('Rauvolfia serpentina', 'rauvolfia serpentina', '蛇根木', 'II', 'species', NULL::text[]),
+  ('Saussurea costus', 'saussurea costus', '云木香', 'I', 'species', NULL::text[]),
+  ('Rhodiola', 'rhodiola', '红景天属', 'II', 'genus', NULL::text[]),
+  ('Nardostachys grandiflora', 'nardostachys grandiflora', '甘松', 'II', 'species', NULL::text[]),
+  ('Renanthera imschootiana', 'renanthera imschootiana', '云南火焰兰', 'I', 'species', NULL::text[]),
+  ('Quercus mongolica', 'quercus mongolica', '蒙古栎', 'III', 'species', NULL::text[]),
+  ('Pinus koraiensis', 'pinus koraiensis', '红松', 'III', 'species', NULL::text[]),
+  ('Fraxinus mandshurica', 'fraxinus mandshurica', '水曲柳', 'III', 'species', NULL::text[]),
+  ('Gnetum montanum', 'gnetum montanum', '买麻藤', 'III', 'species', NULL::text[]),
+  ('Podocarpus neriifolius', 'podocarpus neriifolius', '百日青', 'III', 'species', NULL::text[]),
+  ('Tetracentron sinense', 'tetracentron sinense', '水青树', 'III', 'species', NULL::text[]),
+  ('Magnolia liliifera', 'magnolia liliifera', '盖裂木', 'III', 'species', NULL::text[]),
+  ('Conophytum', 'conophytum', '肉锥花属', 'III', 'genus', NULL::text[]),
+  ('Mestoklema tuberosum', 'mestoklema tuberosum', '块茎密叶枝玉', 'III', 'species', NULL::text[]),
+  ('Raphionacme zeyheri', 'raphionacme zeyheri', '绿花白皮玉', 'III', 'species', NULL::text[]),
+  ('Crassothonna clavifolia', 'crassothonna clavifolia', '棒叶敦菊木', 'III', 'species', NULL::text[]),
+  ('Othonna armiana', 'othonna armiana', '疣基厚敦菊', 'III', 'species', NULL::text[]),
+  ('Othonna cacalioides', 'othonna cacalioides', '蟹甲厚敦菊', 'III', 'species', NULL::text[]),
+  ('Othonna euphorbioides', 'othonna euphorbioides', '刺烛厚敦菊', 'III', 'species', NULL::text[]),
+  ('Othonna retrorsa', 'othonna retrorsa', '反折厚敦菊', 'III', 'species', NULL::text[]),
+  ('Tylecodon bodleyae', 'tylecodon bodleyae', '毛花奇峰木', 'III', 'species', NULL::text[]),
+  ('Tylecodon nolteei', 'tylecodon nolteei', '厚叶奇峰木', 'III', 'species', NULL::text[]),
+  ('Tylecodon reticulatus', 'tylecodon reticulatus', '网状奇峰木', 'III', 'species', NULL::text[]),
+  ('Monsonia herrei', 'monsonia herrei', '刺羽龙骨葵', 'III', 'species', NULL::text[]),
+  ('Monsonia multifida', 'monsonia multifida', '多裂龙骨葵', 'III', 'species', NULL::text[]),
+  ('Monsonia patersonii', 'monsonia patersonii', '硬皮龙骨葵', 'III', 'species', NULL::text[]),
+  ('Pelargonium crassicaule', 'pelargonium crassicaule', '粗茎天竺葵', 'III', 'species', NULL::text[]),
+  ('Pelargonium triste', 'pelargonium triste', '羽叶天竺葵', 'III', 'species', NULL::text[]),
+  ('Lodoicea maldivica', 'lodoicea maldivica', '巨籽棕', 'III', 'species', NULL::text[]),
+  ('Meconopsis regia', 'meconopsis regia', '尼泊尔绿绒蒿', 'III', 'species', NULL::text[]),
+  ('Adenia spinosa', 'adenia spinosa', '多刺蒴莲', 'III', 'species', NULL::text[]),
+  ('Portulacaria pygmaea', 'portulacaria pygmaea', '矮瓷玲珑', 'III', 'species', NULL::text[])
+) AS v(sci, norm, zh, status, rank, excl);

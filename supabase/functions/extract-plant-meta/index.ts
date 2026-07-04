@@ -24,6 +24,14 @@ function htmlToText(html: string): string {
   return text.slice(0, 30000);
 }
 
+function cleanJson(str: string): string {
+  let cleaned = str.trim();
+  if (cleaned.startsWith("```")) {
+    cleaned = cleaned.replace(/^```json\s*/i, "").replace(/```$/, "").trim();
+  }
+  return cleaned;
+}
+
 serve(async (req) => {
   if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
 
@@ -39,11 +47,12 @@ serve(async (req) => {
 
     const text = htmlToText(raw);
 
-    const LOVABLE_API_KEY = Deno.env.get("LOVABLE_API_KEY");
-    if (!LOVABLE_API_KEY) throw new Error("LOVABLE_API_KEY 未配置");
+    const geminiKey = Deno.env.get("GEMINI_API_KEY");
+    const openaiKey = Deno.env.get("OPENAI_API_KEY");
+    const lovableKey = Deno.env.get("LOVABLE_API_KEY");
 
     const systemPrompt = `你是植物信息抽取助手。给定一个植物图鉴页面的纯文本，
-严格只通过 extract_plant_meta 工具返回结构化结果。规则：
+严格只通过 JSON 结构返回结果。规则：
 - title：植物中文名称。优先取页面 H1/标题/中文名，找不到留空。
 - scientific_name：拉丁学名（含命名人，如 "Butomus umbellatus L."）。找不到留空。
 - common_name_en：英文俗名 / common name（例如 "Flowering rush"）。优先取页面中明确标注的 common name / English name；
@@ -66,84 +75,191 @@ serve(async (req) => {
 - summary：植物简介，150-250 字。优先抽取页面"简介/概述/描述/Introduction/Description"段落原文，去除标签；找不到则基于全文摘要。
 找不到的字段返回空字符串或空数组（habitat 例外，按上面规则填 "无记录"），不要编造。`;
 
-    const aiResp = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${LOVABLE_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: "google/gemini-3-flash-preview",
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: `以下是页面正文文本：\n\n${text}` },
-        ],
-        tools: [
-          {
-            type: "function",
-            function: {
-              name: "extract_plant_meta",
-              description: "返回从植物页面抽取出的结构化信息",
-              parameters: {
-                type: "object",
-                properties: {
-                  scientific_name: { type: "string" },
-                  title: { type: "string" },
-                  common_name_en: { type: "string" },
-                  slug: { type: "string" },
-                  family: { type: "string" },
-                  genus: { type: "string" },
-                  habitat: { type: "string" },
-                  tags: { type: "array", items: { type: "string" } },
-                  iucn_status: { type: "string" },
-                  summary: { type: "string" },
-                },
-                required: [
-                  "title",
-                  "scientific_name",
-                  "common_name_en",
-                  "slug",
-                  "family",
-                  "genus",
-                  "habitat",
-                  "tags",
-                  "iucn_status",
-                  "summary",
-                ],
-                additionalProperties: false,
-              },
-            },
-          },
-        ],
-        tool_choice: { type: "function", function: { name: "extract_plant_meta" } },
-      }),
-    });
+    if (geminiKey) {
+      let model = Deno.env.get("AI_MODEL") || "gemini-1.5-flash";
+      if (model === "gemini-2.5-flash") {
+        model = "gemini-1.5-flash";
+      }
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiKey}`;
+      const schema = {
+        type: "object",
+        properties: {
+          title: { type: "string" },
+          scientific_name: { type: "string" },
+          common_name_en: { type: "string" },
+          slug: { type: "string" },
+          family: { type: "string" },
+          genus: { type: "string" },
+          habitat: { type: "string" },
+          tags: { type: "array", items: { type: "string" } },
+          iucn_status: { type: "string" },
+          summary: { type: "string" },
+        },
+        required: [
+          "title",
+          "scientific_name",
+          "common_name_en",
+          "slug",
+          "family",
+          "genus",
+          "habitat",
+          "tags",
+          "iucn_status",
+          "summary",
+        ]
+      };
 
-    if (!aiResp.ok) {
-      if (aiResp.status === 429)
-        return new Response(JSON.stringify({ error: "请求过于频繁，请稍后再试" }), {
-          status: 429,
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        });
-      if (aiResp.status === 402)
-        return new Response(JSON.stringify({ error: "AI 额度已用完，请到工作区充值" }), {
-          status: 402,
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        });
-      const t = await aiResp.text();
-      console.error("AI gateway error", aiResp.status, t);
-      throw new Error(`AI 网关错误 ${aiResp.status}`);
+      const resp = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [
+            { role: "user", parts: [{ text: `以下是页面正文文本：\n\n${text}` }] }
+          ],
+          systemInstruction: {
+            parts: [{ text: systemPrompt }]
+          },
+          generationConfig: {
+            responseMimeType: "application/json",
+            responseSchema: schema
+          }
+        })
+      });
+
+      if (!resp.ok) {
+        const t = await resp.text();
+        console.error("Gemini API Error in extract-plant-meta:", resp.status, t);
+        throw new Error(`Gemini extract-meta error (HTTP ${resp.status})`);
+      }
+
+      const data = await resp.json();
+      const txt = data.candidates?.[0]?.content?.parts?.[0]?.text;
+      if (!txt) throw new Error("Gemini 未返回有效文本");
+      
+      const parsed = JSON.parse(cleanJson(txt));
+      return new Response(JSON.stringify(parsed), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
     }
 
-    const data = await aiResp.json();
-    const call = data.choices?.[0]?.message?.tool_calls?.[0];
-    const args = call?.function?.arguments;
-    if (!args) throw new Error("AI 未返回结构化结果");
-    const parsed = typeof args === "string" ? JSON.parse(args) : args;
+    if (openaiKey) {
+      const apiBase = Deno.env.get("OPENAI_API_BASE") || Deno.env.get("AI_API_BASE") || "https://api.openai.com/v1";
+      const model = Deno.env.get("OPENAI_MODEL") || Deno.env.get("AI_MODEL") || "gpt-4o-mini";
+      
+      const resp = await fetch(`${apiBase}/chat/completions`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${openaiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model,
+          messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: `以下是页面正文文本：\n\n${text}` }
+          ],
+          response_format: { type: "json_object" }
+        })
+      });
 
-    return new Response(JSON.stringify(parsed), {
-      headers: { ...corsHeaders, "Content-Type": "application/json" },
-    });
+      if (!resp.ok) {
+        const t = await resp.text();
+        console.error("OpenAI API Error in extract-plant-meta:", resp.status, t);
+        throw new Error(`OpenAI extract-meta error (HTTP ${resp.status})`);
+      }
+
+      const data = await resp.json();
+      const content = data.choices?.[0]?.message?.content;
+      if (!content) throw new Error("OpenAI 未返回内容");
+      
+      const parsed = JSON.parse(cleanJson(content));
+      return new Response(JSON.stringify(parsed), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    if (lovableKey) {
+      const aiResp = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${lovableKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "google/gemini-3-flash-preview",
+          messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: `以下是页面正文文本：\n\n${text}` },
+          ],
+          tools: [
+            {
+              type: "function",
+              function: {
+                name: "extract_plant_meta",
+                description: "返回从植物页面抽取出的结构化信息",
+                parameters: {
+                  type: "object",
+                  properties: {
+                    scientific_name: { type: "string" },
+                    title: { type: "string" },
+                    common_name_en: { type: "string" },
+                    slug: { type: "string" },
+                    family: { type: "string" },
+                    genus: { type: "string" },
+                    habitat: { type: "string" },
+                    tags: { type: "array", items: { type: "string" } },
+                    iucn_status: { type: "string" },
+                    summary: { type: "string" },
+                  },
+                  required: [
+                    "title",
+                    "scientific_name",
+                    "common_name_en",
+                    "slug",
+                    "family",
+                    "genus",
+                    "habitat",
+                    "tags",
+                    "iucn_status",
+                    "summary",
+                  ],
+                  additionalProperties: false,
+                },
+              },
+            },
+          ],
+          tool_choice: { type: "function", function: { name: "extract_plant_meta" } },
+        }),
+      });
+
+      if (!aiResp.ok) {
+        if (aiResp.status === 429)
+          return new Response(JSON.stringify({ error: "请求过于频繁，请稍后再试" }), {
+            status: 429,
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          });
+        if (aiResp.status === 402)
+          return new Response(JSON.stringify({ error: "AI 额度已用完，请到工作区充值" }), {
+            status: 402,
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          });
+        const t = await aiResp.text();
+        console.error("AI gateway error", aiResp.status, t);
+        throw new Error(`AI 网关错误 ${aiResp.status}`);
+      }
+
+      const data = await aiResp.json();
+      const call = data.choices?.[0]?.message?.tool_calls?.[0];
+      const args = call?.function?.arguments;
+      if (!args) throw new Error("AI 未返回结构化结果");
+      const parsed = typeof args === "string" ? JSON.parse(args) : args;
+
+      return new Response(JSON.stringify(parsed), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    throw new Error("AI 提取服务未配置。请在 Supabase Secrets 中设置 GEMINI_API_KEY 或 OPENAI_API_KEY。");
   } catch (e) {
     console.error("extract-plant-meta error", e);
     return new Response(JSON.stringify({ error: e instanceof Error ? e.message : "未知错误" }), {
