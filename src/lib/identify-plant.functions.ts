@@ -2,6 +2,7 @@ import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
 import { renderDraftHtml, type PlantDraftFields } from "./plant-html-template";
+import { lookupChinaInvasive } from "./china-invasive-list";
 import { slugify } from "./plants";
 
 const AI_MODEL = "google/gemini-2.5-pro";
@@ -1340,17 +1341,23 @@ export const submitPlantDraft = createServerFn({ method: "POST" })
           gbifTaxonKey = chk.taxonKey;
           isInvasive = chk.isInvasive;
         }
-        if (chk?.isInvasive || griisHit) {
+        // The four official national batches are authoritative for China; a hit here
+        // is enough on its own, and adds the 批次 + 重点管理 fact (deterministic).
+        const cl = lookupChinaInvasive(sciFull || sciBinomial);
+        if (chk?.isInvasive || griisHit || cl) {
           isInvasive = true;
           const card = await generateInvasiveCard(meta.title || sciBinomial, meta.scientific_name || sciBinomial);
-          if (card) {
-            invasiveCard = {
-              ...card,
-              degree: griisHit?.degreeLabel ?? null,
-              source: griisHit?.source ?? chk?.source ?? "GBIF · GRIIS 中国名录",
-              source_url: griisHit?.source_url ?? null,
-            };
-          }
+          invasiveCard = {
+            status_zh: card?.status_zh ?? "",
+            harm_zh: card?.harm_zh ?? "",
+            control_zh: card?.control_zh ?? "",
+            degree: griisHit?.degreeLabel ?? null,
+            source: griisHit?.source ?? chk?.source ?? "GBIF · GRIIS 中国名录",
+            source_url: griisHit?.source_url ?? null,
+            china_list: cl
+              ? { batch: cl.batch, date: cl.date, publisher: cl.publisher, keyManaged: cl.keyManaged }
+              : null,
+          };
         }
       }
     } catch (e) {

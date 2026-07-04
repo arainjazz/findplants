@@ -44,6 +44,14 @@ export type PlantDraftFields = {
     /** Citation: the specific registry + year, e.g.「GRIIS 全球入侵等级（中国）（2023）」. */
     source?: string;
     source_url?: string | null;
+    /** National-list fact when the species is on one of the four official batches
+     *  《中国外来入侵物种名单》 — batch + 重点管理名录 status (deterministic, not LLM). */
+    china_list?: {
+      batch: string;
+      date: string;
+      publisher: string;
+      keyManaged: boolean;
+    } | null;
   } | null;
   /** Display badges for conservation / trade / invasion registries the species
    *  matched (国家/省级重点保护, CITES, GTS, GRIIS). Renders a status card after
@@ -157,13 +165,21 @@ i,em{color:var(--gold);}
 @media (min-width:768px){.invasive-card .ic-body{grid-template-columns:1fr 1fr 1fr;}}
 .invasive-card .ic-block .ic-label{display:block;font-family:'Noto Serif SC',serif;font-weight:600;font-size:14px;color:#a12a1a;margin-bottom:6px;padding-bottom:5px;border-bottom:1px solid rgba(192,57,43,.28);}
 .invasive-card .ic-block p{font-size:14px;line-height:1.66;color:#4a1c14;margin:0;}
-.invasive-card .ic-cite{margin-top:16px;padding-top:12px;border-top:1px solid rgba(192,57,43,.22);font-family:'Cormorant Garamond',serif;font-size:12.5px;letter-spacing:.04em;color:#7a2a1c;}
+.invasive-card .ic-national{margin:0 22px;padding:11px 14px;border-radius:6px;background:rgba(192,57,43,.08);border:1px solid rgba(192,57,43,.24);font-size:13px;line-height:1.6;color:#5a2016;}
+.invasive-card .ic-national strong{color:#a12a1a;}
+.invasive-card .ic-km{display:inline-block;margin-left:6px;font-weight:600;}
+.invasive-card .ic-km.on{color:#a12a1a;}
+.invasive-card .ic-km.off{color:#7a5010;}
+.invasive-card .ic-cite{margin:16px 22px 20px;padding-top:12px;border-top:1px solid rgba(192,57,43,.22);font-family:'Cormorant Garamond',serif;font-size:12.5px;letter-spacing:.04em;color:#7a2a1c;}
 .invasive-card .ic-cite a{color:#7a2a1c;text-decoration:underline;}
 @media(prefers-color-scheme:dark){
   .invasive-card{background:#2a1512;border-color:#e05a45;border-left-color:#e05a45;background-image:repeating-linear-gradient(135deg,rgba(224,90,69,0.06) 0,rgba(224,90,69,0.06) 12px,transparent 12px,transparent 24px);}
   .invasive-card .ic-head{background:#8f2a1c;}
   .invasive-card .ic-block .ic-label{color:#f0a595;border-bottom-color:rgba(224,90,69,.35);}
   .invasive-card .ic-block p{color:#e9d9d4;}
+  .invasive-card .ic-national{background:rgba(224,90,69,.12);border-color:rgba(224,90,69,.32);color:#e9d9d4;}
+  .invasive-card .ic-national strong,.invasive-card .ic-km.on{color:#f0a595;}
+  .invasive-card .ic-km.off{color:#d9b57a;}
 }
 
 /* Conservation / registry status card — calm green-gold counterpart to the
@@ -336,8 +352,13 @@ export function renderDraftHtml(fields: PlantDraftFields): string {
   const invCitation = inv?.source_url
     ? `<a href="${invUrl}" target="_blank" rel="noopener">${invSourceTxt}</a>`
     : invSourceTxt;
+  const cl = inv?.china_list;
+  const nationalLine = cl
+    ? `<div class="ic-national">📋 <strong>国家名录</strong>：《中国外来入侵物种名单》${esc(cl.batch)}（${esc(cl.date)} · ${esc(cl.publisher)}）` +
+      `<span class="ic-km ${cl.keyManaged ? "on" : "off"}">${cl.keyManaged ? "已纳入" : "未纳入"}《重点管理外来入侵物种名录》（农业农村部 567 号公告，2022）</span></div>`
+    : "";
   const invasiveCard =
-    inv && (inv.status_zh || inv.harm_zh || inv.control_zh)
+    inv && (inv.status_zh || inv.harm_zh || inv.control_zh || inv.china_list)
       ? `<section class="invasive-card">` +
         `<div class="ic-head"><span class="ic-icon">⚠️</span>` +
         `<div><span class="ic-kicker">Biosecurity Alert · 外来入侵物种警示</span><h2>外来入侵物种</h2></div>` +
@@ -354,6 +375,7 @@ export function renderDraftHtml(fields: PlantDraftFields): string {
           ? `<div class="ic-block"><span class="ic-label">管控与防治建议</span><p>${esc(inv.control_zh)}</p></div>`
           : "") +
         `</div>` +
+        nationalLine +
         `<div class="ic-cite">判定依据 · Source：${invCitation}</div>` +
         `</section>`
       : "";
