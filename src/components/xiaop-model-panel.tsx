@@ -5,6 +5,7 @@ import {
   saveXiaoPConfigFn,
   getXiaoPConfigFn,
   clearXiaoPConfigFn,
+  listProviderModelsFn,
 } from "@/lib/identify-plant.functions";
 import { XiaoPLogo } from "@/components/xiaop-logo";
 import { toast } from "sonner";
@@ -79,10 +80,15 @@ export function XiaoPModelPanel() {
   const [customModel, setCustomModel] = useState("");
   const [baseUrl, setBaseUrl] = useState("https://api.openai.com/v1");
   const [showKey, setShowKey] = useState(false);
+  // Live-fetched model IDs (from the provider's list-models endpoint). When set,
+  // they replace the hard-coded preset list in the dropdown.
+  const [fetchedModels, setFetchedModels] = useState<string[]>([]);
+  const [fetching, setFetching] = useState(false);
 
   const saveFn = useServerFn(saveXiaoPConfigFn);
   const getFn = useServerFn(getXiaoPConfigFn);
   const clearFn = useServerFn(clearXiaoPConfigFn);
+  const listFn = useServerFn(listProviderModelsFn);
 
   const { data: activeConfig, isLoading } = useQuery({
     queryKey: ["xiaop-config"],
@@ -134,10 +140,40 @@ export function XiaoPModelPanel() {
     setProvider(p);
     setModel(m.defaultModel);
     setCustomModel("");
+    setFetchedModels([]); // stale for the old provider
     if (p === "openai") setBaseUrl("https://api.openai.com/v1");
     else if (p === "anthropic") setBaseUrl("https://api.anthropic.com/v1");
     else if (p === "custom") setBaseUrl("");
   };
+
+  // Live-list the models this key can actually use (real auto-detect).
+  const fetchModels = async () => {
+    if (!apiKey.trim()) return toast.error("请先填写 API Key，再拉取可用模型");
+    if (meta.needsBaseUrl && !baseUrl.trim()) return toast.error("请先填写 API Base URL");
+    setFetching(true);
+    try {
+      const res = (await listFn({
+        data: {
+          provider,
+          apiKey: apiKey.replace(/\s+/g, ""),
+          baseUrl: meta.needsBaseUrl ? baseUrl.trim().replace(/\/+$/, "") : "",
+        },
+      })) as { models: string[] };
+      if (!res.models.length) return toast.error("没有拉取到可用模型（key 或接口可能不对）");
+      setFetchedModels(res.models);
+      if (!res.models.includes(effectiveModel)) {
+        setModel(res.models[0]);
+        setCustomModel("");
+      }
+      toast.success(`已拉取 ${res.models.length} 个可用模型`);
+    } catch (e) {
+      toast.error((e as Error).message);
+    } finally {
+      setFetching(false);
+    }
+  };
+  // Options shown in the dropdown: real fetched list if available, else presets.
+  const optionModels = fetchedModels.length > 0 ? fetchedModels : meta.models;
 
   return (
     <div className="mb-6 animate-in fade-in slide-in-from-top-2 duration-300">
@@ -227,8 +263,24 @@ export function XiaoPModelPanel() {
           </div>
 
           <div>
-            <label className="block text-xs font-semibold text-ink-soft mb-1.5">模型</label>
-            {meta.models.length > 0 ? (
+            <div className="flex items-center justify-between mb-1.5">
+              <label className="block text-xs font-semibold text-ink-soft">模型</label>
+              <button
+                type="button"
+                onClick={fetchModels}
+                disabled={fetching}
+                title="用上面填的 API Key 向服务商拉取你实际可用的模型列表"
+                className="inline-flex items-center gap-1 text-[11px] px-2 py-1 rounded-md border border-leaf/40 text-leaf-deep hover:bg-leaf hover:text-background transition-colors cursor-pointer disabled:opacity-50"
+              >
+                {fetching ? (
+                  <span className="w-3 h-3 rounded-full border-2 border-leaf/30 border-t-leaf animate-spin" />
+                ) : (
+                  <RefreshIcon className="w-3 h-3" />
+                )}
+                {fetching ? "拉取中…" : "拉取可用模型"}
+              </button>
+            </div>
+            {optionModels.length > 0 ? (
               <select
                 value={customModel ? "__custom__" : model}
                 onChange={(e) => {
@@ -240,13 +292,13 @@ export function XiaoPModelPanel() {
                 }}
                 className="w-full px-3 py-2 text-xs rounded-lg border border-rule bg-background focus:outline-none focus:border-leaf transition-colors cursor-pointer"
               >
-                {meta.models.map((m) => (
+                {optionModels.map((m) => (
                   <option key={m} value={m}>{m}</option>
                 ))}
                 <option value="__custom__">✏️ 手动输入其他模型名…</option>
               </select>
             ) : null}
-            {(meta.models.length === 0 || customModel !== "") && (
+            {(optionModels.length === 0 || customModel !== "") && (
               <input
                 type="text"
                 value={customModel.trim() || model}
@@ -254,6 +306,9 @@ export function XiaoPModelPanel() {
                 placeholder="例：deepseek-chat / qwen-plus / glm-4"
                 className="mt-1.5 w-full px-3 py-2 text-xs rounded-lg border border-rule bg-background font-mono focus:outline-none focus:border-leaf transition-colors"
               />
+            )}
+            {fetchedModels.length > 0 && (
+              <p className="mt-1 text-[11px] text-leaf-deep">✓ 已按你的 Key 列出 {fetchedModels.length} 个可用模型</p>
             )}
           </div>
 
@@ -296,6 +351,17 @@ export function XiaoPModelPanel() {
         </div>
       )}
     </div>
+  );
+}
+
+function RefreshIcon({ className }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className} aria-hidden="true">
+      <path d="M3 12a9 9 0 0 1 15-6.7L21 8" />
+      <path d="M21 3v5h-5" />
+      <path d="M21 12a9 9 0 0 1-15 6.7L3 16" />
+      <path d="M3 21v-5h5" />
+    </svg>
   );
 }
 

@@ -2439,6 +2439,68 @@ export const saveXiaoPConfigFn = createServerFn({ method: "POST" })
     return { ok: true };
   });
 
+// ─── Live model discovery — list the models a key can actually use ───────────
+// The console's model dropdown is otherwise a hard-coded preset list, so newer
+// models never appear. This queries the provider's own "list models" endpoint
+// (server-side to dodge browser CORS) with the entered key.
+
+const ListModelsInput = z.object({
+  provider: z.enum(["gemini", "openai", "anthropic", "custom"]),
+  apiKey: z.string().min(1).max(2000),
+  baseUrl: z.string().max(300).optional().or(z.literal("")),
+});
+
+function dedupSortModels(a: string[]): string[] {
+  return [...new Set(a.filter(Boolean))].sort((x, y) => x.localeCompare(y));
+}
+
+export const listProviderModelsFn = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input) => ListModelsInput.parse(input))
+  .handler(async ({ data }): Promise<{ models: string[] }> => {
+    const key = data.apiKey.replace(/\s+/g, "");
+    const base = (data.baseUrl || "").trim().replace(/\/+$/, "");
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 20_000);
+    const fail = async (label: string, r: Response) => {
+      throw new Error(`${label} 拉取失败（HTTP ${r.status}）：${(await r.text().catch(() => "")).slice(0, 180)}`);
+    };
+    try {
+      if (data.provider === "gemini") {
+        const root = base || "https://generativelanguage.googleapis.com/v1beta";
+        const r = await fetch(`${root}/models?key=${encodeURIComponent(key)}&pageSize=1000`, { signal: ctrl.signal });
+        if (!r.ok) await fail("Gemini", r);
+        const j: any = await r.json();
+        const models = (j.models || [])
+          .filter((m: any) => (m.supportedGenerationMethods || []).includes("generateContent"))
+          .map((m: any) => String(m.name || "").replace(/^models\//, ""));
+        return { models: dedupSortModels(models) };
+      }
+      if (data.provider === "anthropic") {
+        const root = base || "https://api.anthropic.com/v1";
+        const r = await fetch(`${root}/models?limit=1000`, {
+          signal: ctrl.signal,
+          headers: { "x-api-key": key, "anthropic-version": "2023-06-01" },
+        });
+        if (!r.ok) await fail("Anthropic", r);
+        const j: any = await r.json();
+        return { models: dedupSortModels((j.data || []).map((m: any) => String(m.id || ""))) };
+      }
+      // openai / custom — the OpenAI-compatible GET /models endpoint.
+      const root = base || "https://api.openai.com/v1";
+      const r = await fetch(`${root}/models`, { signal: ctrl.signal, headers: { Authorization: `Bearer ${key}` } });
+      if (!r.ok) await fail("模型", r);
+      const j: any = await r.json();
+      const list = Array.isArray(j.data) ? j.data : Array.isArray(j) ? j : [];
+      return { models: dedupSortModels(list.map((m: any) => String(m.id || m.name || ""))) };
+    } catch (e) {
+      if ((e as Error)?.name === "AbortError") throw new Error("拉取模型超时，请检查网络 / 中转地址（国内可能需挂 VPN）。");
+      throw e instanceof Error ? e : new Error("拉取模型失败");
+    } finally {
+      clearTimeout(timer);
+    }
+  });
+
 export const getXiaoPConfigFn = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
   .handler(async ({ context }) => {
