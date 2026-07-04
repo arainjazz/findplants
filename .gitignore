@@ -30,3 +30,13 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Environment / secrets — never commit
+.env
+.env.*
+!.env.example
+
+# Tooling caches & throwaway probes (kept local, not shipped)
+.serena/
+scratch/
+supabase/.temp/
