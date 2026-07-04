@@ -48,15 +48,27 @@ export type ConservationData = { lists: ConservationList[]; taxa: ConservationTa
  * using react-query just get no data).
  */
 export async function fetchConservationData(): Promise<ConservationData> {
-  const [listsRes, taxaRes] = await Promise.all([
-    supabase.from("conservation_lists").select("id,kind,name,province,source_note,source_url"),
-    supabase
-      .from("conservation_taxa")
-      .select("list_id,scientific_name,chinese_name,normalized_name,status,rank,excluded_names"),
-  ]);
+  const listsRes = await supabase
+    .from("conservation_lists")
+    .select("id,kind,name,province,source_note,source_url");
   if (listsRes.error) throw listsRes.error;
-  if (taxaRes.error) throw taxaRes.error;
-  return { lists: listsRes.data ?? [], taxa: taxaRes.data ?? [] };
+  // conservation_taxa exceeds PostgREST's default 1000-row cap (2000+ rows across
+  // national/provincial/CITES/GTS/GRIIS). Page through ALL rows — otherwise the
+  // later-seeded registries (GRIIS/GTS) fall past row 1000 and never match, so the
+  // map never flags invasives and the /plants GRIIS·GTS filters return nothing.
+  const PAGE = 1000;
+  const taxa: ConservationTaxon[] = [];
+  for (let from = 0; ; from += PAGE) {
+    const { data, error } = await supabase
+      .from("conservation_taxa")
+      .select("list_id,scientific_name,chinese_name,normalized_name,status,rank,excluded_names")
+      .range(from, from + PAGE - 1);
+    if (error) throw error;
+    const rows = (data ?? []) as ConservationTaxon[];
+    taxa.push(...rows);
+    if (rows.length < PAGE) break;
+  }
+  return { lists: listsRes.data ?? [], taxa };
 }
 
 /** What a single plant matched, across all registries. */

@@ -39,7 +39,11 @@ export type PlantDraftFields = {
     status_zh: string;
     harm_zh: string;
     control_zh: string;
+    /** GRIIS invasion degree label (四等级之一), e.g. 「入侵物种（Invasive）」. */
+    degree?: string | null;
+    /** Citation: the specific registry + year, e.g.「GRIIS 全球入侵等级（中国）（2023）」. */
     source?: string;
+    source_url?: string | null;
   } | null;
   /** Display badges for conservation / trade / invasion registries the species
    *  matched (国家/省级重点保护, CITES, GTS, GRIIS). Renders a status card after
@@ -82,7 +86,7 @@ body{font-family:'Noto Serif SC',serif;color:var(--ink-soft);background-color:va
 .tax-row span strong{color:var(--ink-soft);}
 .hero{display:grid;grid-template-columns:1.4fr 1fr;gap:36px;margin:46px 0 56px;align-items:start;}
 @media (max-width:820px){.hero{grid-template-columns:1fr;} .masthead h1{font-size:44px;}}
-.hero .field-capture{margin-top:22px;padding-top:20px;border-top:1px solid var(--rule);}
+.hero .field-capture{margin-top:0;}
 .hero .capture-meta{font-family:'Cormorant Garamond',serif;font-size:14px;letter-spacing:.18em;text-transform:uppercase;color:var(--ink-faint);margin-bottom:14px;}
 .hero .place{font-family:'Noto Serif SC',serif;font-size:22px;color:var(--ink);font-weight:500;margin-bottom:6px;}
 .hero .coords{font-family:'EB Garamond',serif;font-size:14px;color:var(--ink-faint);margin-bottom:18px;}
@@ -153,6 +157,8 @@ i,em{color:var(--gold);}
 @media (min-width:768px){.invasive-card .ic-body{grid-template-columns:1fr 1fr 1fr;}}
 .invasive-card .ic-block .ic-label{display:block;font-family:'Noto Serif SC',serif;font-weight:600;font-size:14px;color:#a12a1a;margin-bottom:6px;padding-bottom:5px;border-bottom:1px solid rgba(192,57,43,.28);}
 .invasive-card .ic-block p{font-size:14px;line-height:1.66;color:#4a1c14;margin:0;}
+.invasive-card .ic-cite{margin-top:16px;padding-top:12px;border-top:1px solid rgba(192,57,43,.22);font-family:'Cormorant Garamond',serif;font-size:12.5px;letter-spacing:.04em;color:#7a2a1c;}
+.invasive-card .ic-cite a{color:#7a2a1c;text-decoration:underline;}
 @media(prefers-color-scheme:dark){
   .invasive-card{background:#2a1512;border-color:#e05a45;border-left-color:#e05a45;background-image:repeating-linear-gradient(135deg,rgba(224,90,69,0.06) 0,rgba(224,90,69,0.06) 12px,transparent 12px,transparent 24px);}
   .invasive-card .ic-head{background:#8f2a1c;}
@@ -207,8 +213,6 @@ i,em{color:var(--gold);}
   <section class="hero">
     <div class="img-slot"><img src="{{photo_url}}" alt="{{title}} 拍摄照片"/></div>
     <div>
-      <p>{{summary_zh}}</p>
-      <p class="en-p">{{summary_en}}</p>
       <div class="field-capture">
         <p class="capture-meta">FIELD CAPTURE · 拍 摄 记 录</p>
         <p class="place">{{capture_place}}</p>
@@ -327,12 +331,18 @@ export function renderDraftHtml(fields: PlantDraftFields): string {
     .join("");
   // Invasive-species warning card (only when GBIF/GRIIS confirmed a China invasive).
   const inv = fields.invasive;
+  const invSourceTxt = esc(inv?.source || "GBIF · GRIIS 中国名录");
+  const invUrl = (inv?.source_url || "").replace(/"/g, "&quot;");
+  const invCitation = inv?.source_url
+    ? `<a href="${invUrl}" target="_blank" rel="noopener">${invSourceTxt}</a>`
+    : invSourceTxt;
   const invasiveCard =
     inv && (inv.status_zh || inv.harm_zh || inv.control_zh)
       ? `<section class="invasive-card">` +
         `<div class="ic-head"><span class="ic-icon">⚠️</span>` +
         `<div><span class="ic-kicker">Biosecurity Alert · 外来入侵物种警示</span><h2>外来入侵物种</h2></div>` +
-        `<span class="ic-badge">${esc(inv.source || "GBIF · GRIIS 中国名录")}</span></div>` +
+        (inv.degree ? `<span class="ic-badge">入侵等级：${esc(inv.degree)}</span>` : "") +
+        `</div>` +
         `<div class="ic-body">` +
         (inv.status_zh
           ? `<div class="ic-block"><span class="ic-label">在中国的入侵状况</span><p>${esc(inv.status_zh)}</p></div>`
@@ -343,7 +353,9 @@ export function renderDraftHtml(fields: PlantDraftFields): string {
         (inv.control_zh
           ? `<div class="ic-block"><span class="ic-label">管控与防治建议</span><p>${esc(inv.control_zh)}</p></div>`
           : "") +
-        `</div></section>`
+        `</div>` +
+        `<div class="ic-cite">判定依据 · Source：${invCitation}</div>` +
+        `</section>`
       : "";
   // Conservation / registry status card (only when the species matched a registry).
   const consBadges = (fields.conservation ?? []).filter((b) => b && b.label);

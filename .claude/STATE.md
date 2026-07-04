@@ -38,6 +38,26 @@ _Read this FIRST and update it LAST, every session._
 - **注意/待办**：BlockNote 正文存的是 `blocksToFullHTML` 的 HTML（含 bn-* 包裹 div），公开页用 prose-project 基础样式渲染，
   基本可读；若样式不够精细，后续可引 BlockNote 展示态 CSS 或改 blocksToHTMLLossy。旧 rich-editor.tsx 仍在（未删）。
 
+## 🆕 2026-07-04 — 入侵物种 4 连修：1000 行封顶 / 摘要重复 / 卡片等级+引用 / 地图标记 (DONE code, tsc+build OK, preview 验证; NOT deployed)
+用户拍到 拟蒲公英 Tragopogon dubius，草稿出了入侵警示卡但有 4 问题。逐一修复并 preview 实测：
+- **根因（最关键）= 1000 行封顶**：`conservation_taxa` 有 2055 行，但 `fetchConservationData`（conservation.ts）和
+  submitPlantDraft 的 conservation 查询都没翻页 → PostgREST 默认只返回前 1000 行 → 后灌的 GRIIS(449)/GTS 全部落在 1000 行外
+  没加载（实测只加载到 4 条 griis）。导致：①地图 matcher 匹配不到入侵种、②/plants 的 GRIIS/GTS 筛选永远空（用户说的"筛选条件缺失"）。
+  **修**：两处都改成 `.range(from,from+999)` 循环翻页取全部。**实测**：taxaLoaded 1000→2055、Tragopogon→griis "invasive"、
+  地图 isInvasiveSighting 从 0 → 4（含 Tragopogon/Medicago sativa/Hordeum jubatum）。
+- **①摘要与拍摄记录上方重复**（plant-html-template.ts）：草稿页 drafts.$id 有独立「摘要·Summary」块（对），而 hero 又把
+  `{{summary_zh/en}}` 作为引导段渲染在 拍摄记录 上方 → 重复。**修**：hero 删掉 summary 两段，只留 `.field-capture`（拍摄记录=
+  看图鉴定分析）；.field-capture 去掉 top-border。bun 渲染确认 hero 不再含 summary。
+- **②③卡片缺引用与四等级**（identify-plant.functions.ts + template）：重构 submitPlantDraft——先做（翻页后的）conservation 匹配
+  拿 `griisHit`（degree 标签 + griis 名录 name/version/source_url），再据此 + GBIF live 生成入侵卡；invasive 判定改为
+  「GBIF 说入侵 或 本地 GRIIS 命中」。PlantDraftFields.invasive 加 `degree/source_url`；卡片头部加「入侵等级：Invasive 入侵物种」
+  chip，底部加「判定依据·Source：GRIIS 全球入侵等级（中国）（2023）」带链接（.ic-cite CSS）。bun 渲染四项断言全 true。
+  注意：本地 GRIIS（GBIF 托管版）只有 invasive/established 两级，非完整四级（source_note 已说明），卡片显示实际命中的那级。
+- **验证**：tsc EXIT=0、`npm run build` 通过、preview 实测（矩阵器/地图/模板渲染）。**生效范围**：#③筛选+#④地图是客户端逻辑，
+  部署后对**现有**数据即时生效（用户那株 Tragopogon 部署后地图立刻变黄三角）；#①hero+#②③卡片是模板改动，只对**新识别**的草稿
+  生效（旧草稿 html_content 已存，需重识别/编辑）。**USER**：`npm run build && wrangler deploy`(VPN)。可选：应用
+  `20260703000000_invasive_species.sql`（加 is_invasive 列，点亮"只看入侵"的 GBIF 分布叠加层；地图打标不依赖它）。
+
 ## 🎯 Current goal
 Fix **observation/activity location recognition** (`capture_place`) + assorted UI
 details. (Session title: "Fix activity location recognition and UI details".)

@@ -1282,58 +1282,79 @@ export const submitPlantDraft = createServerFn({ method: "POST" })
     // generate a three-part warning card rendered before Section I. Fully
     // non-fatal: any failure just skips the card / flag. taxonKey/flag are also
     // persisted so the /explore map can mark these with danger triangles.
+    // ── Conservation registry match (国家/省级重点保护 · CITES · GTS · GRIIS) ──
+    // Load the registries ONCE, paginating past PostgREST's 1000-row cap (GRIIS/GTS
+    // are seeded last, so they fall past row 1000 and would otherwise never match).
+    // The GRIIS hit feeds BOTH the invasive card (degree + precise citation) and the
+    // status-badge card. Fully non-fatal — unseeded tables just skip the cards.
+    let conservationBadgesList: PlantDraftFields["conservation"] = null;
+    let griisHit: { degreeLabel: string; source: string; source_url: string | null } | null = null;
+    const sciFull = (meta.scientific_name || "").trim();
+    try {
+      if (sciFull) {
+        const listsRes = await supabaseAdmin
+          .from("conservation_lists")
+          .select("id,kind,name,province,version,source_note,source_url");
+        const lists = (listsRes.data ?? []) as any[];
+        const taxa: any[] = [];
+        for (let from = 0; ; from += 1000) {
+          const { data } = await supabaseAdmin
+            .from("conservation_taxa")
+            .select("list_id,scientific_name,chinese_name,normalized_name,status,rank,excluded_names")
+            .range(from, from + 999);
+          const rows = data ?? [];
+          taxa.push(...rows);
+          if (rows.length < 1000) break;
+        }
+        if (taxa.length) {
+          const { buildConservationMatcher, conservationBadges, GRIIS_DEGREES } = await import("./conservation");
+          const hit = buildConservationMatcher({ lists, taxa })(sciFull, meta.family || null);
+          const badges = conservationBadges(hit, lists);
+          if (badges.length) conservationBadgesList = badges;
+          if (hit.griis) {
+            const gl = lists.find((l) => l.kind === "griis");
+            const deg = GRIIS_DEGREES.find((d) => d.value === hit.griis);
+            griisHit = {
+              degreeLabel: deg?.label ?? hit.griis,
+              source: gl ? `${gl.name}${gl.version ? "（" + gl.version + "）" : ""}` : "GRIIS 全球入侵物种数据库·中国",
+              source_url: gl?.source_url ?? null,
+            };
+          }
+        }
+      }
+    } catch (e) {
+      console.warn("[SubmitPlantDraft] conservation match failed:", e);
+    }
+
+    // ── Invasive-species warning card ──
+    // Invasive if the live GBIF/GRIIS check says so OR the LOCAL GRIIS registry matches
+    // (the local list is authoritative for China, and gives the degree + citation).
     let invasiveCard: PlantDraftFields["invasive"] = null;
     let isInvasive = false;
     let gbifTaxonKey: number | null = null;
     try {
-      const sciBinomial = (meta.scientific_name || "").trim().split(/\s+/).slice(0, 2).join(" ");
+      const sciBinomial = sciFull.split(/\s+/).slice(0, 2).join(" ");
       if (sciBinomial) {
         const chk = await gbifCheckInvasive(sciBinomial);
         if (chk) {
           gbifTaxonKey = chk.taxonKey;
           isInvasive = chk.isInvasive;
-          if (chk.isInvasive) {
-            const card = await generateInvasiveCard(meta.title || sciBinomial, meta.scientific_name || sciBinomial);
-            if (card) {
-              invasiveCard = {
-                ...card,
-                source: chk.source || "GBIF · GRIIS 中国名录",
-              };
-            }
+        }
+        if (chk?.isInvasive || griisHit) {
+          isInvasive = true;
+          const card = await generateInvasiveCard(meta.title || sciBinomial, meta.scientific_name || sciBinomial);
+          if (card) {
+            invasiveCard = {
+              ...card,
+              degree: griisHit?.degreeLabel ?? null,
+              source: griisHit?.source ?? chk?.source ?? "GBIF · GRIIS 中国名录",
+              source_url: griisHit?.source_url ?? null,
+            };
           }
         }
       }
     } catch (e) {
       console.warn("[SubmitPlantDraft] invasive check failed:", e);
-    }
-
-    // Conservation / registry match (国家/省级重点保护 · CITES · GTS · GRIIS). Reuses
-    // the same rank-aware matcher the 档案检索 filters use, fed from the conservation
-    // tables via the admin client, and renders a status card after the invasive card.
-    // Fully non-fatal: any failure (or unseeded tables) just skips the card.
-    let conservationBadgesList: PlantDraftFields["conservation"] = null;
-    try {
-      const sci = (meta.scientific_name || "").trim();
-      if (sci) {
-        const [listsRes, taxaRes] = await Promise.all([
-          supabaseAdmin
-            .from("conservation_lists")
-            .select("id,kind,name,province,source_note,source_url"),
-          supabaseAdmin
-            .from("conservation_taxa")
-            .select("list_id,scientific_name,chinese_name,normalized_name,status,rank,excluded_names"),
-        ]);
-        const lists = (listsRes.data ?? []) as any[];
-        const taxa = (taxaRes.data ?? []) as any[];
-        if (taxa.length) {
-          const { buildConservationMatcher, conservationBadges } = await import("./conservation");
-          const hit = buildConservationMatcher({ lists, taxa })(sci, meta.family || null);
-          const badges = conservationBadges(hit, lists);
-          if (badges.length) conservationBadgesList = badges;
-        }
-      }
-    } catch (e) {
-      console.warn("[SubmitPlantDraft] conservation match failed:", e);
     }
 
     // Compose HTML.
