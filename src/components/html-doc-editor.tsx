@@ -1,5 +1,5 @@
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
-import { compressImage } from "@/lib/image-compress";
+import { compressImage, extForMime } from "@/lib/image-compress";
 import { createPortal } from "react-dom";
 import { FolderOpen, Clipboard, Link2, Globe, Pencil, ExternalLink, Trash2 } from "lucide-react";
 import { supabase } from "@/integrations/supabase/client";
@@ -124,15 +124,25 @@ export const HtmlDocEditor = forwardRef<HtmlDocEditorHandle, Props>(function Htm
       };
     }
     fetch(htmlUrl)
-      .then((r) => r.text())
+      .then((r) => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.text();
+      })
       .then((text) => {
         if (cancelled) return;
-        sessionStorage.setItem(cacheKey, text);
+        // sessionStorage has a ~5MB quota — a batch of large HTML files fills it
+        // fast, and QuotaExceededError must not blank the editor. Cache is optional.
+        try {
+          sessionStorage.setItem(cacheKey, text);
+        } catch {
+          /* quota full — skip caching, still render */
+        }
         apply(text);
       })
-      .catch(() => {
+      .catch((err: unknown) => {
+        if (cancelled) return;
         setLoading(false);
-        toast.error("无法读取 HTML 文件");
+        toast.error(`无法读取 HTML 文件（${err instanceof Error ? err.message : String(err)}）`);
       });
     return () => {
       cancelled = true;
@@ -278,12 +288,12 @@ export const HtmlDocEditor = forwardRef<HtmlDocEditorHandle, Props>(function Htm
       console.error("Image compression failed, using original:", err);
     }
 
-    const ext = file.name.split(".").pop() || "jpg";
+    const ext = extForMime(fileToUpload.type, file.name.split(".").pop() || "jpg");
     const path = `${user.id}/inline/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
     const { error } = await supabase.storage.from("plant-images").upload(path, fileToUpload, {
       cacheControl: "3600",
       upsert: false,
-      contentType: file.type,
+      contentType: fileToUpload.type,
     });
     if (error) throw error;
     return supabase.storage.from("plant-images").getPublicUrl(path).data.publicUrl;

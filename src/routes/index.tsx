@@ -14,6 +14,7 @@ import { useServerFn } from "@tanstack/react-start";
 import { fetchPublishedPosts, blogCoverUrl, type BlogPost } from "@/lib/blog";
 import { type EditorColumnEntry } from "@/lib/editor-stats";
 import { fetchEditorColumnFn } from "@/lib/identify-plant.functions";
+import { SafeImg } from "@/components/safe-img";
 
 export const Route = createFileRoute("/")({
   head: () => ({
@@ -76,7 +77,8 @@ function HomePage() {
 
   const hero: Plant | undefined = sorted[0];
   const sub = sorted.slice(1, 4);
-  const rest = sorted.slice(4);
+  // 首页最多展示 18 个条目：hero(1) + sub(3) + rest(14)。
+  const rest = sorted.slice(4, 18);
 
   const toggleFeatured = async (p: Plant) => {
     const { error } = await supabase
@@ -208,21 +210,24 @@ function HomePage() {
                   <p className="label">全部条目 · All Entries</p>
                   <Link to="/plants" className="label hover:text-vermilion">浏览全部 →</Link>
                 </div>
-                <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-x-8 gap-y-4">
+                {/* 紧凑的图片卡片网格（手机端 2 列，非列表式）。 */}
+                <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-x-4 gap-y-6 sm:gap-x-6">
                   {rest.map((p) => (
-                    <Link key={p.id} to="/plants/$slug" params={{ slug: p.slug }} className="flex gap-4 py-3 border-b border-rule-soft hover:bg-paper-deep/40 px-2 -mx-2 transition-colors group">
-                      <div className="w-16 h-16 flex-shrink-0 overflow-hidden border border-rule bg-paper-deep">
-                        {p.cover_url ? <img src={p.cover_url} alt="" className="w-full h-full object-cover" /> : <PlantPattern small />}
-                      </div>
-                      <div className="min-w-0">
-                        <h3 className="font-display text-lg font-semibold truncate group-hover:text-vermilion transition-colors">{p.title}</h3>
-                        {p.scientific_name && <p className="italic text-xs text-ink-faint truncate">{p.scientific_name}</p>}
-                        {tab === "hot" ? (
-                          <p className="label text-[10px] mt-0.5">{p.comments_count ?? 0} 评论</p>
+                    <Link key={p.id} to="/plants/$slug" params={{ slug: p.slug }} className="group block">
+                      <div className="overflow-hidden border border-rule bg-paper-deep mb-2 aspect-square">
+                        {p.cover_url ? (
+                          <img src={p.cover_url} alt={p.title} className="w-full h-full object-cover group-hover:scale-[1.04] transition-transform duration-500" />
                         ) : (
-                          p.family && <p className="label text-[10px] mt-0.5">{p.family}</p>
+                          <PlantPattern />
                         )}
                       </div>
+                      <h3 className="font-display text-sm sm:text-base font-semibold leading-tight line-clamp-2 group-hover:text-vermilion transition-colors">{p.title}</h3>
+                      {p.scientific_name && <p className="italic text-[11px] text-ink-faint truncate">{p.scientific_name}</p>}
+                      {tab === "hot" ? (
+                        <p className="label text-[10px] mt-0.5">{p.comments_count ?? 0} 评论</p>
+                      ) : (
+                        p.family && <p className="label text-[10px] mt-0.5">{p.family}</p>
+                      )}
                     </Link>
                   ))}
                 </div>
@@ -294,11 +299,12 @@ function EditorsBlogStrip({ posts }: { posts: BlogPost[] }) {
         {list.map((p) => (
           <Link key={p.id} to="/blog/$slug" params={{ slug: p.slug }} className="group block">
             <div className="overflow-hidden border border-rule bg-paper-deep mb-3 aspect-[16/10]">
-              {blogCoverUrl(p) ? (
-                <img src={blogCoverUrl(p)!} alt={p.title} className="w-full h-full object-cover group-hover:scale-[1.03] transition-transform duration-500" />
-              ) : (
-                <PlantPattern />
-              )}
+              <SafeImg
+                src={blogCoverUrl(p)}
+                alt={p.title}
+                className="w-full h-full object-cover group-hover:scale-[1.03] transition-transform duration-500"
+                fallback={<PlantPattern />}
+              />
             </div>
             <h3 className="font-display text-xl font-semibold leading-snug group-hover:text-vermilion transition-colors line-clamp-2">{p.title}</h3>
             {p.subtitle && <p className="text-sm text-ink-soft mt-1 line-clamp-2">{p.subtitle}</p>}
@@ -369,11 +375,12 @@ function ContributorsColumn({ editors }: { editors: EditorColumnEntry[] }) {
         {editors.map((e) => (
           <a key={e.id} href={`/editors/${e.id}`} className="p-4 flex flex-col items-center text-center hover:bg-paper-deep/40 transition-colors cursor-pointer group rounded-sm">
             <div className="w-16 h-16 rounded-full overflow-hidden border border-rule bg-background flex items-center justify-center mb-2 group-hover:border-ink">
-              {e.avatar_url ? (
-                <img src={e.avatar_url} alt={e.display_name} className="w-full h-full object-cover" />
-              ) : (
-                <span className="font-display text-2xl text-ink-faint">{e.display_name.slice(0, 1)}</span>
-              )}
+              <SafeImg
+                src={e.avatar_url}
+                alt={e.display_name}
+                className="w-full h-full object-cover"
+                fallback={<span className="font-display text-2xl text-ink-faint">{e.display_name.slice(0, 1)}</span>}
+              />
             </div>
             <h3 className="font-semibold text-sm truncate max-w-full">{e.display_name}</h3>
             <p className="text-[10px] text-ink-faint mt-0.5">

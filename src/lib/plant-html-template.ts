@@ -74,6 +74,13 @@ export type PlantDraftFields = {
     national?: boolean;
     sources?: { name: string; url: string | null }[];
   } | null;
+  /** #3 定种置信度 + 补拍指引（非 HTML 渲染字段；随 ai_payload 存库，草稿页 React 侧展示）。
+   *  模型对本次照片不足以确诊时置 'low'，并在 needs_more_photos_* 写明该补拍哪些
+   *  器官/角度（如花特写、果实、叶背、整株）。此时不得给出「确诊」口吻，best-guess
+   *  一律以「疑似」标注。'high'/'medium' 则正常出稿。 */
+  identification_confidence?: "high" | "medium" | "low";
+  needs_more_photos_zh?: string;
+  needs_more_photos_en?: string;
   capture_place: string;
   capture_lat: string;
   capture_lng: string;
@@ -198,6 +205,13 @@ i,em{color:var(--gold);}
   .invasive-card .ic-national strong,.invasive-card .ic-km.on{color:#f0a595;}
   .invasive-card .ic-km.off{color:#d9b57a;}
 }
+@media(max-width:640px){
+  .invasive-card .ic-head{flex-wrap:wrap;gap:8px 12px;padding:14px 16px;}
+  .invasive-card .ic-head h2{font-size:19px;}
+  .invasive-card .ic-badge{margin-left:0;order:3;flex-basis:100%;white-space:normal;}
+  .invasive-card .ic-body{padding:16px;}
+  .invasive-card .ic-national,.invasive-card .ic-cite{margin-left:16px;margin-right:16px;}
+}
 
 /* Conservation / registry status card — calm green-gold counterpart to the
    invasive card, shown before Section I when the species matches 重点保护/CITES/
@@ -266,8 +280,8 @@ i,em{color:var(--gold);}
   <section class="hero">
     <div class="img-slot"><img src="{{photo_url}}" alt="{{title}} 拍摄照片"/></div>
     <div>
+      <h2 style="font-size:18px;font-weight:600;color:var(--ink);margin-bottom:12px;letter-spacing:0.1em;">拍摄记录 · Field Capture</h2>
       <div class="field-capture">
-        <p class="capture-meta">FIELD CAPTURE · 拍 摄 记 录</p>
         <p class="place">{{capture_place}}</p>
         <p class="coords">{{capture_lat}}, {{capture_lng}} · {{capture_date}}</p>
         {{field_capture_notes}}

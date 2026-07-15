@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { useServerFn } from "@tanstack/react-start";
 import { useNavigate } from "@tanstack/react-router";
-import { submitPlantDraft } from "@/lib/identify-plant.functions";
+import { quickIdentifyDraft } from "@/lib/identify-plant.functions";
+import { useAuth } from "@/hooks/use-auth";
 import { toast } from "sonner";
 
 type Phase = "idle" | "captured" | "submitting";
@@ -14,19 +15,51 @@ const LOADING_STEPS = [
   "💾 正在写入云端，即将生成草稿..."
 ];
 
-export function CameraIdentify() {
+/** 补拍复核上下文：从草稿页「去补拍」带来，count=本次是第几次补拍（≥3 服务端强制出结论）。
+ *  advice=首次识别给出的「需要补拍哪些部位」具体建议（needs_more_photos_zh）。 */
+export type RetakeContext = { count: number; title?: string; sci?: string; advice?: string; mergeDraftId?: string };
+
+// Ordinal label for the retake counter. 3 is the last allowed retake (server forces
+// a final result at count ≥ 3), so it reads「最后一次补拍」.
+function retakeOrdinal(count: number): string {
+  if (count >= 3) return "最后一次补拍";
+  return count === 1 ? "第一次补拍" : count === 2 ? "第二次补拍" : `第 ${count} 次补拍`;
+}
+
+export function CameraIdentify({ retake: retakeCtx = null }: { retake?: RetakeContext | null } = {}) {
+  const retakeMode = !!retakeCtx;
+  const { user } = useAuth(); // 获取当前登录用户
   const [phase, setPhase] = useState<Phase>("idle");
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   // Captured photo's natural aspect ratio (w/h). Drives the viewfinder frame so
   // its border hugs the real image instead of letterboxing a fixed square.
   const [imgAspect, setImgAspect] = useState<number | null>(null);
   const [coords, setCoords] = useState<{ lat: number; lng: number } | null>(null);
+  const [geoRequested, setGeoRequested] = useState(false); // track if we've requested geolocation
+  // Coarse location-permission status, surfaced on the review screen so a wrong
+  // "deny" tap doesn't silently persist. "denied" → we show a re-acquire button
+  // + settings guide instead of failing quietly.
+  const [geoStatus, setGeoStatus] = useState<"idle" | "loading" | "granted" | "denied" | "unavailable" | "timeout">("idle");
   const [stepIndex, setStepIndex] = useState(0);
+  // Last identify failure, kept on screen (a toast vanishes before the user can read
+  // the cause). Server errors already carry「原因 + 怎么办」in their message.
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const cameraInputRef = useRef<HTMLInputElement | null>(null);
   const albumInputRef = useRef<HTMLInputElement | null>(null);
   const capturedBlobRef = useRef<Blob | null>(null);
+  // Mirror of `coords` for reads inside async callbacks (avoids stale closures)
+  // — ingestImage must not wipe coords already obtained at shutter-tap time.
+  const coordsRef = useRef<{ lat: number; lng: number } | null>(null);
+  // GPS parsed from the photo's own EXIF metadata. Used as a FALLBACK when the
+  // live browser geolocation is denied/unavailable (e.g. Chrome iOS without the
+  // permission) — reading EXIF needs no permission prompt.
+  const exifCoordsRef = useRef<{ lat: number; lng: number } | null>(null);
   const navigate = useNavigate();
-  const submit = useServerFn(submitPlantDraft);
+  const submit = useServerFn(quickIdentifyDraft);
+  // The user's ORIGINAL (uncompressed) file — kept so "保存原图到相册" saves the good
+  // copy. A web-camera capture is NOT auto-saved to the iPhone album, so this button
+  // is the user's escape hatch to keep the shot (re-identify later from good signal).
+  const originalFileRef = useRef<File | null>(null);
 
   useEffect(() => {
     return () => {
@@ -53,45 +86,190 @@ export function CameraIdentify() {
     return () => clearInterval(interval);
   }, [phase]);
 
-  // Shared pipeline: read location (EXIF for picked files, geolocation otherwise),
-  // compress, generate a preview, and move to the "captured" review state.
+  const applyCoords = (c: { lat: number; lng: number } | null) => {
+    coordsRef.current = c;
+    setCoords(c);
+  };
+
+  /**
+   * Request the browser's live position.
+   *
+   * ⚠️ MUST be called from a real user gesture (a click/tap handler), NOT from the
+   * file-input `change` event. When the native camera closes, the page has just
+   * regained focus and has NO user activation — Chrome on iOS then silently denies
+   * geolocation and never shows its permission prompt (Safari is lenient and still
+   * prompts, which is why the two browsers behaved differently). So we fire this on
+   * the shutter/album tap, before the picker opens.
+   *
+   * Once a site is set to "denied" no code can force a re-prompt; we detect that via
+   * the Permissions API and route the user to the settings guide instead.
+   */
+  const requestGeo = () => {
+    if (!navigator.geolocation) {
+      setGeoStatus("unavailable");
+      return;
+    }
+    setGeoRequested(true);
+    setGeoStatus("loading");
+
+    // iOS WKWebView (which Chrome iOS is built on) has a long-standing bug: with
+    // enableHighAccuracy the request can hang forever and fire NEITHER callback,
+    // ignoring the built-in `timeout` — so the spinner would spin indefinitely and
+    // the user never gets a prompt OR an error. This settled/hard-timer pair
+    // guarantees the flow always resolves. We also use COARSE accuracy: network/
+    // Wi-Fi positioning is faster and far less likely to hang than GPS, and
+    // district-level is all the reverse-geocoder needs.
+    let settled = false;
+    const settle = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(hardTimer);
+      setGeoRequested(false);
+      fn();
+    };
+
+    const hardTimer = setTimeout(() => {
+      settle(() => {
+        if (exifCoordsRef.current) {
+          if (!coordsRef.current) applyCoords(exifCoordsRef.current);
+          setGeoStatus("granted");
+          toast.success("✓ 已使用照片自带位置", { id: "geo-exif" });
+          return;
+        }
+        console.warn("[Geolocation] hard timeout — no callback fired (likely iOS Location Services off for Chrome)");
+        setGeoStatus("timeout");
+        toast.error("定位无响应：请检查 iOS 设置 → 隐私与安全性 → 定位服务，确认已开启且 Chrome 设为「使用 App 期间」", {
+          id: "geo-timeout",
+          duration: 9000,
+        });
+      });
+    }, 13_000);
+
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        settle(() => {
+          applyCoords({ lat: pos.coords.latitude, lng: pos.coords.longitude });
+          setGeoStatus("granted");
+          toast.success("✓ 已获取当前位置", { id: "geo-success" });
+        });
+      },
+      (err) => {
+        console.warn("[Geolocation] Failed or denied:", err.code, err.message);
+        settle(() => {
+          // If the photo carries EXIF GPS, we still have a location — surface it.
+          if (exifCoordsRef.current) {
+            if (!coordsRef.current) applyCoords(exifCoordsRef.current);
+            setGeoStatus("granted");
+            toast.success("✓ 已使用照片自带位置", { id: "geo-exif" });
+          } else if (err.code === err.PERMISSION_DENIED) {
+            setGeoStatus("denied");
+            toast.info("未获取到定位权限 — 地点很重要，请点「开启定位」重试", { id: "geo-denied" });
+          } else {
+            // POSITION_UNAVAILABLE / TIMEOUT — usually iOS Location Services off.
+            setGeoStatus("timeout");
+            toast.error("暂时拿不到定位：请检查 iOS 设置 → 隐私与安全性 → 定位服务 是否已为 Chrome 开启，再点「开启定位」重试", {
+              id: "geo-failed",
+              duration: 9000,
+            });
+          }
+        });
+      },
+      { timeout: 12_000, maximumAge: 60_000, enableHighAccuracy: false },
+    );
+  };
+
+  // Probe the real permission state so the banner can tell "还没授权（点一下就能弹框）"
+  // apart from "已被拒绝（只能去设置里改）". Not supported everywhere → undefined.
+  const [permState, setPermState] = useState<PermissionState | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const p = await navigator.permissions?.query({ name: "geolocation" as PermissionName });
+        if (!p || cancelled) return;
+        setPermState(p.state);
+        p.onchange = () => setPermState(p.state);
+      } catch {
+        /* Permissions API unsupported (older Safari) — banner falls back to generic copy */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Retake mode: opening from the draft page's「去补拍」lands here to re-shoot the
+  // SAME plant. Auto-open the camera immediately (the tap that navigated here still
+  // counts as transient user activation on a client-side route change, so the picker
+  // usually opens with no extra tap; if the browser blocks it, the prominent「打开相机
+  // 补拍」button below is the one-tap fallback).
+  const autoOpenRef = useRef(false);
+  useEffect(() => {
+    if (!retakeMode || autoOpenRef.current) return;
+    autoOpenRef.current = true;
+    openCamera();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [retakeMode]);
+
+  // Retake mode: once a shot is captured, go straight into identification (no manual
+  // "AI识别" tap). Reset on each retake so every re-shot auto-identifies.
+  const autoSubmitRef = useRef(false);
+  useEffect(() => {
+    if (retakeMode && phase === "captured" && !autoSubmitRef.current && capturedBlobRef.current) {
+      autoSubmitRef.current = true;
+      void onSubmit();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phase, retakeMode]);
+
+  // Shared pipeline: compress the image, generate a preview, and move to the "captured"
+  // review state. Geolocation strategy depends on the source:
+  // - Camera shutter → browser's live geolocation (where the user is NOW)
+  // - Album upload → photo's EXIF GPS first (where it was TAKEN), browser location as fallback
   const ingestImage = async (file: File, { tryExif }: { tryExif: boolean }) => {
     if (!file.type.startsWith("image/")) {
       toast.error("请选择图片文件");
       return;
     }
 
-    const toastId = toast.loading("正在优化图片并读取地理位置...");
+    originalFileRef.current = file;
+    const toastId = toast.loading("正在优化图片并获取位置...");
 
-    // 1) Try EXIF GPS from the original uploaded photo itself (most accurate).
-    let gotExif = false;
+    // NOTE: do NOT reset coords/geoStatus here. The live position was already
+    // requested from the shutter/album TAP (a real user gesture) — resetting would
+    // throw away a good fix, and re-requesting from this `change` handler is exactly
+    // the no-user-activation path that Chrome iOS silently denies.
+    exifCoordsRef.current = null;
+
+    // For album uploads (tryExif=true), prioritize EXIF GPS — it reflects where the
+    // photo was taken, not where the user is now scrolling through their library.
+    // For shutter captures (tryExif=false), skip EXIF and use live geolocation only.
     if (tryExif) {
       try {
         const exifr = (await import("exifr")).default;
         const gps = await exifr.gps(file);
-        if (gps && typeof gps.latitude === "number" && typeof gps.longitude === "number") {
-          setCoords({ lat: gps.latitude, lng: gps.longitude });
-          gotExif = true;
+        if (gps && Number.isFinite(gps.latitude) && Number.isFinite(gps.longitude)) {
+          exifCoordsRef.current = { lat: gps.latitude, lng: gps.longitude };
+          // For album uploads, EXIF GPS wins — apply it immediately, overriding any
+          // stale browser location from a previous tap.
+          applyCoords({ lat: gps.latitude, lng: gps.longitude });
+        } else {
+          // No EXIF GPS in the photo → fall back to browser's live location if available,
+          // or request it if not already in flight.
+          if (!coordsRef.current && geoStatus !== "loading" && !geoRequested) requestGeo();
         }
       } catch {
-        /* ignore */
+        // EXIF read failed → fall back to browser location
+        if (!coordsRef.current && geoStatus !== "loading" && !geoRequested) requestGeo();
       }
+    } else {
+      // Shutter capture: browser's live geolocation was already requested on tap.
+      // Last-resort retry only if the tap-time request produced nothing and none is
+      // in flight. On Chrome iOS this will fail silently (no activation) — that's fine.
+      if (!coordsRef.current && geoStatus !== "loading" && !geoRequested) requestGeo();
     }
 
-    // 2) Fall back to current browser geolocation if EXIF missing. Native-camera
-    //    captures usually carry no GPS EXIF, so this is the common path.
-    if (!gotExif && navigator.geolocation) {
-      navigator.geolocation.getCurrentPosition(
-        (pos) => {
-          setCoords({ lat: pos.coords.latitude, lng: pos.coords.longitude });
-          toast.success("已获取当前位置 GPS 坐标");
-        },
-        () => setCoords(null),
-        { timeout: 8000, maximumAge: 60_000 },
-      );
-    }
-
-    // 3) Compress the image to save bandwidth and storage space
+    // Compress the image to save bandwidth and storage space
     let url: string;
     try {
       const { compressImage } = await import("@/lib/image-compress");
@@ -124,11 +302,25 @@ export function CameraIdentify() {
   // Open the phone's NATIVE camera app (full focus/zoom/flash, real-framing viewfinder)
   // via a file input with capture=environment. The photo it returns flows through the
   // exact same pipeline as an album pick — so what you shoot is what gets identified.
+  //
+  // We ask for the position HERE, inside the tap handler, while the page still has
+  // user activation — this is what makes Chrome iOS actually show its permission
+  // prompt. The GPS fix resolves in the background while the camera app is open.
   const openCamera = () => {
+    applyCoords(null);
+    requestGeo();
     if (cameraInputRef.current) {
       cameraInputRef.current.value = ""; // allow re-taking the same shot
       cameraInputRef.current.click();
     }
+  };
+
+  // Album pick: same gesture-time request. EXIF GPS from the chosen photo still acts
+  // as the fallback if the live fix is denied.
+  const openAlbum = () => {
+    applyCoords(null);
+    requestGeo();
+    albumInputRef.current?.click();
   };
 
   const retake = () => {
@@ -136,37 +328,139 @@ export function CameraIdentify() {
     setPreviewUrl(null);
     setImgAspect(null);
     capturedBlobRef.current = null;
-    setCoords(null);
+    originalFileRef.current = null;
+    exifCoordsRef.current = null;
+    applyCoords(null);
+    setGeoRequested(false);
+    setGeoStatus("idle");
     setPhase("idle");
+    autoSubmitRef.current = false; // allow the next retake shot to auto-identify
     // Reset inputs
     if (cameraInputRef.current) cameraInputRef.current.value = "";
     if (albumInputRef.current) albumInputRef.current.value = "";
   };
 
+  // Save the ORIGINAL photo to the user's device/album. Web can't write the camera
+  // roll silently, so we use the native share sheet (iOS shows「存储图像」) and fall
+  // back to a plain download where sharing files isn't supported.
+  const saveToAlbum = async () => {
+    const file = originalFileRef.current;
+    if (!file) return;
+    const nav = navigator as Navigator & {
+      canShare?: (d: { files: File[] }) => boolean;
+      share?: (d: { files: File[]; title?: string }) => Promise<void>;
+    };
+    try {
+      if (nav.share && nav.canShare && nav.canShare({ files: [file] })) {
+        await nav.share({ files: [file], title: "植物照片" });
+        return;
+      }
+    } catch {
+      /* user cancelled or share unsupported → fall through to download */
+    }
+    try {
+      const url = URL.createObjectURL(file);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = file.name || `plant-${Date.now()}.jpg`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      toast.success("已导出原图，请在下载/分享中保存到相册", { id: "album-save" });
+    } catch {
+      toast.error("保存失败，请长按图片手动保存");
+    }
+  };
+
   const onSubmit = async () => {
     const blob = capturedBlobRef.current;
     if (!blob) return;
+
+    // If geolocation is still pending, wait up to 3 seconds for it to complete
+    if (geoRequested) {
+      const waitId = toast.loading("等待位置信息...");
+      let waited = 0;
+      while (geoRequested && waited < 3000) {
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        waited += 300;
+      }
+      toast.dismiss(waitId);
+    }
+
+    // For album uploads, EXIF GPS was already applied to coords if present.
+    // For shutter captures, coords holds the browser's live location.
+    const finalCoords = coords;
+
     setPhase("submitting");
+    setErrorMsg(null);
     try {
       const base64 = await blobToBase64(blob);
       const res = await submit({
         data: {
           photo_base64: base64,
           photo_mime: blob.type || "image/jpeg",
-          lat: coords?.lat ?? null,
-          lng: coords?.lng ?? null,
+          lat: finalCoords?.lat ?? null,
+          lng: finalCoords?.lng ?? null,
+          logged_in_user_id: user?.id, // 传递登录用户 ID
+          retake_count: retakeCtx?.count ?? 0,
+          species_hint_title: retakeCtx?.title,
+          species_hint_sci: retakeCtx?.sci,
+          merge_draft_id: retakeCtx?.mergeDraftId,
         },
       });
-      toast.success("识别成功！正在跳转草稿…");
-      navigate({ to: "/drafts/$id", params: { id: (res as { draftId: string }).draftId } });
+      toast.success("已生成简介摘要卡，正在跳转…");
+      const newId = (res as { draftId: string }).draftId;
+      // Signal the draft page to auto-open the share card as the first screen.
+      try {
+        sessionStorage.setItem("plantspedia:justIdentified", newId);
+      } catch {
+        /* private mode / storage disabled — the card still opens via the button */
+      }
+      navigate({ to: "/drafts/$id", params: { id: newId } });
     } catch (e) {
       setPhase("captured");
-      toast.error(e instanceof Error ? e.message : "识别失败，请重试");
+      const msg = e instanceof Error && e.message ? e.message : "识别失败（UNKNOWN）：发生了未知错误，请重试。";
+      setErrorMsg(msg);
+      toast.error(msg, { duration: 12000 });
     }
   };
 
   return (
     <div className="max-w-md mx-auto w-full bg-paper-deep/35 border border-rule/70 p-4 md:p-5 rounded-3xl shadow-lg mb-12 select-none animate-in fade-in slide-in-from-bottom-4 duration-500">
+
+      {/* Safety notice — always visible above the viewfinder. AI identifications are
+          not a food/medicinal-use authority; keep this prominent and bold. */}
+      <p className="text-center text-sm font-bold text-leaf-deep mb-3 leading-snug px-2">
+        AI 识别内容不能采纳为食用药用参考！
+      </p>
+
+      {/* Retake mode — arrived from a draft's「去补拍」. Show what we're re-checking and
+          a one-tap camera button (fallback when the auto-open was blocked). */}
+      {retakeMode && phase === "idle" && (
+        <div className="mb-3 rounded-2xl border border-amber-500/40 bg-amber-500/10 px-3 py-3 text-center space-y-2">
+          <p className="text-sm font-semibold text-amber-700 leading-snug">
+            正在补拍复核{retakeCtx?.title ? `「${retakeCtx.title}」` : ""}（{retakeOrdinal(retakeCtx?.count ?? 1)}）
+          </p>
+          {retakeCtx?.advice?.trim() && (
+            <div className="text-left mx-auto max-w-[300px] rounded-lg bg-background/60 border border-amber-500/25 px-2.5 py-2">
+              <p className="text-[11px] font-semibold text-amber-700 mb-0.5">上次识别建议补拍：</p>
+              <p className="text-[11px] text-ink-soft leading-relaxed whitespace-pre-line">{retakeCtx.advice}</p>
+            </div>
+          )}
+          <p className="text-[11px] text-ink-faint leading-relaxed">
+            请对准<strong>同一株植物</strong>按上面建议补拍更清晰的照片，<strong>尽量不要同时拍到多种植物</strong>，拍完会自动重新识别。
+            {(retakeCtx?.count ?? 0) >= 3 && "本次为第 3 次补拍，将直接给出最终结论。"}
+          </p>
+          <button
+            onClick={openCamera}
+            className="inline-flex items-center gap-1.5 bg-amber-600 text-background px-5 py-2 text-sm font-semibold rounded-full hover:bg-amber-500 transition-colors cursor-pointer"
+          >
+            <CameraIcon className="w-4 h-4" />
+            打开相机补拍
+          </button>
+        </div>
+      )}
 
       {/* 1. Viewfinder area — outer centers the frame so a portrait shot stays
           centred; the inner frame's border hugs the real image 画幅. */}
@@ -194,7 +488,7 @@ export function CameraIdentify() {
               </div>
               <p className="text-sm font-bold text-ink-soft leading-snug">点击下方快门调用相机拍摄，或上传已有照片</p>
               <p className="text-xs text-ink-faint leading-normal mt-2 max-w-[220px]">
-                建议尽量使照片清晰且主体突出，可在设置中开启位置授权获取分布地图。
+                建议尽量使照片清晰且主体突出。拍摄时会请求定位，用于记录分布地图。
               </p>
             </div>
           </>
@@ -240,13 +534,130 @@ export function CameraIdentify() {
       </div>
       </div>
 
+      {/* Idle: let the user grant location BEFORE opening the camera. Tapping here is
+          a real user gesture, which is the only reliable way to make Chrome iOS show
+          its permission prompt. */}
+      {phase === "idle" && permState !== "granted" && (
+        <div className="mt-3">
+          {permState === "denied" ? (
+            <div className="text-xs bg-amber-500/10 border border-amber-500/40 rounded-xl px-3 py-2 space-y-1">
+              <p className="flex items-center gap-1.5 font-semibold text-amber-700">
+                <MapPinIcon className="w-3.5 h-3.5 shrink-0" />
+                本站的定位权限已被拒绝
+              </p>
+              <p className="text-[11px] text-ink-faint leading-relaxed">
+                浏览器不允许网页再次弹出授权框，需手动开启：Chrome 右下角 ⋯ → 设置 → 内容设置 → 位置信息 →
+                允许 plantspedia.club；并确认 iOS 设置 → 隐私与安全性 → 定位服务 → Chrome 为「使用 App 期间」。
+              </p>
+            </div>
+          ) : (
+            <>
+              <button
+                onClick={requestGeo}
+                className="w-full flex items-center justify-center gap-1.5 text-xs text-ink-soft bg-paper-deep/40 hover:bg-paper-deep/70 border border-rule/50 rounded-xl px-3 py-2 transition-colors cursor-pointer"
+              >
+                <MapPinIcon className="w-3.5 h-3.5 text-vermilion shrink-0" />
+                {geoStatus === "loading" ? "正在获取位置…" : geoStatus === "timeout" ? "定位无响应，点此重试" : "开启定位（记录这株植物的位置）"}
+              </button>
+              {geoStatus === "timeout" && (
+                <p className="mt-1.5 text-[11px] text-amber-700 leading-relaxed">
+                  一直转圈通常是 iOS 关掉了定位：请打开 iOS 设置 → 隐私与安全性 → 定位服务，确认总开关已开、且 Chrome 设为「使用 App 期间」并开启「精确位置」，再点上方按钮重试。
+                </p>
+              )}
+            </>
+          )}
+        </div>
+      )}
+
+      {/* Identify failure — stays on screen with the full cause + next step, so the
+          user isn't left with a vanished toast saying only "429". */}
+      {phase === "captured" && errorMsg && (
+        <div className="mt-3 rounded-xl border border-destructive/40 bg-destructive/5 px-3 py-2.5">
+          <p className="flex items-center gap-1.5 text-xs font-semibold text-destructive">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <circle cx="12" cy="12" r="10" /><path d="M12 8v4" /><path d="M12 16h.01" />
+            </svg>
+            识别失败
+          </p>
+          <p className="mt-1 text-xs text-ink-soft leading-relaxed">{errorMsg}</p>
+          <button
+            onClick={() => setErrorMsg(null)}
+            className="mt-1.5 text-[11px] text-ink-faint hover:text-vermilion underline underline-offset-2 cursor-pointer"
+          >
+            知道了
+          </button>
+        </div>
+      )}
+
+      {/* Location status — only while reviewing a captured shot. Keeps the GPS
+          state visible and gives a one-tap re-acquire so a mistaken "deny" isn't
+          a dead end. */}
+      {phase === "captured" && (
+        <div className="mt-3">
+          {geoStatus === "loading" || geoRequested ? (
+            <div className="flex items-center gap-2 text-xs text-ink-soft bg-paper-deep/40 border border-rule/50 rounded-xl px-3 py-2">
+              <span className="w-3.5 h-3.5 rounded-full border-2 border-rule/30 border-t-vermilion animate-spin shrink-0" />
+              正在获取拍摄位置…
+            </div>
+          ) : coords ? (
+            <div className="flex items-center gap-2 text-xs text-leaf-deep bg-leaf/10 border border-leaf/30 rounded-xl px-3 py-2">
+              <MapPinIcon className="w-3.5 h-3.5 text-leaf-deep shrink-0" />
+              <span className="tabular-nums">已获取位置 {coords.lat.toFixed(4)}, {coords.lng.toFixed(4)}</span>
+              <button
+                onClick={requestGeo}
+                className="ml-auto text-[11px] text-ink-faint hover:text-vermilion underline underline-offset-2 cursor-pointer"
+              >
+                重新获取
+              </button>
+            </div>
+          ) : (
+            <div className="text-xs bg-amber-500/10 border border-amber-500/40 rounded-xl px-3 py-2 space-y-1.5">
+              <div className="flex items-center gap-2 text-amber-700">
+                <MapPinIcon className="w-3.5 h-3.5 shrink-0" />
+                <span className="font-semibold">未获取到拍摄位置</span>
+                <button
+                  onClick={requestGeo}
+                  className="ml-auto px-2 py-0.5 rounded-full border border-amber-500/60 text-amber-700 hover:bg-amber-500 hover:text-background transition-colors text-[11px] font-medium cursor-pointer"
+                >
+                  开启定位
+                </button>
+              </div>
+              <p className="text-[11px] text-ink-faint leading-relaxed">
+                {geoStatus === "unavailable"
+                  ? "此浏览器不支持定位。"
+                  : geoStatus === "timeout"
+                    ? "定位无响应（一直转圈）——十有八九是 iOS 关掉了定位。请打开 iOS 设置 → 隐私与安全性 → 定位服务：确认总开关已开，且 Chrome 一项设为「使用 App 期间」并打开「精确位置」，然后回来点「开启定位」。"
+                    : permState === "denied"
+                      ? "本站定位权限已被拒绝，浏览器不会再弹授权框。请到 Chrome ⋯ → 设置 → 内容设置 → 位置信息中允许本站，再确认 iOS 设置 → 隐私与安全性 → 定位服务 → Chrome 为「使用 App 期间」。"
+                      : "地点对识别与分布地图很重要。点「开启定位」后应会弹出授权框；若无反应，请检查 Chrome 与 iOS 的定位权限。"}
+              </p>
+            </div>
+          )}
+
+          {/* Save original to album — web can't auto-save the camera roll, so offer
+              it explicitly. Lets the user keep the shot to re-identify later if the
+              signal is bad here. */}
+          <button
+            onClick={saveToAlbum}
+            className="mt-2 w-full flex items-center justify-center gap-1.5 text-xs text-ink-soft bg-paper-deep/40 hover:bg-paper-deep/70 border border-rule/50 rounded-xl px-3 py-2 transition-colors cursor-pointer"
+          >
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+              <polyline points="7 10 12 15 17 10" />
+              <line x1="12" y1="15" x2="12" y2="3" />
+            </svg>
+            保存原图到相册（信号不好时可稍后重新上传识别）
+          </button>
+        </div>
+      )}
+
       {/* 2. Control bar */}
       <div className="mt-4 pt-2">
         {phase === "idle" ? (
           <div className="flex items-center justify-between px-6">
             {/* Gallery Upload Button */}
             <button
-              onClick={() => albumInputRef.current?.click()}
+              onClick={openAlbum}
               title="选择相册照片"
               className="w-12 h-12 rounded-full border border-rule bg-background flex items-center justify-center text-ink hover:bg-ink hover:text-background transition-all cursor-pointer shadow-sm active:scale-90"
             >

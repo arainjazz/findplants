@@ -14,6 +14,60 @@ export type Database = {
   }
   public: {
     Tables: {
+      ai_usage_logs: {
+        Row: {
+          id: string
+          created_at: string
+          user_id: string | null
+          user_label: string | null
+          provider: string
+          model: string
+          prompt_tokens: number
+          completion_tokens: number
+          total_tokens: number
+          capture_place: string | null
+          capture_lat: number | null
+          capture_lng: number | null
+          draft_id: string | null
+          draft_title: string | null
+          task_type: string | null
+        }
+        Insert: {
+          id?: string
+          created_at?: string
+          user_id?: string | null
+          user_label?: string | null
+          provider: string
+          model: string
+          prompt_tokens?: number
+          completion_tokens?: number
+          total_tokens?: number
+          capture_place?: string | null
+          capture_lat?: number | null
+          capture_lng?: number | null
+          draft_id?: string | null
+          draft_title?: string | null
+          task_type?: string | null
+        }
+        Update: {
+          id?: string
+          created_at?: string
+          user_id?: string | null
+          user_label?: string | null
+          provider?: string
+          model?: string
+          prompt_tokens?: number
+          completion_tokens?: number
+          total_tokens?: number
+          capture_place?: string | null
+          capture_lat?: number | null
+          capture_lng?: number | null
+          draft_id?: string | null
+          draft_title?: string | null
+          task_type?: string | null
+        }
+        Relationships: []
+      }
       blog_posts: {
         Row: {
           author_id: string
@@ -389,6 +443,7 @@ export type Database = {
           created_at: string
           created_by: string | null
           creator_label: string
+          enrich_silver_spent: boolean
           family: string | null
           gbif_taxon_key: number | null
           genus: string | null
@@ -398,12 +453,15 @@ export type Database = {
           iucn_status: string | null
           photo_url: string
           published_plant_id: string | null
+          retake_count: number
           scientific_name: string | null
           status: string
+          submitted_for_review: boolean
           summary: string | null
           tags: string[]
           title: string
           updated_at: string
+          user_photos: Json
         }
         Insert: {
           adopted?: boolean
@@ -419,6 +477,7 @@ export type Database = {
           created_at?: string
           created_by?: string | null
           creator_label?: string
+          enrich_silver_spent?: boolean
           family?: string | null
           gbif_taxon_key?: number | null
           genus?: string | null
@@ -428,12 +487,15 @@ export type Database = {
           iucn_status?: string | null
           photo_url: string
           published_plant_id?: string | null
+          retake_count?: number
           scientific_name?: string | null
           status?: string
+          submitted_for_review?: boolean
           summary?: string | null
           tags?: string[]
           title: string
           updated_at?: string
+          user_photos?: Json
         }
         Update: {
           adopted?: boolean
@@ -449,6 +511,7 @@ export type Database = {
           created_at?: string
           created_by?: string | null
           creator_label?: string
+          enrich_silver_spent?: boolean
           family?: string | null
           gbif_taxon_key?: number | null
           genus?: string | null
@@ -458,12 +521,15 @@ export type Database = {
           iucn_status?: string | null
           photo_url?: string
           published_plant_id?: string | null
+          retake_count?: number
           scientific_name?: string | null
           status?: string
+          submitted_for_review?: boolean
           summary?: string | null
           tags?: string[]
           title?: string
           updated_at?: string
+          user_photos?: Json
         }
         Relationships: [
           {
@@ -625,6 +691,7 @@ export type Database = {
       plants: {
         Row: {
           author_id: string
+          body_text: string | null
           co_author_ids: string[]
           co_author_names: string[]
           comments_count: number
@@ -652,6 +719,7 @@ export type Database = {
         }
         Insert: {
           author_id: string
+          body_text?: string | null
           co_author_ids?: string[]
           co_author_names?: string[]
           comments_count?: number
@@ -679,6 +747,7 @@ export type Database = {
         }
         Update: {
           author_id?: string
+          body_text?: string | null
           co_author_ids?: string[]
           co_author_names?: string[]
           comments_count?: number
@@ -721,6 +790,7 @@ export type Database = {
           created_at: string
           display_name: string | null
           gold_used: number
+          silver_used: number
           id: string
           updated_at: string
         }
@@ -730,6 +800,7 @@ export type Database = {
           created_at?: string
           display_name?: string | null
           gold_used?: number
+          silver_used?: number
           id: string
           updated_at?: string
         }
@@ -739,6 +810,7 @@ export type Database = {
           created_at?: string
           display_name?: string | null
           gold_used?: number
+          silver_used?: number
           id?: string
           updated_at?: string
         }

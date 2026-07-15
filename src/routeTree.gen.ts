@@ -28,6 +28,7 @@ import { Route as EditorsIdRouteImport } from './routes/editors.$id'
 import { Route as DraftsIdRouteImport } from './routes/drafts.$id'
 import { Route as BlogSlugRouteImport } from './routes/blog.$slug'
 import { Route as AuthenticatedAdminIndexRouteImport } from './routes/_authenticated/admin.index'
+import { Route as AuthenticatedAdminUsageStatsRouteImport } from './routes/_authenticated/admin.usage-stats'
 import { Route as AuthenticatedAdminTagsRouteImport } from './routes/_authenticated/admin.tags'
 import { Route as AuthenticatedAdminNewRouteImport } from './routes/_authenticated/admin.new'
 import { Route as AuthenticatedAdminBatchNewRouteImport } from './routes/_authenticated/admin.batch-new'
@@ -134,6 +135,12 @@ const AuthenticatedAdminIndexRoute = AuthenticatedAdminIndexRouteImport.update({
   path: '/admin/',
   getParentRoute: () => AuthenticatedRoute,
 } as any)
+const AuthenticatedAdminUsageStatsRoute =
+  AuthenticatedAdminUsageStatsRouteImport.update({
+    id: '/admin/usage-stats',
+    path: '/admin/usage-stats',
+    getParentRoute: () => AuthenticatedRoute,
+  } as any)
 const AuthenticatedAdminTagsRoute = AuthenticatedAdminTagsRouteImport.update({
   id: '/admin/tags',
   path: '/admin/tags',
@@ -221,6 +228,7 @@ export interface FileRoutesByFullPath {
   '/admin/batch-new': typeof AuthenticatedAdminBatchNewRoute
   '/admin/new': typeof AuthenticatedAdminNewRoute
   '/admin/tags': typeof AuthenticatedAdminTagsRoute
+  '/admin/usage-stats': typeof AuthenticatedAdminUsageStatsRoute
   '/admin/': typeof AuthenticatedAdminIndexRoute
   '/admin/blog/new': typeof AuthenticatedAdminBlogNewRoute
   '/admin/catalogs/$id': typeof AuthenticatedAdminCatalogsIdRoute
@@ -252,6 +260,7 @@ export interface FileRoutesByTo {
   '/admin/batch-new': typeof AuthenticatedAdminBatchNewRoute
   '/admin/new': typeof AuthenticatedAdminNewRoute
   '/admin/tags': typeof AuthenticatedAdminTagsRoute
+  '/admin/usage-stats': typeof AuthenticatedAdminUsageStatsRoute
   '/admin': typeof AuthenticatedAdminIndexRoute
   '/admin/blog/new': typeof AuthenticatedAdminBlogNewRoute
   '/admin/catalogs/$id': typeof AuthenticatedAdminCatalogsIdRoute
@@ -285,6 +294,7 @@ export interface FileRoutesById {
   '/_authenticated/admin/batch-new': typeof AuthenticatedAdminBatchNewRoute
   '/_authenticated/admin/new': typeof AuthenticatedAdminNewRoute
   '/_authenticated/admin/tags': typeof AuthenticatedAdminTagsRoute
+  '/_authenticated/admin/usage-stats': typeof AuthenticatedAdminUsageStatsRoute
   '/_authenticated/admin/': typeof AuthenticatedAdminIndexRoute
   '/_authenticated/admin/blog/new': typeof AuthenticatedAdminBlogNewRoute
   '/_authenticated/admin/catalogs/$id': typeof AuthenticatedAdminCatalogsIdRoute
@@ -318,6 +328,7 @@ export interface FileRouteTypes {
     | '/admin/batch-new'
     | '/admin/new'
     | '/admin/tags'
+    | '/admin/usage-stats'
     | '/admin/'
     | '/admin/blog/new'
     | '/admin/catalogs/$id'
@@ -349,6 +360,7 @@ export interface FileRouteTypes {
     | '/admin/batch-new'
     | '/admin/new'
     | '/admin/tags'
+    | '/admin/usage-stats'
     | '/admin'
     | '/admin/blog/new'
     | '/admin/catalogs/$id'
@@ -381,6 +393,7 @@ export interface FileRouteTypes {
     | '/_authenticated/admin/batch-new'
     | '/_authenticated/admin/new'
     | '/_authenticated/admin/tags'
+    | '/_authenticated/admin/usage-stats'
     | '/_authenticated/admin/'
     | '/_authenticated/admin/blog/new'
     | '/_authenticated/admin/catalogs/$id'
@@ -547,6 +560,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AuthenticatedAdminIndexRouteImport
       parentRoute: typeof AuthenticatedRoute
     }
+    '/_authenticated/admin/usage-stats': {
+      id: '/_authenticated/admin/usage-stats'
+      path: '/admin/usage-stats'
+      fullPath: '/admin/usage-stats'
+      preLoaderRoute: typeof AuthenticatedAdminUsageStatsRouteImport
+      parentRoute: typeof AuthenticatedRoute
+    }
     '/_authenticated/admin/tags': {
       id: '/_authenticated/admin/tags'
       path: '/admin/tags'
@@ -632,6 +652,7 @@ interface AuthenticatedRouteChildren {
   AuthenticatedAdminBatchNewRoute: typeof AuthenticatedAdminBatchNewRoute
   AuthenticatedAdminNewRoute: typeof AuthenticatedAdminNewRoute
   AuthenticatedAdminTagsRoute: typeof AuthenticatedAdminTagsRoute
+  AuthenticatedAdminUsageStatsRoute: typeof AuthenticatedAdminUsageStatsRoute
   AuthenticatedAdminIndexRoute: typeof AuthenticatedAdminIndexRoute
   AuthenticatedAdminBlogNewRoute: typeof AuthenticatedAdminBlogNewRoute
   AuthenticatedAdminCatalogsIdRoute: typeof AuthenticatedAdminCatalogsIdRoute
@@ -647,6 +668,7 @@ const AuthenticatedRouteChildren: AuthenticatedRouteChildren = {
   AuthenticatedAdminBatchNewRoute: AuthenticatedAdminBatchNewRoute,
   AuthenticatedAdminNewRoute: AuthenticatedAdminNewRoute,
   AuthenticatedAdminTagsRoute: AuthenticatedAdminTagsRoute,
+  AuthenticatedAdminUsageStatsRoute: AuthenticatedAdminUsageStatsRoute,
   AuthenticatedAdminIndexRoute: AuthenticatedAdminIndexRoute,
   AuthenticatedAdminBlogNewRoute: AuthenticatedAdminBlogNewRoute,
   AuthenticatedAdminCatalogsIdRoute: AuthenticatedAdminCatalogsIdRoute,

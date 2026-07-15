@@ -1,16 +1,17 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useEffect, useMemo, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useServerFn } from "@tanstack/react-start";
 import { SiteHeader, SiteFooter } from "@/components/site-header";
 import { useAuth } from "@/hooks/use-auth";
 import { supabase } from "@/integrations/supabase/client";
 import {
-  approveApplication,
   fetchApplications,
   isCurrentUserAdmin,
   rejectApplication,
   type EditorApplication,
 } from "@/lib/edits";
+import { approveApplicationFn, confirmUserEmailFn } from "@/lib/identify-plant.functions";
 import { toast } from "sonner";
 
 export const Route = createFileRoute("/_authenticated/admin/applications")({
@@ -137,15 +138,34 @@ function ApplicationCard({ app, adminId }: { app: EditorApplication; adminId: st
   const [busy, setBusy] = useState(false);
   const [showReject, setShowReject] = useState(false);
   const [reason, setReason] = useState("");
+  const approveFn = useServerFn(approveApplicationFn);
+  const confirmEmailFn = useServerFn(confirmUserEmailFn);
 
   const onApprove = async () => {
     setBusy(true);
     try {
-      await approveApplication(app, adminId);
-      toast.success(`已通过 ${app.email} 的申请`);
+      const res = (await approveFn({ data: { applicationId: app.id, userId: app.user_id } })) as { emailConfirmed?: boolean };
+      toast.success(
+        res?.emailConfirmed
+          ? `已通过 ${app.email} 的申请，并已确认邮箱，对方可直接登录`
+          : `已通过 ${app.email} 的申请（邮箱确认未成功，可用「确认邮箱」按钮重试）`,
+      );
       qc.invalidateQueries({ queryKey: ["editor-applications"] });
     } catch (e) {
       toast.error("操作失败：" + (e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // For editors approved BEFORE auto-confirm existed (e.g. still "email not confirmed").
+  const onConfirmEmail = async () => {
+    setBusy(true);
+    try {
+      await confirmEmailFn({ data: { userId: app.user_id } });
+      toast.success(`已确认 ${app.email} 的邮箱，对方现在可以登录了`);
+    } catch (e) {
+      toast.error("确认失败：" + (e as Error).message);
     } finally {
       setBusy(false);
     }
@@ -197,6 +217,19 @@ function ApplicationCard({ app, adminId }: { app: EditorApplication; adminId: st
       </div>
       {app.status === "rejected" && app.reject_reason && (
         <p className="text-xs text-destructive mb-3">拒绝理由：{app.reject_reason}</p>
+      )}
+      {app.status === "approved" && (
+        <div className="flex items-center gap-2 flex-wrap">
+          <button
+            onClick={onConfirmEmail}
+            disabled={busy}
+            title="若该用户登录时报「email not confirmed」，点此手动确认其邮箱（老数据补救）"
+            className="px-3 py-1.5 text-sm border border-leaf-deep text-leaf-deep hover:bg-leaf-deep hover:text-background transition-colors disabled:opacity-60"
+          >
+            {busy ? "处理中…" : "确认邮箱 · 放行登录"}
+          </button>
+          <span className="text-xs text-ink-faint">已通过审核。若对方登录仍报「email not confirmed」，点左侧按钮。</span>
+        </div>
       )}
       {app.status === "pending" && (
         <>

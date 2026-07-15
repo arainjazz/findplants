@@ -47,6 +47,51 @@ export function entryType(p: { source?: string | null; content_type?: string | n
   return { key: "manual", label: "富文本" };
 }
 
+/**
+ * 归一化学名到「属+种」查重键：去掉 markdown 星号/下划线，取前两个空格分词，小写。
+ * 用于判定「同一物种」——容忍命名人后缀与格式差异。
+ *   "*Anthurium crystallinum* Linden ex André" → "anthurium crystallinum"
+ *   "Anthurium crystallinum Linden & André"     → "anthurium crystallinum"
+ */
+export function speciesKey(scientificName: string | null | undefined): string {
+  if (!scientificName) return "";
+  const cleaned = scientificName.replace(/[*_]/g, " ").replace(/\s+/g, " ").trim();
+  const tokens = cleaned.split(" ").filter(Boolean);
+  return tokens.slice(0, 2).join(" ").toLowerCase();
+}
+
+/** 剥离 HTML → 可见正文纯文本（去 script/style/标签/实体/补充观测卡片）。用于查重相似度与 body_text 存储。 */
+export function visibleBodyText(html: string): string {
+  return html
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<section[^>]*class="merged-observation"[\s\S]*?<\/section>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&[a-z#0-9]+;/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+/** 字符 n-gram 集合（对中文友好：先去空白再切 3-gram）。 */
+export function textShingles(text: string, n = 3): Set<string> {
+  const t = text.replace(/\s+/g, "");
+  const s = new Set<string>();
+  for (let i = 0; i + n <= t.length; i++) s.add(t.slice(i, i + n));
+  return s;
+}
+/** 两个 shingle 集合的 Jaccard 相似度（0–1）。 */
+export function jaccardSimilarity(a: Set<string>, b: Set<string>): number {
+  if (a.size === 0 && b.size === 0) return 1;
+  let inter = 0;
+  for (const x of a) if (b.has(x)) inter++;
+  const uni = a.size + b.size - inter;
+  return uni === 0 ? 0 : inter / uni;
+}
+/** 便捷：两段可见正文文本的相似度。 */
+export function bodyTextSimilarity(textA: string, textB: string): number {
+  return jaccardSimilarity(textShingles(textA), textShingles(textB));
+}
+
 export function slugify(s: string) {
   return s
     .toLowerCase()

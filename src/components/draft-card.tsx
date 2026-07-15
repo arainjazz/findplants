@@ -1,6 +1,7 @@
 import { Link } from "@tanstack/react-router";
 import type { PlantDraft } from "@/lib/drafts";
 import { displayPlace } from "@/lib/editor-stats";
+import { SafeImg } from "@/components/safe-img";
 
 export function DraftCard({ draft: d, showPendingBadge = false }: { draft: PlantDraft; showPendingBadge?: boolean }) {
   return (
@@ -21,7 +22,16 @@ export function DraftCard({ draft: d, showPendingBadge = false }: { draft: Plant
         className="group flex gap-3 border border-rule bg-paper-deep/30 hover:border-vermilion transition-colors p-3"
       >
         <div className="w-24 h-24 sm:w-28 sm:h-28 flex-shrink-0 overflow-hidden bg-paper-deep">
-          <img src={d.photo_url} alt={d.title} className="w-full h-full object-cover group-hover:scale-[1.04] transition-transform duration-500" />
+          <SafeImg
+            src={d.photo_url}
+            alt={d.title}
+            className="w-full h-full object-cover group-hover:scale-[1.04] transition-transform duration-500"
+            fallback={
+              <div className="w-full h-full flex items-center justify-center bg-paper-deep">
+                <span className="font-display text-3xl text-leaf-deep/40">❦</span>
+              </div>
+            }
+          />
         </div>
         <div className="min-w-0 flex-1">
           <p className="label text-[10px] text-vermilion mb-0.5">草稿 · {d.creator_label}</p>

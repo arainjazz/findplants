@@ -85,9 +85,10 @@ export function LeafPanel({ stats, name }: { stats: LeafStats; name?: string }) 
         </li>
       </ul>
 
-      {stats.gold > 0 && (
+      {(stats.gold > 0 || stats.isOwner) && (
         <p className="text-[10px] text-ink-faint mt-2 leading-relaxed">
-          可用 {stats.goldAvailable} 次「一键创建物种科普详页」
+          可用 {isFinite(stats.goldAvailable) ? stats.goldAvailable : "∞"} 次「一键创建物种科普详页」
+          {isFinite(stats.silverAvailable) ? ` · 可用 ${stats.silverAvailable} 次「生成进一步草稿」` : " · 生成草稿无限"}
         </p>
       )}
 
@@ -95,11 +96,13 @@ export function LeafPanel({ stats, name }: { stats: LeafStats; name?: string }) 
       <details className="mt-3">
         <summary className="text-[11px] text-vermilion cursor-pointer select-none">积分规则 ▾</summary>
         <ul className="mt-2 space-y-1 text-[11px] text-ink-soft leading-relaxed list-disc pl-4">
-          <li>AI 识别一种植物 → +1 识别铜叶</li>
+          <li>AI 识别一种植物 → +1 识别铜叶；每补拍一次再确认 → 多 +1（补拍 n 次成功得 1+n 枚）</li>
+          <li>补拍满 3 次仍为「疑似」→ 记 1 枚铜叶（疑似结果固定 +1）</li>
           <li>编辑已收录条目的文字 → +1 修文铜叶</li>
           <li>替换已收录条目的图片 → +1 换图铜叶</li>
-          <li>以上被资深编辑<b>采纳</b>后，该枚铜叶翻倍</li>
+          <li>以上被资深编辑<b>采纳</b>后，该枚铜叶翻倍（疑似识别除外）</li>
           <li>满 10 枚铜叶自动得 1 枚银叶；满 10 枚银叶自动得 1 枚金叶</li>
+          <li>1 枚银叶 = 1 次「让 AI 生成进一步介绍草稿」机会（草稿被驳回则退还）</li>
           <li>1 枚金叶 = 1 次「一键创建物种科普详页」机会</li>
           <li>等级：≥1 铜叶 = 铜叶编辑 · ≥1 银叶 = 银叶编辑 · ≥1 金叶 = 金叶编辑 · ≥10 金叶 = 资深编辑</li>
         </ul>

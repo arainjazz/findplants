@@ -1,8 +1,8 @@
 import { createFileRoute, Link, notFound, useNavigate } from "@tanstack/react-router";
-import { compressImage } from "@/lib/image-compress";
+import { compressImage, extForMime } from "@/lib/image-compress";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { SiteHeader, SiteFooter } from "@/components/site-header";
 import { XiaoPAgentPanel } from "@/components/draft-agent-panel";
@@ -10,7 +10,7 @@ import { askPlantAgentFn, applyPlantAgentEditFn } from "@/lib/identify-plant.fun
 import { userModelArg } from "@/lib/xiaop-user-model";
 import { fetchPlantBySlug, fetchAuthor } from "@/lib/plants";
 import { useAuth } from "@/hooks/use-auth";
-import { fetchEditById, isCurrentUserAdmin, revertEdit, fetchEditsForPlant, type PlantEdit } from "@/lib/edits";
+import { fetchEditById, isCurrentUserAdmin, revertEdit, fetchEditsForPlant, fetchOriginProvenance, type PlantEdit } from "@/lib/edits";
 import { EditLogSection } from "@/components/edit-log-section";
 import { PlantComments } from "@/components/plant-comments";
 import { embedVideosInHtml } from "@/lib/embed";
@@ -61,7 +61,12 @@ function PlantDetail() {
   // online image-search dialog is open; on pick we rewrite that <img> and save.
   const [xiaopImg, setXiaopImg] = useState<{ query: string; instruction: string } | null>(null);
   const [revertingId, setRevertingId] = useState<string | null>(null);
+  // 「注 N」被点击时，要在页尾「修改记录」里定位到对应那条并高亮。
+  const [focusedNoteId, setFocusedNoteId] = useState<string | null>(null);
   const coverFileRef = (typeof window !== "undefined" ? { current: null as HTMLInputElement | null } : { current: null });
+  // ResizeObserver 观察 iframe 内容高度变化以自适应外层 iframe 高度。
+  const roRef = useRef<ResizeObserver | null>(null);
+  useEffect(() => () => roRef.current?.disconnect(), []);
   const askPlantAgent = useServerFn(askPlantAgentFn);
   const applyPlantAgent = useServerFn(applyPlantAgentEditFn);
 
@@ -77,6 +82,16 @@ function PlantDetail() {
     enabled: !!plant?.id,
   });
 
+  // 溯源表头：「AI 识别条目」显示「最早识别人/地点/时间」，从最早那条来源草稿回溯。
+  // 注意：采纳流程当前不写 source（留 null）、content_type 为 html，故无法靠字段区分
+  // AI识别 vs skill 上传——唯一可靠信号是「是否存在来源草稿」。对所有条目都查（有索引，
+  // 无草稿的 skill 上传返回 null 即不显示）。
+  const { data: originProv } = useQuery({
+    queryKey: ["plant-origin", plant?.id],
+    queryFn: () => fetchOriginProvenance(plant!.id),
+    enabled: !!plant?.id,
+  });
+
   // Fetch HTML content for srcdoc rendering (so relative refs / fonts work without host CORS issues)
   const [htmlDoc, setHtmlDoc] = useState<string | null>(null);
   useEffect(() => {
@@ -85,7 +100,19 @@ function PlantDetail() {
         .then((r) => r.text())
         .then((text) => {
           // Inject responsive-image CSS so original fixed-width <img> tags scale to viewport.
-          const css = `<style>img,video,iframe{max-width:100%!important;height:auto!important;}body{overflow-x:hidden;}</style>`;
+          const css = `<style>img,video,iframe{max-width:100%!important;height:auto!important;}body{overflow-x:hidden;}` +
+            // 合并进来的「补充观测」卡片限宽居中，其配图限高，避免在模板内容列之外被撑满整页。
+            `.merged-observation{max-width:680px!important;margin-left:auto!important;margin-right:auto!important;}` +
+            `.merged-observation figure{max-width:420px!important;margin-left:0!important;}` +
+            `.merged-observation img{max-height:360px!important;max-width:100%!important;width:auto!important;height:auto!important;object-fit:contain;}` +
+            // 入侵警示卡片头部在窄屏换行，避免「入侵等级」徽章被 overflow:hidden 裁掉（修复存量条目）。
+            `@media(max-width:640px){.invasive-card .ic-head{flex-wrap:wrap!important;gap:8px 12px!important;padding:14px 16px!important;}.invasive-card .ic-head h2{font-size:19px!important;}.invasive-card .ic-badge{margin-left:0!important;order:3!important;flex-basis:100%!important;white-space:normal!important;}}` +
+            // 图片相框修复：ccplants skill 页把每张图写死成 4:3/16:9 相框 + object-fit:cover 裁剪。
+            // 改为按图片原始比例完整显示、不裁剪，仅设一个最大高度防止超高竖图占满屏。
+            // 保留 .broken 占位框的固定尺寸（否则空图会塌成一条线）。
+            `.img-slot:not(.broken),.img-slot.habitat-photo:not(.broken){aspect-ratio:auto!important;height:auto!important;overflow:visible!important;}` +
+            `.img-slot:not(.broken) img{position:static!important;width:100%!important;height:auto!important;max-height:80vh!important;object-fit:contain!important;}` +
+            `</style>`;
           // Forward right-click on edit markers to the parent page.
           const script = `<script>document.addEventListener('contextmenu',function(e){var t=e.target;var m=t&&t.closest&&t.closest('.lov-edit-mark');if(!m)return;e.preventDefault();var id=m.getAttribute('data-edit-id');if(!id)return;var r=m.getBoundingClientRect();parent.postMessage({type:'lov-edit-mark-ctx',editId:id,x:r.left+r.width,y:r.top+r.height},'*');});</script>`;
           const inject = css + script;
@@ -161,10 +188,10 @@ function PlantDetail() {
       console.error("Image compression failed, using original:", err);
     }
 
-    const ext = file.name.split(".").pop() || "jpg";
+    const ext = extForMime(fileToUpload.type, file.name.split(".").pop() || "jpg");
     const path = `${user.id}/cover/${Date.now()}.${ext}`;
     const { error } = await supabase.storage.from("plant-images").upload(path, fileToUpload, {
-      cacheControl: "3600", upsert: false, contentType: file.type,
+      cacheControl: "3600", upsert: false, contentType: fileToUpload.type,
     });
     if (error) return toast.error(error.message);
     await updateCover(supabase.storage.from("plant-images").getPublicUrl(path).data.publicUrl);
@@ -192,6 +219,64 @@ function PlantDetail() {
       window.removeEventListener("click", close);
     };
   }, []);
+
+  // iframe 自适应高度：内容多高 iframe 就多高，整页由父窗口单一滚动 —— 消除固定
+  // calc(100vh-120px) 造成的内部双滚动，以及短页面时页尾被空白撑满的问题。
+  const sizeIframe = (iframe: HTMLIFrameElement) => {
+    const doc = iframe.contentDocument;
+    if (!doc) return;
+    // 容器宽度塌缩（≈0 宽）时，内容会回流成极高的窄条，量到的 scrollHeight 是垃圾值。
+    // 跳过；等宽度恢复后 ResizeObserver 会再次触发、量到正确高度。
+    if (iframe.clientWidth < 240) return;
+    const h = Math.max(doc.documentElement?.scrollHeight ?? 0, doc.body?.scrollHeight ?? 0);
+    if (h > 0) iframe.style.height = `${h}px`;
+  };
+
+  // 「注 N」= 正文里的 .lov-edit-mark 上标。iframe 出于安全无 allow-scripts（中和上传 HTML 里的脚本），
+  // 但 srcDoc + allow-same-origin 是同源，父页面可直接给 iframe 文档挂点击监听 → 定位到页尾「修改记录」，
+  // 并接管页内锚点跳转（沙箱里点 #hash 会把 iframe 导航到 about:srcdoc 显示源码乱码）。
+  const wireIframe = (iframe: HTMLIFrameElement) => {
+    const doc = iframe.contentDocument;
+    if (!doc) return;
+    // 自适应高度 + 图片/字体加载后重新量高。
+    sizeIframe(iframe);
+    [120, 400, 1000, 2500].forEach((t) => setTimeout(() => sizeIframe(iframe), t));
+    try {
+      doc.querySelectorAll("img").forEach((im) => im.addEventListener("load", () => sizeIframe(iframe)));
+      const f = (doc as unknown as { fonts?: { ready?: Promise<unknown> } }).fonts;
+      if (f?.ready) f.ready.then(() => sizeIframe(iframe));
+      roRef.current?.disconnect();
+      const ro = new ResizeObserver(() => sizeIframe(iframe));
+      ro.observe(doc.documentElement);
+      roRef.current = ro;
+    } catch { /* ResizeObserver 不支持时退回定时量高 */ }
+    doc.addEventListener("click", (ev) => {
+      const target = ev.target as Element | null;
+      const mark = (target?.closest?.(".lov-edit-mark") as HTMLElement | null) ?? null;
+      if (mark) {
+        const id = mark.getAttribute("data-edit-id");
+        if (!id) return;
+        ev.preventDefault();
+        // 置空再设：连续点同一条「注」也能重新触发滚动 + 高亮。
+        setFocusedNoteId(null);
+        requestAnimationFrame(() => setFocusedNoteId(id));
+        return;
+      }
+      // 页内锚点（如「博物趣闻」摘要卡 href="#section-vi"）：手动滚动父窗口到目标，
+      // 避免沙箱 srcdoc 的 #hash 导航把 iframe 变成一屏源码乱码。
+      const anchor = (target?.closest?.('a[href^="#"]') as HTMLAnchorElement | null) ?? null;
+      if (anchor) {
+        const rawId = (anchor.getAttribute("href") || "").slice(1);
+        if (!rawId) return;
+        let el: Element | null = null;
+        try { el = doc.getElementById(decodeURIComponent(rawId)) || doc.getElementById(rawId); } catch { el = doc.getElementById(rawId); }
+        if (!el) return;
+        ev.preventDefault();
+        const top = iframe.getBoundingClientRect().top + window.scrollY + el.getBoundingClientRect().top;
+        window.scrollTo({ top: Math.max(0, top - 90), behavior: "smooth" });
+      }
+    });
+  };
 
   // 小P蛙: ask about this published page.
   const askXiaoP = async (
@@ -331,8 +416,18 @@ function PlantDetail() {
     (plant.co_author_ids ?? []).includes(user.id)
   );
 
+  const fmtDate = (ts: string) => {
+    try {
+      return new Date(ts).toLocaleDateString("zh-CN", { year: "numeric", month: "2-digit", day: "2-digit" });
+    } catch {
+      return ts;
+    }
+  };
+  // 采纳编辑/时间：用现有 create 行（editor_name 已解析），无需额外查询。
+  const createRow = plantEdits.find((e) => e.kind === "create");
+
   const attributionFooter = (
-    <div className="mt-10 pt-6 border-t border-rule text-xs text-ink-faint">
+    <div className="mt-10 pt-6 border-t border-rule text-xs text-ink-faint space-y-1">
       <p>
         创建者：<span className="text-ink">{author?.display_name ?? "佚名"}</span>
         {plant.co_author_names && plant.co_author_names.length > 0 && (
@@ -342,6 +437,26 @@ function PlantDetail() {
           </>
         )}
       </p>
+      {originProv ? (
+        // AI 识别条目：最早识别人/地点/时间 ｜ 采纳编辑/时间
+        <p>
+          最早识别：<span className="text-ink">{originProv.identifierName}</span>
+          {originProv.place && <> · {originProv.place}</>}
+          {" · "}{fmtDate(originProv.identifiedAt)}
+          {createRow && (
+            <>
+              {" ｜ "}采纳：<span className="text-ink">{createRow.editor_name ?? "编辑"}</span>
+              {" · "}{fmtDate(createRow.created_at)}
+            </>
+          )}
+        </p>
+      ) : (
+        // AI skill 条目（上传 HTML / 金叶一键）：上传编辑 + 时间
+        <p>
+          上传：<span className="text-ink">{createRow?.editor_name ?? author?.display_name ?? "编辑"}</span>
+          {" · "}{fmtDate(createRow?.created_at ?? plant.created_at)}
+        </p>
+      )}
     </div>
   );
 
@@ -422,8 +537,10 @@ function PlantDetail() {
               title={plant.title}
               srcDoc={htmlDoc}
               sandbox="allow-same-origin allow-popups"
-              className="w-full"
-              style={{ height: "calc(100vh - 120px)" }}
+              onLoad={(e) => wireIframe(e.currentTarget)}
+              className="w-full block"
+              scrolling="no"
+              style={{ minHeight: "60vh" }}
             />
           ) : plant.html_url ? (
             <iframe
@@ -438,37 +555,24 @@ function PlantDetail() {
           )}
         </main>
         <div className="mx-auto max-w-3xl px-6 w-full">
-          {plant.cover_url && (
-            <figure
-              className="mt-6 border border-rule cursor-context-menu"
-              onContextMenu={(e) => {
-                if (!canEdit) return;
-                e.preventDefault();
-                setCoverMenu({ x: e.clientX, y: e.clientY });
-              }}
-            >
-              <img src={plant.cover_url} alt={plant.title} className="w-full" />
-              {canEdit && (
-                <figcaption className="px-2 py-1 text-[10px] text-ink-faint">右键封面图可编辑</figcaption>
-              )}
-            </figure>
-          )}
+          {/* 封面图不在此重复展示——编辑封面请用条目右上角「编辑 →」。 */}
           {attributionFooter}
           <EditLogSection
             edits={plantEdits}
             isEditor={canEdit}
             reverting={revertingId}
             onRevert={onRevertPlantEdit}
+            focusEditId={focusedNoteId}
           />
           <PlantComments plantId={plant.id} />
         </div>
-        {renderCoverMenu()}
         {/* 小P蛙 — 编辑登录后可对该已发布页提问并改写（标注范围或整页），保存上线并记入修改记录 */}
         {canEdit && (
           <XiaoPAgentPanel
             storageKey={`plant:${plant.id}`}
             greetingTitle={plant.title}
             canApply={true}
+            isRegistered={!!user}
             scopes={pageSections}
             ask={askXiaoP}
             apply={applyXiaoP}
@@ -610,6 +714,7 @@ function PlantDetail() {
             isEditor={canEdit}
             reverting={revertingId}
             onRevert={onRevertPlantEdit}
+            focusEditId={focusedNoteId}
           />
         </article>
         <PlantComments plantId={plant.id} />
@@ -621,7 +726,7 @@ function PlantDetail() {
         .prose-plant p { margin: 0 0 1.1em; }
         .prose-plant h2 { font-family: var(--font-display); font-size: 2rem; margin: 2em 0 0.6em; font-weight: 600; }
         .prose-plant h3 { font-family: var(--font-display); font-size: 1.4rem; margin: 1.6em 0 0.5em; font-weight: 600; }
-        .prose-plant img { max-width: 100%; margin: 1.5em 0; border: 1px solid var(--rule); }
+        .prose-plant img { max-width: 100%; height: auto; margin: 1.5em 0; border: 1px solid var(--rule); }
         .prose-plant ul, .prose-plant ol { margin: 0 0 1.1em 1.4em; }
         .prose-plant blockquote { border-left: 3px solid var(--vermilion); padding-left: 1em; margin: 1.2em 0; color: var(--ink-soft); font-style: italic; }
         .prose-plant a { color: var(--vermilion); text-decoration: underline; }

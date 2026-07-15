@@ -1,11 +1,12 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useQuery } from "@tanstack/react-query";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type TouchEvent as ReactTouchEvent } from "react";
 import { SiteHeader, SiteFooter } from "@/components/site-header";
 import { fetchGeoSightings, type GeoSighting } from "@/lib/drafts";
 import { gbifChinaOccurrencesFn } from "@/lib/identify-plant.functions";
 import { displayPlace } from "@/lib/editor-stats";
 import { fetchConservationData, buildConservationMatcher } from "@/lib/conservation";
+import { useAuth } from "@/hooks/use-auth";
 
 export const Route = createFileRoute("/explore")({
   head: () => ({
@@ -115,18 +116,6 @@ function speciesKey(s: GeoSighting) {
   return s.scientific_name?.trim().toLowerCase() || s.title?.trim().toLowerCase() || "";
 }
 
-const PLANT_MARKER_HTML =
-  '<div style="width:32px;height:32px;border-radius:9999px;background:rgba(16,185,129,0.3);border:1px solid #10b981;display:flex;align-items:center;justify-content:center;font-size:18px;cursor:pointer;box-shadow:0 1px 4px rgba(0,0,0,0.25);">🌱</div>';
-
-// Invasive alien species (GBIF/GRIIS China) — a YELLOW hazard triangle with a RED
-// "!", replacing the green dot so an invasive sighting reads as a warning.
-const INVASIVE_MARKER_HTML =
-  '<div style="cursor:pointer;filter:drop-shadow(0 1px 3px rgba(0,0,0,0.45));line-height:0;">' +
-  '<svg width="30" height="28" viewBox="0 0 30 28" xmlns="http://www.w3.org/2000/svg">' +
-  '<path d="M15 2 L28.5 26 L1.5 26 Z" fill="#facc15" stroke="#ffffff" stroke-width="2" stroke-linejoin="round"/>' +
-  '<rect x="13.4" y="9.5" width="3.2" height="9" rx="1.6" fill="#dc2626"/>' +
-  '<circle cx="15" cy="22.6" r="1.9" fill="#dc2626"/></svg></div>';
-
 // GBIF China occurrence overlay point — a small, faded HOLLOW triangle, visually
 // subordinate to our own GPS sightings (these are reference distribution points,
 // coarser than a real observation).
@@ -137,14 +126,6 @@ const GBIF_MARKER_HTML =
 const gbifClusterHtml = (n: number) =>
   `<div style="min-width:26px;height:26px;padding:0 6px;border-radius:9999px;background:rgba(220,38,38,0.72);color:#fff;border:1.5px solid #fff;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:12px;box-shadow:0 1px 4px rgba(0,0,0,0.3);">${n}</div>`;
 
-// 国家/省级重点保护物种 — a gold shield, distinct from the green dot and the red
-// invasive triangle. Marks sightings that match the 重点保护 registries.
-const PROTECTED_MARKER_HTML =
-  '<div style="cursor:pointer;filter:drop-shadow(0 1px 3px rgba(0,0,0,0.4));line-height:0;">' +
-  '<svg width="26" height="30" viewBox="0 0 26 30" xmlns="http://www.w3.org/2000/svg">' +
-  '<path d="M13 1 L24 5 V15 C24 23 19 27.5 13 29 C7 27.5 2 23 2 15 V5 Z" fill="rgba(202,138,4,0.96)" stroke="#fff" stroke-width="2" stroke-linejoin="round"/>' +
-  '<path d="M13 8 L14.9 12 L19 12.5 L16 15.4 L16.8 19.5 L13 17.4 L9.2 19.5 L10 15.4 L7 12.5 L11.1 12 Z" fill="#fff"/></svg></div>';
-
 function ExplorePage() {
   const AMap = useAMap();
   const [map, setMap] = useState<any>(null);
@@ -154,6 +135,9 @@ function ExplorePage() {
   const [selectedArea, setSelectedArea] = useState<string | null>(null);
   const [invasiveOnly, setInvasiveOnly] = useState(false);
   const [protectedOnly, setProtectedOnly] = useState(false);
+  // 「只显示我识别的植物」— login-only. Off = everyone's sightings; on = only mine.
+  const { user } = useAuth();
+  const [mineOnly, setMineOnly] = useState(false);
   const [baseMode, setBaseMode] = useState<BaseMode>("flat");
   const [expanded, setExpanded] = useState<{ lng: number; lat: number; items: GeoSighting[] } | null>(null);
   const [tick, setTick] = useState(0);
@@ -218,6 +202,50 @@ function ExplorePage() {
   const isInvasiveSighting = (s: GeoSighting) => s.is_invasive || !!consStatus.get(s.id)?.griis;
   const isProtectedSighting = (s: GeoSighting) => !!consStatus.get(s.id)?.protected;
 
+  // ── 地图 4 类点：按优先级取单色 入侵红 > 保护棕 > 采纳绿 > 未采纳蓝 ──
+  // 采纳 = 草稿已收录(status='approved')；入侵/保护由物种身份决定，与采纳无关。
+  type PtCat = "invasive" | "protected" | "adopted" | "unadopted";
+  const CAT_COLOR: Record<PtCat, string> = {
+    invasive: "#dc2626", protected: "#b45309", adopted: "#2e9e5b", unadopted: "#2563eb",
+  };
+  const CAT_LABEL: Record<PtCat, string> = {
+    invasive: "入侵物种", protected: "重点保护", adopted: "已采纳", unadopted: "未采纳",
+  };
+  const CAT_GLYPH: Record<PtCat, string> = { invasive: "!", protected: "🛡", adopted: "", unadopted: "" };
+  const CAT_ORDER: PtCat[] = ["invasive", "protected", "adopted", "unadopted"];
+  const categoryOf = (s: GeoSighting): PtCat => {
+    if (isInvasiveSighting(s)) return "invasive";
+    if (isProtectedSighting(s)) return "protected";
+    if (s.status === "approved") return "adopted";
+    return "unadopted";
+  };
+  const catZ = (c: PtCat) => (c === "invasive" ? 14 : c === "protected" ? 13 : c === "adopted" ? 12 : 11);
+  // 单点：4 色实心圈（入侵/保护带小字形）。
+  const singleMarkerHtml = (cat: PtCat) => {
+    const glyph = CAT_GLYPH[cat]
+      ? `<span style="color:#fff;font-weight:800;font-size:12px;line-height:1;">${CAT_GLYPH[cat]}</span>` : "";
+    return `<div style="cursor:pointer;width:20px;height:20px;border-radius:9999px;background:${CAT_COLOR[cat]};border:2px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,0.4);display:flex;align-items:center;justify-content:center;">${glyph}</div>`;
+  };
+  // 聚合：按成员类型比例上色的饼环 + 中心计数。
+  const clusterPieHtml = (items: GeoSighting[]) => {
+    const counts: Record<PtCat, number> = { invasive: 0, protected: 0, adopted: 0, unadopted: 0 };
+    for (const s of items) counts[categoryOf(s)]++;
+    const total = items.length || 1;
+    let acc = 0;
+    const stops: string[] = [];
+    for (const cat of CAT_ORDER) {
+      const c = counts[cat];
+      if (!c) continue;
+      const start = (acc / total) * 360;
+      acc += c;
+      const end = (acc / total) * 360;
+      stops.push(`${CAT_COLOR[cat]} ${start}deg ${end}deg`);
+    }
+    const bg = `conic-gradient(${stops.join(",")})`;
+    return `<div style="position:relative;width:40px;height:40px;border-radius:9999px;background:${bg};box-shadow:0 2px 6px rgba(0,0,0,0.35);display:flex;align-items:center;justify-content:center;cursor:pointer;">` +
+      `<div style="width:26px;height:26px;border-radius:9999px;background:#fff;color:#1e1008;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:13px;">${items.length}</div></div>`;
+  };
+
   const gcjMap = useMemo(() => {
     const m = new Map<string, [number, number]>();
     for (const s of sightings) m.set(s.id, wgs84togcj02(s.capture_lng, s.capture_lat));
@@ -240,6 +268,49 @@ function ExplorePage() {
     }
   }, []);
 
+  // "我的当前位置" button: (re)locate and recentre the map on the user.
+  const [locating, setLocating] = useState(false);
+  const locateMe = () => {
+    if (!navigator.geolocation || locating) return;
+    setLocating(true);
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        const lat = pos.coords.latitude;
+        const lng = pos.coords.longitude;
+        setUserCoords([lat, lng]);
+        setPermissionState("granted");
+        if (map) {
+          const [glng, glat] = wgs84togcj02(lng, lat);
+          map.setZoomAndCenter(15, [glng, glat]);
+        }
+        setLocating(false);
+      },
+      () => {
+        setPermissionState("denied");
+        setLocating(false);
+      },
+      { enableHighAccuracy: false, timeout: 12000, maximumAge: 60000 },
+    );
+  };
+
+  // Swipe the info panel away (mobile): the top-right collapse button is easy to
+  // miss, so a horizontal swipe (either direction) also collapses it.
+  const panelTouchRef = useRef<{ x: number; y: number } | null>(null);
+  const onPanelTouchStart = (e: ReactTouchEvent) => {
+    const t = e.touches[0];
+    panelTouchRef.current = { x: t.clientX, y: t.clientY };
+  };
+  const onPanelTouchEnd = (e: ReactTouchEvent) => {
+    const s = panelTouchRef.current;
+    panelTouchRef.current = null;
+    if (!s) return;
+    const t = e.changedTouches[0];
+    const dx = t.clientX - s.x;
+    const dy = t.clientY - s.y;
+    // Horizontal-dominant swipe > 55px → collapse (won't fire on a tap or a scroll).
+    if (Math.abs(dx) > 55 && Math.abs(dx) > Math.abs(dy) * 1.4) setPanelOpen(false);
+  };
+
   const sortedSightings = useMemo(() => {
     if (!userCoords) return sightings;
     return [...sightings].sort(
@@ -249,6 +320,8 @@ function ExplorePage() {
     );
   }, [sightings, userCoords]);
 
+  // Area groups: sorted by most recently identified (creation time), not by count.
+  // Show only top 6 for "最近上传识别地区".
   const areaGroups = useMemo(() => {
     const m = new Map<string, GeoSighting[]>();
     for (const s of sightings) {
@@ -257,9 +330,13 @@ function ExplorePage() {
       if (!m.has(area)) m.set(area, []);
       m.get(area)!.push(s);
     }
-    return Array.from(m, ([area, items]) => ({ area, items })).sort(
-      (a, b) => b.items.length - a.items.length || a.area.localeCompare(b.area, "zh"),
-    );
+    // Sort by the most recent sighting's created_at in each area (descending).
+    return Array.from(m, ([area, items]) => {
+      const newest = items.reduce((a, b) => (a.created_at > b.created_at ? a : b));
+      return { area, items, newestAt: newest.created_at };
+    })
+      .sort((a, b) => b.newestAt.localeCompare(a.newestAt))
+      .slice(0, 6); // Only show top 6 most recent areas
   }, [sightings]);
 
   // When either 名录 filter is on, keep sightings matching EITHER active category (union).
@@ -268,16 +345,26 @@ function ExplorePage() {
       ? true
       : (invasiveOnly && isInvasiveSighting(s)) || (protectedOnly && isProtectedSighting(s));
 
+  // 「只显示我识别的植物」: when on (login-only), keep only the current user's records.
+  const mineFilter = (s: GeoSighting) => !mineOnly || (!!user && s.created_by === user.id);
+
   const visibleSightings = useMemo(() => {
-    let arr = sortedSightings.filter(consFilter);
+    let arr = sortedSightings.filter((s) => consFilter(s) && mineFilter(s));
     if (selectedArea) arr = arr.filter((s) => displayPlace(s.capture_place) === selectedArea);
     return arr;
-  }, [sortedSightings, selectedArea, invasiveOnly, protectedOnly, consStatus]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sortedSightings, selectedArea, invasiveOnly, protectedOnly, mineOnly, user?.id, consStatus]);
 
   // Sightings drawn on the map (名录 filters narrow to flagged species).
   const mapSightings = useMemo(
-    () => sightings.filter(consFilter),
-    [sightings, invasiveOnly, protectedOnly, consStatus],
+    () => sightings.filter((s) => consFilter(s) && mineFilter(s)),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [sightings, invasiveOnly, protectedOnly, mineOnly, user?.id, consStatus],
+  );
+  // Count of the current user's own sightings — shown on the mine-only toggle.
+  const mineCount = useMemo(
+    () => (user ? sightings.filter((s) => s.created_by === user.id).length : 0),
+    [sightings, user?.id],
   );
   const invasiveCount = useMemo(() => sightings.filter(isInvasiveSighting).length, [sightings, consStatus]);
   const protectedCount = useMemo(() => sightings.filter(isProtectedSighting).length, [sightings, consStatus]);
@@ -373,6 +460,7 @@ function ExplorePage() {
         ${s.scientific_name ? `<p style="margin:0 0 4px 0;font-style:italic;font-size:12px;color:#6e4c28;">${escapeHtml(s.scientific_name)}</p>` : ""}
         ${isInvasiveSighting(s) ? `<p style="margin:0 0 6px 0;display:inline-block;background:#dc2626;color:#fff;font-size:11px;font-weight:700;padding:2px 8px;border-radius:999px;">⚠️ 外来入侵物种</p>` : ""}
         ${!isInvasiveSighting(s) && isProtectedSighting(s) ? `<p style="margin:0 0 6px 0;display:inline-block;background:#ca8a04;color:#fff;font-size:11px;font-weight:700;padding:2px 8px;border-radius:999px;">🛡️ ${escapeHtml(consStatus.get(s.id)?.label || "重点保护物种")}</p>` : ""}
+        ${!isInvasiveSighting(s) && !isProtectedSighting(s) ? `<p style="margin:0 0 6px 0;display:inline-block;background:${s.status === "approved" ? "#2e9e5b" : "#2563eb"};color:#fff;font-size:11px;font-weight:700;padding:2px 8px;border-radius:999px;">${s.status === "approved" ? "✓ 已采纳收录" : "待编辑采纳"}</p>` : ""}
         ${s.capture_place ? `<p style="margin:0 0 6px 0;font-size:11px;color:#6e4c28;">📍 ${escapeHtml(s.capture_place)}</p>` : ""}
         ${s.photo_url ? `<img src="${escapeHtml(s.photo_url)}" style="width:100%;height:96px;object-fit:cover;border-radius:4px;margin-top:4px;" />` : ""}
         <a href="${nav}" target="_blank" rel="noopener" style="display:block;text-align:center;background:#2e9e5b;color:#fff;font-size:12px;font-weight:600;padding:6px;border-radius:4px;margin-top:8px;text-decoration:none;">🧭 导航到此地</a>
@@ -467,13 +555,12 @@ function ExplorePage() {
         }
         if (grp.length === 1) {
           const { s, g } = grp[0];
-          const inv = isInvasiveSighting(s);
-          const prot = !inv && isProtectedSighting(s);
+          const cat = categoryOf(s);
           const m = new AMap.Marker({
             position: g,
             anchor: "center",
-            content: inv ? INVASIVE_MARKER_HTML : prot ? PROTECTED_MARKER_HTML : PLANT_MARKER_HTML,
-            zIndex: inv ? 14 : prot ? 13 : 12,
+            content: singleMarkerHtml(cat),
+            zIndex: catZ(cat),
           });
           m.on("click", () => openPopup(s));
           out.push(m);
@@ -481,21 +568,13 @@ function ExplorePage() {
           const cgLng = grp.reduce((a, p) => a + p.g[0], 0) / grp.length;
           const cgLat = grp.reduce((a, p) => a + p.g[1], 0) / grp.length;
           const items = grp.map((p) => p.s);
-          // A cluster reads red if it holds any invasive member (⚠), else gold if it
-          // holds a 重点保护 member (🛡), else green.
-          const hasInv = items.some(isInvasiveSighting);
-          const hasProt = !hasInv && items.some(isProtectedSighting);
-          const bg = hasInv ? "rgba(220,38,38,0.9)" : hasProt ? "rgba(202,138,4,0.92)" : "rgba(46,125,50,0.88)";
-          const badge = hasInv
-            ? '<span style="position:absolute;top:-5px;right:-5px;font-size:12px;">⚠️</span>'
-            : hasProt
-              ? '<span style="position:absolute;top:-5px;right:-5px;font-size:12px;">🛡️</span>'
-              : "";
+          // 聚合圈按成员 4 类的比例上色（饼环）；zIndex 取最高优先级成员。
+          const topCat = CAT_ORDER.find((c) => items.some((s) => categoryOf(s) === c)) ?? "unadopted";
           const m = new AMap.Marker({
             position: [cgLng, cgLat],
             anchor: "center",
-            zIndex: hasInv ? 14 : hasProt ? 13 : 12,
-            content: `<div style="position:relative;width:38px;height:38px;border-radius:9999px;background:${bg};color:#fff;border:2px solid #fff;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:13px;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,0.3);">${grp.length}${badge}</div>`,
+            zIndex: catZ(topCat),
+            content: clusterPieHtml(items),
           });
           m.on("click", () => onClusterClick(items, cgLng, cgLat));
           out.push(m);
@@ -928,6 +1007,26 @@ function ExplorePage() {
     <div className="min-h-screen flex flex-col">
       <SiteHeader />
       <main className="flex-1 flex flex-col relative w-full h-[calc(100vh-120px)] min-h-[500px]">
+        {/* 我的当前位置 — recentre the map on the user. Bottom-left, clear of the
+            AMap ToolBar (bottom-right) and the info panel (top-left). */}
+        <button
+          type="button"
+          onClick={locateMe}
+          disabled={locating}
+          aria-label="定位到我的当前位置"
+          title="我的当前位置"
+          className="absolute bottom-6 left-4 z-[500] w-11 h-11 rounded-full bg-background/95 backdrop-blur-md border border-ink/20 shadow-xl flex items-center justify-center text-ink hover:text-vermilion transition-colors disabled:opacity-60"
+        >
+          {locating ? (
+            <span className="w-5 h-5 rounded-full border-2 border-ink/20 border-t-vermilion animate-spin" />
+          ) : (
+            <svg viewBox="0 0 24 24" width="21" height="21" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <circle cx="12" cy="12" r="3" />
+              <path d="M12 2v3M12 19v3M2 12h3M19 12h3" />
+            </svg>
+          )}
+        </button>
+
         {!panelOpen && (
           <button
             type="button"
@@ -943,7 +1042,11 @@ function ExplorePage() {
         )}
 
         {panelOpen && (
-          <div className="absolute top-4 left-4 z-[500] max-w-sm w-[calc(100vw-2rem)] bg-background/92 backdrop-blur-md border border-ink/15 p-5 rounded-lg shadow-2xl">
+          <div
+            className="absolute top-4 left-4 z-[500] max-w-sm w-[calc(100vw-2rem)] bg-background/92 backdrop-blur-md border border-ink/15 p-5 rounded-lg shadow-2xl"
+            onTouchStart={onPanelTouchStart}
+            onTouchEnd={onPanelTouchEnd}
+          >
             <button
               type="button"
               onClick={() => setPanelOpen(false)}
@@ -955,11 +1058,38 @@ function ExplorePage() {
                 <path d="M5 12h14" />
               </svg>
             </button>
+            <p className="md:hidden text-[10px] text-ink-faint/70 mb-1">← 左右滑动此卡片即可收起 →</p>
             <p className="label text-vermilion mb-1 pr-8">Explorer · 身边物种地图</p>
             <h1 className="font-display text-2xl font-bold leading-tight mb-2 text-ink">身边物种地图</h1>
             <p className="text-xs text-ink-faint leading-relaxed mb-4">
               地图上每个标记都是有人用手机拍照识别、并带真实 GPS 坐标的物种记录。点击标记可「导航到此地」或「加入路线」；聚合圆点（少于 20 种）点开会在右侧展开物种卡片，同种在别处的记录以绿线相连。
             </p>
+
+            {/* 只显示我识别的植物 — login-only. Guests never see this button; without
+                logging in there's no way to tell「我的」记录 apart. */}
+            {!isLoading && user && (
+              <div className="mb-3">
+                <button
+                  type="button"
+                  onClick={() => setMineOnly((v) => !v)}
+                  className={`w-full flex items-center gap-2 text-xs font-semibold px-3 py-2 rounded-md border transition-colors ${
+                    mineOnly
+                      ? "bg-emerald-600 text-white border-emerald-600 shadow"
+                      : "bg-emerald-50 text-emerald-800 border-emerald-300 hover:border-emerald-500"
+                  }`}
+                  title="只在地图上显示你本人识别上传的植物记录；再次点击恢复显示所有人的识别"
+                >
+                  <span aria-hidden="true">🙋</span>
+                  <span className="flex-1 text-left">只显示我识别的植物</span>
+                  <span className={mineOnly ? "opacity-90" : "text-emerald-600"}>{mineCount}</span>
+                </button>
+                {mineOnly && (
+                  <p className="mt-1.5 text-[10px] text-ink-faint leading-relaxed">
+                    当前只显示<b className="text-emerald-700">你识别的 {mineCount} 条记录</b>；再次点击可恢复显示所有人的识别。
+                  </p>
+                )}
+              </div>
+            )}
 
             {!isLoading && invasiveCount > 0 && (
               <div className="mb-3">
@@ -1012,9 +1142,28 @@ function ExplorePage() {
               </div>
             )}
 
+            {/* 图例：分布点 4 类配色 — 移到侧边栏"只显示重点保护植物"按钮下方 */}
+            <div className="mb-3 bg-paper border border-ink/10 rounded-lg px-3 py-2.5 text-[11px] text-ink-soft">
+              <p className="font-semibold text-ink mb-1.5 text-xs">分布点图例</p>
+              <div className="grid grid-cols-2 gap-x-3 gap-y-1.5">
+                {([
+                  ["#2563eb", "未采纳"],
+                  ["#2e9e5b", "已采纳"],
+                  ["#dc2626", "入侵物种"],
+                  ["#b45309", "重点保护"],
+                ] as const).map(([color, label]) => (
+                  <div key={label} className="flex items-center gap-1.5">
+                    <span className="inline-block w-3 h-3 rounded-full border border-white shadow" style={{ background: color }} />
+                    {label}
+                  </div>
+                ))}
+              </div>
+              <p className="mt-1.5 text-[9px] text-ink-faint leading-snug">多点重叠时圈内数字为物种数；点开聚合圆会在右侧展开物种卡片。</p>
+            </div>
+
             {!isLoading && areaGroups.length > 0 && (
               <div className="mb-3">
-                <p className="label text-[10px] text-ink-faint mb-1.5">按地区浏览</p>
+                <p className="label text-[10px] text-ink-faint mb-1.5">最近上传识别地区（6个）</p>
                 <div className="flex flex-wrap gap-1.5 max-h-24 overflow-y-auto pr-1">
                   <button
                     type="button"
@@ -1053,8 +1202,10 @@ function ExplorePage() {
                 还没有带定位的识别记录。用手机到「AI 识别」页拍照（并允许定位），就能在这里点亮第一个物种。
               </p>
             ) : (
-              <div className="space-y-2 max-h-52 overflow-y-auto pr-1">
-                {visibleSightings.slice(0, 12).map((p: GeoSighting) => (
+              <>
+                <p className="label text-[10px] text-ink-faint mb-1.5">最新识别物种（6个）</p>
+                <div className="space-y-2 max-h-52 overflow-y-auto pr-1">
+                  {visibleSightings.slice(0, 6).map((p: GeoSighting) => (
                   <a
                     key={p.id}
                     href={`/drafts/${p.id}`}
@@ -1085,6 +1236,7 @@ function ExplorePage() {
                   </a>
                 ))}
               </div>
+              </>
             )}
 
             {permissionState === "denied" && (
@@ -1207,6 +1359,13 @@ function ExplorePage() {
                     style={{ left: fan.cardX, top: c.top, width: fan.cardW, height: fan.cardH }}
                     title={`${c.s.title}${c.s.scientific_name ? ` · ${c.s.scientific_name}` : ""}`}
                   >
+                    {/* 右上角类型角标：入侵红 / 保护棕 / 已采纳绿 / 未采纳蓝 */}
+                    <span
+                      className="absolute top-0 right-0 z-10 px-1 py-px rounded-bl text-[8px] font-bold text-white leading-none"
+                      style={{ background: CAT_COLOR[categoryOf(c.s)] }}
+                    >
+                      {CAT_LABEL[categoryOf(c.s)]}
+                    </span>
                     <a href={`/drafts/${c.s.id}`} className="relative h-full shrink-0 bg-paper-deep flex items-center justify-center text-emerald-600" style={{ width: thumb }}>
                       🌱
                       {c.s.photo_url && (

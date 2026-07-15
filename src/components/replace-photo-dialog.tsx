@@ -5,7 +5,7 @@ import { Camera, Globe } from "lucide-react";
 import { CameraCaptureDialog } from "@/components/camera-capture-dialog";
 import { ImageSearchDialog } from "@/components/html-doc-editor";
 import { uploadAssetFn } from "@/lib/identify-plant.functions";
-import { compressImage } from "@/lib/image-compress";
+import { compressImage, extForMime } from "@/lib/image-compress";
 
 type Names = {
   scientific_name?: string | null;
@@ -63,12 +63,13 @@ export function ReplacePhotoDialog({
         /* fall back to original blob */
       }
       const base64 = await blobToBase64(file);
+      const mime = file.type || "image/jpeg";
       const res = await upload({
         data: {
           bucket: "plant-images",
-          path: `drafts/replace/${draftId}-${slot}-${Date.now()}.jpg`,
+          path: `drafts/replace/${draftId}-${slot}-${Date.now()}.${extForMime(mime)}`,
           file_base64: base64,
-          content_type: "image/jpeg",
+          content_type: mime,
         },
       });
       await onReplaced((res as { url: string }).url);

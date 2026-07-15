@@ -1,5 +1,5 @@
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
-import { compressImage } from "@/lib/image-compress";
+import { compressImage, extForMime } from "@/lib/image-compress";
 import { useServerFn } from "@tanstack/react-start";
 import { extractPlantMetaFn, savePlantFn, uploadAssetFn } from "@/lib/identify-plant.functions";
 import { useEffect, useRef, useState } from "react";
@@ -106,7 +106,7 @@ function BatchNewPage() {
       console.error("Image compression failed, using original:", err);
     }
 
-    const ext = img.name.split(".").pop() || "bin";
+    const ext = extForMime(fileToUpload.type, img.name.split(".").pop() || "bin");
     const path = `${user.id}/batch-img/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
 
     const reader = new FileReader();
@@ -217,7 +217,13 @@ function BatchNewPage() {
     }
     setItems((prev) => [...prev, ...next]);
     if (next.length) toast.success(`已上传 ${next.length} 个文件，正在识别…`);
-    next.forEach((it) => runExtract(it.key, it.htmlUrl));
+    // Extract sequentially — firing them all at once slams the Gemini per-minute
+    // quota, so only the first succeeds and the rest 429 even after retries.
+    void (async () => {
+      for (const it of next) {
+        await runExtract(it.key, it.htmlUrl);
+      }
+    })();
   };
 
   const processPickedFiles = async (files: File[]) => {
@@ -794,7 +800,7 @@ function BatchCard({
       console.error("Image compression failed, using original:", err);
     }
 
-    const ext = file.name.split(".").pop() || "jpg";
+    const ext = extForMime(fileToUpload.type, file.name.split(".").pop() || "jpg");
     const path = `${user.id}/cover/${Date.now()}.${ext}`;
 
     const reader = new FileReader();

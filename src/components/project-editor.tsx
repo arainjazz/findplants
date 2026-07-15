@@ -3,7 +3,7 @@ import { useNavigate } from "@tanstack/react-router";
 import { toast } from "sonner";
 import { useAuth } from "@/hooks/use-auth";
 import { supabase } from "@/integrations/supabase/client";
-import { compressImage } from "@/lib/image-compress";
+import { compressImage, extForMime } from "@/lib/image-compress";
 import { BlockEditor } from "@/components/block-editor";
 import { createProject, updateProject, type Project } from "@/lib/projects";
 
@@ -31,11 +31,11 @@ export function ProjectEditor({ initial }: { initial?: Project }) {
     } catch (err) {
       console.error("compress failed, using original:", err);
     }
-    const ext = file.name.split(".").pop() || "jpg";
+    const ext = extForMime(toUpload.type, file.name.split(".").pop() || "jpg");
     const path = `${user!.id}/${prefix}/${Date.now()}-${Math.random().toString(36).slice(2, 6)}.${ext}`;
     const { error } = await supabase.storage
       .from("plant-images")
-      .upload(path, toUpload, { upsert: false, contentType: file.type });
+      .upload(path, toUpload, { upsert: false, contentType: toUpload.type });
     if (error) throw error;
     return supabase.storage.from("plant-images").getPublicUrl(path).data.publicUrl;
   };

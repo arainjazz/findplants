@@ -73,7 +73,7 @@ export const XIAOP_PROVIDERS: XiaoPProviderMeta[] = [
     icon: "🔵",
     keyPlaceholder: "AIzaSy... 或 AQ.xxx...",
     defaultModel: "gemini-2.5-flash",
-    models: ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash"],
+    models: ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.5-flash-lite", "gemini-3-flash-preview", "gemini-3-pro-preview", "gemini-3.1-pro-preview"],
     needsBaseUrl: false,
     visionNote: "Gemini 全系支持视觉，推荐。",
   },

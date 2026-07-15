@@ -2,7 +2,7 @@ import { useMemo, useState } from "react";
 import { useServerFn } from "@tanstack/react-start";
 import { ImageSearchDialog } from "@/components/html-doc-editor";
 import { uploadAssetFn } from "@/lib/identify-plant.functions";
-import { compressImage } from "@/lib/image-compress";
+import { compressImage, extForMime } from "@/lib/image-compress";
 
 /**
  * 小P蛙换图流程（确定性，不经过大模型）：
@@ -57,12 +57,13 @@ export function ReplaceImageFlow({
       /* keep original */
     }
     const base64 = await blobToBase64(file);
+    const mime = file.type || "image/jpeg";
     const res = (await upload({
       data: {
         bucket: "plant-images",
-        path: `${uploadPathPrefix}-${Date.now()}.jpg`,
+        path: `${uploadPathPrefix}-${Date.now()}.${extForMime(mime)}`,
         file_base64: base64,
-        content_type: file.type || "image/jpeg",
+        content_type: mime,
       },
     })) as { url: string };
     return res.url;

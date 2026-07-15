@@ -8,7 +8,7 @@ import { supabase } from "@/integrations/supabase/client";
 import { uploadAssetFn } from "@/lib/identify-plant.functions";
 import { fetchMyPosts, blogCoverUrl } from "@/lib/blog";
 import { fetchMyNotifications, getLastSeen, markNotificationsSeen } from "@/lib/notifications";
-import { compressImage } from "@/lib/image-compress";
+import { compressImage, extForMime } from "@/lib/image-compress";
 import { computeLeaves } from "@/lib/leaves";
 import { LeafPanel } from "@/components/leaf-panel";
 import { EntryTypeBadge } from "@/components/entry-type-badge";
@@ -107,12 +107,13 @@ function ProfilePage() {
       let blob: Blob | File = f;
       try { blob = await compressImage(f, 512, 512, 0.85); } catch { /* keep original */ }
       const base64 = await blobToBase64(blob);
+      const mime = blob.type || "image/jpeg";
       const res = await upload({
         data: {
           bucket: "plant-images",
-          path: `avatars/${uid}-${Date.now()}.jpg`,
+          path: `avatars/${uid}-${Date.now()}.${extForMime(mime)}`,
           file_base64: base64,
-          content_type: "image/jpeg",
+          content_type: mime,
         },
       });
       const url = (res as { url: string }).url;

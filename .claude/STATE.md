@@ -1,13 +1,955 @@
 # Plantspedia — Working State  (single source of truth)
 
-_Last updated: 2026-06-24 — by Claude (rebuilt `/explore` 身边物种地图: nav rename, 3 base
-layers 平面/卫星/地形, and replaced markercluster spiderfy with a custom fan-out — black
-radial+horizontal connectors → right-side species cards (photo+科属种) + green cross-links to
-the same species elsewhere. DEPLOYED LIVE Version `a1c1b792-9894-4466-af23-bd54700e3980`.)
-Earlier 06-20: fixed + DEPLOYED the 定边县
-cross-province split (Version `36a58ebd`). 06-14: diagnosed "session 一直报错" = GFW resetting
-long-lived API streams, not Anthropic/code; see Blockers._
+_Last updated: 2026-07-14 (续4) — by Claude (Task #3/#5 Token统计 + 多模型管理界面改进)_
 _Read this FIRST and update it LAST, every session._
+
+## 🆕 2026-07-14 (续4) — Token统计 + 多模型管理界面改进 (DONE code, tsc=0; ⚠️ NOT deployed; ⚠️ 需跑迁移)
+完成了两个剩余任务：Task #5 (Token Usage 详细统计) 和 Task #3 (多模型管理界面改进)。
+
+### ✅ Task #5: Token Usage 详细统计
+1. **数据库迁移**：
+   - 新建 `supabase/migrations/20260714140000_add_task_type_to_usage_logs.sql`
+   - 为 `ai_usage_logs` 表添加 `task_type` 列（VARCHAR(50)）
+   - 添加两个索引：`idx_ai_usage_logs_task_type` 和 `idx_ai_usage_logs_model_task`
+   - 任务类型：`quick_identify`（快速识别）、`enrich_draft`（银叶完整草稿）、`gold_page`（金叶详情页）、`chat`（小P对话）
+
+2. **代码修改 - 标记 task_type**：
+   - 修改 3 处现有 insert（identify-plant.functions.ts）：
+     - Line 2303: `quickIdentifyDraft` → `task_type: "enrich_draft"` (完整草稿生成)
+     - Line 2590: `identifyQuick` → `task_type: "quick_identify"` (快速摘要卡)
+     - Line 2783: `enrichDraft` → `task_type: "enrich_draft"` (银叶完整草稿)
+   - ⚠️ **金叶和小P对话的 usage log 暂未实现**：
+     - `createGoldDetailPageFn`、`askDraftAgentFn`、`askPlantAgentFn` 调用的 `xiaopTextCall` 只返回文本，不返回 token usage
+     - 需要重构 `xiaopTextCall`、`geminiChat`、`openaiCompatChat`、`anthropicChat` 返回 `{text, usage}` 对象
+     - 这是一个大改动，建议单独迭代
+
+3. **统计页面**：
+   - 新建 `src/routes/_authenticated/admin.usage-stats.tsx`
+   - 按模型分组，展开显示各任务类型详情
+   - 表格形式：调用次数、Prompt Tokens、Completion Tokens、总 Tokens
+   - 支持展开/折叠，按 token 消耗排序
+   - 顶部显示总调用次数、总 Token 消耗、模型数量
+
+4. **类型定义**：
+   - 手动编辑 `src/integrations/supabase/types.ts`，添加 `ai_usage_logs` 表定义（含 `task_type` 字段）
+
+### ✅ Task #3: 多模型管理界面改进
+重构了 3 个模型配置组件，统一添加：多 key 支持、拖拽排序、完整显示 key（带安全提示）。
+
+1. **identify.tsx AdminModelPanel**（AI 模型控制台）：
+   - 多 key 支持：`keys: string[]` 替代单个 `apiKey`，每个 key 一个输入框
+   - 拖拽排序：HTML5 Drag & Drop API，拖动调整优先级（Gemini 限流时按顺序轮换）
+   - 完整显示 key：移除掩码，显示/隐藏切换按钮
+   - 安全提示：⚠️ Key 完整显示在此页面，请注意屏幕分享时遮挡
+   - UI 增强：拖动图标（三横线）、删除按钮（×）、优先级标签
+
+2. **xiaop-model-panel.tsx**（小P蛙模型控制台）：
+   - 同样的多 key 支持 + 拖拽排序 + 完整显示逻辑
+   - 与 AdminModelPanel 保持一致的交互体验
+   - Gemini key 可添加多个，其他 provider 支持单 key
+
+3. **xiaop-user-settings.tsx**（用户自己的小P模型设置）：
+   - 从单个 `apiKey: string` 改为 `keys: string[]`
+   - 加载现有配置时自动拆分逗号分隔的 key（向后兼容）
+   - 保存时 join 为逗号分隔字符串存入 localStorage
+   - 同样的拖拽排序 UI
+
+### 📋 技术细节
+- **拖拽实现**：原生 HTML5 Drag & Drop API，无需第三方库
+  - `draggable={keys.length > 1}`
+  - `onDragStart` / `onDragEnd` / `onDragOver` / `onDrop`
+  - 拖动时 opacity 0.5，视觉反馈清晰
+- **状态管理**：`keys` 数组，`joinedKey` 用于保存和拉取模型
+- **类型安全**：tsc --noEmit EXIT=0，所有改动通过类型检查
+- **用户体验**：
+  - 拖动图标仅在多 key 时显示
+  - 删除按钮仅在多 key 时显示
+  - Gemini 显示「＋ 再加一个 Gemini key」按钮
+  - 优先级标签：（优先级 1）、（优先级 2）...
+
+### ⚠️ 待办（用户后续需求）
+1. **部署前必做**：
+   - Supabase Dashboard 跑迁移 `20260714140000_add_task_type_to_usage_logs.sql`
+   - `npm run build && ./node_modules/.bin/wrangler deploy`（VPN）
+
+2. **真机验证**：
+   - 访问 `/admin/usage-stats` 查看统计页面
+   - 测试三个模型配置面板的拖拽排序
+   - 验证多 key 轮换逻辑（故意用过期 key 触发 429）
+
+3. **金叶和小P对话 usage log**（独立任务）：
+   - 重构 `xiaopTextCall` 系列函数返回 `{text, usage}` 对象
+   - 在 `createGoldDetailPageFn` 中记录 3 次 LLM 调用的 token（三阶段生成）
+   - 在 `askDraftAgentFn` / `askPlantAgentFn` 中记录对话 token
+   - 标记 `task_type: "gold_page"` 和 `task_type: "chat"`
+   - 估计工作量：2-3 小时（涉及多个底层函数签名变更）
+
+## 🆕 2026-07-14 (续3) — 银叶/金叶联网调研 + 分享卡重排 + 相机提示 (DONE code, tsc=0; ⚠️ NOT deployed)
+用户要求为银叶草稿生成和金叶详页创建添加联网搜索能力，以及重新设计分享卡排版。已完成：
+
+### ✅ 核心功能：联网调研集成
+1. **银叶 enrichDraft 联网调研**：
+   - 在 `enrichDraft` 生成完整草稿前，调用 `xiaopGroundedSearch` 查询该物种的最新研究、保护状态、分布更新等权威信息
+   - 联网查询：「{物种名}（{学名}）植物的最新研究进展、保护状态、分布范围、生态作用、栽培技术的权威资料（优先中国植物志、GBIF、IUCN、学术期刊）」
+   - 搜索结果（digest + sources）注入到 `callAiIdentify` 的 system prompt，作为「联网调研·权威参考资料」区块
+   - 仅 Gemini 可用（google_search grounding），其他 provider 跳过；失败 graceful 降级
+
+2. **金叶 createGoldDetailPageFn 联网调研**：
+   - 金叶三阶段生成（形态生境、人文博物、生态演化）各自独立联网查询：
+     - Phase 1: 形态特征、生境分布、近缘种区分、栽培养护（优先中国植物志、Flora of China、园艺文献）
+     - Phase 2: 人文历史、民俗用途、文学记载、本草典籍、食药用价值（优先古籍数据库、民族植物学文献）
+     - Phase 3: 生态功能、入侵风险、保护管理、近期科研进展（优先 IUCN、GBIF、学术期刊）
+   - 每次调研结果通过 `withWebContext` helper 注入对应阶段的 system prompt
+   - 确保内容准确性和时效性（尤其对需要最新资料的保护状态、入侵动态、科研进展）
+
+3. **金叶改用小P蛙模型**（Task #7 附带完成）：
+   - `createGoldDetailPageFn` 已通过 `data.userModel` → `toOverride` → `xiaopTextCall` 的 override 参数使用小P蛙模型控制台配置
+   - 用户在「我的小P模型」设置的模型会应用到金叶创建，与小P对话共用同一套模型配置
+
+### ✅ 分享卡重新排版（share-card.ts + drafts.$id.tsx）
+4. **新版分享卡布局**（按用户要求完全重写）：
+   - **页头**：小P蛙 logo + 品牌 | 地点信息移到**右侧**（地点和坐标分两行，地点图标+地点名 / 坐标）
+   - **名称块**：科属（绿色） + **中文名和拉丁学名同行显示**（中文名大号粗体，拉丁学名小号斜体紧跟） + 俗名
+   - **发现者信息区**（新设计，占两行）：
+     - 左侧：**圆形头像**（80px，查询 profiles.avatar_url，无头像显示灰色圆）
+     - 右侧第一行：「X 发现了一种新植物」（绿色粗体）
+     - 右侧第二行：**本轮铜叶 +N** + **三叶统计**（铜/银/金徽章+数字，紧凑排列）
+   - **140字摘要**：保留截断逻辑（……访问 plantspedia.club 阅读完整内容）
+   - **移除银叶金叶作用介绍**（原底部带状区的两行权益提示已删除）
+   - **页尾**（左下角）：**加分隔线**（左侧短横线 200px） + 「X 邀请你加入 plantspedia.club」（左对齐，两行）
+
+5. **数据传递**：
+   - ShareCardData 类型新增 `discovererAvatar?: string | null`
+   - drafts.$id.tsx 新增查询 creator profile（获取 avatar_url + display_name）
+   - renderShareCard 调用时传递 `discovererAvatar: creatorProfile?.avatar_url || null`
+
+### ✅ UI 调整
+6. **相机提示样式**（camera-identify.tsx）：
+   - 警示文字「AI 识别内容不能采纳为食用药用参考！」改为绿色（`text-leaf-deep`，原为 `text-vermilion`）
+   - 移除三角形感叹号 emoji（`⚠️`）
+   - 保持粗体和显眼位置（viewfinder 上方常驻）
+
+### 📋 技术细节
+- **联网调研实现**：复用现有 `xiaopGroundedSearch` 函数（STATE.md 2026-07-12 续十二已实现）
+- **参数传递链**：`enrichDraft` → `buildDraftContent` → `callAiIdentify(webResearch)` → system prompt 注入
+- **金叶调研**：三次独立 `xiaopGroundedSearch` 调用 + `withWebContext` helper 动态注入
+- **分享卡绘制**：纯 Canvas 2D 直绘（1080×1920），圆形头像用 `ctx.arc` + `clip()`
+- **降级策略**：联网失败或非 Gemini provider → webResearch = null，原流程照常进行；头像缺失 → 灰色圆形占位
+- **类型安全**：`tsc --noEmit` EXIT=0（所有改动已通过类型检查）
+
+### ⏳ 待办（用户后续需求，未在本次实现）
+- **多模型管理界面改进**（Task #3）：显示完整 key/url（不隐藏）、每个 provider 支持多 key（+删除按钮）、优先级排序
+  - 需要改动：identify.tsx AdminModelPanel、xiaop-model-panel.tsx、xiaop-user-settings.tsx 三个组件
+  - 工作量大（涉及 UI 重构 + 状态管理 + 新增排序逻辑），建议单独迭代
+- **Token Usage 详细统计**（Task #5）：增加 task_type 字段，按「模型+任务」维度分组展示
+  - 需要：① 数据库迁移（`ai_usage_logs` 表加 `task_type` 列）；② 修改 7 处 insert（标记任务类型：识别/银叶/金叶/小P对话）；③ 统计页面按模型+任务分组
+  - 建议独立迭代（需数据库改动 + 多处代码修改）
+
+### ⚠️ 部署前检查
+- **代码状态**：tsc=0、所有改动完成
+- **待部署**：`npm run build && ./node_modules/.bin/wrangler deploy`（VPN）
+- **真机验证**：
+  1. 生成银叶草稿，检查内容是否引用最新资料（控制台查 log 确认联网成功）
+  2. 创建金叶详页，验证三阶段是否都有联网调研
+  3. 相机页面警示文字为绿色、无感叹号
+  4. **生成分享卡**，验证新排版：地点右侧、中文拉丁同行、发现者头像+统计两行、页尾左下角分隔线
+  5. 访客/无头像用户：灰色圆形占位符正常显示
+
+## 🆕 2026-07-14 (续2) — 识别人修复 + 相册 EXIF GPS 优先 (DONE code, tsc=0; ⚠️ NOT deployed)
+用户反馈 2 个关键 bug，已修复：
+1. **✅ 识别人显示为「访客」bug 修复**：已登录用户拍照识别后 creator_label 仍显示访客 → 根因是前端未传递登录用户
+   ID 到服务端。修复：① SubmitInput 新增 `logged_in_user_id` 字段；② camera-identify.tsx 从 `useAuth()` 读 `user.id` 
+   并传给 `quickIdentifyDraft`；③ 服务端 `resolveCreator` 优先用 `logged_in_user_id` 查 profiles.display_name，兜底才
+   读 Authorization header。现在已登录用户识别时，草稿/分享卡的识别人正确显示为拍摄者（不再是访客）。
+2. **✅ 相册上传改用 EXIF GPS 优先（不用浏览器实时定位）**：用户要求从相册上传照片时，地理位置应该读照片拍摄时的
+   EXIF GPS，而不是浏览器当前位置。修复：`ingestImage` 区分两种场景 — ① **快门拍照**（tryExif=false）：用浏览器实时
+   定位（当前位置）；② **相册上传**（tryExif=true）：优先读 EXIF GPS（拍摄时位置），立即应用到 coords，无 EXIF 才
+   兜底用浏览器定位。避免用户在家翻相册时，外地拍的照片被标记为当前家里的位置。
+
+## 📋 用户问题解答（已在会话中回复）
+- **AI 草稿/金叶详页是否联网？** 答：都**不联网**，用模型的公共知识库。只有**小P蛙对话**（askDraftAgentFn/askPlantAgentFn）
+  具备联网能力（Gemini grounding），且需模型自己判断 `needsWebSearch=true` 才激活。
+- **银叶/金叶走哪个模型控制台？** 答：走「**AI 模型控制台**」（identify.tsx AdminModelPanel → site_config.ai_model_config），
+  不是「小P蛙模型控制台」。但用户在「我的小P模型」里配的模型会 override 全站默认（包括银叶/金叶）。
+- **两个控制台的联网能力？** 答：AI 模型控制台**不联网**；小P蛙模型控制台**有联网能力**，但仅在对话里激活（Gemini + 模型
+  自判 needsWebSearch=true 时调 google_search grounding）。
+- **gemini-3.5 模型消失？** 答：Google API 的 `/models` 端点返回的列表里已经没有 3.5 系列了（可能已下线或对该 key 停用）。
+  代码默认配置是稳定的 `gemini-2.5-flash`，不受影响。
+
+## 🆕 2026-07-14 (续) — 疑似统一 + 简介卡/分享卡修复 + 删数据 (DONE code, tsc=0; ⚠️ NOT deployed; ✅ 数据删除已完成)
+用户反馈 6 项卡片问题 + 1 批数据删除，全部完成：
+1. **疑似信号统一（标题/正文/补拍激活一致）**：新增 `normalizeIdentification(meta)` 服务端规范化——任一处露出「疑似」
+   （confidence=low 或 summary_zh 以「疑似」开头）→ 全部统一为 low + summary 带前缀 + needs_more_photos_zh 兜底填充 →
+   标题、正文、补拍横幅三者同源。草稿页 h1、简介卡 h1、分享卡名称、补拍横幅都读统一的 `draftTentative` 判定。
+2. **简介卡加科属 + 疑似标题**：`buildSummaryCardHtml` 改为对象签名，新增科·属行（绿色）、标题在 tentative 时前缀「疑似」（红色）。
+3. **草稿页标题疑似显示**：drafts.$id.tsx h1 在 `draftTentative` 时显示「疑似 XX」（剥重复前缀）。
+4. **分享卡识别人 = 拍摄者（非点击者）**：discovererName 改为来自 `draft.creator_label`（访客→小P蛙），不再用当前登录用户的
+   profileName。删掉 profileName 查询（已无用）。无论谁点「生成分享卡」，识别人都是正确的拍摄者。
+5. **分享卡重排**：① 科·属从右上角移到名称块内（绿色大号，更醒目）；② 分隔线到名称块间距 50→74px（呼吸空间）；
+   ③ 配图改**正方形** 936×936（不再 16:9，减少竖图裁切）；④ 简介行数动态计算（防溢出到底部叶片带）。
+6. **✅ 数据删除（不可逆，已完成）**：删除光叶子花全部 + 6/25–7/05 九种（苦豆子/问荆/吊兰/黄花菜/匍匐毛茛/大车前/粘刺槐/刺蔷薇/空心莲子草）
+   + 7/13 五种（泽泻/堇菜等）。**共删 12 条 plants + 7 条 drafts = 19 条记录**，及关联 plant_edits/plant_tags + 31 个存储文件。
+   脚本：`scratch/find_plants_to_delete.mjs`（发现）+ `scratch/delete_plants.mjs`（执行）。
+- **验证**：tsc EXIT=0；dev server 8080 已起（未真机预览分享卡/简介卡视觉，需登录 + 真实识别）。
+- **⚠️ 待办**：`npm run build && wrangler deploy`（VPN）。真机：拍一张疑似物种→标题/正文/横幅都显示疑似、补拍激活；
+  生成分享卡→识别人=拍摄者、科属明显、配图正方形不裁关键特征。
+
+## 🆕 2026-07-14 — 补拍合并 + 提交门控 + 多图简介卡 + 地图「只看我识别」7 项 (DONE code, tsc=0; ⚠️ NOT deployed；⚠️ 需跑迁移；⚠️ 未真机)
+上一个会话（cowork）实现了用户 7 项需求，`tsc --noEmit` EXIT=0。**本次会话（本条由主 Claude 补写，因上个会话 STATE.md 写保护未能自记）核对：新列在 types.ts 三处 + drafts.ts/identify-plant.functions.ts/drafts.$id.tsx/explore.tsx 代码里均真实存在。**
+1. **补拍计数序数化**：计数器显示「第一次补拍 / 第二次补拍 / 最后一次补拍」（≥3=最后），相机横幅 + 草稿页补拍按钮/提示两处。
+2. **升出 low 即不再疑似**：疑似/存疑横幅只在 confidence=low 时显示；补拍抬到 medium/high 后「疑似」字样 + 补拍横幅都消失。
+3. **补拍合并 + 分享卡封面 + 多图简介卡**：补拍**合并进同一草稿**（不再新建）；新照片作封面（photo_url=脱 low 的那张，分享卡用它），
+   所有照片累积进 `user_photos`；简介摘要卡每次补拍重生成为**多图画廊**（覆盖上一版单图）；草稿页摘要卡也渲染完整画廊。
+4. **提交门控**：刚识别的草稿**私有**——不进 AI 待审队列、不上地图，直到点「保存为待审批草稿」（新 `submitDraftForReviewFn` 翻
+   真实 `submitted_for_review` 标志；此前是假 toast）。未提交草稿留给用户继续完善。
+5. **用户操作栏**：「保存为待审批草稿」加橙色双线边框强调 + 做真实提交；「保存在本地」删除。适用所有草稿状态。
+6. **地图新筛选**：「只显示我识别的植物」仅登录用户可见（explore.tsx `mineOnly`/`mineFilter`）。关=所有人，开=只看自己；
+   未提交→提交的草稿显示为蓝色「未采纳」标记。
+- **⚠️ 待用户做（两步，顺序：先迁移后部署）**：
+  ① **Supabase 后台跑迁移** `supabase/migrations/20260714120000_draft_submit_and_photos.sql`
+     （加 submitted_for_review + user_photos 两列 + 回填既有草稿为 submitted_for_review=true / user_photos=[photo_url]，
+      保证既有记录不从队列/地图消失）。**代码对缺列 graceful 降级**（门控退回全可见、画廊退回单图），故部署早于迁移不崩，但功能减半。
+  ② `npm run build && ./node_modules/.bin/wrangler deploy`。
+- **⚠️ 未验证**：cowork 未真机测（需登录 + 真实补拍 + 迁移）；仅靠 tsc + 代码逻辑保证。types.ts 已 cowork 手改好（retake_count/submitted_for_review/user_photos 三处），无需再动。
+- **项目 ref = `ianlasfsfuaibqldkfyb`**（= 显示名「arainjazz's project」；地址栏 /project/ 后那串）。见 [[supabase-migration-workflow]]。
+
+## ✅ 2026-07-13 已部署上线 Version `e73e49c8-63cd-43d6-a37e-62d27e21fb61`（含续三/续四/续五全部改动）
+三域名 200。**部署失败根因 = `Completion token has already been consumed [code:100312]`**：资源上传时网络抖动
+触发多次重试 → Cloudflare 一次性「完成令牌」被重复提交作废 → 最后提交 Worker 脚本被拒。**非代码问题**。
+**解法：直接重跑 `wrangler deploy`**——资源已缓存（"No updated asset files to upload"），拿新令牌直接传脚本即成（8.75s）。
+沉淀：这和老的 "fetch failed" 同源（GFW 掐大上传→重试），处理方式一样=重跑 2-3 次。
+⚠️ **仍待用户做**：Supabase Dashboard 跑 `20260713140000_widen_plant_edits_kind.sql`——否则「博客修改进修改记录」
+（续四 A）线上仍不生效（blog_edit/draft_* insert 被 kind CHECK 约束拒、静默失败）。其余改动已随本次部署生效。
+
+## 🆕 2026-07-13 (续五) — skill 页图片写死相框 → 改按原比例（用户选：不裁剪+两者都做）(DONE code, tsc=0; ✅ 已部署)
+**根因**：ccplants-v19 skill 生成的页面给每张图写死 `.img-slot{aspect-ratio:4/3!important;overflow:hidden}` +
+`.img-slot img{height:100%!important;object-fit:cover!important}` → 所有图被裁成 4:3（生境 16:9）相框，不按图片真实比例。
+**用户经 AskUserQuestion 选定**：① 按原比例完整显示（不裁剪，设 max-height 防超高竖图）；② 现有页 + 生成器模板都改。
+**改动**：
+1. **现有 237+ 页（plants.$slug.tsx 注入 CSS）**：追加 `.img-slot:not(.broken){aspect-ratio:auto!important;height:auto!important;overflow:visible!important}` +
+   `.img-slot:not(.broken) img{width:100%!important;height:auto!important;max-height:80vh!important;object-fit:contain!important}`
+   （注入在 </head> 后=更晚 source order + 同特异性 → 覆盖 baked 的 `.img-slot img` !important）。保留 .broken 占位框尺寸。
+2. **金叶生成器（premium-page.ts CSS）**：`.img-slot` 去掉 aspect-ratio+overflow:hidden；img 改 height:auto+max-height:80vh+contain；.broken 保留 4:3。
+3. **ccplants-v19 SKILL.md**：改「核心原则」文案 + CSS 示例 + checklist 两项 → 自然比例、只有 .broken 才 aspect-ratio:4/3。
+   （旧 `ccplants` skill 本就 height:auto，无需改。）
+- **验证**：tsc=0；preview 实测艾页 iframe 内 8 张图 **croppedCount=0**（渲染比例 == 自然比例，含竖图0.61/方图1.00/横图1.83），object-fit 已从 cover 变 contain。
+- **⏳ 待办**：`npm run build && wrangler deploy`（用户上次 deploy 失败，暂缓；本改动纯 CSS，随下次部署生效。已生成页无需重生成）。
+
+## 🆕 2026-07-13 (续四) — 用户第 3 轮反馈（修改记录/草稿菜单/删无地点/补配图）(DONE code, tsc=0; ⚠️ NOT deployed；⚠️ 需跑迁移)
+- **A. 博客修改不进修改记录 = plant_edits.kind CHECK 约束太窄**（根因，node 实测）：线上约束只允许
+  `text,image,revert,create,html_save,branch,merge,tag_create,catalog_create,catalog_append,draft_approve`——
+  **blog_publish / draft_image / draft_text / draft_reject / ai_page_edit 全部被拒**，而这些 insert 都
+  `.catch(()=>{})` 静默吞掉 → 博客/草稿/小P蛙的编辑从来没记进日志。⚠️ **必须跑迁移**
+  `supabase/migrations/20260713140000_widen_plant_edits_kind.sql`（加上这些 + 新 `blog_edit`）后才生效。
+  代码侧：blog-editor.tsx 新增 `logBlogEdit`（编辑已存在博文即记 blog_edit，带 before/after html）；
+  edits.ts kind union、edit-log-section、edits.tsx（label/color/isCatalog/onRevert 恢复 content_html）都加了 blog_edit。
+- **B. 图片修改记录缩略图点开看大图**（edits.tsx）：EditSnapshotPreview 缩略图改成 button→onZoom→
+  EditsPage 顶层 `lightbox` 状态渲染全屏遮罩，任意处点击关闭（cursor-zoom-out）。
+- **C. 删无「识别出地点」草稿**：上一轮删了 23（无坐标无地名）；本轮再删 1（小野豌豆，有坐标但
+  capture_place 空、pending）——按「地名空且未发布」删。保留 2 条已发布空地名。备份 _deleted_noplace_backup.json。
+- **D. 给保留草稿补配图**（scratch/refill_draft_photos.mjs）：上一轮孤儿清理误删了 117/137 草稿照片。
+  从 iNaturalist taxa API 按学名取图，回填 photo_url + 替换 html_content 里的旧图 URL。**117 张全部补上**
+  （status 200），0 仍破损。⚠️ 这是替代图（非用户原图，原图已永久删除）。可 rerun（_refill_progress.json 断点续传）。
+- **E. 草稿功能菜单分两栏**（drafts.$id.tsx）：① 编辑操作栏（isEditor，绿框）= 继续编辑 HTML · **采纳识别**
+  （=审核通过并收录，识别用户 +2 铜叶：新 onAdoptApprove 先 setAdopted 再 onApprove）· 驳回草稿（银叶退还提示）。
+  ② 用户操作栏（所有人）= 进入编辑 · 保存为待审批草稿 · 保存在本地 · **生成分享卡·存相册（双线边框强调）** · 分享链接。
+  删掉了原 owner-only 采纳 toggle（onAdoptDraft/isOwner 一并删）。
+- **F. 简介摘要卡**：配图移到卡**内部右侧**（SafeImg，方形）；识别人放到**识别时间下面**（同一格 stacked）；
+  精简草稿（notEnriched）**不再渲染下方重复 iframe**（内容与摘要卡重复）；完整草稿仍渲染 iframe。
+  另：enrichDraft 服务端——**已通过申请的编辑（editor/admin）免银叶**（查 user_roles，silverExempt = owner||editor），
+  UI 文案同步（编辑显示「免银叶」）。
+- **验证**：tsc=0；preview 实测草稿页（lite: 无 iframe+摘要卡带图+识别人在识别时间下+双线分享卡按钮；full: 有 iframe）。
+  ⚠️ **A/B 需登录 + 迁移才能真机验证**（编辑操作栏、edits 页、blog_edit 记录都要 auth；blog_edit 记录还要先跑迁移）。
+  lint 报的全是**存量** prettier + identify-plant.functions.ts 的 no-explicit-any，非本次引入。
+- **⏳ 待办**：① Supabase Dashboard 跑 `20260713140000_widen_plant_edits_kind.sql`（否则 A 不生效）；
+  ② `npm run build && wrangler deploy`；③ 真机：编辑登录看草稿编辑操作栏 / 改博客后看修改记录 / 点图片缩略图看大图。
+
+## 🆕 2026-07-13 (续三) — 用户 7 项反馈（删无地点草稿 + 首页18条 + 详页修复 + 导航改名）(DONE code, tsc=0; ⚠️ NOT deployed)
+1. **删无地点 AI 草稿**：`plant_drafts` 里坐标空且地名空且未发布的 23 条（19 pending 带审 + 4 rejected）
+   已删（161→138）。保留 2 条「无地点但已发布」的（避免破坏线上条目）。备份见
+   `scratch/_deleted_drafts_backup.json`；脚本 `scratch/delete_noloc_drafts.mjs`（`select("*")` 会因
+   html_content 过大 terminated，务必只 select 需要的列）。
+2. **首页最多 18 条**（index.tsx）：`rest = sorted.slice(4, 18)`（hero1+sub3+rest14）。归档区从
+   行列表改为**紧凑图片卡网格** `grid-cols-2 sm:grid-cols-3 lg:grid-cols-4`（手机 2 列、非列表式）。
+3. **【根因】首页封面/头像不显示 = 图片被 07-13 孤儿清理误删**：full_audit 只用「植物页」建引用集，
+   漏了博客封面(inline/)、编辑头像(avatars/)、**草稿照片**。实测 `_orphans.json`(432) 含这些路径、URL 均 404。
+   受损：**118/138 草稿照片**、吉木头像、2 篇博客的正文首图。**像素永久丢失、不可恢复**。
+   修法=新增 `src/components/safe-img.tsx`（onError/空 src → 优雅占位），接入首页博客封面/编辑头像/DraftCard。
+   首页 broken img 数 3→0。⚠️ **告知用户：这些图需重新上传；下次清理孤儿务必把 blog/avatar/draft 也算进引用集**。
+4. **博物趣闻摘要卡点开显示乱码 → 修**（plants.$slug.tsx）：ccplants 页有 `<a class="section-vi-summary-card"
+   href="#section-vi">`，但详页 iframe 是 `sandbox`（无 allow-scripts）srcdoc，点 #hash 会导航到 about:srcdoc
+   显示源码乱码。修=父页在 iframe doc 上拦截 `a[href^="#"]` 点击、preventDefault、手动 `window.scrollTo` 到目标。
+   实测 defaultPrevented=true（handler 生效）。
+5. **页尾撑满 → 修**（plants.$slug.tsx）：iframe 原固定 `height:calc(100vh-120px)` → 内部双滚动 + 短页页尾空白。
+   改为**自适应高度**（`wireIframe` 里 sizeIframe：量 scrollHeight 设 iframe.style.height + ResizeObserver + 定时重量 +
+   img/font 加载重量）+ `scrolling="no"`。**关键 guard**：`iframe.clientWidth<240` 时跳过量高（容器 0 宽时内容
+   回流成 28 万 px 窄条会把 iframe 撑爆；等宽度恢复 RO 再量）。实测正常宽度下 iframe=12732px、单一滚动。
+6. **右键编辑封面卡不再重复出现在评论卡上方**（plants.$slug.tsx HTML 分支）：删掉页尾那个 cover `<figure>`
+   + 其 renderCoverMenu() 调用（编辑封面走右上角「编辑 →」）。非 HTML 分支的正文封面保留。
+7. **导航「项目驱动调研成果」→「项目预告与成果」**（site-header.tsx，桌面+抽屉两处）。
+- **验证**：tsc=0；preview 实测（首页无 broken 图 + 18 条 + 2 列网格；详页单滚动 + section-vi handler 生效 + 导航改名）。
+  ⚠️ preview pane 对 12000px 高 iframe 有 0 宽/0 高的 headless 量测抖动 + scroll 偶尔超时，故 section-vi 真实滚动
+  未在 pane 目视到（但 handler 逻辑已验证）。**待办**：`npm run build && wrangler deploy`；真机点一次博物趣闻卡确认滚动。
+
+## 🆕 2026-07-13 (续二) — 删 AI 识别数据 + Gemini key 诊断：病根=配置了不存在的模型
+用户要求：删全部 AI 识别资料（含已采纳条目）、看释放多少空间、判断是"所有 key 超额"还是"两 key 轮换机制失败"。
+1. **删除范围**（scratch/delete_ai_data.mjs）：`plant_drafts` 137 行全删 + `plants` 中 source∈{ai_identify,draft_merge,
+   gold_oneclick} 的 **4 条**（晶状花烛/狐尾大麦/华丽针茅=ai_identify，悬崖菊=gold_oneclick）+ 各自 plant_edits/plant_tags +
+   storage：`plant-images/drafts/` 全部 + 这 4 条的 html/cover/正文引用图。**保留** 249 条精选图鉴（source=null 237 +
+   html_upload 12，非 AI 识别）+ ai_usage_logs（143 行，微小、留作诊断）。
+   - **释放空间**：存储 750.9→**739.9MB**（约 11MB）。释放少=**符合预期**：AI 草稿照片大多是外链 iNaturalist（不占本站），
+     Supabase 里的 AI 图仅 drafts/ 13.9MB。存储大头是批量精选页面，非 AI。
+2. **Gemini key 诊断（scratch/test_keys.mjs，走本地代理 127.0.0.1:7888 绕过 GFW 直连 Google）——两个假设都不对**：
+   - 两个 key（AQ.A…9-Yg / AQ.A…Ktdw）**都健康、都没超额**：models.list 正常返回、`gemini-2.5-flash` generateContent 返回
+     **HTTP 200 ✅**。
+   - 轮换机制**没坏**：site_config 里两 key 用逗号/换行干净分隔（splitGeminiKeys 正确切成 2 个），非历史上的"粘死"。
+   - **真正病根**：管理台配置的模型是 `gemini-3.5-flash`——**这个模型根本不存在**！两个 key 的真实可用列表最新只到
+     `gemini-3.1-pro-preview`/`gemini-3-flash-preview`，无 3.5。每次识别打到不存在的模型→失败；轮换救不了（两 key 结果一样，
+     callGeminiWithRotation 对模型错误正确地不轮换）。雷是 2026-07-12（续八）误信"gemini-3.5-flash 存在"改配置埋的。
+   - **修复**：① 直接改 site_config.ai_model_config.model → `gemini-2.5-flash`（DB 改，**线上立即生效**，识别现在就能用）；
+     ② 代码三处静态预设默认从 gemini-3.5-flash → gemini-2.5-flash + models 列表换成真实存在的
+     （identify.tsx / xiaop-model-panel.tsx / xiaop-user-model.ts；含 identify.tsx useState 默认）防"恢复默认"再踩雷。
+   - **注意**：gemini-3-flash-preview / gemini-3.1-* 是 preview，实测常 503 UNAVAILABLE；稳定可用的是 gemini-2.5-flash。
+     用户若想用更新的，用管理台「拉取可用模型」按 key 实时列，别手打不存在的名字。
+- **验证**：tsc=0；key 实测 2.5-flash=200；删除后 plant_drafts=0、AI 采纳条目=0。build+deploy 见下。
+
+## 🆕 2026-07-13 — 批量上传三处根因修复 + Supabase 存储告急 (DONE code, tsc=0; ⚠️ NOT deployed)
+用户反馈批量上传：大量文件上传失败、出现全空编辑框、自动识别只有第一个成功。三个根因全部定位并修复：
+1. **全空编辑框**（html-doc-editor.tsx 初始加载 effect）：`sessionStorage.setItem(cacheKey, text)` 无 try/catch——
+   sessionStorage 配额约 5MB，批量传多个大 HTML 很快塞满，QuotaExceededError 直接进 `.catch` → docText 留空 →
+   编辑框全空。且 `fetch(htmlUrl)` 不查 `r.ok`（404/错误体也当 HTML 渲染）。修：setItem 包 try/catch（缓存可选、
+   照常渲染）+ 检查 r.ok + 错误 toast 带具体原因。（打字持久化那个 effect 本来就有 try/catch，没动。）
+2. **自动识别只有第一个成功**（admin.batch-new.tsx finalizeBatch）：`next.forEach(runExtract)` 并发全开 →
+   同时 N 个 Gemini 调用打爆免费档 RPM → 除第一个外全部 429（旧重试 5s/10s 也扛不住）。修：改为 async IIFE
+   **顺序逐个识别**。
+3. **extractPlantMetaFn 只用 .env 单 key**：没接管理台 key 池/轮换。修：`loadAiConfig()` + `splitGeminiKeys` 组
+   key 池（管理台 gemini keys + env key 去重），手写重试循环删掉，换 `callGeminiWithRotation`（429 自动换 key）；
+   模型取管理台配置，回退 env AI_MODEL。
+4. **Supabase 存储用量（scratch/storage_usage.mjs 实测，list API 递归求和）**：plant-images 4324 个文件 903.2MB +
+   plant-html 274 个 21.2MB = **共 924.4MB；免费档 1GB 上限只剩约 75.6MB**——这也是"大量文件上传失败"的最可能
+   直接原因。⚠️ 探针脚本自己在运行时读 .env（未打印 key）。**待用户决策**：升级 Pro（100GB）或清理 plant-images
+   里失败批次留下的孤儿图（batch-img/ 前缀下未被任何 HTML 引用的）。
+- **验证**：tsc=0；dev server 起、/admin/batch-new 正常跳登录、console 无错。批量上传全流程需 admin 登录，未实测。
+- **✅ DEPLOYED 2026-07-13：Version `9a292141-7c6b-4e1e-b6d9-8011c330ed71`**（build OK，上传 57 文件 27s 一次过）。
+
+### ✅ 抢救已上传的孤儿 HTML → 补建 237 条目（scratch/rescue_orphans.mjs，实际写库完成）
+**关键发现**：文件其实早传上去了（plant-html 桶 274 个），但只有 16 个建成了条目——**258 个是孤儿**
+（HTML 躺在存储桶里，plants 表没行 = 网站不显示）。原因正是上面三个 bug 让批量页当时没能点成「创建条目」。
+- **抢救脚本**：列出未被任何 plants.html_url 引用的孤儿 → 逐个 fetch HTML → **本地正则解析 ccplants 模板**
+  （`extract-plant-meta` 边缘函数实为 404 未部署 + 本地 Gemini 被地区限制，故不走 AI）：title=`<h1>`（去汉字间距）、
+  family/genus=masthead `.mast-name-zh + .mast-name-la`、scientific_name=`.hero-binomial`、common_name_en=`.hero-vernacular`、
+  summary=首个 ≥80 字 CJK `<p>`、cover=首图、HTML 实体解码 → 去重（学名前两词，无学名回退 `zh:标题`，且与已有 253 条比对）
+  → 直接 insert plants（author_id=ab8bee60…上传者/admin，source=rescue_script）+ 写 plant_edits create 日志。
+- **结果**：创建 **237**、跳过 21（重复批次重传）、失败 0。plants 总数 16→**253**。
+- **线上实测**：/plants/cistanche-deserticola-ma-1960（肉苁蓉）等条目 masthead/hero/配图/正文全部正常渲染
+  （首帧会短暂显示 src 回退的纯文本，htmlDoc fetch 完即 srcDoc 正常——非 bug）。
+- **⚠️ 存储仍告急**：本次未增加存储（复用已传文件）。plant-images 仍 903MB（含 3919 个 batch-img、约 695MB，
+  大量是重传批次的重复图）、总 924MB/1GB。**下次大批量上传前必须先扩容 Pro 或清理孤儿图**（batch-img/ 下
+  未被任何已发布 HTML 引用的）。清理脚本可后续按需写（先列出候选、用户确认再删）。
+- **待办**：用户真机重跑一次小批量上传验证三修生效（顺序识别不再只成第一个 / 编辑框不再空）。
+
+### ✅ 2026-07-13 (续) — 用户第二轮反馈 5 项全处理
+1. **孤儿图清理**：full_audit.mjs 一次遍历 253 页建"被引用图"集合 → 432 张未被任何页面/封面引用的孤儿图
+   (173.5MB) 全删（delete_orphans.mjs，一批 fetch failed 但服务端已删，重跑确认）。**存储 924MB→751MB，
+   可用 76MB→249MB**。plant-images 4324→3892（=被引用数，干净）。
+2. **科/属下拉加计数**（plants.index.tsx familyOptions/genusOptions）：Set→Map 计数，label 加 `（n）`，
+   镜像已有的 IUCN/保护名录写法。preview 实测：亚麻科（1）伞形科（4）兰科（4）… 属同理。
+3. **IUCN 只显示无危(11) 根因=237 条抢救条目 iucn_status 全空**（我的抢救解析器当初没取 IUCN）。修：
+   full_audit 从每页 `.conservation-badge .cb-status` 解析真实等级 → apply_iucn.mjs 回填 106 条。
+   preview 实测下拉：CR(2) EN(2) VU(11) NT(5) LC(94) DD(3)——各级都出来了。(另 147 页无 IUCN 徽章=保持未评估。)
+4. **裸果木遗漏 = 名录数据缺失，非匹配失败**（conservation_probe.mjs + national_gap.mjs 确证）：匹配器工作正常
+   （四合木/绵刺/沙冬青/半日花/蒙古扁桃/肉苁蓉都正确命中国家名录）；但国家（2021）种子迁移从 PDF 提取时漏了
+   **裸果木/长叶红砂/绶草**（均国家二级）。补：迁移 `20260713120000_national_2021_gap_fill.sql` + 直接 insert
+   conservation_taxa（幂等）。preview 实测：国家（2021）匹配数 11→14，筛选结果含裸果木/长叶红砂/绶草。
+   ⚠️ **规模判断**：这三个是收藏中确认的国家名录遗漏；那份"匹配省级未匹配国家"49 条大多是内蒙古 2009 的
+   地方药用植物（本就非国家级），不是遗漏。**要彻底核对 455 种需重新解析官方 2021 PDF 与库比对**（另一独立
+   数据任务，未做——不凭记忆瞎补，避免灌错保护级别）。
+5. **答用户：237 条已入库，不需再点「全部应用/全部创建」**（那是浏览器内未入库时的按钮，再点会造重复）。
+- **验证**：tsc=0；build OK；preview 全部实测过（科属计数/IUCN 全等级/裸果木命中国家名录）。
+- **详情页保护卡** = 烘焙在 ccplants HTML 里的，和站点实时匹配器(conservationMatcher)是两套；用户说的"名单"
+  = 索引页筛选/匹配器，已修。裸果木详情页正文里的保护状态是页面自带文案，非本次范围。
+
+## 🆕 2026-07-12 (续十二) — 小P蛙联网搜索（Gemini Google Search grounding，两段式）(✅ DEPLOYED `b00485fa-fb70-448e-a8c1-6ed8b74915fb`)
+用户问小P蛙有无联网 → 答：**无**（对话只用训练知识+当前页面文本+图片；识别管线才查 PlantNet/GBIF 等）。用户要加 → 上。
+**关键约束**：Gemini `google_search` grounding 与 `responseSchema`（小P对话依赖的结构化输出）**互斥**，不能同一次调用。
+**方案=两段式**（identify-plant.functions.ts 新增）：
+- `resolveXiaoPGemini(override)`：解析小P有效 Gemini key/model（镜像 xiaopTextCall），非 Gemini 返回 null（grounding 仅 Gemini）。
+- `xiaopGroundedSearch(query, override)`：单独一次**自由文本** Gemini 调用带 `tools:[{google_search:{}}]`（无 schema），
+  解析 `candidates[0].content.parts[].text` 为 digest + `groundingMetadata.groundingChunks[].web.{uri,title}` 为 sources(≤6)。失败→null。
+- `xiaopAskWithGrounding(...)`：①第一次结构化问答；②若模型置 `needsWebSearch=true`+`webQuery` → 跑 grounded search →
+  把 digest+来源作为一条 user 消息注入 → ③第二次结构化问答；来源链接兜底追加到 reply 末尾（📎联网检索来源）。grounding 不可用/失败则原样返回第一次答案。
+- 两个 ask fn（askDraftAgentFn + askPlantAgentFn）：schema 加 `needsWebSearch`(bool)+`webQuery`(str)、system prompt 加「需最新网络信息才置 true」指令、
+  调用从 `xiaopTextCall` 换成 `xiaopAskWithGrounding`。
+- **仅 Gemini 生效**（DeepSeek/OpenAI/自定义无原生联网，走原路）；只在模型判定需要时才联网（省 token/延时）；全程 graceful（搜索失败不影响回答）。
+- **验证**：tsc=0、build OK、部署 10s。⚠️ **grounding 无法本地验证**（dev server 连 Gemini 被 GFW geo-block 400；线上 Workers 出口正常）。
+  待真机：登录后问小P一个时效性问题（如"XX最新保护级别/最新研究"）→ 看回答末尾是否带「📎联网检索来源」链接。
+
+## 🆕 2026-07-12 (续十一) — DeepSeek image_url 崩 + quick 用错模型 + enrich 用户名 + 疑似标题 4 修 (✅ DEPLOYED `d749d939-1ab9-4458-a373-b990cf0050fe`)
+1. **DeepSeek(纯文本模型)聊天崩**（openaiCompatChat）：`messages[N]: unknown variant image_url` = deepseek-chat 不支持视觉，拒 image_url 400。
+   之前 identify 路径有降级、**聊天路径没有**。修：openaiCompatChat 重构为 `buildMessages(useImages)` + `send(useImages)`；
+   带图 400 且错误含 image_url/unknown variant 等 → **自动去图重发一次**（纯文本聊天照常，只是看不了图）。
+   （"恢复默认仍报错"多半是用户清的是**管理台 AI 配置**，而小P聊天用的是**每用户 localStorage override**——那个要在小P「模型设置」里点「恢复默认」清。）
+2. **quick 摘要卡用错模型**（identifyQuick）：原写死 `process.env.AI_MODEL`(=2.5-flash) → 用量统计 quick 显 2.5、enrich 才显 3.5。
+   修：identifyQuick 先 `loadAiConfig()`，若 provider=gemini 用**管理台的 model+key**（3.5-flash），否则回退 env。现在 quick 与 enrich 同模型。
+3. **enrich 用量统计用户名全写成 "enrich"/👻**（enrichDraft usage log）：原写死 `user_id:null, user_label:"enrich"`。
+   修：查 profiles.display_name（回退 email 前缀）→ `user_id:userId, user_label:"{名字}（进一步草稿）"`。
+4. **疑似分享卡中文标题没加疑似**：根因=检测只认 `confidence==='low'`，但用户的榕树是 `confidence:'medium'` + summary 以「疑似」开头。
+   修：drafts.$id onMakeCard 检测放宽为 low **或** summary/title 以「疑似」开头；share-card.ts 标题格式改「**（疑似）名字**」（剥重复前缀+醒目色）。
+   preview 实测榕树(medium+疑似summary)→卡片标题「（疑似）榕树」✓。
+- **验证**：tsc=0、build OK、部署第 2 次成功 10s。疑似标题 preview 实测过；其余三项靠 tsc+build+代码逻辑（需真机 deepseek/识别验证）。
+
+## 🆕 2026-07-12 (续十) — 小P蛙访客拦截 + 三处配置面板加拉取模型/Base URL 前置/URL 格式说明 (✅ DEPLOYED `6557d5be-bc34-4307-8706-8a3664b25d78`)
+用户确认两级模型机制 + 提要求。**两级机制现状**：①管理台配的是**全站默认模型**（site_config，注册用户用）；②小P对话侧栏「模型设置」
+是**每用户自己的模型**（localStorage，xiaop-user-settings）。**之前缺**访客拦截——`askDraftAgentFn` 无 auth 中间件，访客能直接聊。
+**改动**：
+1. **访客拦截**（draft-agent-panel.tsx）：加 `isRegistered` prop（默认 true）；`send()` 里 `!isRegistered` → 直接回
+   `GUEST_NOTICE`（"只有注册用户可以使用默认配置模型来让小P蛙蹦跶…注册登录后还能配置自己的模型…"），**不调 LLM、不烧 token**。
+   drafts.$id.tsx + plants.$slug.tsx 传 `isRegistered={!!user}`。**preview 实测**：登出后发消息→出提示、不请求模型；（登录态门自动放行）。
+2. **三处配置面板统一**：Base URL **前置**到「模型」之前 + 「模型」区加**拉取可用模型**（listProviderModelsFn，任意登录用户可调）→
+   下拉选真实模型 + 手动输入兜底；Base URL 加**分服务商格式说明**（OpenAI/自定义：填到 /v1、系统请求 {BaseURL}/chat/completions；
+   Gemini/Anthropic：无需 Base URL）。改的三处：identify.tsx AdminModelPanel（原顺序 model 在前→已换）、xiaop-model-panel.tsx（同换）、
+   **xiaop-user-settings.tsx（原本完全没有拉取，本次新增 fetch+下拉+顺序调整）**。preview 实测 xiaop-user-settings 顺序=服务商/Key/BaseURL/模型 + 拉取按钮在。
+- **验证**：tsc=0、build OK、部署第 2 次成功。管理台两面板需 admin 登录未在 preview 实测（靠 tsc+build+与已验证的 user-settings 同构）。
+
+## 🆕 2026-07-12 (续九) — 批准编辑=自动确认邮箱（放行登录）(✅ DEPLOYED `ed347f50-b2d3-4bfe-8181-1344ce207934`)
+用户：已批准的 linda0319linda@gmail.com 登录仍报「email not confirmed」。**根因**：`approveApplication`（edits.ts，客户端）只加
+editor 角色 + 标 approved，**不确认邮箱**；Supabase 登录要邮箱先确认（点验证邮件链接，常没收到/进垃圾箱）→ 批准≠可登录。
+邮箱确认需 **service role**（`auth.admin.updateUserById(uid,{email_confirm:true})`），客户端做不了 → 必须服务端。
+**改动**（identify-plant.functions.ts + admin.applications.tsx）：
+- 新服务端 fn `approveApplicationFn`（requireSupabaseAuth+admin 校验）：加 editor 角色 → 标 approved → **`auth.admin.updateUserById email_confirm:true`**
+  （非致命，失败只 warn）→ 返回 {ok,emailConfirmed}。admin.applications onApprove 改调它（原客户端 approveApplication 废弃，保留未删）。
+- 新 fn `confirmUserEmailFn({userId})`：给**已批准但没确认**的老数据补确认。admin.applications 在「已通过」卡片加
+  「**确认邮箱·放行登录**」按钮 → 调它。
+- supabaseAdmin 用 `process.env.SUPABASE_SERVICE_ROLE_KEY`（写 site_config 一直成功=该 key 有效）→ auth.admin 应可用；
+  失败也有兜底（approve 非致命 + 独立按钮报错→退回后台手动确认）。
+- **验证**：tsc=0、build OK、部署 114s 一次过（/admin/applications 200）。⚠️ 面板需 admin 登录才可见，**未在 preview 实测**（无密码）。
+- **linda 立即放行（用户操作，一次点击）**：登录 plantspedia.club（admin）→ /admin/applications →「已通过」标签 → 找 linda →
+  点「确认邮箱·放行登录」。若按钮报错=service key 对 auth.admin 无效，则退回 Supabase 后台 Authentication→Users→Confirm email。
+
+## 🆕 2026-07-12 (续八) — 模型清单更新到 Gemini 3.x + 多 key 改多输入框 + 澄清"小P对话可选3.5" (✅ DEPLOYED `30879d2e-4024-42a9-a730-f3513248107d`)
+用户：拉取/下拉仍没 3.5；小P**对话界面**却能选 3.5，很奇怪。**查证（WebFetch ai.google.dev/models，环境日期 2026-07）**：
+Gemini 3.5 确实存在（`gemini-3.5-flash` 最强、`gemini-3.1-flash-lite`、`gemini-3.1-pro-preview`、`gemini-3-flash-preview` 等），
+2.5 系列未废弃但**旧别名 gemini-2.5-flash 对新 key/项目被 Google 停用**（→ 之前 404；.env 旧 key 仍能用故没事）。
+**"小P对话能选3.5"之谜**：xiaop-user-settings.tsx（对话界面里的"我的小P模型"）模型是**自由文本输入框**（可手打任意名），
+不是真实可用清单——用户自己打进去的，非系统列出。已向用户澄清。
+**改动**：
+- 三处静态 gemini 预设更新到 3.x（identify.tsx PROVIDERS、xiaop-model-panel.tsx PROVIDERS、xiaop-user-model.ts XIAOP_PROVIDERS）：
+  `[gemini-3.5-flash, gemini-3.1-flash-lite, gemini-3.1-pro-preview, gemini-2.5-flash, gemini-2.5-pro, gemini-2.5-flash-lite]`，
+  默认模型改 `gemini-3.5-flash`。（真实可用仍以「拉取可用模型」按 key 查为准。）
+- **多 key 改多输入框**（identify.tsx AdminModelPanel）：`apiKey:string` → `keys:string[]`（默认 [""]），每 key 一个 input +「移除×」，
+  gemini 显「＋再加一个 Gemini key」；保存/拉取时 `keys.map(trim).filter().join(",")`。**不再提示逗号/分号分隔**。
+  （XiaoPModelPanel 仍是单框逗号——本次先只改主 AI 面板；如需同款多框后续再做。）
+- **验证**：tsc=0、build OK、部署 46s 一次过。⚠️ 管理面板需 admin 登录才可见，**多输入框 UI 未在 preview 实测**（我无 admin 密码，不便登录），靠 tsc+build 保证。
+- **给用户**：进「修改配置」→ 每个 key 一个框（点＋加第二个）→ 填好 →「拉取可用模型」看你 key 真实能用哪些 → 选 `gemini-3.5-flash`（或拉取列表里的）→ 保存。
+  若拉取列表**没有** 3.5 = 你这把 free-tier key 的项目暂不开放该模型（Google 侧限制，非本站）；可先用列表里最高的。
+
+## 🆕 2026-07-12 (续七) — key 掩码排版 + 主 AI 面板加「拉取可用模型」（模型名过时 404）(✅ DEPLOYED `2a00f26e-5c7f-4a12-b78f-66a5c92b5415`)
+续六修好 401 后，进展到 **404 NOT_FOUND**：`gemini-2.5-flash is no longer available to new users`——用户的新 key 所属项目已停用
+旧模型别名。主 AI 模型面板(identify.tsx AdminModelPanel)此前**只有静态旧下拉、没有拉取按钮**（拉取按钮之前只加在 小P蛙面板）。
+另外两把长 key 掩码用 `*`.repeat(len-6) 生成一大排星号 → 手机端排版崩。
+**修复**：
+- identify.tsx AdminModelPanel 加 `fetchModels()`+「拉取可用模型」按钮（复用 listProviderModelsFn，用当前 key 实时列真实可用模型，
+  写入 optionModels 覆盖静态列表；命中不到当前 model 自动选第一个）+ 提示「旧模型名对新 key 可能 404，点拉取重选」。
+- 掩码统一改短： `k.length<=10?k:`${k.slice(0,4)}…${k.slice(-4)}`` （getAiConfigFn 多 key 池、getXiaoPConfigFn、getPlantNetKeyFn 三处），
+  多 key 显示 "AQ.A…xxxx · AQ.A…yyyy（共 N 个 key）"。identify.tsx Key 行加 break-all。
+- **给用户**：进「修改配置」→ 填好 key → 点**拉取可用模型** → 从真实列表选一个（如新的 gemini-3 / 最新 flash）→ 保存。
+  **不要把 key 贴进聊天**（泄露风险）——已向用户说明。tsc=0、build OK、部署第 2 次成功 13s。
+
+## 🆕 2026-07-12 (续六) — 多 Gemini key（AQ. 新格式）逗号分隔被粘死 → 401 修复 (✅ DEPLOYED `9193cfdd-ae25-4e10-b013-93c9ab9f61d4`)
+用户在 AI 模型控制台填两个 gemini key（逗号分隔）→ 快速摘要卡成功（走 .env key）但「生成进一步草稿」401 UNAUTHENTICATED
+（Expected OAuth 2…）。**根因**：`splitGeminiKeys` 只认旧版 `AIza…` 正则；新版 `AQ.` 开头的 key 逗号分隔时，
+`tokens.every(AIza正则)` 为假 → 走 `unfuseGeminiKeys(join(""))` 把两把 key **粘回成一个乱码串** → Google 拒 = 401。
+且 `saveAiConfigFn`/`normalizeApiKey` 在**保存时**就已粘死，DB 存的是坏值。（快速卡走 `process.env.GEMINI_API_KEY` 单 key 故没事；
+enrich 走 `loadAiConfig()` 管理台 key 故炸。）**修复**（identify-plant.functions.ts）：
+- `splitGeminiKeys` 重写：先按**强分隔符 `[,;\n\r]`** 拆（用户逗号意图优先，任何格式都不再粘回）；≥2 段=显式 key 池，
+  各段仅去内部空白；单段再判空格分隔的合法 AIza 池 / 否则去空白后 unfuse。
+- `unfuseGeminiKeys` 增强：除 `AIza` 前缀外，也支持按 `AQ.` 前缀拆分**已粘死的存量值**（每段须匹配 `^AQ\.[A-Za-z0-9._-]{15,}$` 才拆），
+  → 无需重存也能从坏值恢复两把 key。
+- node 实测 15 例全过（含 AQ 逗号、AQ 已粘死恢复、AIza 逗号/换行/fused、单 key、混合、空）。tsc=0、build OK、部署 45s 一次过。
+- **给用户**：改动对存量坏值也生效（自动拆回）；若仍报错，建议回控制台**重存一次**两把 key（现在保存不再粘死）；
+  若重存后仍 401，则是 key 本身无效或该 key 所属 Google 项目未启用 Generative Language API（非本站问题）。
+
+## 🆕 2026-07-12 (续五) — 用户第二轮反馈：卡片改版2 + 报错诊断 + 补拍建议 + 登录回跳
+### ✅ DEPLOYED 2026-07-12：Version `4b632ab8-a50c-43b7-a1e5-b7c69ba1cfd2`（含续四 Phase A/B 全部）。三域名 200。
+⚠️ **部署前实测：`plant_drafts.retake_count` 列仍不存在**（anon 查询 42703）——用户以为跑了迁移但该列没建成。
+代码兜底=不崩，但**补拍变量加分(1+n)暂未生效**（退回旧每次+1，且 retake_count 不落库）。
+**待用户补跑** `supabase/migrations/20260712100000_draft_retake_count.sql`（就一句 ALTER…ADD COLUMN retake_count）后补拍计分才真正生效。
+（编辑申请 090000 迁移之前已生效。）
+1. **Gemini 400 误诊修正**（identify-plant.functions.ts describeGeminiError）：用户本地上传报 `HTTP 400 · FAILED_PRECONDITION
+   · User location is not supported`，旧文案错说「照片过大/密钥格式」。**真因=Gemini API 在当前地区不可用**（本地直连在中国大陆
+   被 Google 拒）。新增分支：body 含 "user location is not supported" 或 status=FAILED_PRECONDITION → 明确解释「地区限制，
+   非照片/密钥问题；本地需经受支持地区代理/VPN，线上 Workers 通常 OK；或换 OpenAI/中转」。→ **答用户：本地测不了识别是地区限制。**
+2. **分享卡改版2**（share-card.ts 重写）：① 科·属移到**与 logo 同行右侧**（drawFitLine 右对齐单行，不再在下方）；
+   ② 修「X发现了新植物」标题与简介**重叠**（headingBaseline+48 净距）；③ 简介**硬上限 140 字**，超出→「……（访问
+   plantspedia.club 阅读完整内容）」；④「本轮铜叶 +N」用**站点真实铜叶徽章 PNG**（leaf-bronze.png 等，非手绘）；⑤ 登录用户
+   右侧显示**铜/银/金叶徽章+数量**统计；访客右侧留空（登录 CTA 移到弹窗）；⑥ 银叶/金叶权益**分两行**、各带 silver/gold 徽章。
+3. **访客登录回跳**：卡片弹窗访客显「登录/注册后积累叶片→」按钮 → 存 sessionStorage justIdentified=draftId +
+   跳 `/login?redirect=/drafts/<id>`。login.tsx/signup.tsx 加 validateSearch(redirect，仅同源 `/` 开头防开放重定向)：
+   登录成功/已登录→`window.location.href=redirect`；signup 若返回 session（关邮箱验证）直接回跳、否则带 redirect 去 /login；
+   emailRedirectTo 也带 redirect。登录后回到草稿页→auto-show 重新弹卡（此时有真实叶片统计）。已登录则不显该按钮。
+4. **补拍建议具体化**（camera-identify 横幅）：草稿页「去补拍」Link 带 `nmp`=首次 needs_more_photos_zh(≤300)；identify.tsx
+   validateSearch 加 nmp→retakeCtx.advice；横幅显「上次识别建议补拍：{advice}」+ 固定提示「对准同一株、**尽量不要同时拍到
+   多种植物**、拍完自动重识别」。
+- **验证**：tsc=0、build OK(4193 KiB)。preview：卡片改版2 全部渲染正确（科属同行右/无重叠/140截断/真铜叶徽章/两行权益带银金徽章/
+   访客登录按钮在弹窗）、补拍横幅显具体建议+多株警示。**⚠️ 未真机**：登录回跳全程、Gemini 真报错文案、真机补拍。
+- **①定位在 MacBook 本地失败**＝浏览器**站点级**定位权限（localhost:5199）被拒或系统返回 PERMISSION_DENIED，非代码 bug；
+   线上 HTTPS 的手势请求逻辑已就绪。这属环境问题，未改代码。
+
+## 🆕 2026-07-12 (续四) — 识别卡/补拍/加分 大改（用户 4 项反馈）分阶段
+用户 4 项：①拍摄框上加粗体警示「AI识别内容不能采纳为食用药用参考！」②补拍流程（点补拍直接开相机→识别；满3次必出结果；
+疑似时中文名显示「疑似X植物」；加分=1+补拍次数，疑似恒+1）③识别后**自动**弹重设计分享卡（不用点）④分享按钮平台。
+**两处澄清已问用户**：加分公式=**1+n**（补拍0→+1、1→+2、2→+3、3→+4；疑似恒+1）；分享=**只用系统分享面板**
+（网页无法自定义面板里的 App、也无法把图片推给抖音/IG/小红书这类无网页接口平台 → 系统面板发图+附带详情页URL 即最优）。
+
+### Phase A ✅ DONE (tsc=0, preview 验证; NOT deployed) — 点①③④
+- **①粗体警示**（camera-identify.tsx）：viewfinder 上方常驻红色粗体 `⚠️ AI 识别内容不能采纳为食用药用参考！`。preview 实测 weight=700、vermilion。
+- **③分享卡重设计**（`src/lib/share-card.ts` 大改）：1080×**1920**(9:16 更高容更多文字)；小P蛙 logo 改 `drawContain`**完整不裁**；
+  科·属 `drawFitLine` 强制**单行**自动缩字号；名称块（疑似→前缀「疑似」红色）；用户图 cover；照片下**首行**=「{X}发现了一种新植物！」
+  （X=注册名，访客=小P蛙）；简介溢出→「……（访问 plantspedia.club 阅读完整内容）」；奖励带=铜叶徽+「本轮铜叶 +N」，
+  右侧 铜/银/金叶统计（访客显「登录后可累积叶片」）+ 银叶/金叶权益提示（带识别名）；页尾「{X} 邀请你加入 plantspedia.club…」。
+- **③自动弹卡**：camera-identify 成功后 `sessionStorage['plantspedia:justIdentified']=draftId`；drafts.$id 挂载读旗标→静默 `onMakeCard({silent})`
+  →自动开预览 modal（等 draft+leaves 就绪，ref 防重入，消费后清旗标）。preview 实测：设旗标→导航→卡自动开 1080×1920、旗标已清。
+- **④分享带 URL**（shareOrSaveImage 加 opts.url/text/title）：navigator.share 同时带 files+url+text（详情页链接随图走）。桌面无 files 分享→下载兜底。
+- data：drafts.$id 加 profile.display_name 查询得 discovererName；leafEarned=疑似?1:1+(draft.retake_count??0)（**前向兼容** Phase B 的列）。
+- **验证**：tsc=0；preview 三态（细叶针茅有地/紫叶酢浆草无地/警示语）+ 自动弹卡 + logo 完整 + 科属单行 + 截断语 + 权益提示，均 OK，无 console 错误。
+
+### Phase B ✅ DONE (tsc=0, build OK, preview 验证 UI; NOT deployed) — 点② 补拍流程 + 变量加分
+⚠️ **需在 Supabase 后台执行 `supabase/migrations/20260712100000_draft_retake_count.sql`**
+（`ALTER TABLE plant_drafts ADD COLUMN IF NOT EXISTS retake_count int default 0`；已同步手改 types.ts 三处）。
+**代码对缺列非致命降级**：retake_count 不进 INSERT（改为**成功后 best-effort UPDATE**，缺列静默失败，识别不崩）；
+leaves.ts / serverLeafBalance 的 identifyBronze 查 retake_count 若报错→回退旧计数制。**故部署可早于迁移**（暂按现状+1 计分）。
+- **变量加分**（leaves.ts `identifyBronze` + identify-plant.functions.ts `serverLeafBalance` 同步）：识别铜叶由 COUNT 改 **SUM**：
+  每份草稿 = 疑似(ai_payload.identification_confidence==='low')恒 1；否则 (1+retake_count)，采纳(adopted)再×2。查
+  `retake_count, adopted, conf:ai_payload->>identification_confidence`；列缺失→回退 draftCount 旧制。
+- **补拍开相机**（camera-identify.tsx）：新增 prop `retake:{count,title,sci}`。retakeMode 下 useEffect **自动 openCamera()**
+  （client-side 导航的 transient activation 通常还在→直接弹相机；被拦则显「打开相机补拍」大按钮兜底一次点击）；
+  拍到照片→**自动 onSubmit()**（每次补拍都自动重识别，retake() 里重置 autoSubmitRef）；submit 带
+  retake_count/species_hint_title/species_hint_sci。顶部加「正在补拍复核「X」（第 N 次）」amber 横幅。
+- **服务端**（quickIdentifyDraft + identifyQuick）：SubmitInput 加 retake_count/species_hint_*；identifyQuick 收 opts
+  {speciesHint,forceResult,retakeCount}→system prompt 拼「补拍复核：上一轮判断为 X，确认或修正」+ forceResult(retake≥3)
+  「必须出最终结论，不足则 low=疑似、needs_more_photos 留空」。retake_count>0 时成功后 UPDATE 存列。
+- **草稿页**（drafts.$id.tsx）：存疑横幅「去补拍」→ `<Link to=/identify search={{retake:n+1,st:title,ss:sci}}>`；
+  retake_count<3 才显「去补拍」（提示第 n 次成功得 1+n 枚铜叶）；≥3 显「已完成 3 次补拍，最终结果（疑似），记 1 枚铜叶」。
+- **identify.tsx**：route 加 validateSearch(retake/st/ss)；IdentifyPage 读 search 传 `<CameraIdentify retake={retakeCtx}>`。
+- **验证**：tsc=0、build OK（4190 KiB）；preview 实测补拍横幅（第 1/2/3 次文案、≥3 显「最终结论」、粗体警示同框）、
+  自动 openCamera 未卡死。**⚠️ 未真机验证**（需真实拍照+识别+迁移）：自动开相机在真机 iOS 的 activation 成功率、
+  自动重识别、服务端强制出结果、变量加分数字。console 报错仅 Vite HMR websocket（preview pane HMR socket 挂了）非应用错误。
+- **⏳待办**：① 用户跑迁移；② `npm run build && wrangler deploy`；③ 真机走一遍补拍全程 + 核对铜叶数字。
+
+## 🆕 2026-07-12 (续三) — AI 识别分享卡 + 社媒分享 (✅ DEPLOYED Version `b153e015-3a92-4d4b-80c2-72f0d39bb8be`)
+（第一次 deploy fetch failed，重试第 2 次即成功、15s；asset 已缓存不重传。三域名均 200。）
+下一迭代第一块：把识别草稿渲染成一张手机 feed 友好的**分享卡图片**，走系统分享面板发微信/小红书/微博 + 存相册兜底
+（按 STATE 早先锁定方案：渲染成图 + navigator.share({files}) + 存图兜底；**不做**逐平台 OAuth）。
+- **新文件 `src/lib/share-card.ts`**：纯 canvas 2D 直绘（**不引 html2canvas**，bundle 只 +9KiB；且 iOS Safari 的
+  SVG-foreignObject→canvas 被封，直绘最稳）。`renderShareCard(data)`→1080×1500 PNG Blob；版式=小P蛙 logo+
+  Plantspedia 抬头 · 科/属右对齐 · 📍地点+坐标 · 分隔线 · 中文名/拉丁/英文+俗名 · 用户图(cover 裁切) · 简介(≤4 行省略号)
+  · 绿色「识别成功·铜叶 +N（累计 M）」通知条(自绘叶形) · plantspedia.club 落款。
+  **防跨域污染**：用户图用 `fetch→objectURL` 载入（非 crossOrigin img），toBlob 不会 taint。
+  `shareOrSaveImage(blob,name)`：canShare({files}) 有→系统面板；无（桌面）→ `<a download>` 兜底；返回 shared/downloaded/cancelled。
+- **`drafts.$id.tsx`**：toolbar 加「生成分享卡·存相册」按钮（原「分享给好友」改名「分享链接」保留 URL 分享）；
+  `onMakeCard`→渲染→弹**预览 modal**（显示卡图 + 「分享/存相册」+「关闭」+ 手机可长按存图说明）；
+  leafEarned = draft.adopted?2:1，leafTotal = leaves.bronze（未登录 null→只显 +N）。加 cardUrl/cardBlobRef + 卸载 revoke。
+- **验证**：tsc=0、build OK、dry-run 4182 KiB。preview 两例真机数据：①细叶针茅（有地点+坐标+长简介）→卡片 1080×1500
+  全元素齐、文字清晰、简介 4 行省略；②紫叶酢浆草（**无地点**）→坐标行优雅省略、科/属换行、布局不塌。无 console 错误。
+- **待部署**：`npm run build && ./node_modules/.bin/wrangler deploy`（minify 已生效，~19s）。
+- **⏳同期后续可选**：详情页 plants.$slug 也加分享卡（已收录条目分享）；卡片配色深色模式；多语切换。
+
+## 🆕 2026-07-12 (续) — deploy 卡在 8.6MB 脚本 PUT：已用 minify 减半（4174 KiB），待重试
+✅ 编辑申请修复迁移用户已在后台执行成功（申请页恢复）。
+deploy 剩余唯一失败点 = Worker 脚本一次性 PUT（~8730 KiB，不可续传，GFW/代理掐长上传）。
+**修**：wrangler.jsonc 加 `"minify": true`（wrangler 打包 server bundle 默认不 minify）→ dry-run 实测
+Total Upload 8730→**4174 KiB**（gzip 1710→1206），PUT 体积减半、传输窗口减半。assets 99 个已全部缓存不重传。
+**✅ DEPLOYED 2026-07-12：Version `cb8ec1ed-f8e4-4666-bc6b-99d9aa809e3f`** — minify 后**一次过**，
+脚本上传仅 18.96s（上次 8.7MB 版本要 161s 还反复 fetch failed）。plantspedia.club / www / /identify 均 200。
+本次上线 = 2026-07-11（四）批次全部内容：名称漂移根修、owner 金/银叶无限、银叶扣/退机制、地图右滑收起+定位按钮。
+**待真机**：拍照→草稿名不变；银叶扣/退（silver_leaf 迁移用户已执行过？确认 profiles.silver_used 列在）；
+手机若见旧 UI = PWA SW 缓存，强刷。**结论沉淀**：`"minify": true` 永久生效，deploy 从此不再是 8.6MB 大 PUT。
+
+## 🆕 2026-07-12 — 编辑申请页永远为空：根因已定位 + 修复迁移已写好（⚠️ 待用户在 Supabase 后台执行）
+用户问「为什么有人注册申请成为编辑，编辑申请页看不到任何消息」。**根因（代码级确证）**：
+`supabase/migrations/20260606034500_fix_admin_rls.sql` 为了给 arainjazz 邮箱自动加 admin 角色，
+`CREATE OR REPLACE` 重写了 `handle_new_user()`，但**丢掉了 2026-05-13 版里写入 editor_applications 的那段**
+——signup.tsx 传的 `editor_application_bio` metadata 从那以后被静默忽略，申请表零新行 → 审核页空。
+（顺带：该版 profiles INSERT 还丢了 ON CONFLICT，同 id 重建会炸，一并修。）
+**修复**：新迁移 `supabase/migrations/20260712090000_restore_editor_application_insert.sql` —— 合并两版行为
+（profiles upsert + admin 自动角色 + editor_applications 写入），并**回填**：凡 auth.users metadata 里有
+bio 但 editor_applications 无行的用户，按注册时间补一条 pending 申请。
+**下一步（用户）**：Supabase Dashboard → SQL Editor 跑该文件全文 → 刷新 /admin/applications 应看到回填的待审申请。
+无前端代码改动、无需部署。⚠️ 无法本地验证 DB：旧 service-role key 已于 2026-07-04 被禁用（legacy keys off），
+scratch/*.py 探针全部 401；新 secret key 只在 .env（按规矩不读）。
+
+## 🆕 2026-07-11（四）— 名称漂移根修 + owner无限 + 银叶机制 + 地图右滑/定位 (DONE code, tsc=0+build OK)
+⚠️ **需先在 Supabase 后台执行 `scratch/migration_silver_leaf.sql`**（加 profiles.silver_used、
+plant_drafts.enrich_silver_spent；已同步手改 types.ts）。用户已同意去执行。代码对缺列**非致命降级**（读→0，写→跳过），
+故部署早于迁移也不崩，只是暂不真正扣/退银叶。
+1. **名称漂移真修**（identify-plant.functions.ts）：上一轮 pin 有洞——「跳过重新定种」只看 `pinnedSci`，
+   phase-1 只存中文名、学名空时仍会重新定种→学名漂移。改成 `pinned = pinnedSci || pinnedTitle`，
+   两个 re-ID stage 都 gate on `!pinned`。→ **答用户：是 enrich 的洞，非识别不准。**
+2. **owner（arainjazz@gmail.com）金叶+银叶无限**：`serverGoldAvailable`→`serverLeafBalance(userId,email)`
+   算 gold+silver、owner→Infinity；createGoldDetailPageFn owner 不扣叶、goldRemaining=null（前端显示∞）；
+   lib/leaves.ts computeLeaves + LeafStats 加 silverUsed/silverAvailable，owner→Infinity；leaf-panel 显示 ∞。
+3. **银叶机制**：enrichDraft 加 requireSupabaseAuth + 校验 silverAvailable≥1（不足报 SILVER_INSUFFICIENT）；
+   生成成功后非 owner 扣 1 银叶（乐观并发 `.eq(silver_used,原值)`）+ 标记 draft.enrich_silver_spent=true；
+   rejectPlantDraft 驳回时若该 draft enrich_silver_spent 则退还（原子翻 flag 保证只退一次，退给 created_by）。
+   前端：草稿页 enrich CTA 加银叶提示（消耗1枚+驳回退还+当前可用）、未登录显示「登录后可生成」跳 /login；
+   leaf-panel 规则加「1银叶=1次生成草稿（驳回退还）」。
+4. **地图（explore.tsx）**：① 说明卡加 onTouchStart/End，水平滑动>55px 收起（避免误触竖向滚动）+ 卡顶提示
+   「←左右滑动收起→」；② 新增左下角「我的当前位置」按钮 `locateMe()`（getCurrentPosition→setUserCoords+
+   map.setZoomAndCenter(15)），wgs84togcj02 转坐标。
+**验证**：tsc=0、build OK；/explore preview 真机数据渲染、定位按钮+滑动提示在、无 console 错误。
+**⛔ DEPLOY BLOCKED 2026-07-11 07:48**：`wrangler deploy` 两次均 `fetch failed`（GFW 掐 api.cloudflare.com
+大上传）；第二次增量进度到 "Uploaded 26 of 39 assets" 后仍失败。**dist/ 已 build 好，纯网络重试**：
+网络稳一点或换 VPN 出口节点（HK/JP）后重跑 `./node_modules/.bin/wrangler deploy`（增量续传，会越传越少）。
+**别忘了**部署后去 Supabase 跑 `scratch/migration_silver_leaf.sql`。
+**待真机**：拍照→草稿名不变；银叶扣/退（迁移后）；地图右滑收起+定位。
+
+## 🆕 2026-07-11（三）— 定位卡死 + 3 个显示 bug 修复 (DONE code, tsc=0; 已随本批部署)
+1. **定位一直转圈、无授权弹窗（Chrome iOS）** — 根因：iOS WKWebView 已知 bug，`enableHighAccuracy:true` 时
+   getCurrentPosition 可能**两个回调都不触发、且忽略内置 timeout** → 永远 loading。若还无弹窗，多半是
+   **iOS 定位服务对 Chrome 关闭**（系统压根没法弹框）。修 `camera-identify.tsx requestGeo`：
+   ① 加 `settled` + 13s **硬墙 setTimeout** 保证收敛；② 改 `enableHighAccuracy:false`（网络定位更快更不易卡）；
+   ③ 加 `geoStatus:"timeout"` + 明确文案「查 iOS 设置→隐私→定位服务→Chrome」。⚠️ 无法替用户开系统开关。
+2. **enrich「只有配图没有文字」** — 根因：`findExistingSpeciesDraft` 把刚建的 phase-1 lite 卡（同物种、
+   payload 只有 summary）当可复用完整草稿 → token-saving 复用空 payload → 有图无文。修：跳过
+   `_enriched===false` 或缺 morphology_zh/habitat_zh 的 payload。
+3. **草稿名与卡片名不一致** — 修：`callAiIdentify` 加 `speciesHint`（有 pin 时跳过重新定种+硬指令锁定）；
+   `buildDraftContent` 透传并在渲染前把 meta.title/学名覆盖为 pin；`enrichDraft` 传 phase-1 名，DB 列
+   title/学名/科/属/俗名锁定为 phase-1 值。
+4. **金叶详页图片不显示** — 根因：`rehostImages` 用 `cf.image`(付费 Image Resizing)，未开通时 resized 子请求
+   失败→整批图被 drop。修：download(useResize) resized 失败**回退 plain fetch**，MAX_STORE 提到 5MB。
+**验证**：tsc=0。**待真机**：Chrome iOS 定位；完整草稿有正文且名不变；金叶详页图显示。
+
+### PlantNet 多图（已答）：现状只发单图 `organs:"auto"`。**多张不同器官图→更准**（API 支持一次≤5 图、
+每图带 organ 标签，本就是多器官证据融合）。卡片重设计应支持 1–5 张连拍/上传。
+
+### 大改造待办（下一期）：AI 卡片重设计 + 社媒分享
+指定版式：科/属页头 + 小P蛙 logo + 坐标 + 分隔线 + 拉丁/中/英/俗名 + 用户图+140字简介 + 积分通知(铜叶+2/+1及总数)
++ 保存到相册/分享；进一步草稿按钮加「消耗一枚银叶」规则。⚠️ **社媒分享现实**：网页无法替用户登录发到
+微信/小红书/抖音/微博；可行=卡片渲染成图片 + `navigator.share({files})` 系统分享面板 + 存图兜底；**不做**逐平台 OAuth。
+
+## 🆕 2026-07-10（二）— Gemini 429 + 报错必须"代码+原因+怎么办" (DONE code, tsc=0; **NOT deployed**)
+**用户误解澄清**：Pl@ntNet 只是 Stage 0，输出「物种判定+置信度」的 `idHint` 塞进 LLM system prompt；
+**它不写任何文案**。summary/形态/生境/人文/养护 全由 Gemini 生成 → Gemini 429 会让整个识别失败（即使 Pl@ntNet 已定种）。
+429 = Gemini 免费额度超限（RESOURCE_EXHAUSTED），分「每分钟RPM」和「每日RPD」两种。
+**新增错误层**（identify-plant.functions.ts）：
+- `class AiError {code,message}`；`parseGeminiError(body)` 解析 Google 结构化错误
+  （error.status / error.message / details[].QuotaFailure.violations[0].quotaId / RetryInfo.retryDelay）。
+- `isDailyQuota(quotaId)` = /PerDay/i。`describeGeminiError(status,body,model)` → 429(日/分钟)/503/400/401/403/404/5xx
+  各自的中文「代码+原因+怎么办」。`describeHttpAiError(tag,...)` 供 OpenAI/Anthropic/自定义中转分支复用。
+- **智能重试**：日额度耗尽 → 不再重试（原来盲目重试 3 次白等 15s）；分钟限流 → 按 Google 的 retryDelay 退避（上限30s）。
+- GEMINI_EMPTY（带 blockReason: SAFETY/MAX_TOKENS）、GEMINI_BAD_JSON、GEMINI_NETWORK、AI_MODEL_NOT_MULTIMODAL 均有码有因。
+- `identifyQuick` 原先把 429 吞成 null → 回退重跑再等一轮；现在日额度耗尽直接 throw AiError（catch 里 `instanceof AiError` 重抛）。
+- 存储/草稿类错误也补码：STORAGE_UPLOAD_FAILED / DRAFT_INSERT_FAILED / DRAFT_NOT_FOUND / DRAFT_ALREADY_APPROVED /
+  DRAFT_NO_PHOTO / PHOTO_FETCH_FAILED / DRAFT_UPDATE_FAILED（共 9 处）。
+**前端**：toast 会消失 → camera-identify 加 `errorMsg` 常驻红色面板（复核态）；drafts.$id 加 `enrichError` 面板；
+两处 toast duration 12s。
+**验证**：tsc=0；用 Google 真实 429 payload 四种形态实测 parser（日额度→daily=true不重试；分钟→retry=28s；
+bad key→INVALID_ARGUMENT；非JSON→优雅降级）；preview 两路由 200、无 console 错误。
+**下一步**：部署。
+
+### 追加：Gemini 多 key 自动轮换池 (DONE code, tsc=0; **NOT deployed**)
+用户实测：重试后摘要卡成功 → 撞的是**每分钟限流 RPM**，不是日额度。病根是「生成完整草稿」一步会连打
+Gemini 多次：`callAiIdentify`(重稿) + `generateConservationCard` + `generateInvasiveCard`（后两者走
+`xiaopTextCall`→`geminiChat`，默认同一个 key），加上旧重试逻辑失败后再补请求 → RPM 爆掉。
+**关键事实**：Gemini 免费额度(RPM+RPD)按 **Google Cloud 项目**计，每个 key 属一个项目 → N 个不同账号/项目的
+key = N 套独立配额桶。所以 429 时应「换 key」而不是「干等」。
+- `splitGeminiKeys()` + `unfuseGeminiKeys()`：apiKey 字段支持逗号/换行/分号分隔的 key 池；
+  单 key 夹杂空格仍自愈；**单行 <input> 粘贴会吞掉换行把两个 key 粘死** → 用 `(?=AIza)` 前瞻切分复原，
+  且仅当每段都是 35–45 字符合法 key 才切（含 "AIza" 子串的单 key 不会被误切）。
+- `callGeminiWithRotation(keys, {model,body,timeoutMs,label})`：每 key —— 429日额度→退休该 key；
+  429分钟限流→**立刻换下一个 key**（另一项目 RPM 独立）；401/403/invalid→退休；5xx→换 key；
+  400/404 是配置错(每个 key 都一样)→立即抛。全池扫完且仍有可用 key → 按 Google RetryInfo 退避一次再扫一轮。
+- 接入 3 处：`callAiIdentify` 的 Gemini 分支（删掉原手写重试循环）、`identifyQuick`、`geminiChat`
+  （后者同时覆盖 小P蛙 对话 + 入侵卡/保护卡）。
+- `normalizeApiKey(provider, raw)`：gemini 保留 key 池(逗号 join)，其他 provider 维持去空格。
+  接入 loadAiConfig / loadXiaoPConfig / toOverride / saveAiConfigFn / saveXiaoPConfigFn；
+  `listProviderModelsFn` 取池中第一个 key 探测。zod apiKey max 1000→4000。
+- 前端：identify.tsx + xiaop-model-panel.tsx 保存时不再 `replace(/\s+/g,"")`（改 `.trim()`，服务端按 provider 归一化）；
+  Pl@ntNet key 仍去空格。AdminModelPanel gemini 下加提示「可填多个 key，429 自动轮换」；
+  `getAiConfigFn` 返回 keyCount + 逐个掩码「共 N 个 key」。
+- **验证**：tsc=0；node 实测 `splitGeminiKeys` 9 例全过（含 fused-paste 复原、含 AIza 子串不误切）；
+  `callGeminiWithRotation` 决策表 7 例全过（分钟限流0等待换key / 日额度退休 / 双日额度快速失败 /
+  单key按28s退避 / 400快速失败 / 401轮换）。preview 两路由 200、无 console 错误。
+- **待办**：`geminiChat` 的 `maxRetry` 参数已失效（轮换器内部管重试），签名保留未清理。
+
+### ✅ DEPLOYED 2026-07-11：Version `e2360b36-dd4c-4869-ac25-eedac1177842`
+本次上线包含：多 key 轮换池（callGeminiWithRotation，逗号/换行分隔多个 Gemini key，撞 RPM 自动换 key、
+日额度耗尽跳过该 key）、Gemini/OpenAI/Anthropic 报错「代码+原因+怎么办」、金叶详页生成器
+（createGoldDetailPageFn + premium-page.ts）。plantspedia.club / www / /identify 均 200。
+**部署踩坑记录**：这次 wrangler 走**本地代理** `127.0.0.1:7888`（HTTP_PROXY/HTTPS_PROXY 已设，egress 出台湾 HiNet），
+资源上传（99 文件 ~8.7MB）**头两次 fetch failed**，但 asset 上传是**增量**的——第 3 次「No updated asset files to
+upload」直接进到脚本上传（161s 慢但成功）。**结论：deploy 报 fetch failed 别慌，重跑 2-3 次即可，asset 不会重传。**
+**待办**：管理后台加第二个 Gemini key（逗号分隔）；金叶账号真机试生成一次。
+
+### ✅ 金叶「一键创建详细科普页」生成器 (DONE code, tsc=0, lint clean; ✅ 已部署)
+ccplants-v19 skill 的**服务端移植**。新文件 `src/lib/premium-page.ts`：
+- `ANTI_FABRICATION` + `WRITING_RULES` 从 SKILL.md 移植；`factsBlock()` 把服务端实查的名录数据
+  作为 ground truth 注入 prompt（禁止模型改写/自行加名录；未命中就要写"未被收录于…"）。
+- **三段式 LLM**（PREMIUM_SCHEMA_1/2/3 + premiumPrompt1/2/3）：单次巨型调用必然超输出上限被截断成坏 JSON，
+  故拆成 ①引言+形态总览+6特征卡+近似种 ②生境7chips+人文5卡+文学原文 ③生态+分布入侵+博物趣闻(驱动问题+5小节)。
+- `renderPremiumHtml()` 版面：masthead / hero+俗名条 / 6 章节 / 10 个 img-slot / 2 栏杂志式趣闻 / references / colophon。
+  响应式 @900px 全部塌成单列。`escKeepStrong()` 只放行 `<strong>`（XSS 已测）。
+- ⚠️ **刻意砍掉 v19 的 Section V「最新资讯」**：它要求每张卡带可点击 URL，而站内模型无法联网核实，
+  强行生成=逼它编造链接、违反反虚构协议。改为 `renderReferences()` 用**真实**链接
+  （GBIF taxonKey / POWO / iNat / Wikimedia / 名录 source_url）程序化渲染。
+- 文学卡：`has_record=false` 或 original_text 为空 → 不出 blockquote，改出"宁缺毋造"说明（防模型撒谎）。
+
+`identify-plant.functions.ts` 新增：
+- `serverGoldAvailable(userId)`：**服务端**重算金叶余额（绝不信客户端传的数），镜像 lib/leaves.ts 公式。
+- `gatherVerifiedFacts(draft)`：查 conservation_lists/taxa + GRIIS + gbifCheckInvasive + lookupChinaInvasive，
+  组装 VerifiedFacts + 真实 sources 链接。
+- `createGoldDetailPageFn`（requireSupabaseAuth）：验余额 → 载草稿(需有学名) → 取证 → fetchSpeciesPhotos(9)+rehostImages
+  → 三段 LLM(走 xiaopTextCall，支持小P蛙独立模型/用户 override) → renderPremiumHtml → 传 plant-html 桶 → 插 plants 行
+  (`source:'gold_oneclick'`) → **最后**扣叶：`.eq("gold_used", 原值)` 乐观并发，双标签页不会重复扣。
+  扣叶失败只 console.error 不抛（页已生成，不能让用户白丢）。
+  `UserModelInput` 是后声明的 const → inputValidator 里在**请求时**引用，避免 TS2448。
+
+`drafts.$id.tsx`：金叶按钮从占位 toast 换成真实调用 `createGoldDetailPageFn` → 成功后 invalidate leaves、
+跳 `/plants/$slug`；加 goldBusy/goldError（常驻错误面板）；生成中禁止点遮罩关闭弹窗。
+
+**验证**：tsc=0 + eslint clean；node 实测渲染器（6卡/7chips/5人文卡/5趣闻小节/2栏/引用链接/无横向溢出/
+XSS 转义/<strong> 保留/文学卡三态：无记录、has_record但空文本、真有原文）；浏览器实测桌面 1280 三栏 masthead +
+两栏 intro，移动 375 全塌单列无溢出；**修了一个真 bug**：img onerror 加 .broken 时占位 <span> 只存在于"无 URL"分支，
+导致死链变成静默空灰框 → 改为两分支都输出 <span>，CSS 控制显隐（已实测死链会显示"图片待补"）。
+
+**待办**：真机跑一次真实生成（需金叶账号 + Gemini 配额）；生成耗时可能数分钟，考虑后续改成后台任务 + 轮询。
+
+### 已答：ccplants-v19 skill 接入小P蛙（已实现，见上）
+skill 在 `~/.claude/skills/ccplants-v19/SKILL.md`（40KB，801行，无 references/scripts）。
+它是**给带工具的 agent 用的工作流**：要查 FoC/POWO/GBIF/IUCN/CNKI 做研究、用 curl 串行下载 Wikimedia 图
+（含 UA 伪装+4s 间隔限流规避）、生成分布图 SVG、写文件、跑 G1–G5 质量门。
+而站内 小P蛙 = `xiaopTextCall` 单次 LLM 调用，**无工具、无 shell、无文件系统**（跑在 CF Workers）。
+→ 不能"调用"这个 skill；但可以**移植**：把 SKILL.md 的结构/写作规则/反虚构协议做成 system prompt + HTML 模板，
+配合站内已有的服务端能力（fetchSpeciesPhotos+rehostImages 填图槽、GBIF/GRIIS/保护名录查询、conservation.ts），
+由 小P蛙 的模型产出 HTML。这正好可以充当金叶「一键创建详细科普页」的生成器（目前是占位）。
+
+## 🆕 2026-07-10 — 上线后 5 项真机反馈修复 (DONE, tsc=0; ✅ 已部署上线)
+**DEPLOYED 2026-07-10：Version `dc5f6914-aaf2-4101-be7a-b868d1ee7be7`**（脚本上传 21.22s 一次过）。
+线上校验：3 域名均 200；已 curl 线上 `assets/identify-*.js` chunk 确认含新字符串
+（"拍摄时会请求定位"/"开启定位"/"本站的定位权限已被拒绝"）→ 新代码确实生效，非缓存。
+⚠️ **用户必做**：Chrome 里本站定位此前被设为 denied，浏览器不会再弹框——须手动清：
+Chrome ⋯ → 设置 → 内容设置 → 位置信息 → 允许 plantspedia.club。清完后新的"手势时请求"逻辑才能弹框。
+⚠️ 手机若仍见旧 UI = PWA SW 缓存，需强刷。
+1. **【根因】Chrome iOS 不弹定位授权框**（camera-identify.tsx）：`requestGeo()` 原先只在 `ingestImage` 里调用，
+   而它由 file input 的 **change 事件**触发——原生相机刚关闭、页面刚回前台，**没有 user activation**。
+   Chrome iOS 此时静默拒绝且不弹框；Safari 宽容仍弹 → 完美解释"Safari 行、Chrome 不行"。
+   修复：把 `requestGeo()` 移到**快门/相册按钮的 click handler**（真实手势）里，相机打开前就请求；
+   `ingestImage` 不再重置 coords（否则丢掉手势时拿到的定位）；加 `coordsRef` 防 stale closure；
+   加 Permissions API 探测 `permState`，idle 态显示「开启定位」按钮（prompt）或「已被拒绝+手动开启指引」（denied）。
+   ⚠️ denied 后任何代码都无法强制重弹，只能引导设置——已在 UI 说明。
+2. **补拍按钮**（drafts.$id.tsx）：存疑横幅内加「按上面的提示去补拍」按钮 → Link 到 /identify；加 CameraIcon。
+3. **补拍提示改大白话**：AI_META_SCHEMA + AI_QUICK_SCHEMA 的 needs_more_photos_zh/en 描述 + 两处 systemPrompt
+   全部改为「面向不懂植物学的普通人，①②③ 编号，2–4 条一句话一个动作，严禁术语(脉序/被毛/托叶/花序…)，
+   如『把叶子翻过来拍背面（看清叶脉和有没有细毛）』」。横幅加 whitespace-pre-line 以显示编号换行。
+4. **【根因】配图高度雷同**（fetchSpeciesPhotos）：旧代码 `for (ph of obs.photos)` **从同一条观察记录里连取多张**
+   （同株同天同角度）。修复：每条观察/occurrence 只取 `photos[0]`；新增 `pickDiverse()` 按
+   (place, season月份, user) 三轴贪心去重（strict 3→2→1 三轮放宽）；候选池 per_page 30→60。
+   **实测验证**（Taraxacum officinale 真实 API）：旧法5张里有2张同属一条观察记录(同用户同月)；
+   新法5张 = 5个不同观察/用户/月份/地点。
+5. **存 Supabase 前压缩**（rehostImages + Wikimedia）：
+   · Wikimedia 原先用 `ii.url`=**全尺寸原图**（实测 1.85/6.45/9.40 MB！）→ 改用 `ii.thumburl`，iiurlwidth 640→1200。
+   · rehostImages：fetch 带 `cf:{image:{width:1280,quality:78,fit:scale-down,format:webp}}`（CF Image Resizing，
+     未启用则自动忽略=安全 no-op；dev/Node 也忽略）；MAX_STORE_BYTES 3MB、MAX_SOURCE_BYTES 20MB（超限跳过）。
+   · ⚠️ Workers 无 sharp/canvas，无法进程内重编码；压缩靠「源端要缩略图 + CF Resizing + 硬上限」三层。
+   · 用户原图本就在客户端 compressImage(1200,0.75) 压过再上传，无需改。
+**验证**：tsc=0；preview 确认 permState 探测 + denied 分支文案渲染、无 console 错误；iNat/Wikimedia 两个 API 实测。
+**下一步**：`npm run build && ./node_modules/.bin/wrangler deploy`（VPN 开），然后手机 Chrome 真机验证定位弹框。
+
+## 🆕 2026-07-09（下午）— 识别流程4项大改 (代码全 DONE; ✅ 已部署上线)
+**DEPLOYED 2026-07-10：Version `8d142583-79ad-477c-bf2b-716ea578a2b5`**（wrangler 4.99.0，
+本地二进制 `./node_modules/.bin/wrangler`；全局无 wrangler 命令）。脚本上传 69.88s 一次过（VPN 开着）。
+plantspedia.club / www / /identify 均 200。⚠️ 手机若仍见旧 UI = PWA SW 缓存，需强刷/清缓存。
+**待真机验证**：拍照→秒出摘要卡→「生成完整草稿」→配图不裂→金叶账号见详页按钮。
+用户提出4项需求：
+1. **地点不臆造 + 授权可重试**（✅ DONE, tsc=0, 已preview验证）
+   - `identify-plant.functions.ts` systemPrompt：habitat_zh 在 hintPlace 为空时改为「严禁臆造，写拍摄地点未知」；
+     加硬性规则#4 全局禁止任何字段编造/反推拍摄地名。（根因：正文地点是 LLM 现编，卡片才是真实 GPS 反查）
+   - `camera-identify.tsx`：抽出 `requestGeo()`，加 `geoStatus` 状态；复核界面新增位置横幅
+     （loading/已获取+重新获取/未获取到amber+重新获取位置按钮+iOS/Chrome 设置引导）。
+     ⚠️ 浏览器不允许强制重弹原生授权框；denied 后只能引导去设置——已在文案说明。
+2. **AI 配图转存 Supabase**（✅ DONE, tsc=0）— 新增 `rehostImages(urls, prefix)`（10s超时+类型/8MB守卫，
+   逐张非致命，失败丢弃）；submit 流程 `fetchSpeciesPhotos`→`rehostImages("drafts/species/section")`，
+   全失败才回退外链。修复国内热链裂图。⚠️未真机（需真实识别跑）。
+3. **不轻易定种**（✅ 轻量版 DONE, tsc=0；多图合判分期留后续）— 决策「两者都要,分期」。
+   - AI_META_SCHEMA 加 `identification_confidence`(high/medium/low) + `needs_more_photos_zh/en`；
+     PlantDraftFields 加同名可选非渲染字段（随 ai_payload 存库）；systemPrompt 加硬性「宁可 low 也不武断定种，
+     low 时必须列补拍器官/角度清单，summary 以疑似开头」。
+   - `drafts.$id.tsx` 标题下加 amber 存疑横幅（读 ai_payload.identification_confidence + needs_more_photos_zh）。
+   - ⏳后续期：多图连拍/上传合并送 AI 联合判断（新流程）。
+4. **两段式生成**（🔨 进行中）— 决策：分享面板存相册 / 金叶详页先门控+确认+扣叶（生成器后补）。
+   - **4a 后端 ✅ DONE, tsc=0**（identify-plant.functions.ts）：
+     · 抽出 `buildDraftContent({dataUrl,photoUrl,place,lat,lng})` = 原 submit 的重活（识别→配图rehost→
+       保护/入侵卡→renderDraftHtml），无 DB 写；submitPlantDraft 改为 upload+buildDraftContent+INSERT（行为不变）。
+     · 新增 `identifyQuick(dataUrl,place)` = 仅 Gemini 的轻量识别（species+短摘要+field_notes+置信度+补拍，
+       AI_QUICK_SCHEMA，45s超时，无key返回null）。
+     · 新增 `quickIdentifyDraft`(phase1)：auth+geocode+upload+identifyQuick→INSERT 轻草稿
+       (ai_payload._enriched=false，html=极简摘要卡)；无 Gemini 时回退 buildDraftContent(enriched=true)。
+       返回 {draftId, enriched, identification_confidence, needs_more_photos_zh, title}。
+     · 新增 `enrichDraft`(phase2)：EnrichInput{draft_id}；load草稿→重新 fetch photo_url→dataUrl→
+       buildDraftContent→UPDATE 同行 + ai_payload._enriched=true；已 approved/已 enriched 拒绝。
+     · 抽 `resolveCreator()` 共享 auth。**camera 仍用旧 submitPlantDraft，应用不受影响。**
+   - **4b 前端相机 ✅ DONE, tsc=0, preview验证**（camera-identify.tsx）：submit 改用 `quickIdentifyDraft`；
+     成功 toast「已生成简介摘要卡」→跳 /drafts/$id；加 `originalFileRef` + `saveToAlbum()`
+     (navigator.canShare/share files → iOS 存储图像；不支持则 <a download> 回退)；复核界面位置横幅下方
+     加「保存原图到相册」按钮。已 preview 确认横幅+按钮渲染。
+   - **4c 草稿页 ✅ DONE, tsc=0, 路由挂载验证**（drafts.$id.tsx）：加 leaves 查询(computeLeaves)→goldAvailable；
+     `notEnriched = ai_payload._enriched===false`（旧草稿无此字段→视为已 enriched，行为不变）；
+     notEnriched 时摘要卡下方显示「让 AI 生成进一步介绍草稿」按钮→`onEnrich` 调 enrichDraft + invalidate；
+     enriched && goldAvailable>0 时页尾显示 amber「用1金叶创建详细科普页」+用户指定提示文案 + 二次确认弹窗。
+     ⚠️**确认后暂不扣金叶/不建页**（生成器为后续一期，toast 告知「即将上线」）——避免为占位烧掉用户挣的金叶。
+   - **待真机**：手机 Chrome /identify 拍照→快速出摘要卡→草稿页「生成完整草稿」→配图非裂图；金叶用户见按钮。
+   - **⏳后续期**：① 金叶详页 premium HTML 生成器 + 真实扣 gold_used；② #3 多图连拍合判。
+
+## 🆕 2026-07-09 — Chrome 定位兜底 + 入侵卡移动端显示 (DONE code, tsc EXIT=0; NOT deployed, 未真机)
+用户：手机 Safari 拍照能显示具体地点、Chrome 不能；且入侵警示卡在手机端显示不全。
+- **定位（camera-identify.tsx）**：`getCurrentPosition` **无法绕过**浏览器授权弹窗（已向用户说明）。Chrome iOS 失败多为
+  未给站点/Chrome app 定位权限。用户选「实时优先 + EXIF 兜底」。实现：ingestImage 里并行用 `exifr.gps(file)` 读照片自带
+  GPS 存 `exifCoordsRef`（无需授权），live 成功则覆盖；denied 分支若有 EXIF 则 setCoords+toast「✓ 已使用照片自带位置」；
+  onSubmit `finalCoords = coords ?? exifCoordsRef.current`。retake 里重置 ref。exifr 已在 deps。
+  ⚠️ EXIF 反映拍摄时的地点（相册旧照可能是旧地点）——用户接受的权衡。
+- **入侵卡（plant-html-template.ts）**：根因 `.ic-head` flex 不换行 + 卡片 `overflow:hidden` → 窄屏「入侵等级」徽章被裁。
+  加 `@media(max-width:640px)`：ic-head flex-wrap:wrap、badge flex-basis:100% order:3 换独立整行、h2 缩到 19px。
+  **存量草稿/条目**：同款覆盖注入 iframe——plants.$slug.tsx css 串 + draft-enhance.ts VIEWER_STYLE 移动端块。
+- **验证**：tsc EXIT=0。**USER VERIFY**：手机 Chrome /identify 拍照→草稿出具体地点（或用相册带 GPS 的照片）；
+  拍入侵种→草稿/详情页入侵卡头部徽章换行不裁切。然后 `npm run build && wrangler deploy`(VPN)。
+
+## 🆕 2026-07-05 — 大改造方案敲定 + Phase 1 溯源表头 (DONE code, tsc EXIT=0, 已真机验证; NOT deployed)
+用户规划了一个 6 模块大升级（见 memory `distribution-map-entry-dedup-spec`）。分阶段小步走，**先搭数据地基**。
+**已锁定的 4 个决策：** ①地图点按优先级取单色 入侵红>保护棕>采纳绿>未采纳蓝，聚合点画比例饼环；
+②skill 查重相似度分档（学名前两词相同才触发）：**≥60%** → 自动合并/去已有页编辑；**<60%** → 平行存在/自动合并/去编辑；
+③相似度=服务端"可见正文文本"(剥 HTML/图/拍摄记录) n-gram 比对；④先做数据地基。
+**两类条目**：AI识别条目(`source='ai_identify'`，采纳草稿生成) + AI skill条目(`html_upload`+`gold_oneclick`小P蛙调 ccplants-v19)。
+去掉站内富文本编辑 → 不再有新 `manual`（用户确认库里无旧 manual 条目=选项c）。**博客/项目是独立内容域，不受影响。**
+
+**⚠️ 已修正的认知错误：** ①`/explore` **已有** Leaflet 地图(markercluster+观测点+入侵黄三角)，地图模块是**扩展**不是新建。
+②采纳草稿生成的条目 `source` 当前是 **null**（不是 ai_identify）、`content_type='html'` → 无法靠字段区分 AI识别vs skill上传，
+**唯一可靠信号=是否存在来源草稿**(`plant_drafts.published_plant_id`)。
+
+**Phase 1 已完成第一片（零 schema 改动，纯加法）— 溯源表头：**
+- `src/lib/edits.ts` 加 `fetchOriginProvenance(plantId)`：取指向该条目最早的 plant_drafts，解析识别者显示名。
+- `src/routes/plants.$slug.tsx`：`attributionFooter` 在"创建者"下加"最早识别：{用户}·{地点}·{时间} ｜ 采纳：{编辑}·{时间}"。
+  采纳人/时间取自现有 `plant_edits` 的 `kind='create'` 行(editor_name 已解析)。对**所有**条目查来源草稿（skill 上传无草稿→不显示）。
+- **已真机验证**：/plants/medicago-sativa-l（紫花苜蓿）正确显示"最早识别：吉木·内蒙古…·2026/06/24 ｜ 采纳：吉木·2026/06/24"，
+  无 console 报错，tsc EXIT=0。（capture_place 有"伊金霍洛旗"重复=原始数据粒度问题，非本次 bug。）
+**Phase 1 剩余两片已完成（tsc EXIT=0，真机验证）：**
+- **skill 条目页尾"上传：{编辑}·{时间}"**：`attributionFooter` 改成三元——有来源草稿→"最早识别…"；无→"上传…"。
+  ⚠️ 当前库里 **11 条全部有来源草稿**（无纯 skill 条目），故"上传"行暂无真实数据可视验证，仅 tsc+构造验证。
+- **「注 N」点击跳页尾**：注=正文里现有的 `.lov-edit-mark` 上标（编辑改块时 html-doc-editor 自动加，`data-edit-id`）。
+  **关键坑**：详情页 iframe `sandbox` **无 allow-scripts**（故意，中和上传 HTML 的脚本防 XSS）→ 注入脚本 postMessage 跑不了。
+  **正解**：srcDoc+allow-same-origin=同源，父页面在 iframe `onLoad` 里直接给 `contentDocument` 挂委托 click 监听 → setFocusedNoteId
+  → `EditLogSection` 收到 `focusEditId` 后自动展开+滚动到 `#note-{id}`+红色高亮 2.4s。（`edit-log-section.tsx` 加 focusEditId prop+行 id+flash。）
+  真机验证：合成 `.lov-edit-mark` 注入 iframe 点击 → 修改记录展开、正确行高亮。**验证时被 SW+Vite 缓存坑过**（served 旧模块）——
+  排查靠对比磁盘 grep vs served；清 `node_modules/.vite`+重启+注销 SW 后通过。见 [[pwa-service-worker-caching]]。
+## 🆕 2026-07-05 (续) — P2 采纳去重合并流程 (DONE code, tsc EXIT=0; 核心逻辑真机验证; 写路径待用户授权测)
+"采纳识别"改造针对的是 **drafts.$id.tsx 的「审核通过并收录本站」按钮**（onApprove→`approvePlantDraft`），
+不是那个铜叶奖励开关。**收录=创建 AI 识别条目**。
+- **`src/lib/plants.ts` 加 `speciesKey()`**：去 markdown 星号/下划线 + 取前两词 + 小写。**真机验证**：两个 Anthurium
+  （`*Anthurium crystallinum* Linden ex André` vs `Anthurium crystallinum Linden & André`）→ 都 `anthurium crystallinum` 匹配；
+  两个 Convolvulus 不同种 → 不匹配。学名脏数据（`*...*`、命名人后缀）能正确归一。
+- **`approvePlantDraft` 三分支**（输入加可选 `mergeTargetId`）：
+  ① `mergeTargetId` 传了 → **合并**：先建 `kind='merge'` + `marker_n=N` 的 plant_edits 行拿 id → 拉目标 HTML 追加
+     「补充观测」卡片（含 `.lov-edit-mark[data-edit-id]` 注N，用 P1 的点击跳转）→ 传新 HTML、更新 html_url + co-author →
+     草稿标 approved/published_plant_id=目标。② 无 mergeTargetId 但同物种已有条目 → 返回 `{conflict,target,whatsNew}`（**不写库**）。
+     ③ 无同物种 → 正常新建，**显式写 `source:'ai_identify'`**（修了 P1 发现的 source=null 问题）。
+  匹配用 `speciesKey`，服务端取全表(仅 ~11 行)在 JS 里比；表变大再加归一化列优化。
+- **`src/routes/drafts.$id.tsx`**：onApprove 收到 conflict → 弹窗（该物种已有条目 X + whatsNew + 「查看已有条目/取消/确认合并」）；
+  「确认合并」→ 再调 approve 带 mergeTargetId。
+- **已真机验证（用户自测 + 我修正）**：两个 Anthurium 草稿走通了 create→conflict→merge。条目
+  `anthurium-crystallinum-linden-andre`（晶状花烛，id `764a439f…`）source=ai_identify ✓、合并卡片「注」点击跳页尾高亮 ✓。
+- **修正的两个体验问题**：① 「注」去掉编号（原 `注N` 会出现"注2 没注1"的困惑，且用户原始 spec 只要"注"符号）；
+  ② 合并卡片图片限宽（`max-width/height:420px`、卡片 `max-width:680px` 居中），原来大图撑满整页。均已在代码修好（未来合并自动生效）。
+  那条已存在的测试条目是老代码生成的旧 HTML → 我用 `uploadAssetFn`(service-role)+`savePlantFn` 就地重写了它的存储 HTML 修正。
+  ⚠️ 教训：合并卡片追加在模板内容列**之外**（body 级），所以要自己限宽，否则被撑满。
+**P2 真机验证发现并修复的 3 个问题（2026-07-05）：**
+- **合并卡片图撑满整页**：卡片是 `<body>` 直接子元素、在模板内容列之外，`max-width:100%` 就是整个 iframe 宽。
+  修：① 合并 fn 里卡片限宽 `max-width:680px`、figure 420px、img `max-height`；② 更关键——**详情页注入的 iframe CSS**
+  加 `.merged-observation{max-width:680px;margin:auto}` + `.merged-observation img{max-height:360px!important;width:auto!important}`，
+  这样**存量大图也在渲染时被压住**（改存储 HTML 会被 plant-html 桶 RLS 挡，只有 service-role 能写）。已验证渲染 270×360。
+- **双击「确认合并」→ 注1 卡片被冲掉**：读-改-写竞态（两次合并都读到没注1的旧 HTML，后者覆盖前者）。
+  修：合并前**原子认领**草稿（条件更新 `.neq('status','approved').select()`，认领不到直接返回）+ 卡片带 `data-draft-id` 幂等兜底。
+- **经纬度显示超长小数**：`Number(lat).toFixed(5)`（仅对未来合并生效；存量卡片 HTML 里的长小数改不动=无关紧要）。
+- **测试数据就地修正**：用预览里的 admin 会话（arainjazz，admin，是条目作者）删掉了那条多余的 marker_n=1 空记录；
+  图片靠上面的注入 CSS 已修好。注：浏览器 anon+用户 token **写不了 plant-html 存储桶**（RLS），所以存量卡片的长坐标没改。
+- **⚠️ 反复被 SW+Vite 缓存坑**：验证跳转时多次跑到旧模块，必须「stop 预览 + rm -rf node_modules/.vite + 重启 + 注销 SW」才稳。
+  用户本地测也要硬刷/清 SW。见 [[pwa-service-worker-caching]]。
+## 🆕 2026-07-05 (续) — P3 skill 条目改造 + 查重 (P3a/P3b DONE+真机验证; P3d-1 逻辑验证但抓取 flaky; 待架构定夺)
+- **P3a 按钮改名**（admin.index.tsx）：`+批量添加条目→+批量添加 skill 条目`、`+新建条目→+添加 skill 条目`、空态同改。**真机 ✓**。
+- **P3b 去掉站内编辑**（plant-editor.tsx）：默认 content_type='html'、移除「正文类型」单选与富文本分支，legend 改「上传 HTML 正文」。
+  旧 rich 条目仍能渲染（库里其实没有 rich 条目）。**真机 ✓**（0 radio、无"站内编辑"）。
+- **P3d-1 查重服务端 fn** `checkSkillDuplicateFn`（identify-plant.functions.ts）：speciesKey 前两词匹配候选 → 拉各自正文
+  可见文本（`visibleBodyText` 去 script/style/标签/实体/merged-observation）做字符 3-gram Jaccard → band ≥0.6 high / <0.6 low。
+  **逻辑真机验证**：自身对比=1.0/high ✓、排除自身=null ✓、无同属=null ✓、Robinia-vs-Equisetum=0.229/low ✓。
+  **⚠️ 但服务端 fetch 存储 HTML 在本地(GFW 后)flaky**：3 次跑出 [0.229, 0, null]——抓取偶发失败/空。
+- **架构决策：用户选了 (B) body_text 列**。用户已跑 `ALTER TABLE plants ADD COLUMN IF NOT EXISTS body_text text;`。
+  types.ts 手加 body_text（Row/Insert/Update）。DONE + tsc。
+- **P3d body_text 架构落地（DONE + 真机验证）**：
+  - 相似度助手 `visibleBodyText/textShingles/jaccardSimilarity/bodyTextSimilarity` 移到 `plants.ts`（客户端也用）。
+  - `checkSkillDuplicateFn` 重写：读候选 DB `body_text` + 客户端传入 `newBodyText`，**零 HTTP 抓取**。返回 match（含 html_url/co_author_names 供合并）+ similarity + band。
+  - 写路径 populate：`savePlantFn`（payload.body_text 仅在提供时写，纯编辑不清空）+ `approvePlantDraft`（新建时从 draft.html_content 算）。
+  - **backfill**：浏览器抓 13 条 HTML→visibleBodyText→写库，全成功（7k–12k 字符，浏览器抓 HTML 无 CORS，稳）。
+  - **验证稳定**：自身=1.0/high×3、跨属 Robinia-vs-Equisetum=0.229/low×3（**不再 flaky**）、排除自身=null。
+- **P3d-2 UI（DONE + tsc + 页面加载 OK）**：plant-editor 查重弹窗升级为分档单命中：high(≥60%)→自动合并/去已有页编辑；
+  low(<60%)→和已有版本平行存在/自动合并/去已有页编辑。上传 HTML 后 finalizeHtmlUpload 捕获 bodyText→runSkillDupCheck。
+  performBranch=平行、performMerge=自动合并、performGoEdit=navigate 到 /admin/edit/$id。**站内查重 checkDuplicateScientific 已删**。
+  ⚠️ 弹窗本身未做真实文件上传的端到端触发（需用户上传同种 HTML 才弹）；依赖项全绿。
+- **P3c**：skill 页尾「上传 {编辑}·{时间}」P1 已做；改动「注」靠现有块编辑+P1 跳转框架。
+## 🆕 2026-07-05 (续) — 地图模块 4 色分布点 + 比例饼环 (DONE + AMap 实时验证)
+⚠️ 更正：`/explore` 用的是 **AMap（高德）** 不是 Leaflet。自定义距离聚合（CLUSTER_PX=15），非 AMap 原生。
+- **4 类分类**（explore.tsx `categoryOf`）：按优先级取单色 入侵红`#dc2626` > 保护棕`#b45309` > 采纳绿`#2e9e5b` > 未采纳蓝`#2563eb`。
+  采纳 = `status==='approved'`；入侵/保护由 conservation matcher（学名）判定，与采纳无关。
+- **单点**=4 色实心圈（入侵带"!"、保护带"🛡"字形）；旧的三角/盾/绿点常量已删。
+- **聚合**=`clusterPieHtml`：按成员 4 类比例的 `conic-gradient` 饼环 + 中心白底计数。
+- **图例**（bottom-right）+ **fan-out 卡片右上角类型角标**（CAT_COLOR/CAT_LABEL）+ 单点 popup 加"已采纳/待采纳"徽章。
+- **真机验证（AMap 这次加载成功）**：94 观测 = 73 未采纳/15 采纳/4 入侵/2 保护；DOM 实测 2 个饼环
+  conic-gradient 比例精确（88点大聚合 红16.4°/棕4.1°/绿49°/蓝290°；4点小聚合 棕90°/绿180°/蓝90°）+ 2 单点绿/蓝圈。tsc EXIT=0。
+  注：AMap key 偶发不在 localhost 加载（域名白名单），第一次失败第二次成功——纯逻辑已另用真实数据验证过。
+
+**六模块进度：** ①两类条目 ✅ ②地图 ✅ ③采纳去重合并 ✅ ④skill 查重 ✅ ⑤省 token 草稿 ✅ ⑥注/页尾框架 ✅
+**剩：隐私打磨**（未采纳点 GPS 脱敏）。
+
+## 🆕 2026-07-06 — 模块⑤省 token 草稿 + 地理定位/地图UI修复 (DONE code, tsc EXIT=0, DEPLOYED Version `ca3570fb`)
+**模块⑤省 token 草稿：** 当廉价识别（Pl@ntNet/quickIdentify）拿到学名后，查询同种已有草稿的 ai_payload（通用正文），
+若命中则只生成 field_notes_zh/en（拍摄记录，本张照片特有），合并后返回完整 meta。省下 19 个通用字段的生成 token。
+- **`findExistingSpeciesDraft(speciesName)`**（identify-plant.functions.ts 新增）：用 `speciesKey()` 归一化学名
+  （genus+species 小写），查最近 50 条有 ai_payload 的草稿，匹配同种返回其 ai_payload。全程 try/catch，失败返回 null。
+- **`generateFieldNotesOnly(photoDataUrl, hintPlace, speciesName, existingTitle)`**（新增）：小型 Gemini 调用
+  （仅生成 120–220 字中文 + 45–85 词英文拍摄记录），返回 `{field_notes_zh, field_notes_en, usage}` 或 null。
+- **`callAiIdentify` 新增 token-saving 分支**（line ~430）：在 Stage 0/1（Pl@ntNet/quickIdentify）后，若拿到
+  `earlySpeciesName` → 查旧草稿 → 若命中且 field_notes 生成成功 → 合并返回，model 标记为 `reuse+field_notes`，
+  provider 标记 `${stageModel}+reuse`。任何失败都回退到现有完整生成（零破坏性）。
+
+**Bug 修复 × 7：**
+1. **GRIIS 不再出现在保护与名录收录卡片中**（conservation.ts `conservationBadges`）：GRIIS（全球入侵）是单独的红色警示卡片，
+   不应与国家重点保护/CITES/GTS 混在绿色「保护与名录收录」卡片里。现在 `conservationBadges` 只返回 protected/cites/gts，
+   GRIIS 被明确排除（注释说明）。
+2. **改用浏览器实时地理定位**（camera-identify.tsx `ingestImage`）：不再读取照片 EXIF GPS（照片可能几周前拍的、地点已变），
+   改为拍照/选图时**立即调用 `navigator.geolocation.getCurrentPosition()`** 获取用户**当前**位置（需用户授权）。配置
+   `enableHighAccuracy: true` 提高精度，10s 超时。新增 `geoRequested` 状态跟踪定位请求，`onSubmit` 时等待最多 3 秒让
+   定位完成（避免异步竞态）。拒绝/失败时提示「未授权位置权限，识别将继续（无位置信息）」→ coords=null 非致命。
+3. **annotation 下拉显示「拍摄记录」项**（plant-html-template.ts）：原模板中拍摄记录区域只有 `<p class="capture-meta">`
+   （是 p 标签不是标题），导致 `querySelectorAll("h1, h2, h3")` 无法提取。**修复**：在 hero section 右栏开头添加
+   `<h2>拍摄记录 · Field Capture</h2>` 真实标题（18px，letter-spacing 0.1em），删除原 p.capture-meta。现在草稿页和
+   详情页的 annotation 下拉都会显示「拍摄记录」选项，小P蛙可以针对拍摄记录单独提问/编辑。
+4. **地理定位异步竞态**（camera-identify.tsx）：之前 `getCurrentPosition` 是异步非阻塞，用户快速点提交时定位可能还没完成
+   → coords 为 null。**修复**：① `ingestImage` 调用定位时设 `geoRequested=true`，完成/失败时设为 false；② `onSubmit`
+   检查 `geoRequested`，若为 true 则等待最多 3s（300ms 轮询）；③ toast 明确提示「等待位置信息...」→「✓ 已获取当前位置」。
+5. **地理定位调试日志**（identify-plant.functions.ts `submitPlantDraft`）：添加 console.log 输出收到的 lat/lng 和
+   reverse-geocode 结果，帮助诊断手机端"未知地点"问题。若 coords 为 null 输出 warn。
+6. **地图图例位置调整**（explore.tsx）：从右下角移至侧边栏"只显示重点保护植物"按钮下方，避免遮挡地图底部区域。背景改为
+   `bg-paper` + 边框圆角，与侧边栏风格统一。
+7. **地图侧边栏改为最近地区+最新物种**（explore.tsx）：① "按地区浏览"改为"最近上传识别地区（6个）"，`areaGroups` 按每个
+   地区最新识别时间倒序排列（不再按物种数量），只显示前 6 个；② 物种列表标题改为"最新识别物种（6个）"，从 `slice(0, 12)`
+   改为 `slice(0, 6)`，只显示最新 6 个识别记录；③ `GeoSighting` 类型新增 `created_at: string` 字段，查询时包含该列。
+
+**验证**：tsc EXIT=0、`npm run build` 通过、**已部署 LIVE** Version `ca3570fb-52a3-40ed-8152-6ee86c23ad93`。
+**真机测试**（用户完成）：
+① 手机端 /identify 拍照 → 允许位置授权 → toast 显示「✓ 已获取当前位置」→ 草稿 capture_place 显示当前地址（不再是"未知地点"）
+   → 后台日志显示 `[SubmitPlantDraft] Received coords: lat=...` 和 `Reverse-geocoded to: ...`；
+② /explore 地图页 → 图例在侧边栏"只显示重点保护植物"按钮下方（不在右下角）；
+③ 侧边栏显示"最近上传识别地区（6个）"（按时间排序）和"最新识别物种（6个）"（不再是12个）；
+④ 拍两张同种植物（如银杏）→ 第二张 console 出现 `[TokenSave] Found existing draft` + token 数显著降低；
+⑤ 拍入侵物种 → 草稿红色入侵卡 + 绿色保护卡（若命中）**不含** GRIIS 徽章；
+⑥ 草稿页/详情页小P蛙 annotation 下拉显示「拍摄记录 · Field Capture」选项。
 
 ## 🆕 2026-07-04 — 项目驱动调研成果 + BlockNote 编辑器 + 地图入侵标记 (DONE code, tsc EXIT=0, build OK; NOT deployed, 未真机)
 安全善后完成后继续做功能。用户 6 项需求：

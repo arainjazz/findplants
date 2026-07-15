@@ -198,6 +198,8 @@ export type ConservationBadge = { kind: string; label: string };
  * status labels), reusing the same option label sets the filter dropdowns show.
  * Shared by the draft HTML template (增量③) and any other surface that wants to
  * render a plant's registry status. Empty array when the plant matched nothing.
+ * NOTE: GRIIS (全球入侵) is EXCLUDED — it has its own standalone card, not part of
+ * the green "保护与名录收录" card. Only protected/CITES/GTS appear here.
  */
 export function conservationBadges(
   hit: ConservationHit,
@@ -217,9 +219,6 @@ export function conservationBadges(
     const o = GTS_CATEGORIES.find((x) => x.value === hit.gts);
     badges.push({ kind: "gts", label: `GTS 全球树木红色名录 · ${o?.label ?? hit.gts}` });
   }
-  if (hit.griis) {
-    const o = GRIIS_DEGREES.find((x) => x.value === hit.griis);
-    badges.push({ kind: "griis", label: `GRIIS 全球入侵等级 · ${o?.label ?? hit.griis}` });
-  }
+  // GRIIS intentionally omitted — it renders in a separate invasive-species warning card
   return badges;
 }

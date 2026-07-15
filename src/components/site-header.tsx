@@ -200,7 +200,7 @@ export function SiteHeader() {
           <Link to="/explore" className="hover:text-vermilion transition-colors" activeProps={{ className: "font-semibold" }}>身边物种地图</Link>
           <a href="/plant-image-search.html" className="hover:text-vermilion transition-colors">植物搜图</a>
           <Link to="/blog" className="hover:text-vermilion transition-colors" activeProps={{ className: "font-semibold" }}>编辑博客</Link>
-          <Link to="/projects" className="hover:text-vermilion transition-colors" activeProps={{ className: "font-semibold" }}>项目驱动调研成果</Link>
+          <Link to="/projects" className="hover:text-vermilion transition-colors" activeProps={{ className: "font-semibold" }}>项目预告与成果</Link>
           <Link to="/edits" className="hover:text-vermilion transition-colors" activeProps={{ className: "font-semibold" }}>修改记录</Link>
           {user && isAdmin && (
             <Link to="/admin/applications" className="relative hover:text-vermilion transition-colors" title="编辑申请审核">
@@ -273,7 +273,7 @@ export function SiteHeader() {
           <Link to="/explore" onClick={() => setMenuOpen(false)} className="hover:text-vermilion">身边物种地图</Link>
           <a href="/plant-image-search.html" onClick={() => setMenuOpen(false)} className="hover:text-vermilion">植物搜图</a>
           <Link to="/blog" onClick={() => setMenuOpen(false)} className="hover:text-vermilion">编辑博客</Link>
-          <Link to="/projects" onClick={() => setMenuOpen(false)} className="hover:text-vermilion">项目驱动调研成果</Link>
+          <Link to="/projects" onClick={() => setMenuOpen(false)} className="hover:text-vermilion">项目预告与成果</Link>
           <Link to="/edits" onClick={() => setMenuOpen(false)} className="hover:text-vermilion">修改记录</Link>
           {user && isAdmin && (
             <Link to="/admin/applications" onClick={() => setMenuOpen(false)} className="hover:text-vermilion">
@@ -313,8 +313,8 @@ export function SiteHeader() {
 
 export function SiteFooter() {
   return (
-    <footer className="border-t border-ink/40 bg-transparent px-6 py-6 text-center mt-8 md:mt-10">
-      <div className="mx-auto max-w-6xl text-center">
+    <footer className="border-t border-ink/40 bg-transparent mt-8 md:mt-10">
+      <div className="mx-auto max-w-[min(100vw-2rem,1800px)] px-6 py-6 text-center">
         <p className="text-xs text-ink-faint">
           开放的植物志社区 · 内容 copilot with AI，需要编辑进行校对和修改（尤其是配图的替换和配图缺失问题），想成为网站运维成员请联系{" "}
           <a href="mailto:arainjazz@163.com" className="hover:text-vermilion underline">

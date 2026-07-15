@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { compressImage } from "@/lib/image-compress";
+import { compressImage, extForMime } from "@/lib/image-compress";
 import { useNavigate } from "@tanstack/react-router";
 import { toast } from "sonner";
 import { useAuth } from "@/hooks/use-auth";
@@ -39,11 +39,11 @@ export function BlogEditor({ initial }: { initial?: BlogPost }) {
         console.error("Image compression failed, using original:", err);
       }
 
-      const ext = file.name.split(".").pop() || "jpg";
+      const ext = extForMime(fileToUpload.type, file.name.split(".").pop() || "jpg");
       const path = `${user.id}/blog-cover/${Date.now()}.${ext}`;
       const { error } = await supabase.storage
         .from("plant-images")
-        .upload(path, fileToUpload, { upsert: false, contentType: file.type });
+        .upload(path, fileToUpload, { upsert: false, contentType: fileToUpload.type });
       if (error) throw error;
       const url = supabase.storage.from("plant-images").getPublicUrl(path).data
         .publicUrl;
@@ -75,6 +75,28 @@ export function BlogEditor({ initial }: { initial?: BlogPost }) {
     }
   };
 
+  // Record an edit to an existing post (content/title/cover changed) so it shows
+  // in 修改记录. Carries before/after HTML for the diff viewer + image thumbnails.
+  const logBlogEdit = async (postId: string, t: string, beforeHtml: string, afterHtml: string) => {
+    if (!user) return;
+    try {
+      await supabase.from("plant_edits").insert({
+        plant_id: null,
+        editor_id: user.id,
+        editor_name: (user.user_metadata?.full_name as string) || user.email || "编辑",
+        kind: "blog_edit",
+        marker_n: 0,
+        block_path: postId,
+        source: "blog",
+        summary: `编辑博文：${t}`,
+        before_html: beforeHtml,
+        after_html: afterHtml,
+      });
+    } catch {
+      /* logging is best-effort */
+    }
+  };
+
   const save = async (publish: boolean) => {
     if (!user) return toast.error("请先登录");
     if (!title.trim()) return toast.error("请输入标题");
@@ -83,6 +105,11 @@ export function BlogEditor({ initial }: { initial?: BlogPost }) {
       const authorName =
         (user.user_metadata?.full_name as string) || user.email || "作者";
       if (initial) {
+        const changed =
+          html !== (initial.content_html ?? "") ||
+          title.trim() !== (initial.title ?? "") ||
+          (subtitle.trim() || null) !== (initial.subtitle ?? null) ||
+          (coverUrl.trim() || null) !== (initial.cover_url ?? null);
         const next = await updatePost(initial.id, {
           title: title.trim(),
           subtitle: subtitle.trim() || null,
@@ -92,6 +119,7 @@ export function BlogEditor({ initial }: { initial?: BlogPost }) {
         });
         toast.success(publish ? "已发布" : "已保存");
         if (publish && !initial.published) await logBlogPublish(next.id, next.title);
+        else if (changed) await logBlogEdit(next.id, next.title, initial.content_html ?? "", html);
         if (publish) navigate({ to: "/blog/$slug", params: { slug: next.slug } });
       } else {
         const post = await createPost({
@@ -188,11 +216,11 @@ export function BlogEditor({ initial }: { initial?: BlogPost }) {
           } catch {
             /* use original on compress failure */
           }
-          const ext = file.name.split(".").pop() || "jpg";
+          const ext = extForMime(f.type, file.name.split(".").pop() || "jpg");
           const path = `${user!.id}/blog/${Date.now()}-${Math.random().toString(36).slice(2, 6)}.${ext}`;
           const { error } = await supabase.storage
             .from("plant-images")
-            .upload(path, f, { upsert: false, contentType: file.type });
+            .upload(path, f, { upsert: false, contentType: f.type });
           if (error) throw error;
           return supabase.storage.from("plant-images").getPublicUrl(path).data.publicUrl;
         }}

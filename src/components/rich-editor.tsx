@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { compressImage } from "@/lib/image-compress";
+import { compressImage, extForMime } from "@/lib/image-compress";
 import { createPortal } from "react-dom";
 import { useEditor, EditorContent, type Editor } from "@tiptap/react";
 import type { EditorView } from "@tiptap/pm/view";
@@ -151,12 +151,12 @@ export function RichEditor({ value, onChange }: Props) {
         console.error("Image compression failed, using original:", err);
       }
 
-      const ext = file.name.split(".").pop() || "jpg";
+      const ext = extForMime(fileToUpload.type, file.name.split(".").pop() || "jpg");
       const path = `${user.id}/inline/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
       const { error } = await supabase.storage.from("plant-images").upload(path, fileToUpload, {
         cacheControl: "3600",
         upsert: false,
-        contentType: file.type,
+        contentType: fileToUpload.type,
       });
       if (error) throw error;
       return supabase.storage.from("plant-images").getPublicUrl(path).data.publicUrl;

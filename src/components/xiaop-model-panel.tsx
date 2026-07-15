@@ -9,6 +9,8 @@ import {
 } from "@/lib/identify-plant.functions";
 import { XiaoPLogo } from "@/components/xiaop-logo";
 import { toast } from "sonner";
+import { useAuth } from "@/hooks/use-auth";
+import { isOwnerEmail } from "@/lib/leaves";
 
 type Provider = "gemini" | "openai" | "anthropic" | "custom";
 
@@ -29,7 +31,7 @@ const PROVIDERS: ProviderMeta[] = [
     icon: "🔵",
     placeholder: "AQ.xxx... 或 AIzaSy...",
     defaultModel: "gemini-2.5-flash",
-    models: ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"],
+    models: ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.5-flash-lite", "gemini-3-flash-preview", "gemini-3-pro-preview", "gemini-3.1-pro-preview"],
     needsBaseUrl: false,
   },
   {
@@ -72,10 +74,18 @@ const PROVIDERS: ProviderMeta[] = [
  * unset → defaults to the .env Gemini. Reusable on /identify and /admin.
  */
 export function XiaoPModelPanel() {
+  const { user } = useAuth();
+  const isOwner = isOwnerEmail(user?.email);
+
+  // 仅 owner 可见
+  if (!isOwner) return null;
+
   const qc = useQueryClient();
   const [isOpen, setIsOpen] = useState(false);
   const [provider, setProvider] = useState<Provider>("gemini");
-  const [apiKey, setApiKey] = useState("");
+  // One input PER key — same pattern as AdminModelPanel for consistency
+  const [keys, setKeys] = useState<string[]>([""]);
+  const joinedKey = keys.map((k) => k.trim()).filter(Boolean).join(",");
   const [model, setModel] = useState("gemini-2.5-flash");
   const [customModel, setCustomModel] = useState("");
   const [baseUrl, setBaseUrl] = useState("https://api.openai.com/v1");
@@ -99,14 +109,14 @@ export function XiaoPModelPanel() {
   const saveMutation = useMutation({
     mutationFn: async () => {
       const effectiveModel = customModel.trim() || model;
-      if (!apiKey.trim()) throw new Error("请填写 API Key");
+      if (!joinedKey) throw new Error("请至少填写一个 API Key");
       if (!effectiveModel) throw new Error("请选择或填写模型名称");
       const meta = PROVIDERS.find((p) => p.id === provider)!;
       if (meta.needsBaseUrl && !baseUrl.trim()) throw new Error("请填写 API Base URL");
       await saveFn({
         data: {
           provider,
-          apiKey: apiKey.replace(/\s+/g, ""),
+          apiKey: joinedKey,
           model: effectiveModel,
           baseUrl: meta.needsBaseUrl ? baseUrl.trim().replace(/\/+$/, "") : "",
         },
@@ -116,7 +126,7 @@ export function XiaoPModelPanel() {
       qc.invalidateQueries({ queryKey: ["xiaop-config"] });
       toast.success("✅ 小P蛙模型已保存，全站对话/改写生效");
       setIsOpen(false);
-      setApiKey("");
+      setKeys([""]);
     },
     onError: (e: Error) => toast.error(e.message),
   });
@@ -148,14 +158,14 @@ export function XiaoPModelPanel() {
 
   // Live-list the models this key can actually use (real auto-detect).
   const fetchModels = async () => {
-    if (!apiKey.trim()) return toast.error("请先填写 API Key，再拉取可用模型");
+    if (!joinedKey) return toast.error("请先填写 API Key，再拉取可用模型");
     if (meta.needsBaseUrl && !baseUrl.trim()) return toast.error("请先填写 API Base URL");
     setFetching(true);
     try {
       const res = (await listFn({
         data: {
           provider,
-          apiKey: apiKey.replace(/\s+/g, ""),
+          apiKey: joinedKey,
           baseUrl: meta.needsBaseUrl ? baseUrl.trim().replace(/\/+$/, "") : "",
         },
       })) as { models: string[] };
@@ -242,26 +252,119 @@ export function XiaoPModelPanel() {
           </div>
 
           <div>
-            <label className="block text-xs font-semibold text-ink-soft mb-1.5">API Key</label>
-            <div className="relative">
-              <input
-                type={showKey ? "text" : "password"}
-                value={apiKey}
-                onChange={(e) => setApiKey(e.target.value)}
-                placeholder={meta.placeholder}
-                className="w-full pr-10 pl-3 py-2 text-xs rounded-lg border border-rule bg-background font-mono focus:outline-none focus:border-leaf transition-colors"
-              />
+            <div className="flex items-center justify-between mb-1.5">
+              <label className="block text-xs font-semibold text-ink-soft">
+                API Key（可加多个，拖动调整优先级）
+              </label>
               <button
                 type="button"
                 onClick={() => setShowKey((v) => !v)}
-                className="absolute right-2 top-1/2 -translate-y-1/2 text-ink-faint hover:text-ink transition-colors cursor-pointer"
+                className="text-[11px] text-ink-faint hover:text-ink transition-colors cursor-pointer inline-flex items-center gap-1"
               >
                 {showKey ? <EyeOffIcon className="w-3.5 h-3.5" /> : <EyeIcon className="w-3.5 h-3.5" />}
+                {showKey ? "隐藏" : "显示"}
               </button>
             </div>
-            <p className="mt-1 text-[11px] text-ink-faint">Key 加密存储在服务端数据库，浏览器不可读取。</p>
+            <div className="space-y-2">
+              {keys.map((k, i) => (
+                <div
+                  key={i}
+                  draggable={keys.length > 1}
+                  onDragStart={(e) => {
+                    e.dataTransfer.effectAllowed = "move";
+                    e.dataTransfer.setData("text/plain", String(i));
+                    (e.currentTarget as HTMLElement).style.opacity = "0.5";
+                  }}
+                  onDragEnd={(e) => {
+                    (e.currentTarget as HTMLElement).style.opacity = "1";
+                  }}
+                  onDragOver={(e) => {
+                    e.preventDefault();
+                    e.dataTransfer.dropEffect = "move";
+                  }}
+                  onDrop={(e) => {
+                    e.preventDefault();
+                    const fromIndex = parseInt(e.dataTransfer.getData("text/plain"), 10);
+                    const toIndex = i;
+                    if (fromIndex !== toIndex) {
+                      setKeys((arr) => {
+                        const newArr = [...arr];
+                        const [moved] = newArr.splice(fromIndex, 1);
+                        newArr.splice(toIndex, 0, moved);
+                        return newArr;
+                      });
+                    }
+                  }}
+                  className={`flex items-center gap-2 ${keys.length > 1 ? "cursor-move" : ""} group`}
+                >
+                  {keys.length > 1 && (
+                    <div className="shrink-0 text-ink-faint group-hover:text-ink transition-colors" title="拖动调整优先级">
+                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 8h16M4 16h16" />
+                      </svg>
+                    </div>
+                  )}
+                  <input
+                    type={showKey ? "text" : "password"}
+                    value={k}
+                    onChange={(e) => setKeys((arr) => arr.map((x, j) => (j === i ? e.target.value : x)))}
+                    placeholder={`${meta.placeholder}${keys.length > 1 ? `（优先级 ${i + 1}）` : ""}`}
+                    className="flex-1 min-w-0 px-3 py-2 text-xs rounded-lg border border-rule bg-background font-mono focus:outline-none focus:border-leaf transition-colors"
+                  />
+                  {keys.length > 1 && (
+                    <button
+                      type="button"
+                      onClick={() => setKeys((arr) => arr.filter((_, j) => j !== i))}
+                      title="移除这个 key"
+                      className="shrink-0 w-7 h-7 rounded-lg border border-rule text-ink-faint hover:border-destructive hover:text-destructive transition-colors cursor-pointer inline-flex items-center justify-center"
+                    >
+                      ×
+                    </button>
+                  )}
+                </div>
+              ))}
+            </div>
+            <button
+              type="button"
+              onClick={() => setKeys((arr) => [...arr, ""])}
+              className="mt-2 text-[11px] text-leaf-deep hover:text-leaf font-medium cursor-pointer inline-flex items-center gap-1"
+            >
+              ＋ 再加一个 API Key
+            </button>
+            <p className="mt-1 text-[11px] text-ink-faint">
+              ⚠️ Key 完整显示在此页面，请注意屏幕分享时遮挡。Key 加密存储在服务端。
+              多个 key 按顺序优先使用；Gemini 限流时（429）自动换下一个。
+            </p>
           </div>
 
+          {/* Base URL first (needed before fetching models). */}
+          {meta.needsBaseUrl ? (
+            <div>
+              <label className="block text-xs font-semibold text-ink-soft mb-1.5">
+                API Base URL <span className="ml-1.5 font-normal text-ink-faint">（中转 / 代理 / 自定义接口）</span>
+              </label>
+              <input
+                type="text"
+                value={baseUrl}
+                onChange={(e) => setBaseUrl(e.target.value)}
+                placeholder="https://api.openai.com/v1"
+                className="w-full px-3 py-2 text-xs rounded-lg border border-rule bg-background font-mono focus:outline-none focus:border-leaf transition-colors"
+              />
+              <p className="mt-1 text-[11px] text-ink-faint leading-relaxed">
+                {provider === "openai"
+                  ? "OpenAI 官方填 https://api.openai.com/v1；中转填到 /v1 为止。系统请求 {BaseURL}/chat/completions。"
+                  : "OpenAI 兼容格式，填到 /v1 为止（例：https://你的中转域名/v1）。系统请求 {BaseURL}/chat/completions；兼容硅基流动 / One API / 通义 / DeepSeek 等。"}
+              </p>
+            </div>
+          ) : (
+            <p className="text-[11px] text-ink-faint leading-relaxed">
+              {provider === "gemini"
+                ? "Gemini 无需填 Base URL（走 Google 官方地址）。填好 Key 后点下方「拉取可用模型」。"
+                : "Anthropic 无需填 Base URL（走官方 api.anthropic.com）。填好 Key 后点下方「拉取可用模型」。"}
+            </p>
+          )}
+
+          {/* Model after Base URL, with live Fetch. */}
           <div>
             <div className="flex items-center justify-between mb-1.5">
               <label className="block text-xs font-semibold text-ink-soft">模型</label>
@@ -269,7 +372,7 @@ export function XiaoPModelPanel() {
                 type="button"
                 onClick={fetchModels}
                 disabled={fetching}
-                title="用上面填的 API Key 向服务商拉取你实际可用的模型列表"
+                title="用上面的 Key / Base URL 向服务商拉取你实际可用的模型列表"
                 className="inline-flex items-center gap-1 text-[11px] px-2 py-1 rounded-md border border-leaf/40 text-leaf-deep hover:bg-leaf hover:text-background transition-colors cursor-pointer disabled:opacity-50"
               >
                 {fetching ? (
@@ -311,22 +414,6 @@ export function XiaoPModelPanel() {
               <p className="mt-1 text-[11px] text-leaf-deep">✓ 已按你的 Key 列出 {fetchedModels.length} 个可用模型</p>
             )}
           </div>
-
-          {meta.needsBaseUrl && (
-            <div>
-              <label className="block text-xs font-semibold text-ink-soft mb-1.5">
-                API Base URL <span className="ml-1.5 font-normal text-ink-faint">（中转 / 代理 / 自定义接口）</span>
-              </label>
-              <input
-                type="text"
-                value={baseUrl}
-                onChange={(e) => setBaseUrl(e.target.value)}
-                placeholder="https://api.openai.com/v1"
-                className="w-full px-3 py-2 text-xs rounded-lg border border-rule bg-background font-mono focus:outline-none focus:border-leaf transition-colors"
-              />
-              <p className="mt-1 text-[11px] text-ink-faint">兼容硅基流动、One API、阿里通义千问等 OpenAI 格式接口</p>
-            </div>
-          )}
 
           <div className="p-2.5 rounded-lg bg-background border border-rule/50 text-[11px] text-ink-soft font-mono">
             Provider: <strong>{provider}</strong> &nbsp;|&nbsp; Model: <strong>{effectiveModel || "（未填）"}</strong>

@@ -1,8 +1,51 @@
 /**
  * Client-side image compression utility.
- * Resizes images to a maximum boundary (default 1600px) and compresses quality
- * to save network bandwidth and storage space in Supabase.
+ * Resizes images to a maximum boundary (default 1600px) and re-encodes them —
+ * preferring WebP, which is typically 25–35% smaller than JPEG at the same
+ * visual quality and far smaller than PNG for photos — to save storage and
+ * bandwidth. Falls back to JPEG/PNG when the browser can't encode WebP.
+ *
+ * IMPORTANT: the returned Blob's `.type` is the ACTUAL output MIME. Callers must
+ * declare the upload `content_type`/`contentType` from the returned blob's
+ * `.type` (not the original File's type) or the stored object will be mislabeled
+ * and may fail to render. Use `extForMime(blob.type)` to pick a matching path
+ * extension.
  */
+
+let _webpSupported: boolean | null = null;
+function supportsWebP(): boolean {
+  if (_webpSupported !== null) return _webpSupported;
+  try {
+    const c = document.createElement("canvas");
+    c.width = 1;
+    c.height = 1;
+    _webpSupported = c.toDataURL("image/webp").startsWith("data:image/webp");
+  } catch {
+    _webpSupported = false;
+  }
+  return _webpSupported;
+}
+
+/** Map an image MIME type to a file extension (no dot). */
+export function extForMime(mime: string | undefined, fallback = "jpg"): string {
+  switch (mime) {
+    case "image/webp":
+      return "webp";
+    case "image/jpeg":
+      return "jpg";
+    case "image/png":
+      return "png";
+    case "image/avif":
+      return "avif";
+    case "image/gif":
+      return "gif";
+    case "image/svg+xml":
+      return "svg";
+    default:
+      return fallback;
+  }
+}
+
 export async function compressImage(
   file: File,
   maxWidth = 1600,
@@ -51,9 +94,14 @@ export async function compressImage(
         canvas.height = height;
         ctx.drawImage(img, 0, 0, width, height);
 
-        // Determine output type (WebP is ideal, fallback to JPEG for standard photos)
-        // PNGs are output as PNGs to preserve transparency, otherwise JPEG.
-        const outputType = file.type === "image/png" ? "image/png" : "image/jpeg";
+        // WebP is the big storage win (handles both photos and transparency).
+        // Fall back to PNG (to keep alpha) or JPEG when WebP encoding is
+        // unavailable in this browser.
+        const outputType = supportsWebP()
+          ? "image/webp"
+          : file.type === "image/png"
+            ? "image/png"
+            : "image/jpeg";
 
         canvas.toBlob(
           (blob) => {

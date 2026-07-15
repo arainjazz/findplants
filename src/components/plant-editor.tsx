@@ -1,8 +1,8 @@
 import { useState, useEffect, useRef } from "react";
-import { compressImage } from "@/lib/image-compress";
+import { compressImage, extForMime } from "@/lib/image-compress";
 import { useNavigate } from "@tanstack/react-router";
 import { useServerFn } from "@tanstack/react-start";
-import { extractPlantMetaFn, savePlantFn, uploadAssetFn } from "@/lib/identify-plant.functions";
+import { extractPlantMetaFn, savePlantFn, uploadAssetFn, checkSkillDuplicateFn } from "@/lib/identify-plant.functions";
 import { useQueryClient } from "@tanstack/react-query";
 import {
   FolderOpen,
@@ -15,7 +15,7 @@ import {
 } from "lucide-react";
 import { supabase } from "@/integrations/supabase/client";
 import { useAuth } from "@/hooks/use-auth";
-import { slugify, type Plant } from "@/lib/plants";
+import { slugify, visibleBodyText, type Plant } from "@/lib/plants";
 import { toast } from "sonner";
 import { RichEditor } from "@/components/rich-editor";
 import { HtmlDocEditor, ImageSearchDialog } from "@/components/html-doc-editor";
@@ -37,6 +37,7 @@ export function PlantEditor({ initial }: Props) {
   const extractMeta = useServerFn(extractPlantMetaFn);
   const savePlant = useServerFn(savePlantFn);
   const uploadAsset = useServerFn(uploadAssetFn);
+  const checkSkillDup = useServerFn(checkSkillDuplicateFn);
   const htmlInputRef = useRef<HTMLInputElement>(null);
   const htmlFolderInputRef = useRef<HTMLInputElement>(null);
   const hydratedDraftRef = useRef(false);
@@ -53,7 +54,8 @@ export function PlantEditor({ initial }: Props) {
   const [habitat, setHabitat] = useState(initial?.habitat ?? "");
   const [summary, setSummary] = useState(initial?.summary ?? "");
   const [coverUrl, setCoverUrl] = useState(initial?.cover_url ?? "");
-  const [contentType, setContentType] = useState<"rich" | "html">(initial?.content_type ?? "rich");
+  // skill 条目一律走上传 HTML（站内富文本编辑已下线）；旧的 rich 条目仍能渲染。
+  const [contentType, setContentType] = useState<"rich" | "html">(initial?.content_type ?? "html");
   const [richContent, setRichContent] = useState(initial?.rich_content ?? "");
   const [htmlUrl, setHtmlUrl] = useState(initial?.html_url ?? "");
   const [tags, setTags] = useState<string>((initial?.tags ?? []).join(", "));
@@ -73,11 +75,12 @@ export function PlantEditor({ initial }: Props) {
   const [showCoverSearch, setShowCoverSearch] = useState(false);
   const [pageImages, setPageImages] = useState<string[]>([]);
   const [showPagePicker, setShowPagePicker] = useState(false);
-  const [dupCandidates, setDupCandidates] = useState<
-    Array<{ id: string; title: string; slug: string; html_url: string | null; co_author_names: string[]; author_id: string }>
-  >([]);
+  // skill 查重（P3）：单个最相似命中 + 相似度分档。
+  type DupTarget = { id: string; title: string; slug: string; html_url: string | null; co_author_names: string[]; author_id: string };
+  const [dupMatch, setDupMatch] = useState<{ target: DupTarget; similarity: number; band: "high" | "low" } | null>(null);
   const [dupOpen, setDupOpen] = useState(false);
   const [mergeBusy, setMergeBusy] = useState(false);
+  const [bodyText, setBodyText] = useState("");
 
   // Load all tags + current plant's tags
   useEffect(() => {
@@ -204,7 +207,7 @@ export function PlantEditor({ initial }: Props) {
       }
     }
 
-    const ext = file.name.split(".").pop() || "bin";
+    const ext = extForMime(fileToUpload.type, file.name.split(".").pop() || "bin");
     const path = `${user.id}/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
 
     const reader = new FileReader();
@@ -354,33 +357,34 @@ export function PlantEditor({ initial }: Props) {
       const data = await extractMeta({ data: { htmlUrl: url } });
       applyExtractedMeta(data);
       toast.success(successMessage);
-      // After AI extraction, check for duplicate scientific name (new entries only).
-      const sci = typeof data?.scientific_name === "string" ? data.scientific_name.trim() : "";
-      if (sci && !initial) await checkDuplicateScientific(sci);
+      return data;
     } catch (err) {
       toast.error("识别失败：" + (err as Error).message);
+      return null;
     } finally {
       setExtracting(false);
     }
   };
 
-  const checkDuplicateScientific = async (sci: string) => {
-    const { data } = await supabase
-      .from("plants")
-      .select("id, title, slug, html_url, co_author_names, author_id, parent_id")
-      .ilike("scientific_name", sci)
-      .is("parent_id", null)
-      .limit(8);
-    const hits = (data ?? []) as typeof dupCandidates extends Array<infer T> ? T[] : never;
-    if (hits.length > 0) {
-      setDupCandidates(hits as typeof dupCandidates);
-      setDupOpen(true);
+  /**
+   * skill 查重（P3）：学名前两词相同 + 正文相似度分档。newBodyText 由客户端从上传的 HTML 算好传入。
+   * 命中则弹分档对话框（≥60% 高相似 / <60% 低相似）。仅新建（!initial）时触发。
+   */
+  const runSkillDupCheck = async (sci: string, newBodyText: string) => {
+    try {
+      const res = await checkSkillDup({ data: { scientificName: sci, newBodyText, excludePlantId: initial?.id } });
+      if (res?.match) {
+        setDupMatch({ target: res.match as DupTarget, similarity: res.similarity ?? 0, band: (res.band as "high" | "low") ?? "low" });
+        setDupOpen(true);
+      }
+    } catch {
+      /* 查重失败不阻塞保存 */
     }
   };
 
   // Merge: append uploaded html body into target plant's html as a new section,
   // upload merged file, set target html_url, add current user as co-author.
-  const performMerge = async (target: typeof dupCandidates[number]) => {
+  const performMerge = async (target: DupTarget) => {
     if (!user || !htmlUrl) return;
     setMergeBusy(true);
     try {
@@ -447,10 +451,16 @@ export function PlantEditor({ initial }: Props) {
 
   // Branch: continue with normal save but record parent_id and a "branch" log.
   const [branchParentId, setBranchParentId] = useState<string | null>(null);
-  const performBranch = (target: typeof dupCandidates[number]) => {
+  const performBranch = (target: DupTarget) => {
     setBranchParentId(target.id);
     setDupOpen(false);
-    toast.message("已设为分支，保存时将关联到原条目并显示「由 X 创建」标签");
+    toast.message("已设为平行条目，保存时将与原条目同名并列，右上角标注编辑名");
+  };
+
+  // 去已有页面编辑添加内容：跳到该条目的编辑页。
+  const performGoEdit = (target: DupTarget) => {
+    setDupOpen(false);
+    navigate({ to: "/admin/edit/$id", params: { id: target.id } });
   };
 
   // Finalize: rewrite refs (if image map provided) and upload HTML to storage.
@@ -481,7 +491,12 @@ export function PlantEditor({ initial }: Props) {
     setHtmlUrl(uploadedUrl);
     setUploadingHtml(false);
     toast.success("HTML 已上传");
-    await extractMetaFromUrl(uploadedUrl, "已根据 HTML 自动填入标题和字段，请检查后保存");
+    // 捕获正文可见文本：既用于 body_text 存储，也用于 skill 查重（避免服务端抓 HTML）。
+    const bt = visibleBodyText(finalText);
+    setBodyText(bt);
+    const meta = await extractMetaFromUrl(uploadedUrl, "已根据 HTML 自动填入标题和字段，请检查后保存");
+    const sci = typeof meta?.scientific_name === "string" ? meta.scientific_name.trim() : "";
+    if (sci && !initial) await runSkillDupCheck(sci, bt);
   };
 
   const isImageFile = (file: File) =>
@@ -664,6 +679,8 @@ export function PlantEditor({ initial }: Props) {
             is_featured: isFeatured,
             author_id: user.id,
             parent_id: branchParentId || null,
+            // 正文可见文本（skill 查重用）；纯编辑无新上传时为空 → 传 undefined，服务端保持原值。
+            body_text: bodyText || undefined,
           },
           editorName,
           editSummary: initial ? `${editorName} 编辑修改了条目「${title.trim()}」` : undefined,
@@ -920,27 +937,7 @@ export function PlantEditor({ initial }: Props) {
       </Field>
 
       <fieldset className="border border-ink p-5">
-        <legend className="label px-2">正文类型</legend>
-        <div className="flex gap-6 mb-4">
-          <label className="flex items-center gap-2">
-            <input
-              type="radio"
-              checked={contentType === "rich"}
-              onChange={() => setContentType("rich")}
-            />
-            站内编辑
-          </label>
-          <label className="flex items-center gap-2">
-            <input
-              type="radio"
-              checked={contentType === "html"}
-              onChange={() => {
-                setContentType("html");
-              }}
-            />
-            上传 HTML 文件
-          </label>
-        </div>
+        <legend className="label px-2">上传 HTML 正文</legend>
         {contentType === "rich" ? (
           <Field label="正文（所见即所得：可加粗、插标题、插图片、链接等）">
             <RichEditor value={richContent} onChange={setRichContent} />
@@ -1162,43 +1159,47 @@ export function PlantEditor({ initial }: Props) {
         </div>
       )}
 
-      {dupOpen && (
+      {dupOpen && dupMatch && (
         <div className="fixed inset-0 z-[60] bg-black/60 flex items-center justify-center p-4" onClick={() => setDupOpen(false)}>
-          <div className="bg-background border border-ink shadow-xl w-full max-w-2xl p-5" onClick={(e) => e.stopPropagation()}>
-            <h3 className="label text-vermilion mb-2">检测到同名学名已存在</h3>
-            <p className="text-sm mb-3">学名「<em className="font-serif">{scientificName}</em>」已存在以下条目，请选择：</p>
-            <ul className="space-y-3">
-              {dupCandidates.map((c) => (
-                <li key={c.id} className="border border-rule p-3">
-                  <div className="flex items-center justify-between gap-2">
-                    <div>
-                      <p className="font-medium">{c.title}</p>
-                      <p className="text-xs text-ink-faint">/plants/{c.slug}</p>
-                      {c.co_author_names?.length > 0 && (
-                        <p className="text-[11px] text-ink-faint mt-1">共建者：{c.co_author_names.join(", ")}</p>
-                      )}
-                    </div>
-                    <div className="flex gap-2 shrink-0">
-                      <button
-                        type="button"
-                        disabled={mergeBusy}
-                        onClick={() => performMerge(c)}
-                        className="bg-emerald-700 text-white px-3 py-1.5 text-xs hover:bg-emerald-800 disabled:opacity-60"
-                      >
-                        {mergeBusy ? "合并中…" : "合并到此条目"}
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => performBranch(c)}
-                        className="border border-ink px-3 py-1.5 text-xs hover:bg-ink hover:text-background"
-                      >
-                        不合并 · 创建分支
-                      </button>
-                    </div>
-                  </div>
-                </li>
-              ))}
-            </ul>
+          <div className="bg-background border border-ink shadow-xl w-full max-w-lg p-5" onClick={(e) => e.stopPropagation()}>
+            <h3 className="label text-vermilion mb-2">该物种条目已存在</h3>
+            <p className="text-sm mb-1">
+              已收录档案里已有同物种条目「<span className="font-medium">{dupMatch.target.title}</span>」
+              <span className="text-ink-faint">（/plants/{dupMatch.target.slug}）</span>。
+            </p>
+            <p className="text-xs text-ink-faint mb-4">
+              正文相似度约 <span className="font-semibold text-ink">{Math.round(dupMatch.similarity * 100)}%</span>
+              {dupMatch.band === "high"
+                ? "（≥60%：内容高度相似，建议合并或去原页编辑，不另建重复页）"
+                : "（<60%：内容差异较大，可平行并列、合并或去原页编辑）"}
+            </p>
+            <div className="flex flex-col gap-2">
+              {/* 低相似度（<60%）才提供「平行存在」 */}
+              {dupMatch.band === "low" && (
+                <button
+                  type="button"
+                  onClick={() => performBranch(dupMatch.target)}
+                  className="border border-ink px-3 py-2 text-sm hover:bg-ink hover:text-background text-left"
+                >
+                  和已有版本平行存在<span className="text-xs opacity-70"> · 同名并列，右上角标注编辑名</span>
+                </button>
+              )}
+              <button
+                type="button"
+                disabled={mergeBusy}
+                onClick={() => performMerge(dupMatch.target)}
+                className="bg-emerald-700 text-white px-3 py-2 text-sm hover:bg-emerald-800 disabled:opacity-60 text-left"
+              >
+                {mergeBusy ? "合并中…" : "自动合并"}<span className="text-xs opacity-80"> · 新内容注入原页，做成卡片加「注」</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => performGoEdit(dupMatch.target)}
+                className="border border-ink px-3 py-2 text-sm hover:bg-ink hover:text-background text-left"
+              >
+                去已有页面编辑添加内容<span className="text-xs opacity-70"> · 跳到该条目编辑页手动整合</span>
+              </button>
+            </div>
             <div className="flex justify-end mt-4">
               <button onClick={() => setDupOpen(false)} className="text-sm text-ink-faint hover:text-ink">取消</button>
             </div>

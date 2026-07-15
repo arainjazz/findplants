@@ -6,19 +6,31 @@ import { useAuth } from "@/hooks/use-auth";
 import { toast } from "sonner";
 
 export const Route = createFileRoute("/login")({
+  // Optional post-login destination (e.g. back to a share card). Only same-origin
+  // relative paths are honored, so it can't be turned into an open redirect.
+  validateSearch: (search: Record<string, unknown>): { redirect?: string } => ({
+    redirect: typeof search.redirect === "string" && search.redirect.startsWith("/") ? search.redirect : undefined,
+  }),
   component: LoginPage,
 });
 
 function LoginPage() {
   const navigate = useNavigate();
   const { user } = useAuth();
+  const { redirect } = Route.useSearch();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
 
+  const goNext = () => {
+    if (redirect) window.location.href = redirect;
+    else navigate({ to: "/admin" });
+  };
+
   useEffect(() => {
-    if (user) navigate({ to: "/admin" });
-  }, [user, navigate]);
+    if (user) goNext();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user]);
 
   const onSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -28,7 +40,7 @@ function LoginPage() {
     setLoading(false);
     if (error) return toast.error(error.message);
     toast.success("登录成功");
-    navigate({ to: "/admin" });
+    goNext();
   };
 
   return (
@@ -51,7 +63,7 @@ function LoginPage() {
               {loading ? "正在登录…" : "登录"}
             </button>
           </form>
-          <p className="text-sm text-ink-faint mt-6">还没有账号？ <Link to="/signup" className="text-vermilion hover:underline">申请成为编辑</Link></p>
+          <p className="text-sm text-ink-faint mt-6">还没有账号？ <Link to="/signup" search={redirect ? { redirect } : undefined} className="text-vermilion hover:underline">申请成为编辑</Link></p>
         </div>
       </main>
       <SiteFooter />

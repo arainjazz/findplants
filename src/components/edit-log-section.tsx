@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { PlantEdit } from "@/lib/edits";
 
 const KIND_LABEL: Record<string, string> = {
@@ -18,6 +18,7 @@ const KIND_LABEL: Record<string, string> = {
   draft_reject: "驳回",
   ai_page_edit: "小P蛙改写",
   blog_publish: "发布博文",
+  blog_edit: "编辑博文",
 };
 
 function kindLabel(k: string) {
@@ -50,14 +51,30 @@ export function EditLogSection({
   onRevert,
   reverting,
   defaultOpen = false,
+  focusEditId = null,
 }: {
   edits: PlantEdit[];
   isEditor: boolean;
   onRevert?: (edit: PlantEdit) => void;
   reverting?: string | null;
   defaultOpen?: boolean;
+  /** 当正文里的「注 N」被点击时传入对应 plant_edits.id：自动展开、滚动到该条并短暂高亮。 */
+  focusEditId?: string | null;
 }) {
   const [open, setOpen] = useState(defaultOpen);
+  const [flashId, setFlashId] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!focusEditId) return;
+    setOpen(true);
+    setFlashId(focusEditId);
+    // 等列表因 open=true 渲染出来后再滚动。
+    const t1 = setTimeout(() => {
+      document.getElementById(`note-${focusEditId}`)?.scrollIntoView({ behavior: "smooth", block: "center" });
+    }, 60);
+    const t2 = setTimeout(() => setFlashId(null), 2400);
+    return () => { clearTimeout(t1); clearTimeout(t2); };
+  }, [focusEditId]);
 
   const canRevert = (e: PlantEdit) =>
     isEditor &&
@@ -101,7 +118,13 @@ export function EditLogSection({
           ) : (
             <ul className="divide-y divide-rule-soft border-y border-rule">
               {edits.map((e) => (
-                <li key={e.id} className="py-2.5 flex items-start gap-3 text-sm">
+                <li
+                  key={e.id}
+                  id={`note-${e.id}`}
+                  className={`py-2.5 px-2 -mx-2 flex items-start gap-3 text-sm transition-colors duration-500 ${
+                    flashId === e.id ? "bg-vermilion/10 ring-1 ring-vermilion/40 rounded" : ""
+                  }`}
+                >
                   <span
                     className={`mt-0.5 shrink-0 text-[10px] font-semibold px-1.5 py-0.5 rounded border ${
                       e.kind === "ai_page_edit" || e.source === "xiaop_agent"

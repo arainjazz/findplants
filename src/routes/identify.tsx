@@ -13,6 +13,7 @@ import {
   saveAiConfigFn,
   getAiConfigFn,
   clearAiConfigFn,
+  listProviderModelsFn,
   fetchAiUsageFn,
   savePlantNetKeyFn,
   getPlantNetKeyFn,
@@ -22,6 +23,14 @@ import { XiaoPModelPanel } from "@/components/xiaop-model-panel";
 import { toast } from "sonner";
 
 export const Route = createFileRoute("/identify")({
+  // Retake context carried from a draft's「去补拍」: retake=第几次补拍, st=物种中文名, ss=学名。
+  validateSearch: (search: Record<string, unknown>): { retake?: number; st?: string; ss?: string; nmp?: string; md?: string } => ({
+    retake: search.retake != null && Number(search.retake) > 0 ? Math.min(10, Math.floor(Number(search.retake))) : undefined,
+    st: typeof search.st === "string" ? search.st.slice(0, 200) : undefined,
+    ss: typeof search.ss === "string" ? search.ss.slice(0, 200) : undefined,
+    nmp: typeof search.nmp === "string" ? search.nmp.slice(0, 300) : undefined,
+    md: typeof search.md === "string" ? search.md.slice(0, 64) : undefined,
+  }),
   head: () => ({
     meta: [
       { title: "AI 识别植物 · Plantspedia" },
@@ -52,7 +61,7 @@ const PROVIDERS: ProviderMeta[] = [
     icon: "🔵",
     placeholder: "AQ.xxx... 或 AIzaSy...",
     defaultModel: "gemini-2.5-flash",
-    models: ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"],
+    models: ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.5-flash-lite", "gemini-3-flash-preview", "gemini-3-pro-preview", "gemini-3.1-pro-preview"],
     needsBaseUrl: false,
   },
   {
@@ -222,17 +231,25 @@ function PlantNetPanel() {
 
 function AdminModelPanel() {
   const qc = useQueryClient();
-  const [isOpen, setIsOpen] = useState(false);
+  const [isOpen, setIsOpen] = useState(true);  // 默认展开，直接显示配置
   const [provider, setProvider] = useState<Provider>("gemini");
-  const [apiKey, setApiKey] = useState("");
+  // One input PER key — clearer than a single comma-separated field (which was easy
+  // to mistype). Joined with "," only at save/fetch time; the server pools them.
+  const [keys, setKeys] = useState<string[]>([""]);
+  const joinedKey = keys.map((k) => k.trim()).filter(Boolean).join(",");
   const [model, setModel] = useState("gemini-2.5-flash");
   const [customModel, setCustomModel] = useState("");
   const [baseUrl, setBaseUrl] = useState("https://api.openai.com/v1");
   const [showKey, setShowKey] = useState(false);
+  // Live-fetched model IDs (from the key's real list-models endpoint). Overrides
+  // the static presets so a new-format key can pick a model that actually exists.
+  const [fetchedModels, setFetchedModels] = useState<string[]>([]);
+  const [fetching, setFetching] = useState(false);
 
   const saveFn = useServerFn(saveAiConfigFn);
   const getFn = useServerFn(getAiConfigFn);
   const clearFn = useServerFn(clearAiConfigFn);
+  const listFn = useServerFn(listProviderModelsFn);
 
   // Load current active config from server
   const { data: activeConfig, isLoading } = useQuery({
@@ -244,7 +261,7 @@ function AdminModelPanel() {
   const saveMutation = useMutation({
     mutationFn: async () => {
       const effectiveModel = customModel.trim() || model;
-      if (!apiKey.trim()) throw new Error("请填写 API Key");
+      if (!joinedKey) throw new Error("请至少填写一个 API Key");
       if (!effectiveModel) throw new Error("请选择或填写模型名称");
       const meta = PROVIDERS.find((p) => p.id === provider)!;
       if (meta.needsBaseUrl && !baseUrl.trim()) throw new Error("请填写 API Base URL");
@@ -252,9 +269,9 @@ function AdminModelPanel() {
       await saveFn({
         data: {
           provider,
-          // Strip ALL whitespace — a key pasted with stray spaces/newlines silently
-          // 401s on every identify (the server re-sanitizes too, as a safety net).
-          apiKey: apiKey.replace(/\s+/g, ""),
+          // Each field is one key; join with "," so the server pools them (Gemini
+          // rotates across the pool on 429). The server re-sanitizes as a safety net.
+          apiKey: joinedKey,
           model: effectiveModel,
           baseUrl: meta.needsBaseUrl ? baseUrl.trim().replace(/\/+$/, "") : "",
         },
@@ -264,7 +281,7 @@ function AdminModelPanel() {
       qc.invalidateQueries({ queryKey: ["ai-config"] });
       toast.success("✅ AI 配置已保存，全站生效（包括手机端访客）");
       setIsOpen(false);
-      setApiKey("");
+      setKeys([""]);
     },
     onError: (e: Error) => toast.error(e.message),
   });
@@ -280,15 +297,47 @@ function AdminModelPanel() {
 
   const meta = PROVIDERS.find((p) => p.id === provider)!;
   const effectiveModel = customModel.trim() || model;
+  // Real model list if fetched, else the (possibly stale) presets.
+  const optionModels = fetchedModels.length > 0 ? fetchedModels : meta.models;
 
   const handleProviderChange = (p: Provider) => {
     const m = PROVIDERS.find((x) => x.id === p)!;
     setProvider(p);
     setModel(m.defaultModel);
     setCustomModel("");
+    setFetchedModels([]);
     if (p === "openai") setBaseUrl("https://api.openai.com/v1");
     else if (p === "anthropic") setBaseUrl("https://api.anthropic.com/v1");
     else if (p === "custom") setBaseUrl("");
+  };
+
+  // Live-list the models THIS key can actually call — the reliable way to pick a
+  // model that isn't deprecated for the key's project (e.g. a new-format key can't
+  // use gemini-2.5-flash; this surfaces the model names it *can* use).
+  const fetchModels = async () => {
+    if (!joinedKey) return toast.error("请先填写 API Key，再拉取可用模型");
+    if (meta.needsBaseUrl && !baseUrl.trim()) return toast.error("请先填写 API Base URL");
+    setFetching(true);
+    try {
+      const res = (await listFn({
+        data: {
+          provider,
+          apiKey: joinedKey,
+          baseUrl: meta.needsBaseUrl ? baseUrl.trim().replace(/\/+$/, "") : "",
+        },
+      })) as { models: string[] };
+      if (!res.models.length) return toast.error("没有拉取到可用模型（key 或接口可能不对）");
+      setFetchedModels(res.models);
+      if (!res.models.includes(effectiveModel)) {
+        setModel(res.models[0]);
+        setCustomModel("");
+      }
+      toast.success(`已拉取 ${res.models.length} 个可用模型`);
+    } catch (e) {
+      toast.error((e as Error).message);
+    } finally {
+      setFetching(false);
+    }
   };
 
   const providerLabel = (id: string) => PROVIDERS.find((p) => p.id === id)?.label ?? id;
@@ -337,7 +386,7 @@ function AdminModelPanel() {
         )}
 
         {activeConfig && (
-          <span className="text-[11px] text-ink-faint">
+          <span className="text-[11px] text-ink-faint break-all min-w-0">
             Key：{activeConfig.apiKeyMasked}
           </span>
         )}
@@ -373,68 +422,95 @@ function AdminModelPanel() {
             </div>
           </div>
 
-          {/* API Key */}
+          {/* API Key(s) — one input per key, add/remove rows, drag to reorder priority. */}
           <div>
-            <label className="block text-xs font-semibold text-ink-soft mb-1.5">
-              API Key
-            </label>
-            <div className="relative">
-              <input
-                id="admin-ai-api-key"
-                type={showKey ? "text" : "password"}
-                value={apiKey}
-                onChange={(e) => setApiKey(e.target.value)}
-                placeholder={meta.placeholder}
-                className="w-full pr-10 pl-3 py-2 text-xs rounded-lg border border-rule bg-background font-mono focus:outline-none focus:border-amber-400 transition-colors"
-              />
+            <div className="flex items-center justify-between mb-1.5">
+              <label className="block text-xs font-semibold text-ink-soft">
+                API Key（可加多个，拖动调整优先级）
+              </label>
               <button
                 type="button"
                 onClick={() => setShowKey((v) => !v)}
-                className="absolute right-2 top-1/2 -translate-y-1/2 text-ink-faint hover:text-ink transition-colors cursor-pointer"
+                className="text-[11px] text-ink-faint hover:text-ink transition-colors cursor-pointer inline-flex items-center gap-1"
               >
                 {showKey ? <EyeOffIcon className="w-3.5 h-3.5" /> : <EyeIcon className="w-3.5 h-3.5" />}
+                {showKey ? "隐藏" : "显示"}
               </button>
             </div>
-            <p className="mt-1 text-[11px] text-ink-faint">Key 加密存储在服务端数据库，浏览器不可读取。</p>
+            <div className="space-y-2">
+              {keys.map((k, i) => (
+                <div
+                  key={i}
+                  draggable={keys.length > 1}
+                  onDragStart={(e) => {
+                    e.dataTransfer.effectAllowed = "move";
+                    e.dataTransfer.setData("text/plain", String(i));
+                    (e.currentTarget as HTMLElement).style.opacity = "0.5";
+                  }}
+                  onDragEnd={(e) => {
+                    (e.currentTarget as HTMLElement).style.opacity = "1";
+                  }}
+                  onDragOver={(e) => {
+                    e.preventDefault();
+                    e.dataTransfer.dropEffect = "move";
+                  }}
+                  onDrop={(e) => {
+                    e.preventDefault();
+                    const fromIndex = parseInt(e.dataTransfer.getData("text/plain"), 10);
+                    const toIndex = i;
+                    if (fromIndex !== toIndex) {
+                      setKeys((arr) => {
+                        const newArr = [...arr];
+                        const [moved] = newArr.splice(fromIndex, 1);
+                        newArr.splice(toIndex, 0, moved);
+                        return newArr;
+                      });
+                    }
+                  }}
+                  className={`flex items-center gap-2 ${keys.length > 1 ? "cursor-move" : ""} group`}
+                >
+                  {keys.length > 1 && (
+                    <div className="shrink-0 text-ink-faint group-hover:text-ink transition-colors" title="拖动调整优先级">
+                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 8h16M4 16h16" />
+                      </svg>
+                    </div>
+                  )}
+                  <input
+                    type={showKey ? "text" : "password"}
+                    value={k}
+                    onChange={(e) => setKeys((arr) => arr.map((x, j) => (j === i ? e.target.value : x)))}
+                    placeholder={`${meta.placeholder}${keys.length > 1 ? `（优先级 ${i + 1}）` : ""}`}
+                    className="flex-1 min-w-0 px-3 py-2 text-xs rounded-lg border border-rule bg-background font-mono focus:outline-none focus:border-amber-400 transition-colors"
+                  />
+                  {keys.length > 1 && (
+                    <button
+                      type="button"
+                      onClick={() => setKeys((arr) => arr.filter((_, j) => j !== i))}
+                      title="移除这个 key"
+                      className="shrink-0 w-7 h-7 rounded-lg border border-rule text-ink-faint hover:border-destructive hover:text-destructive transition-colors cursor-pointer inline-flex items-center justify-center"
+                    >
+                      ×
+                    </button>
+                  )}
+                </div>
+              ))}
+            </div>
+            <button
+              type="button"
+              onClick={() => setKeys((arr) => [...arr, ""])}
+              className="mt-2 text-[11px] text-amber-700 hover:text-amber-800 font-medium cursor-pointer inline-flex items-center gap-1"
+            >
+              ＋ 再加一个 API Key
+            </button>
+            <p className="mt-1.5 text-[11px] text-ink-faint leading-relaxed">
+              ⚠️ Key 完整显示在此页面，请注意屏幕分享时遮挡。Key 加密存储在服务端。
+              多个 key 按顺序优先使用；Gemini 限流时（429）自动换下一个，OpenAI/Anthropic/自定义接口也支持轮换。
+            </p>
           </div>
 
-          {/* Model */}
-          <div>
-            <label className="block text-xs font-semibold text-ink-soft mb-1.5">模型</label>
-            {meta.models.length > 0 ? (
-              <select
-                id="admin-ai-model-select"
-                value={customModel ? "__custom__" : model}
-                onChange={(e) => {
-                  if (e.target.value === "__custom__") {
-                    setCustomModel(" ");
-                  } else {
-                    setModel(e.target.value);
-                    setCustomModel("");
-                  }
-                }}
-                className="w-full px-3 py-2 text-xs rounded-lg border border-rule bg-background focus:outline-none focus:border-amber-400 transition-colors cursor-pointer"
-              >
-                {meta.models.map((m) => (
-                  <option key={m} value={m}>{m}</option>
-                ))}
-                <option value="__custom__">✏️ 手动输入其他模型名…</option>
-              </select>
-            ) : null}
-            {(meta.models.length === 0 || customModel !== "") && (
-              <input
-                id="admin-ai-model-custom"
-                type="text"
-                value={customModel.trim() || model}
-                onChange={(e) => setCustomModel(e.target.value)}
-                placeholder="例：deepseek-vision / qwen-vl-plus"
-                className="mt-1.5 w-full px-3 py-2 text-xs rounded-lg border border-rule bg-background font-mono focus:outline-none focus:border-amber-400 transition-colors"
-              />
-            )}
-          </div>
-
-          {/* Base URL (only for providers that need it) */}
-          {meta.needsBaseUrl && (
+          {/* Base URL (only for providers that need it) — filled BEFORE fetching models. */}
+          {meta.needsBaseUrl ? (
             <div>
               <label className="block text-xs font-semibold text-ink-soft mb-1.5">
                 API Base URL
@@ -448,9 +524,71 @@ function AdminModelPanel() {
                 placeholder="https://api.openai.com/v1"
                 className="w-full px-3 py-2 text-xs rounded-lg border border-rule bg-background font-mono focus:outline-none focus:border-amber-400 transition-colors"
               />
-              <p className="mt-1 text-[11px] text-ink-faint">兼容硅基流动、One API、阿里通义千问等 OpenAI 格式接口</p>
+              <p className="mt-1 text-[11px] text-ink-faint leading-relaxed">
+                {provider === "openai"
+                  ? "OpenAI 官方填 https://api.openai.com/v1；中转填到 /v1 为止。系统请求 {BaseURL}/chat/completions。"
+                  : "OpenAI 兼容格式，填到 /v1 为止（例：https://你的中转域名/v1）。系统请求 {BaseURL}/chat/completions；兼容硅基流动 / One API / 通义 / DeepSeek 等。"}
+              </p>
             </div>
+          ) : (
+            <p className="text-[11px] text-ink-faint leading-relaxed">
+              {provider === "gemini"
+                ? "Gemini 无需填 Base URL（走 Google 官方 generativelanguage.googleapis.com）。填好 Key 后点下方「拉取可用模型」。"
+                : "Anthropic 无需填 Base URL（走官方 api.anthropic.com）。填好 Key 后点下方「拉取可用模型」。"}
+            </p>
           )}
+
+          {/* Model — placed AFTER Base URL, with a live Fetch to auto-detect real models. */}
+          <div>
+            <div className="flex items-center justify-between mb-1.5">
+              <label className="block text-xs font-semibold text-ink-soft">模型</label>
+              <button
+                type="button"
+                onClick={fetchModels}
+                disabled={fetching}
+                title="用上面的 Key / Base URL 向服务商拉取你实际可用的模型列表"
+                className="inline-flex items-center gap-1 text-[11px] px-2 py-1 rounded-md border border-amber-400/60 text-amber-700 hover:bg-amber-500 hover:text-white transition-all cursor-pointer disabled:opacity-50"
+              >
+                {fetching ? "拉取中…" : "拉取可用模型"}
+              </button>
+            </div>
+            {optionModels.length > 0 ? (
+              <select
+                id="admin-ai-model-select"
+                value={customModel ? "__custom__" : model}
+                onChange={(e) => {
+                  if (e.target.value === "__custom__") {
+                    setCustomModel(" ");
+                  } else {
+                    setModel(e.target.value);
+                    setCustomModel("");
+                  }
+                }}
+                className="w-full px-3 py-2 text-xs rounded-lg border border-rule bg-background focus:outline-none focus:border-amber-400 transition-colors cursor-pointer"
+              >
+                {optionModels.map((m) => (
+                  <option key={m} value={m}>{m}</option>
+                ))}
+                <option value="__custom__">✏️ 手动输入其他模型名…</option>
+              </select>
+            ) : null}
+            {(optionModels.length === 0 || customModel !== "") && (
+              <input
+                id="admin-ai-model-custom"
+                type="text"
+                value={customModel.trim() || model}
+                onChange={(e) => setCustomModel(e.target.value)}
+                placeholder="例：deepseek-vision / qwen-vl-plus"
+                className="mt-1.5 w-full px-3 py-2 text-xs rounded-lg border border-rule bg-background font-mono focus:outline-none focus:border-amber-400 transition-colors"
+              />
+            )}
+            {fetchedModels.length > 0 && (
+              <p className="mt-1 text-[11px] text-emerald-600">✓ 已按你的 Key 列出 {fetchedModels.length} 个可用模型，请从中选一个</p>
+            )}
+            <p className="mt-1 text-[11px] text-ink-faint leading-relaxed">
+              旧模型名（如 gemini-2.5-flash）对新申请的 key 可能已停用而报 404。点「拉取可用模型」按你的 key 列出真实可用的模型再选。
+            </p>
+          </div>
 
           {/* Preview */}
           <div className="p-2.5 rounded-lg bg-background border border-rule/50 text-[11px] text-ink-soft font-mono">
@@ -485,6 +623,8 @@ function AdminModelPanel() {
 
 function IdentifyPage() {
   const { user } = useAuth();
+  const { retake, st, ss, nmp, md } = Route.useSearch();
+  const retakeCtx = retake && retake > 0 ? { count: retake, title: st, sci: ss, advice: nmp, mergeDraftId: md } : null;
 
   const { data: role = null } = useQuery({
     queryKey: ["user-role", user?.id],
@@ -528,7 +668,7 @@ function IdentifyPage() {
         {/* Admin-only 小P蛙 agent model config */}
         {isAdmin && <XiaoPModelPanel />}
 
-        <CameraIdentify />
+        <CameraIdentify retake={retakeCtx} />
 
         {isEditorOrAdmin && (
           <section className="mt-12 border-t border-rule pt-8">

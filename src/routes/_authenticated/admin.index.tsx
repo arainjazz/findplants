@@ -6,7 +6,6 @@ import { useAuth } from "@/hooks/use-auth";
 import { isCurrentUserAdmin } from "@/lib/edits";
 import { fetchAllPlants, fetchMyPlants, type Plant } from "@/lib/plants";
 import { EntryTypeBadge } from "@/components/entry-type-badge";
-import { XiaoPModelPanel } from "@/components/xiaop-model-panel";
 import { supabase } from "@/integrations/supabase/client";
 import { toast } from "sonner";
 import {
@@ -30,6 +29,7 @@ export const Route = createFileRoute("/_authenticated/admin/")({
 function AdminPage() {
   const { user } = useAuth();
   const qc = useQueryClient();
+  const [searchQuery, setSearchQuery] = useState("");
   const { data: isAdmin = false } = useQuery({
     queryKey: ["is-admin", user?.id],
     queryFn: () => isCurrentUserAdmin(user?.id),
@@ -91,6 +91,17 @@ function AdminPage() {
     qc.invalidateQueries({ queryKey: ["home"] });
   };
 
+  // 过滤条目
+  const filteredPlants = plants.filter((p) => {
+    if (!searchQuery.trim()) return true;
+    const q = searchQuery.toLowerCase();
+    return (
+      p.title?.toLowerCase().includes(q) ||
+      p.scientific_name?.toLowerCase().includes(q) ||
+      p.common_names_zh?.toLowerCase().includes(q)
+    );
+  });
+
   const onDeleteCatalog = async (c: RegionalCatalog) => {
     if (!confirm(`确定删除「${regionLabel(c)}」的目录？该地区下所有条目都会被移除。`)) return;
     try {
@@ -119,14 +130,12 @@ function AdminPage() {
               <Link to="/admin/tags" className="border border-emerald-700 text-emerald-700 px-5 py-2 hover:bg-emerald-700 hover:text-background transition-colors">+ 添加 #tag 归类整理标签</Link>
             )}
             <Link to="/admin/catalogs/new" className="border border-ink px-5 py-2 hover:bg-ink hover:text-background transition-colors">+ 地区植物目录</Link>
-            <Link to="/admin/batch-new" className="border border-ink px-5 py-2 hover:bg-ink hover:text-background transition-colors">+ 批量添加条目</Link>
-            <Link to="/admin/new" className="bg-ink text-background px-5 py-2 hover:bg-vermilion transition-colors">+ 新建条目</Link>
+            <Link to="/admin/batch-new" className="border border-ink px-5 py-2 hover:bg-ink hover:text-background transition-colors">+ 批量添加 skill 条目</Link>
+            <Link to="/admin/new" className="bg-ink text-background px-5 py-2 hover:bg-vermilion transition-colors">+ 添加 skill 条目</Link>
             <Link to="/admin/blog/new" className="bg-emerald-700 text-background px-5 py-2 hover:bg-vermilion transition-colors">+ 编辑博客</Link>
             <Link to="/admin/projects/new" className="bg-emerald-700 text-background px-5 py-2 hover:bg-vermilion transition-colors">+ 编辑项目</Link>
           </div>
         </div>
-
-        {isAdmin && <XiaoPModelPanel />}
 
         {myCatalogs.length > 0 && (
           <section className="mb-10">
@@ -168,12 +177,35 @@ function AdminPage() {
         )}
 
         <h2 className="font-display text-2xl font-bold border-b-2 border-ink pb-2 mb-4">条目列表</h2>
+
+        {/* 搜索框 */}
+        <div className="mb-4">
+          <input
+            type="text"
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            placeholder="搜索中文名、拉丁学名、俗名…"
+            className="w-full max-w-md px-4 py-2 text-sm border border-rule rounded-lg focus:outline-none focus:border-ink transition-colors"
+          />
+          {searchQuery && (
+            <p className="mt-1.5 text-xs text-ink-faint">
+              找到 {filteredPlants.length} 条结果
+            </p>
+          )}
+        </div>
+
         {isLoading ? (
           <p className="text-ink-faint">载入中…</p>
-        ) : plants.length === 0 ? (
+        ) : filteredPlants.length === 0 ? (
           <div className="border border-dashed border-rule py-16 text-center">
-            <p className="text-ink-faint mb-4">还没有条目，从新建第一个开始。</p>
-            <Link to="/admin/new" className="border border-ink px-4 py-2 hover:bg-ink hover:text-background transition-colors">+ 创建条目</Link>
+            {searchQuery ? (
+              <p className="text-ink-faint">没有找到匹配「{searchQuery}」的条目</p>
+            ) : (
+              <>
+                <p className="text-ink-faint mb-4">还没有条目，从添加第一个 skill 条目开始。</p>
+                <Link to="/admin/new" className="border border-ink px-4 py-2 hover:bg-ink hover:text-background transition-colors">+ 添加 skill 条目</Link>
+              </>
+            )}
           </div>
         ) : (
           <table className="w-full border-collapse">
@@ -186,7 +218,7 @@ function AdminPage() {
               </tr>
             </thead>
             <tbody>
-              {plants.map((p) => (
+              {filteredPlants.map((p) => (
                 <tr key={p.id} className="border-b border-rule-soft hover:bg-paper-deep/40">
                   <td className="py-4">
                     <Link to="/plants/$slug" params={{ slug: p.slug }} className="font-display text-lg font-semibold hover:text-vermilion">{p.title}</Link>

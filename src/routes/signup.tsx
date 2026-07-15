@@ -6,12 +6,16 @@ import { useAuth } from "@/hooks/use-auth";
 import { toast } from "sonner";
 
 export const Route = createFileRoute("/signup")({
+  validateSearch: (search: Record<string, unknown>): { redirect?: string } => ({
+    redirect: typeof search.redirect === "string" && search.redirect.startsWith("/") ? search.redirect : undefined,
+  }),
   component: SignupPage,
 });
 
 function SignupPage() {
   const navigate = useNavigate();
   const { user } = useAuth();
+  const { redirect } = Route.useSearch();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [name, setName] = useState("");
@@ -19,8 +23,12 @@ function SignupPage() {
   const [loading, setLoading] = useState(false);
 
   useEffect(() => {
-    if (user) navigate({ to: "/admin" });
-  }, [user, navigate]);
+    if (user) {
+      if (redirect) window.location.href = redirect;
+      else navigate({ to: "/admin" });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user]);
 
   const onSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -29,11 +37,12 @@ function SignupPage() {
       return;
     }
     setLoading(true);
-    const { error } = await supabase.auth.signUp({
+    const { data: signUpData, error } = await supabase.auth.signUp({
       email,
       password,
       options: {
-        emailRedirectTo: `${window.location.origin}/login`,
+        // After the email link, land back where they came from (or /login).
+        emailRedirectTo: `${window.location.origin}${redirect ?? "/login"}`,
         data: {
           display_name: name || email.split("@")[0],
           editor_application_bio: bio.trim(),
@@ -45,8 +54,17 @@ function SignupPage() {
       return toast.error(error.message);
     }
     setLoading(false);
+    // If email confirmation is disabled, signUp returns a live session → the user
+    // is already logged in; go straight back to the card. Otherwise they must
+    // verify first, so send them to login carrying the same redirect.
+    if (signUpData.session) {
+      toast.success("注册成功，已自动登录");
+      if (redirect) { window.location.href = redirect; return; }
+      navigate({ to: "/admin" });
+      return;
+    }
     toast.success("申请已提交！请验证邮箱；管理员审核通过后即可获得编辑权限。");
-    navigate({ to: "/login" });
+    navigate({ to: "/login", search: redirect ? { redirect } : undefined });
   };
 
   return (
@@ -86,7 +104,7 @@ function SignupPage() {
               {loading ? "正在提交…" : "申请成为编辑"}
             </button>
           </form>
-          <p className="text-sm text-ink-faint mt-6">已有账号？ <Link to="/login" className="text-vermilion hover:underline">登录</Link></p>
+          <p className="text-sm text-ink-faint mt-6">已有账号？ <Link to="/login" search={redirect ? { redirect } : undefined} className="text-vermilion hover:underline">登录</Link></p>
         </div>
       </main>
       <SiteFooter />

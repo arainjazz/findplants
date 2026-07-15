@@ -2,8 +2,19 @@ import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
 import { renderDraftHtml, type PlantDraftFields } from "./plant-html-template";
+import {
+  renderPremiumHtml,
+  premiumPrompt1,
+  premiumPrompt2,
+  premiumPrompt3,
+  PREMIUM_SCHEMA_1,
+  PREMIUM_SCHEMA_2,
+  PREMIUM_SCHEMA_3,
+  type PremiumFields,
+  type VerifiedFacts,
+} from "./premium-page";
 import { lookupChinaInvasive } from "./china-invasive-list";
-import { slugify } from "./plants";
+import { slugify, speciesKey, visibleBodyText, textShingles, jaccardSimilarity } from "./plants";
 
 const AI_MODEL = "google/gemini-2.5-pro";
 const AI_GATEWAY = "https://ai.gateway.lovable.dev/v1/chat/completions";
@@ -53,6 +64,17 @@ const AI_META_SCHEMA = {
         required: ["category", "value", "tag", "detail"],
       },
     },
+    identification_confidence: {
+      type: "string",
+      enum: ["high", "medium", "low"],
+      description: "对本次定种的置信度。照片清晰、诊断特征充分且与已知物种高度吻合=high；有把握到属但种一级存疑=medium；照片不足以确诊、只能给疑似猜测=low。宁可 low 也不要为凑高置信度而武断定种。",
+    },
+    needs_more_photos_zh: {
+      type: "string",
+      description:
+        "仅当 identification_confidence 为 low（或 medium 且需补证）时填写。**面向完全没有植物学基础的普通用户**，用大白话写 2–4 条可直接照做的拍摄动作，① ② ③ 编号，每条一句话、一个动作，说明「拍哪里 + 怎么拍」。禁止使用专业术语（脉序、被毛、托叶、花序、苞片、腋生 等）；确需提到部位时用日常说法并加括号解释，例如「把叶子翻过来拍背面（看清叶脉和有没有细毛）」「凑近拍一朵完整的花，正面拍清花瓣数量」「拍一下果实或种子」「退后一步拍整棵植物的样子（看高矮和分枝）」「拍一下茎和叶子相连的地方」。high 时留空字符串。",
+    },
+    needs_more_photos_en: { type: "string", description: "英文对应，同样用通俗易懂的日常英语；high 时留空。" },
   },
   required: [
     "title", "scientific_name", "common_name_en", "common_names_zh", "family", "genus",
@@ -68,6 +90,276 @@ function cleanJson(str: string): string {
     cleaned = cleaned.replace(/^```json\s*/i, "").replace(/```$/, "").trim();
   }
   return cleaned;
+}
+
+// ── User-facing error reporting ───────────────────────────────────────────────
+// House rule: an error shown to a user must carry BOTH a machine-readable code AND
+// a plain-language cause + next step. `message` is rendered verbatim in the UI, so
+// it has to read like a sentence, not a stack trace.
+class AiError extends Error {
+  code: string;
+  constructor(code: string, message: string) {
+    super(message);
+    this.name = "AiError";
+    this.code = code;
+  }
+}
+
+/** Extract Google's structured error detail from a Generative Language error body. */
+function parseGeminiError(body: string): {
+  status: string;
+  message: string;
+  quotaId: string;
+  retryDelaySec: number | null;
+} {
+  let status = "";
+  let message = "";
+  let quotaId = "";
+  let retryDelaySec: number | null = null;
+  try {
+    const j = JSON.parse(body);
+    const e = j?.error ?? j?.[0]?.error ?? {};
+    status = e.status || "";
+    message = e.message || "";
+    for (const d of e.details ?? []) {
+      const t = String(d?.["@type"] || "");
+      if (t.includes("QuotaFailure")) quotaId = d?.violations?.[0]?.quotaId || quotaId;
+      else if (t.includes("RetryInfo") && typeof d?.retryDelay === "string") {
+        const m = d.retryDelay.match(/([\d.]+)s/);
+        if (m) retryDelaySec = Math.ceil(parseFloat(m[1]));
+      }
+    }
+  } catch {
+    /* body wasn't JSON — fall back to the generic copy */
+  }
+  return { status, message, quotaId, retryDelaySec };
+}
+
+/** A daily-quota 429 will NOT recover today, so retrying is pure latency. */
+const isDailyQuota = (quotaId: string) => /PerDay/i.test(quotaId);
+
+/** Map a Gemini HTTP failure onto an actionable Chinese message. */
+function describeGeminiError(httpStatus: number, body: string, model: string): AiError {
+  const { status, message, quotaId, retryDelaySec } = parseGeminiError(body);
+  const tail = status ? ` · ${status}` : "";
+  const code = `GEMINI_${httpStatus}${status ? "_" + status : ""}`;
+  const detail = message ? ` Google 原始说明：${message.slice(0, 220)}` : "";
+  const head = `AI 文案生成失败（HTTP ${httpStatus}${tail}）`;
+
+  if (httpStatus === 429) {
+    if (isDailyQuota(quotaId)) {
+      return new AiError(
+        code,
+        `${head}：Gemini 的「每日免费请求额度」已用尽。今天无法再生成，请等待配额重置（太平洋时间次日 0 点），` +
+          `或在管理后台更换 API key / 升级为付费配额。${detail}`,
+      );
+    }
+    return new AiError(
+      code,
+      `${head}：短时间内请求过多，超出 Gemini 的「每分钟请求数」限制。请${retryDelaySec ? ` ${retryDelaySec} 秒` : "稍"}后重试；` +
+        `若频繁出现，说明免费额度偏低，建议升级配额或更换模型。${detail}`,
+    );
+  }
+  if (httpStatus === 503)
+    return new AiError(code, `${head}：Gemini 模型当前过载，已自动重试 3 次仍失败。这是 Google 侧的临时故障，请稍后再试。${detail}`);
+  if (httpStatus === 400) {
+    // Google geo-restriction: the Generative Language API is unavailable in the
+    // caller's region (e.g. running the dev server behind GFW / an unsupported
+    // country). Surfaces as FAILED_PRECONDITION「User location is not supported」.
+    if (/user location is not supported/i.test(body) || status === "FAILED_PRECONDITION") {
+      return new AiError(
+        code,
+        `${head}：Gemini API 在当前服务器/网络所在地区不可用（Google 未开放该地区）。这不是照片或密钥的问题。` +
+          `本地开发时若直连（如在中国大陆），需让请求经由受支持地区的代理/VPN 出口；线上部署在 Cloudflare Workers 通常不受此限。` +
+          `也可在管理后台改用其它服务商（OpenAI/中转）。${detail}`,
+      );
+    }
+    return new AiError(code, `${head}：请求被 Gemini 拒绝。常见原因是照片过大或格式不受支持，也可能是 API key 格式不正确。${detail}`);
+  }
+  if (httpStatus === 401 || httpStatus === 403)
+    return new AiError(code, `${head}：Gemini API key 无效、已被撤销，或该 key 未启用 Generative Language API。请到管理后台检查密钥。${detail}`);
+  if (httpStatus === 404)
+    return new AiError(code, `${head}：模型「${model}」不存在，或当前 key 无权访问它。请在管理后台改用可用的模型名。${detail}`);
+  if (httpStatus >= 500)
+    return new AiError(code, `${head}：Google 服务器内部错误，不是本站的问题，请稍后再试。${detail}`);
+  return new AiError(code, `${head}。${detail || "Gemini 未返回更多说明。"}`);
+}
+
+// ── Gemini API key pool ───────────────────────────────────────────────────────
+// Free-tier Gemini quota (both RPM and RPD) is metered per Google Cloud PROJECT,
+// and each API key belongs to one project. So N keys from N projects/accounts = N
+// independent quota buckets. On a per-minute rate limit we therefore ROTATE to the
+// next key instead of sleeping — another project's RPM bucket is usually still open.
+//
+// Keys come in two formats: the legacy `AIzaSy…` (~39 chars) and the newer `AQ.…`.
+// Several may be given, separated by comma / newline / semicolon. A legacy single
+// key that merely picked up a stray space is still healed (stitched back).
+const GEMINI_KEY_RE = /^AIza[\w-]{20,}$/;
+
+/** Split a token that is two+ keys concatenated with NO separator. A single-line
+ *  <input> silently drops newlines on paste, fusing `KEY1\nKEY2` into `KEY1KEY2`.
+ *  Only split when every resulting part is a well-formed ~39-char key, so a key that
+ *  merely happens to contain "AIza" inside it is never mangled. */
+function unfuseGeminiKeys(token: string): string[] {
+  // Legacy `AIza…` pair fused by a lost newline.
+  if ((token.match(/AIza/g) ?? []).length >= 2) {
+    const parts = token.split(/(?=AIza)/).filter(Boolean);
+    if (parts.length >= 2 && parts.every((p) => GEMINI_KEY_RE.test(p) && p.length >= 35 && p.length <= 45)) return parts;
+  }
+  // New-format `AQ.…` pair fused (e.g. comma dropped by an earlier buggy normalize).
+  // The `AQ.` prefix is a clean split marker; only accept if every part looks like a key.
+  if ((token.match(/AQ\./g) ?? []).length >= 2) {
+    const parts = token.split(/(?=AQ\.)/).filter(Boolean);
+    if (parts.length >= 2 && parts.every((p) => /^AQ\.[A-Za-z0-9._-]{15,}$/.test(p))) return parts;
+  }
+  return [token];
+}
+
+function splitGeminiKeys(raw: string | null | undefined): string[] {
+  const s = String(raw ?? "");
+  // STRONG, intentional separators first: comma / semicolon / newline. If the user
+  // wrote "keyA,keyB" we must honour it for ANY key format — the old code required
+  // every part to match the `AIza…` regex and otherwise re-fused them, which turned
+  // two comma-separated NEW-format `AQ.…` keys back into one garbage string → 401.
+  const strong = s.split(/[,;\n\r]+/).map((x) => x.trim()).filter(Boolean);
+  if (strong.length >= 2) {
+    // Explicit pool — strip only INTERNAL whitespace from each key (heal a stray space).
+    return Array.from(new Set(strong.map((k) => k.replace(/\s+/g, "")).filter(Boolean)));
+  }
+  // Single chunk: no intentional separator was used.
+  const one = (strong[0] ?? "").trim();
+  if (!one) return [];
+  // Whitespace-separated pool of well-formed legacy keys → treat as a pool.
+  const bySpace = one.split(/\s+/).filter(Boolean);
+  if (bySpace.length >= 2 && bySpace.every((t) => GEMINI_KEY_RE.test(t))) {
+    return Array.from(new Set(bySpace));
+  }
+  // Otherwise it's ONE key — possibly mangled by internal spaces, or two legacy keys
+  // fused by a lost newline on paste. Strip whitespace, then try to unfuse AIza pairs.
+  return Array.from(new Set(unfuseGeminiKeys(one.replace(/\s+/g, ""))));
+}
+
+/**
+ * Canonicalize a stored/submitted API key. For Gemini this preserves a multi-key
+ * POOL (re-joined on ","); for every other provider it keeps the old behaviour of
+ * stripping all whitespace (a stray space in an OpenAI key caused 401s).
+ */
+function normalizeApiKey(provider: string | null | undefined, raw: string | null | undefined): string {
+  const s = String(raw ?? "");
+  if (provider === "gemini") return splitGeminiKeys(s).join(",") || s.replace(/\s+/g, "");
+  return s.replace(/\s+/g, "");
+}
+
+type GeminiCallOpts = { model: string; body: unknown; timeoutMs?: number; label?: string };
+
+/**
+ * POST to Gemini generateContent, rotating across the key pool.
+ *
+ * Per key: 429-daily → retire that key for this request; 429-per-minute → immediately
+ * try the NEXT key (its project has its own RPM bucket); 401/403/invalid-key → retire
+ * it; 5xx → try another key. Only once every key has been swept do we back off a
+ * single time (honouring Google's RetryInfo) and sweep the still-viable keys again.
+ * 400/404 are config errors (identical for every key) → surface immediately.
+ * Throws a described AiError when nothing works; otherwise returns the parsed JSON.
+ */
+async function callGeminiWithRotation(keys: string[], opts: GeminiCallOpts): Promise<any> {
+  const { model, body, timeoutMs = 55_000, label = "Gemini" } = opts;
+  if (!keys.length) {
+    throw new AiError("GEMINI_NO_KEY", "AI 文案生成失败（GEMINI_NO_KEY）：服务器没有配置任何 Gemini API key，请到管理后台填写。");
+  }
+  const dead = new Set<number>(); // daily-quota exhausted or invalid → skip for this request
+  let lastErr: AiError | null = null;
+  let suggestedDelay: number | null = null;
+  const payload = JSON.stringify(body);
+
+  for (let round = 0; round < 2; round++) {
+    for (let i = 0; i < keys.length; i++) {
+      if (dead.has(i)) continue;
+      const tag = `${label} key#${i + 1}/${keys.length}`;
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const resp = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${keys[i]}`,
+          { method: "POST", signal: controller.signal, headers: { "Content-Type": "application/json" }, body: payload },
+        );
+        if (resp.ok) {
+          if (i > 0 || round > 0) console.log(`[${tag}] succeeded after rotation`);
+          return await resp.json();
+        }
+
+        const text = await resp.text().catch(() => "");
+        lastErr = describeGeminiError(resp.status, text, model);
+        const { quotaId, retryDelaySec, message } = parseGeminiError(text);
+        if (retryDelaySec) suggestedDelay = Math.min(suggestedDelay ?? retryDelaySec, retryDelaySec);
+
+        if (resp.status === 429) {
+          if (isDailyQuota(quotaId)) {
+            console.warn(`[${tag}] daily quota exhausted — retiring this key for the request`);
+            dead.add(i);
+          } else {
+            console.warn(`[${tag}] per-minute rate limit — rotating to next key`);
+          }
+          continue;
+        }
+        if (resp.status === 401 || resp.status === 403 || /API key not valid|API_KEY_INVALID/i.test(message)) {
+          console.warn(`[${tag}] key rejected (invalid / unauthorised) — retiring it`);
+          dead.add(i);
+          continue;
+        }
+        if (resp.status >= 500) {
+          console.warn(`[${tag}] upstream ${resp.status} — trying another key`);
+          continue;
+        }
+        throw lastErr; // 400 / 404 → same outcome on every key
+      } catch (e) {
+        if (e instanceof AiError) throw e;
+        console.warn(`[${tag}] network error:`, e instanceof Error ? e.message : e);
+        lastErr = new AiError(
+          "GEMINI_NETWORK",
+          `AI 文案生成失败（GEMINI_NETWORK）：无法连接 Gemini 服务器（${e instanceof Error ? e.message : "网络错误"}）。请检查服务器到 Google API 的连通性。`,
+        );
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+    // Whole pool swept. If any key is still viable, back off once, then re-sweep.
+    if (round === 0 && dead.size < keys.length) {
+      const delay = Math.min((suggestedDelay ?? 20) * 1000, 30_000);
+      console.warn(`[${label}] all ${keys.length} key(s) rate-limited; backing off ${delay / 1000}s before a final sweep`);
+      await new Promise((r) => setTimeout(r, delay));
+    }
+  }
+
+  throw (
+    lastErr ??
+    new AiError("GEMINI_UNKNOWN", "AI 文案生成失败（GEMINI_UNKNOWN）：所有 Gemini API key 均不可用，请稍后重试或在管理后台补充新的 key。")
+  );
+}
+
+/** Generic describer for the OpenAI-compatible / Anthropic branches. */
+function describeHttpAiError(tag: string, httpStatus: number, body: string): AiError {
+  let message = "";
+  try {
+    const j = JSON.parse(body);
+    message = j?.error?.message || j?.message || "";
+  } catch {
+    message = body.slice(0, 200);
+  }
+  const detail = message ? ` 原始说明：${message.slice(0, 220)}` : "";
+  const code = `${tag.toUpperCase()}_${httpStatus}`;
+  const head = `${tag} 文案生成失败（HTTP ${httpStatus}）`;
+  if (httpStatus === 429)
+    return new AiError(code, `${head}：请求过于频繁或额度已用尽（rate limit / quota）。请稍后重试，或在管理后台更换 key、升级配额。${detail}`);
+  if (httpStatus === 401 || httpStatus === 403)
+    return new AiError(code, `${head}：API key 无效或无权访问该模型。请到管理后台检查密钥。${detail}`);
+  if (httpStatus === 402)
+    return new AiError(code, `${head}：账户余额不足 / 额度已耗尽，请充值后重试。${detail}`);
+  if (httpStatus === 404)
+    return new AiError(code, `${head}：模型名不存在或该 key 无权访问。请在管理后台改用可用的模型名。${detail}`);
+  if (httpStatus >= 500)
+    return new AiError(code, `${head}：上游服务（或中转网关）内部错误，请稍后再试。${detail}`);
+  return new AiError(code, `${head}。${detail}`);
 }
 
 type AgentReply = {
@@ -203,9 +495,11 @@ async function loadAiConfig(): Promise<AiProviderConfig | null> {
     if (!raw) return null;
     const cfg = typeof raw === "string" ? JSON.parse(raw) : raw;
     if (cfg?.provider && cfg?.apiKey && cfg?.model) {
-      // Defensive sanitization: heal configs saved before write-time cleaning, or
-      // ever re-poisoned, so an embedded space in the key can never cause a 401.
-      cfg.apiKey = String(cfg.apiKey).replace(/\s+/g, "");
+      // Defensive sanitization. `apiKey` may hold a POOL (comma/newline separated).
+      // splitGeminiKeys() heals a single whitespace-mangled key (old behaviour) while
+      // preserving a real multi-key pool; we re-join on "," as the canonical form.
+      // Blind `.replace(/\s+/g,"")` would fuse newline-separated keys into garbage.
+      cfg.apiKey = normalizeApiKey(cfg.provider, cfg.apiKey);
       if (cfg.baseUrl) cfg.baseUrl = String(cfg.baseUrl).trim().replace(/\/+$/, "");
       return cfg as AiProviderConfig;
     }
@@ -343,9 +637,132 @@ async function plantNetIdentify(
   };
 }
 
+/** Token-saving helper: given a species key (normalized scientific name), query the
+ *  most recent approved draft of that species and return its ai_payload (the full AiMeta
+ *  stored at generation time). Returns null if no match or the payload is missing. */
+async function findExistingSpeciesDraft(speciesName: string): Promise<AiMeta | null> {
+  if (!speciesName) return null;
+  const key = speciesKey(speciesName); // normalize to genus+species lowercase
+  if (!key) return null;
+
+  try {
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    // Find the most recent draft whose scientific_name matches the same species key.
+    // We prefer approved drafts (higher quality) but fall back to any draft if needed.
+    const { data } = await supabaseAdmin
+      .from("plant_drafts")
+      .select("ai_payload, scientific_name")
+      .not("ai_payload", "is", null)
+      .order("created_at", { ascending: false })
+      .limit(50); // check recent 50 drafts for a match
+
+    if (!data?.length) return null;
+
+    for (const row of data) {
+      if (!row.scientific_name) continue;
+      const rowKey = speciesKey(row.scientific_name);
+      if (rowKey !== key || !row.ai_payload) continue;
+      const payload = row.ai_payload as AiMeta & { _enriched?: boolean };
+      // CRITICAL: never reuse a phase-1 "lite" card (or any payload missing the
+      // long-form body). Those carry only summary/field_notes — reusing one makes
+      // the "生成完整草稿" step render section images with EMPTY text. Require real
+      // body content before treating a draft as a reusable full draft.
+      if (payload._enriched === false) continue;
+      if (!(payload.morphology_zh || "").trim() || !(payload.habitat_zh || "").trim()) continue;
+      console.log(`[TokenSave] Found existing FULL draft for species key "${key}"`);
+      return payload;
+    }
+  } catch (e) {
+    console.warn("[TokenSave] Failed to query existing drafts:", e);
+  }
+  return null;
+}
+
+/** Token-saving helper: given a photo and the existing species' universal content,
+ *  generate ONLY the field_notes (the photo-specific observation) via a small AI call.
+ *  Returns {field_notes_zh, field_notes_en, usage} or null on any failure. */
+async function generateFieldNotesOnly(
+  photoDataUrl: string,
+  hintPlace: string,
+  speciesName: string,
+  existingTitle: string,
+): Promise<{ field_notes_zh: string; field_notes_en: string; usage: AiTokenUsage } | null> {
+  const geminiKey = process.env.GEMINI_API_KEY;
+  if (!geminiKey) return null; // need Gemini for this small reliable call
+
+  const prompt = `你是 Plantspedia 的植物学家。给定一张实地拍摄的 **${existingTitle}（${speciesName}）** 照片${hintPlace ? `（拍摄于 ${hintPlace}）` : ""}，请生成一份「拍摄记录」，120–220 字中文 + 45–85 词英文。
+
+**主题必须是对这张照片的形态分析，以及据此定种的判断依据**（不要写物种通用知识，只针对本图）：
+① 照片中实际可见的诊断性特征（叶序/叶形/叶缘、花色花瓣数、果实、茎刺毛被、拍摄季节等）；
+② 由这些可见特征如何推导到该物种，哪些特征可与易混种相区分；
+③ 若照片信息不足以确诊，需要哪些补充角度（花特写、果实、叶背等）。
+
+只返回一个 JSON 对象，格式：{"field_notes_zh":"中文拍摄记录","field_notes_en":"English field notes"}。不要 markdown、不要多余文字。`;
+
+  try {
+    const match = photoDataUrl.match(/^data:([^;]+);base64,(.+)$/);
+    const mimeType = match ? match[1] : "image/jpeg";
+    const base64Data = match ? match[2] : photoDataUrl;
+
+    const model = process.env.AI_MODEL || "gemini-2.5-flash";
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiKey}`;
+
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{
+          role: "user",
+          parts: [
+            { text: prompt },
+            { inlineData: { mimeType, data: base64Data } },
+          ],
+        }],
+        generationConfig: {
+          responseMimeType: "application/json",
+          temperature: 0.0,
+        },
+      }),
+    });
+
+    if (!resp.ok) {
+      console.warn("[TokenSave] field_notes generation failed:", resp.status);
+      return null;
+    }
+
+    const data = await resp.json();
+    const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!text) return null;
+
+    const parsed = JSON.parse(cleanJson(text));
+    const u = data.usageMetadata ?? {};
+
+    return {
+      field_notes_zh: (parsed.field_notes_zh || "").toString().trim(),
+      field_notes_en: (parsed.field_notes_en || "").toString().trim(),
+      usage: {
+        prompt_tokens: u.promptTokenCount ?? 0,
+        completion_tokens: u.candidatesTokenCount ?? 0,
+        total_tokens: u.totalTokenCount ?? 0,
+      },
+    };
+  } catch (e) {
+    console.warn("[TokenSave] field_notes generation error:", e);
+    return null;
+  }
+}
+
 async function callAiIdentify(
   photoDataUrl: string,
   hintPlace: string,
+  // When the species is ALREADY decided (e.g. phase-2 enrich of a phase-1 card),
+  // pass it here so the full draft is written FOR that species instead of being
+  // re-identified from scratch — this is what keeps the enriched draft's name
+  // consistent with the summary card the user already saw.
+  speciesHint?: { title?: string; scientificName?: string } | null,
+  // Web research digest from enrichDraft's 联网调研 step. Injected into the system
+  // prompt as authoritative reference material for accuracy + timeliness.
+  webResearch?: { digest: string; sources: { title: string; uri: string }[] },
 ): Promise<{ meta: AiMeta; model: string; provider: string; usage: AiTokenUsage }> {
   // Load admin-configured model from DB (affects ALL users); fall back to env vars
   let dbConfig = await loadAiConfig();
@@ -358,18 +775,35 @@ async function callAiIdentify(
   let stageModel = "";
   let stageUsage: AiTokenUsage | null = null;
   let idHint = "";
+  // A pinned species short-circuits re-identification and locks the name.
+  const pinnedSci = (speciesHint?.scientificName || "").trim();
+  const pinnedTitle = (speciesHint?.title || "").trim();
+  // Treat EITHER a Chinese name or a Latin name as "already identified". Gating only
+  // on pinnedSci was a hole: a phase-1 card with a 中文名 but empty 学名 would still
+  // trigger re-identification here → the Latin name could drift after enrich.
+  const pinned = !!(pinnedSci || pinnedTitle);
+  if (pinned) {
+    idHint +=
+      `\n\n【物种已确定 · 硬性】本图所属物种已由前序识别确定为「${pinnedTitle || pinnedSci}」` +
+      `${pinnedSci ? `（拉丁学名 ${pinnedSci}）` : ""}。请**不要重新定种**，直接据此撰写完整图鉴；` +
+      `返回的 title / scientific_name / family / genus 必须与该物种一致，不得改判为其它物种。`;
+  }
 
   // ── Stage 0: 专业植物识别引擎 Pl@ntNet（独立于写稿大模型；命中即作为定种基准）──
   // Runs first whenever a key is configured, regardless of which LLM writes the draft.
   // Feeds a ranked species verdict + confidence into the shared system prompt. Failure
   // is non-fatal — we simply continue with LLM-only identification.
+  let earlySpeciesName = pinnedSci || ""; // seed from a pinned species (enrich); else set by cheap stages
   const plantNetKey = await loadPlantNetKey();
-  if (plantNetKey) {
+  // When the species is already pinned, skip re-identification entirely — it only
+  // risks disagreeing with the card the user saw, and wastes a Pl@ntNet call.
+  if (plantNetKey && !pinned) {
     const pn = await plantNetIdentify(photoDataUrl, plantNetKey).catch((e) => {
       console.warn("[Pl@ntNet] identify failed; continuing with LLM-only:", e);
       return null;
     });
     if (pn && pn.scientific_name) {
+      earlySpeciesName = pn.scientific_name;
       const pct = Math.round((pn.score ?? 0) * 100);
       idHint += `\n\n【专业识别引擎 Pl@ntNet 判定】最可能物种：${pn.scientific_name}` +
         `${pn.family ? `（科 ${pn.family}${pn.genus ? ` / 属 ${pn.genus}` : ""}）` : ""}` +
@@ -380,17 +814,60 @@ async function callAiIdentify(
     }
   }
 
-  if (dbConfig?.provider === "custom" && dbConfig.apiKey && process.env.GEMINI_API_KEY) {
+  if (!pinned && dbConfig?.provider === "custom" && dbConfig.apiKey && process.env.GEMINI_API_KEY) {
     const quick = await quickIdentify(photoDataUrl, dbConfig).catch((e) => {
       console.warn("[Two-stage] quick ID failed; falling back to Gemini-only:", e);
       return null;
     });
     if (quick && (quick.title || quick.scientific_name)) {
+      if (!earlySpeciesName && quick.scientific_name) earlySpeciesName = quick.scientific_name;
       idHint += `\n\n【初步识别提示】另一视觉模型已将本图判定为：「${quick.title}」${quick.scientific_name ? `（${quick.scientific_name}）` : ""}。请结合照片核对该判定并据此生成草稿；若你认为该判定有误，请以你的判断为准，并在 summary_zh 中简要说明分歧。`;
       stageModel = stageModel ? `${stageModel}+${quick.model}` : quick.model;
       stageUsage = quick.usage;
     }
     dbConfig = null; // route the heavy draft to the env Gemini path below
+  }
+
+  // ── Token-saving branch: if we got a species ID from the cheap stages, try to reuse
+  // an existing draft's universal content and only regenerate the photo-specific field_notes.
+  // Fully non-fatal: any failure falls through to the normal full-draft generation below.
+  if (earlySpeciesName) {
+    const existing = await findExistingSpeciesDraft(earlySpeciesName).catch((e) => {
+      console.warn("[TokenSave] Query failed:", e);
+      return null;
+    });
+    if (existing) {
+      const fieldNotesResult = await generateFieldNotesOnly(
+        photoDataUrl,
+        hintPlace,
+        existing.scientific_name || earlySpeciesName,
+        existing.title || "本物种",
+      ).catch((e) => {
+        console.warn("[TokenSave] field_notes generation failed:", e);
+        return null;
+      });
+
+      if (fieldNotesResult && fieldNotesResult.field_notes_zh) {
+        // Success: merge the existing universal content with the new field_notes
+        const meta: AiMeta = {
+          ...existing,
+          field_notes_zh: fieldNotesResult.field_notes_zh,
+          field_notes_en: fieldNotesResult.field_notes_en,
+        };
+        const totalUsage: AiTokenUsage = {
+          prompt_tokens: (stageUsage?.prompt_tokens ?? 0) + fieldNotesResult.usage.prompt_tokens,
+          completion_tokens: (stageUsage?.completion_tokens ?? 0) + fieldNotesResult.usage.completion_tokens,
+          total_tokens: (stageUsage?.total_tokens ?? 0) + fieldNotesResult.usage.total_tokens,
+        };
+        console.log(`[TokenSave] Reused existing draft, only regenerated field_notes. Tokens: ${totalUsage.total_tokens}`);
+        return {
+          meta,
+          model: stageModel ? `${stageModel}→reuse+field_notes` : "reuse+field_notes",
+          provider: stageModel ? `${stageModel}+reuse` : "reuse",
+          usage: totalUsage,
+        };
+      }
+    }
   }
 
   // A saved admin config is AUTHORITATIVE: route EXCLUSIVELY to that provider and
@@ -409,6 +886,15 @@ async function callAiIdentify(
     : process.env.ANTHROPIC_API_KEY;
   const lovableKey = dbConfig ? "" : process.env.LOVABLE_API_KEY;
 
+  // Build web research context block (if provided by enrichDraft).
+  let webContext = "";
+  if (webResearch && webResearch.digest) {
+    const srcList = webResearch.sources.length
+      ? "\n参考来源：\n" + webResearch.sources.map((s, i) => `[${i + 1}] ${s.title || s.uri} — ${s.uri}`).join("\n")
+      : "";
+    webContext = `\n\n【联网调研·权威参考资料】以下是对该物种最新研究进展、保护状态、分布更新等的联网检索结果，请据此确保你撰写的内容准确、时效性强：\n${webResearch.digest}${srcList}\n`;
+  }
+
   const systemPrompt = `你是 Plantspedia 的首席植物学家与资深图鉴编辑。给定一张实地拍摄的植物照片（如提供了拍摄的经纬度或行政区划信息，请结合该地理背景进行识别），请遵循极其严格的植物学形态学分类标准，识别出精准的物种（拉丁学名需精确到种、变种或亚种），并返回一份完整、信息密度高、辞藻精炼的科普草稿——直接对标已收录的精品条目（如「戈壁天门冬」）。
 
 内容要求（请逐条满足，缺一不可）：
@@ -417,19 +903,21 @@ async function callAiIdentify(
 - common_names_zh：包含该植物的所有中文俗名、别名、以及花卉市场常见的商品名/交易名，用半角逗号隔开（例如 "发财树, 瓜栗, 招财树"）。
 - name_origin_zh：220–360 字，分两部分：① 中文名（俗名、古名、地方名）的字源、典籍出处；② 拉丁学名属名 + 种加词的词根含义、命名人/命名年代背景。name_origin_en：80–140 词。
 - morphology_zh：320–500 字，按 株型/根 → 茎 → 叶 → 花 → 果实/种子 顺序描述，包含具体数值（如高度 cm、叶长 mm、花期月份）。morphology_en：100–160 词。
-- habitat_zh：260–400 字，包含：典型生境与海拔/土壤、世界分布范围、中国分布省份、本次拍摄地点的生态记录（必须自然带入「本次拍摄于 ${hintPlace || "（未知地点）"}」一句）。habitat_en：90–140 词。
+- habitat_zh：260–400 字，包含：典型生境与海拔/土壤、世界分布范围、中国分布省份，以及本次拍摄地点的生态记录。${hintPlace ? `本段必须自然带入「本次拍摄于 ${hintPlace}」一句。` : "⚠️ 本次未提供可靠的拍摄定位：严禁臆造、推断或填入任何具体拍摄地名（省/市/区/县/街道均不可），如需提及拍摄地点只能写「本次拍摄地点未知」。"}habitat_en：90–140 词。
 - culture_zh：360–600 字，本部分的主题是「植物人文」，请尽量分点覆盖以下维度（无相关内容的维度可略写，但严禁编造）：① 文化与民俗；② 植物民族志——世界不同民族/地区对该植物的认知、命名与地方性知识；③ 文学——若有名篇名句或典籍记载，请引用原文片段并注明出处/作者；④ 食用与药用；⑤ 茶饮（若相关）；⑥ 商贸与经济价值；⑦ 博物学史（被发现、引种、命名、栽培传播的历史）。若该物种确无人文记载，则转而详述其生态角色与近缘种的文化对比。culture_en：120–180 词，对应中文要点的精炼意译。
 - care_tips_zh：220–320 字，本部分是「养护方案的依据说明」——结合该物种的原生生境、形态适应与生长习性，解释为什么给出下方 8 张养护卡片里的方案（讲清"为什么"，不要简单罗列数值；具体数值一律放进 care_facts 卡片）。care_tips_en：80–120 词。
 - care_facts：养护卡片，为对象数组，必须依次输出以下 8 张卡片，每张含 4 个字段 category/value/tag/detail（detail ≤ 50 字，简洁实用）：① category「酸碱偏好」，value=适宜 PH 范围（如「PH 6.0–6.5」），tag=酸/碱/中性 之一，detail 说明酸碱偏好及如何用施肥/有机方式调节；② category「施肥方案」，value=常见肥名称，tag=「合成：…／有机：…」，detail 区分速效与缓释；③ category「光照需求」，value=光照强度范围（如「15000–40000 lux / 全日照」），tag 从 喜阳/喜阴/直照/散射 选填，detail 说明光照需求；④ category「土壤基质」，value=土壤类型或配比（如「腐叶土:珍珠岩=3:1」），tag=砂质/泥质/腐殖质/寄生 之一，detail 给基质调配指南；⑤ category「浇水方法」，value=不同生长期每日需水量（如「生长期见干见湿，休眠期少水」），tag=水生/湿土/怕水多烂根/耐旱 之一，detail 说明浇水频率与方法；⑥ category「温度区间」，value=适宜生长温度范围（如「18–28℃，耐 5℃」），tag=热带/亚热带/温带/寒带 之一，detail 说明温度耐受；⑦ category「空气湿度」，value=适宜湿度范围（如「50%–70%」），tag=喜湿/喜干 之一，detail 说明空气湿度；⑧ category「病害防治」，value=常见害虫或病害类型（如「红蜘蛛 / 白粉病」），tag=「合成：药剂名／有机：方法」，detail 给病害防护指南。
 - tags：5–10 个简短中文/英文标签，用于站内检索，如「水生」「禾本科」「多年生」「invasive」「荒漠植物」。
 - iucn_status：仅在你**确有把握**时填入 LC/NT/VU/EN/CR/DD 之一，否则留空字符串。
+- identification_confidence + needs_more_photos_zh/en（**定种严谨性，硬性要求**）：请对本次定种给出诚实的置信度。**宁可承认「无法确定」，也不要凭有限照片武断定成一个错误物种——错误定种比暂不定种更糟。** 判定标准：诊断性特征清晰充分、与某一物种高度吻合才可 high；仅能定到属、种一级仍有多个近似候选记 medium；照片信息不足（缺花/果/叶背等关键器官、角度不佳、主体不清）只能给疑似猜测时记 low。当为 low（medium 视需要）时，**必须**填写 needs_more_photos_zh/en：**读者是完全不懂植物学的普通人**，请用大白话写 2–4 条可直接照做的拍摄动作，① ② ③ 编号，每条一句话、一个动作，讲清「拍哪里 + 怎么拍」。**严禁专业术语**（脉序、被毛、托叶、花序、苞片、腋生…）；确需提到部位时改用日常说法并加括号解释，例如「把叶子翻过来拍背面（看清叶脉和有没有细毛）」「凑近拍一朵完整的花，正面拍清花瓣数量」「拍一下果实或种子」「退后一步拍整棵植物（看清高矮和分枝）」。请针对该疑似类群，挑最能区分近似种的那几项。此时 title/scientific_name 给出最可能的猜测但 summary_zh 必须以「疑似……」开头并说明存疑点，不得使用确诊口吻。high 时 needs_more_photos_* 留空字符串。
 - 所有中文段落采用 Noto Serif SC 风格的正式植物志措辞，避免空话套话；英文段落为对应中文段落的精炼意译，保留拉丁学名斜体（用 *Genus species* 标记）。
 - 若识别不确定，仍要给出最可能的物种，并在 summary 标注「疑似」。
 
 【精准识别与校对指南】
 1. 形态特征分析清单：仔细观察照片中显现的特征（如单叶/复叶、互生/对生、花瓣数、花冠对称性等）。
 2. 地理与生境匹配：如果提供了拍摄地点，优先考虑该生境下可能分布的本土、归化或常见栽培植物，避免识别出地理分布不符的远缘物种。
-3. 近缘种与疑似种对比：如果特征不够完整，请在 summary 中说明「疑似某物种，需与同属的类似物种进行区分，区分要点为……」，展现严谨的植物学素养。` + idHint;
+3. 近缘种与疑似种对比：如果特征不够完整，请在 summary 中说明「疑似某物种，需与同属的类似物种进行区分，区分要点为……」，展现严谨的植物学素养。
+4. 拍摄地点的真实性（硬性要求）：仅当上文明确提供了拍摄地点时，才可在任何段落写出具体地名；若未提供拍摄地点，则**严禁**在 summary_zh / field_notes_zh / habitat_zh / culture_zh 或任何字段中编造、猜测或推断出具体的拍摄地名（不得根据物种分布或照片背景反推一个地名），一律以「拍摄地点未知」表述。` + webContext + idHint;
 
   // ── 1. Google Gemini ──────────────────────────────────────────────────────
   if (geminiKey) {
@@ -443,86 +931,47 @@ async function callAiIdentify(
       const mimeType = match ? match[1] : "image/jpeg";
       const base64Data = match ? match[2] : photoDataUrl;
 
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiKey}`;
-      
-      const schema = AI_META_SCHEMA;
+      const keyPool = splitGeminiKeys(geminiKey);
+      console.log(`[AI Identify] Gemini key pool size: ${keyPool.length}`);
 
-      let attempts = 0;
-      const maxAttempts = 3;
-      let resp: Response | null = null;
-
-      while (attempts < maxAttempts) {
-        attempts++;
-        // 55s timeout per attempt — Gemini vision calls can be slow for large images
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), 55_000);
-        try {
-          resp = await fetch(url, {
-            method: "POST",
-            signal: controller.signal,
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              contents: [
+      // 55s timeout per attempt — Gemini vision calls can be slow for large images.
+      const data = await callGeminiWithRotation(keyPool, {
+        model,
+        timeoutMs: 55_000,
+        label: "AI Identify",
+        body: {
+          contents: [
+            {
+              role: "user",
+              parts: [
                 {
-                  role: "user",
-                  parts: [
-                    {
-                      text: `请识别这张植物照片。${hintPlace ? `拍摄地点：${hintPlace}。` : ""}请按照指定的 JSON 结构返回完整的识别信息。`
-                    },
-                    {
-                      inlineData: {
-                        mimeType,
-                        data: base64Data
-                      }
-                    }
-                  ]
-                }
+                  text: `请识别这张植物照片。${hintPlace ? `拍摄地点：${hintPlace}。` : ""}请按照指定的 JSON 结构返回完整的识别信息。`,
+                },
+                { inlineData: { mimeType, data: base64Data } },
               ],
-              systemInstruction: {
-                parts: [{ text: systemPrompt }]
-              },
-              generationConfig: {
-                responseMimeType: "application/json",
-                responseSchema: schema,
-                temperature: 0.0
-              }
-            })
-          });
-          clearTimeout(timer);
-
-          // 429 = rate limit, 503 = model overloaded — both are transient, retry with backoff
-          if ((resp.status === 429 || resp.status === 503) && attempts < maxAttempts) {
-            const delay = attempts * 5000; // 5s, 10s
-            console.warn(`[AI Identify] Gemini API returned ${resp.status}. Retrying in ${delay / 1000}s... (Attempt ${attempts}/${maxAttempts})`);
-            await new Promise((resolve) => setTimeout(resolve, delay));
-            continue;
-          }
-          break;
-        } catch (err) {
-          clearTimeout(timer);
-          if (attempts < maxAttempts) {
-            const delay = attempts * 5000;
-            console.warn(`[AI Identify] Fetch error, retrying in ${delay / 1000}s...:`, err);
-            await new Promise((resolve) => setTimeout(resolve, delay));
-            continue;
-          }
-          throw err;
-        }
-      }
-
-      if (!resp || !resp.ok) {
-        const status = resp ? resp.status : 500;
-        const t = resp ? await resp.text() : "网络请求失败";
-        console.error("Gemini API Error:", status, t);
-        if (status === 503) throw new Error("Gemini 模型当前过载，已重试 3 次仍失败，请稍后再试");
-        throw new Error(`Gemini 识别出错 (HTTP ${status})`);
-      }
-
-      const data = await resp.json();
+            },
+          ],
+          systemInstruction: { parts: [{ text: systemPrompt }] },
+          generationConfig: {
+            responseMimeType: "application/json",
+            responseSchema: AI_META_SCHEMA,
+            temperature: 0.0,
+          },
+        },
+      });
       const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
       if (!text) {
         console.error("Gemini invalid response structure:", JSON.stringify(data));
-        throw new Error("Gemini 未能返回有效内容");
+        const blockReason = data?.promptFeedback?.blockReason || data?.candidates?.[0]?.finishReason || "";
+        throw new AiError(
+          `GEMINI_EMPTY${blockReason ? "_" + blockReason : ""}`,
+          `AI 文案生成失败（GEMINI_EMPTY${blockReason ? " · " + blockReason : ""}）：Gemini 没有返回任何内容。` +
+            (blockReason === "SAFETY"
+              ? "照片或提示词触发了 Google 的安全过滤，请换一张照片重试。"
+              : blockReason === "MAX_TOKENS"
+                ? "生成内容超出长度上限被截断，请稍后重试。"
+                : "这通常是模型侧的临时异常，请重试一次。"),
+        );
       }
 
       try {
@@ -540,7 +989,10 @@ async function callAiIdentify(
         };
       } catch (e) {
         console.error("Failed to parse Gemini response as JSON:", text, e);
-        throw new Error("Gemini 返回的 JSON 格式不完整");
+        throw new AiError(
+          "GEMINI_BAD_JSON",
+          "AI 文案生成失败（GEMINI_BAD_JSON）：Gemini 返回的内容不是完整的 JSON，通常是生成被中途截断。请重试一次；若反复出现，可在管理后台换一个模型。",
+        );
       }
     } catch (err) {
       console.error("[AI Identify] Google Gemini API call failed. Trying OpenAI or Lovable gateway fallbacks:", err);
@@ -594,7 +1046,7 @@ async function callAiIdentify(
     if (!resp.ok) {
       const t = await resp.text();
       console.error("Anthropic API Error:", resp.status, t);
-      throw new Error(`Anthropic 识别出错 (HTTP ${resp.status})：${t.slice(0, 200)}`);
+      throw describeHttpAiError("Anthropic", resp.status, t);
     }
 
     const data = await resp.json();
@@ -694,11 +1146,13 @@ async function callAiIdentify(
       // content block. Photo ID is impossible without a multimodal model, so surface
       // a clear, actionable message instead of the raw serde error.
       if (/image_url|unknown variant|expected\s+`?text`?|does ?n['’]?t support image|not support.*image|multimodal|vision/i.test(t)) {
-        throw new Error(
-          `${tag}的模型「${model}」不支持图片识别（仅接受纯文本）。拍照识别必须用多模态/视觉模型，例如 Gemini、GPT-4o、Claude 3.5 Sonnet、或通义千问 Qwen-VL。`,
+        throw new AiError(
+          "AI_MODEL_NOT_MULTIMODAL",
+          `AI 文案生成失败（AI_MODEL_NOT_MULTIMODAL）：${tag}的模型「${model}」不支持图片识别（仅接受纯文本）。` +
+            `拍照识别必须用多模态/视觉模型，例如 Gemini、GPT-4o、Claude 3.5 Sonnet、或通义千问 Qwen-VL。请到管理后台更换模型。`,
         );
       }
-      throw new Error(`${tag}识别出错 (HTTP ${status})：${t.slice(0, 200)}`);
+      throw describeHttpAiError(tag, status, t);
     }
 
     const data = await resp.json();
@@ -1014,6 +1468,32 @@ async function fetchSpeciesPhotos(term: string, n: number): Promise<string[]> {
     }
   };
 
+  // Greedy diversity pick: never take two photos that share a place / season /
+  // photographer until we're forced to. Without this the top-voted photos of one
+  // species are usually the SAME plant shot by the same person on the same day.
+  type Cand = { url: string; place: string; season: string; who: string };
+  const pickDiverse = (cands: Cand[], want: number): string[] => {
+    const out: string[] = [];
+    const places = new Set<string>();
+    const seasons = new Set<string>();
+    const whos = new Set<string>();
+    // pass 3 = all three axes must be new; pass 2 = place must be new; pass 1 = anything.
+    for (const strict of [3, 2, 1]) {
+      for (const c of cands) {
+        if (out.length >= want) return out;
+        if (seen.has(c.url)) continue;
+        if (strict === 3 && ((c.place && places.has(c.place)) || (c.season && seasons.has(c.season)) || (c.who && whos.has(c.who)))) continue;
+        if (strict === 2 && c.place && places.has(c.place)) continue;
+        seen.add(c.url);
+        out.push(c.url);
+        if (c.place) places.add(c.place);
+        if (c.season) seasons.add(c.season);
+        if (c.who) whos.add(c.who);
+      }
+    }
+    return out;
+  };
+
   // 1) iNaturalist — best for real, vetted species field photos.
   try {
     const tx = await timeoutFetch(
@@ -1023,7 +1503,7 @@ async function fetchSpeciesPhotos(term: string, n: number): Promise<string[]> {
     const taxonId = tx?.results?.[0]?.id ?? null;
     const params = new URLSearchParams({
       photos: "true",
-      per_page: "30",
+      per_page: "60", // wide candidate pool → real choice for the diversity pass
       order: "desc",
       order_by: "votes",
       quality_grade: "research",
@@ -1031,13 +1511,22 @@ async function fetchSpeciesPhotos(term: string, n: number): Promise<string[]> {
     if (taxonId) params.set("taxon_id", String(taxonId));
     else params.set("q", q);
     const j = await timeoutFetch("https://api.inaturalist.org/v1/observations?" + params);
+    const cands: Cand[] = [];
     for (const obs of j?.results ?? []) {
-      for (const ph of obs?.photos ?? []) {
-        if (!ph?.url) continue;
-        add(String(ph.url).replace(/\/square\./, "/large.").replace(/\/medium\./, "/large."));
-        if (urls.length >= n) return urls;
-      }
+      // ONE photo per observation — extra photos of the same observation are the
+      // same individual from near-identical angles.
+      const ph = obs?.photos?.[0];
+      if (!ph?.url) continue;
+      const coords: number[] = obs?.geojson?.coordinates ?? [];
+      cands.push({
+        url: String(ph.url).replace(/\/square\./, "/large.").replace(/\/medium\./, "/large."),
+        place: obs?.place_guess || coords.map((c) => Math.round(c)).join(","),
+        season: (obs?.observed_on || "").slice(5, 7), // month → different phenology/生境
+        who: obs?.user?.login || "",
+      });
     }
+    for (const u of pickDiverse(cands, n)) urls.push(u);
+    if (urls.length >= n) return urls;
   } catch {
     /* fall through to next source */
   }
@@ -1047,16 +1536,23 @@ async function fetchSpeciesPhotos(term: string, n: number): Promise<string[]> {
     try {
       const m = await timeoutFetch("https://api.gbif.org/v1/species/match?" + new URLSearchParams({ name: q }));
       const key = m?.usageKey ?? null;
-      const params = new URLSearchParams({ mediaType: "StillImage", limit: "30" });
+      const params = new URLSearchParams({ mediaType: "StillImage", limit: "60" });
       if (key) params.set("taxonKey", String(key));
       else params.set("q", q);
       const j = await timeoutFetch("https://api.gbif.org/v1/occurrence/search?" + params);
+      const cands: Cand[] = [];
       for (const occ of j?.results ?? []) {
-        for (const media of occ?.media ?? []) {
-          add(media?.identifier);
-          if (urls.length >= n) return urls;
-        }
+        const media = occ?.media?.[0]; // one image per occurrence
+        if (!media?.identifier) continue;
+        cands.push({
+          url: String(media.identifier),
+          place: occ?.stateProvince || occ?.country || occ?.locality || "",
+          season: String(occ?.month ?? ""),
+          who: occ?.recordedBy || "",
+        });
       }
+      for (const u of pickDiverse(cands, n - urls.length)) urls.push(u);
+      if (urls.length >= n) return urls;
     } catch {
       /* fall through */
     }
@@ -1077,14 +1573,16 @@ async function fetchSpeciesPhotos(term: string, n: number): Promise<string[]> {
             gsrlimit: "30",
             prop: "imageinfo",
             iiprop: "url|mime",
-            iiurlwidth: "640",
+            iiurlwidth: "1200",
           }),
       );
       const pages = j?.query?.pages ?? {};
       for (const k of Object.keys(pages)) {
         const ii = pages[k]?.imageinfo?.[0];
         if (!ii?.url || (ii.mime || "").includes("svg")) continue;
-        add(ii.url);
+        // `url` is the FULL-SIZE original (often 10–50 MB). `thumburl` is the scaled
+        // 1200px render — always prefer it so we store a sane file.
+        add(ii.thumburl || ii.url);
         if (urls.length >= n) return urls;
       }
     } catch {
@@ -1093,6 +1591,86 @@ async function fetchSpeciesPhotos(term: string, n: number): Promise<string[]> {
   }
 
   return urls;
+}
+
+/**
+ * Re-host external species photos into our own Supabase Storage so the published
+ * page / draft never hotlinks iNaturalist / GBIF / Wikimedia directly. Those hosts
+ * are slow-or-blocked from mainland China (AWS-backed iNat static, GBIF media that
+ * frequently 404s, Wikimedia), so hotlinked `<img>` render broken for local users.
+ *
+ * Downloads each URL and uploads it under `${prefix}`. Fully non-fatal and
+ * per-image: a URL that fails to fetch/upload is dropped — fewer good images beats
+ * broken ones. Returns the public URLs, preserving order.
+ *
+ * COMPRESSION (never store an unbounded original):
+ *  1. Sources are asked for a scaled variant up front (iNat `/large.` ≈1024px,
+ *     Wikimedia `thumburl` @1200px) — see fetchSpeciesPhotos.
+ *  2. This fetch requests Cloudflare Image Resizing (`cf.image`). Where the zone has
+ *     it enabled the body arrives already downscaled + re-encoded to WebP; where it
+ *     isn't, the option is ignored and the original comes through (safe no-op).
+ *  3. Hard caps: refuse to download beyond MAX_SOURCE_BYTES, refuse to store beyond
+ *     MAX_STORE_BYTES. Workers has no sharp/canvas, so anything still oversized after
+ *     (1)+(2) is skipped rather than stored.
+ */
+async function rehostImages(urls: string[], prefix: string): Promise<string[]> {
+  const out: string[] = [];
+  const MAX_STORE_BYTES = 5 * 1024 * 1024; // never persist more than 5 MB per image
+  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+
+  // Download one image → {bytes, contentType} or null. Tries Cloudflare Image
+  // Resizing first (downscale+WebP); if that subrequest fails (zone lacks the
+  // Image Resizing add-on → the resized fetch can error or 4xx) it RETRIES with a
+  // plain fetch so the image still gets re-hosted. This is why gold-page images
+  // could come back empty: a failed `cf.image` fetch dropped every slot.
+  const download = async (src: string, useResize: boolean): Promise<{ ab: ArrayBuffer; ct: string } | null> => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 12_000);
+    try {
+      const init = {
+        signal: controller.signal,
+        headers: { "User-Agent": "Plantspedia/1.0" },
+        ...(useResize ? { cf: { image: { width: 1280, quality: 78, fit: "scale-down", format: "webp" } } } : {}),
+      } as RequestInit;
+      const r = await fetch(src, init);
+      if (!r.ok) return null;
+      const ct = (r.headers.get("content-type") || "").toLowerCase();
+      if (!ct.startsWith("image/") || ct.includes("svg")) return null;
+      const ab = await r.arrayBuffer();
+      if (ab.byteLength === 0 || ab.byteLength > MAX_STORE_BYTES) return null;
+      return { ab, ct };
+    } catch {
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
+  for (let i = 0; i < urls.length; i++) {
+    const src = urls[i];
+    try {
+      // Resized first; fall back to the plain original if resizing isn't available.
+      const got = (await download(src, true)) ?? (await download(src, false));
+      if (!got) {
+        console.warn(`[RehostImages] no usable body (resized+plain both failed): ${src}`);
+        continue;
+      }
+      const { ab, ct } = got;
+      const ext = ct.includes("png") ? "png" : ct.includes("webp") ? "webp" : ct.includes("gif") ? "gif" : "jpg";
+      const path = `${prefix}-${Date.now()}-${i}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
+      const { error } = await supabaseAdmin.storage
+        .from("plant-images")
+        .upload(path, Buffer.from(ab), { contentType: ct, upsert: false });
+      if (error) {
+        console.warn(`[RehostImages] upload failed for ${src}:`, error.message);
+        continue;
+      }
+      out.push(supabaseAdmin.storage.from("plant-images").getPublicUrl(path).data.publicUrl);
+    } catch (e) {
+      console.warn(`[RehostImages] failed for ${src}:`, e instanceof Error ? e.message : e);
+    }
+  }
+  return out;
 }
 
 // ── GBIF / GRIIS invasive-species check ──────────────────────────────────────
@@ -1244,12 +1822,383 @@ async function generateConservationCard(
   }
 }
 
+// ── Phase-1 fast summary card ────────────────────────────────────────────────
+// Light schema: species ID + a short bilingual summary + field notes + honest
+// confidence/abstain guidance. NO long-form sections → far fewer output tokens →
+// returns fast so the user sees a card quickly instead of waiting for the full draft.
+const AI_QUICK_SCHEMA = {
+  type: "object",
+  properties: {
+    title: { type: "string", description: "中文物种名" },
+    scientific_name: { type: "string", description: "拉丁学名（含命名人）" },
+    common_name_en: { type: "string", description: "英文俗名" },
+    common_names_zh: { type: "string", description: "中文俗名及商品名（逗号分隔）" },
+    family: { type: "string", description: "科（中文+拉丁）" },
+    genus: { type: "string", description: "属（中文+拉丁）" },
+    iucn_status: { type: "string", description: "IUCN 评级，无把握留空" },
+    tags: { type: "array", items: { type: "string" } },
+    summary_zh: { type: "string", description: "150–260 字趣味导语式摘要" },
+    summary_en: { type: "string", description: "50–90 词" },
+    field_notes_zh: { type: "string", description: "拍摄记录：对本张照片的形态分析 + 定种判断依据" },
+    field_notes_en: { type: "string" },
+    identification_confidence: { type: "string", enum: ["high", "medium", "low"] },
+    needs_more_photos_zh: {
+      type: "string",
+      description:
+        "low/medium 时填写：面向不懂植物学的普通用户，用大白话写 2–4 条可直接照做的拍摄动作，① ② ③ 编号，每条一句话一个动作，禁用专业术语（脉序/被毛/托叶/花序 等），如「把叶子翻过来拍背面（看清叶脉和有没有细毛）」。high 留空",
+    },
+    needs_more_photos_en: { type: "string", description: "英文对应，同样通俗；high 留空" },
+  },
+  required: ["title", "scientific_name", "family", "genus", "summary_zh", "summary_en", "identification_confidence"],
+};
+
+/** Fast phase-1 identify: species + short summary + confidence, via Gemini only.
+ *  Returns null if no Gemini key (caller then falls back to the full pipeline). */
+async function identifyQuick(
+  photoDataUrl: string,
+  hintPlace: string,
+  opts?: { speciesHint?: { title?: string; sci?: string } | null; forceResult?: boolean; retakeCount?: number },
+): Promise<{ meta: AiMeta; model: string; provider: string; usage: AiTokenUsage } | null> {
+  // Prefer the admin-configured Gemini model/key so the quick summary card uses the
+  // SAME model as the rest of the site (e.g. gemini-3.5-flash). The quick path is
+  // Gemini-only, so a non-Gemini admin config falls back to the env Gemini key.
+  const dbConfig = await loadAiConfig();
+  const useDbGemini = dbConfig?.provider === "gemini" && !!dbConfig.apiKey;
+  const geminiKey = useDbGemini ? dbConfig!.apiKey : process.env.GEMINI_API_KEY;
+  if (!geminiKey) return null;
+  const model = useDbGemini && dbConfig!.model ? dbConfig!.model : process.env.AI_MODEL || "gemini-2.5-flash";
+
+  // 补拍复核语境：把上一轮判断和「必须出结论」的硬指令拼进 system prompt。
+  const hintTitle = (opts?.speciesHint?.title || "").trim();
+  const hintSci = (opts?.speciesHint?.sci || "").trim();
+  const retakeCtx =
+    hintTitle || hintSci
+      ? `\n- 补拍复核（硬性）：这是同一株植物的第 ${opts?.retakeCount ?? 1} 次补拍。上一轮倾向判断为「${hintTitle}${hintSci ? `（${hintSci}）` : ""}」。请结合本次更清晰的照片**确认或修正**该判断——若新证据支持另一物种，请大胆改判。`
+      : "";
+  const forceCtx = opts?.forceResult
+    ? `\n- 最终裁定（硬性）：这已是第 ${opts?.retakeCount ?? 3} 次补拍，**必须给出最终结论**。即使证据仍不充分，也要输出你认为最可能的物种，并把 identification_confidence 设为 low（表示"疑似"）、summary_zh 以「疑似」开头；needs_more_photos_zh/en **一律留空**，不要再要求补拍。`
+    : "";
+
+  const system = `你是 Plantspedia 的首席植物学家。请**快速**识别这张实地拍摄的植物照片，并只产出一张"简介摘要卡"所需的少量字段（不要写形态/人文/养护等长篇分区）。${retakeCtx}${forceCtx}
+- summary_zh：150–260 字趣味导语（博物学家口吻，讲与生活相关的趣闻/冷知识，勾起好奇心；不要罗列科属学名形态，也不要复述「本次拍摄于…」）。summary_en：50–90 词意译。
+- field_notes_zh：120–220 字「拍摄记录」，只针对本张照片的可见诊断特征 + 定种依据；field_notes_en：45–85 词。
+- identification_confidence + needs_more_photos_zh/en（**硬性**）：诚实给出置信度。**宁可 low 也不要凭有限照片武断定成错误物种——错误定种比暂不定种更糟。** 诊断特征充分且高度吻合=high；仅能到属=medium；照片不足只能疑似=low。为 low（medium 视需要）时必须填 needs_more_photos_*：**读者是完全不懂植物学的普通人**，用大白话写 2–4 条可直接照做的拍摄动作，① ② ③ 编号，每条一句话一个动作，讲清「拍哪里+怎么拍」；**严禁专业术语**（脉序/被毛/托叶/花序/苞片…），如「把叶子翻过来拍背面（看清叶脉和有没有细毛）」「凑近拍一朵完整的花，正面拍清花瓣数量」「退后一步拍整棵植物」。且 summary_zh 以「疑似……」开头、不得用确诊口吻；high 时 needs_more_photos_* 留空。
+- 拍摄地点真实性（硬性）：仅当上文给出拍摄地点时才可写具体地名；未提供则严禁编造/反推任何地名，一律「拍摄地点未知」。
+- 中文用正式植物志措辞；拉丁学名用 *Genus species* 斜体标记。`;
+
+  const match = photoDataUrl.match(/^data:([^;]+);base64,(.+)$/);
+  const mimeType = match ? match[1] : "image/jpeg";
+  const base64Data = match ? match[2] : photoDataUrl;
+
+  try {
+    const data = await callGeminiWithRotation(splitGeminiKeys(geminiKey), {
+      model,
+      timeoutMs: 45_000,
+      label: "identifyQuick",
+      body: {
+        contents: [
+          {
+            role: "user",
+            parts: [
+              { text: `请识别这张植物照片。${hintPlace ? `拍摄地点：${hintPlace}。` : ""}只按指定 JSON 结构返回简介摘要卡字段。` },
+              { inlineData: { mimeType, data: base64Data } },
+            ],
+          },
+        ],
+        systemInstruction: { parts: [{ text: system }] },
+        generationConfig: { responseMimeType: "application/json", responseSchema: AI_QUICK_SCHEMA, temperature: 0.0 },
+      },
+    });
+    const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!text) return null;
+    const meta = JSON.parse(cleanJson(text)) as AiMeta;
+    const u = data.usageMetadata ?? {};
+    return {
+      meta,
+      model,
+      provider: "gemini-quick",
+      usage: {
+        prompt_tokens: u.promptTokenCount ?? 0,
+        completion_tokens: u.candidatesTokenCount ?? 0,
+        total_tokens: u.totalTokenCount ?? 0,
+      },
+    };
+  } catch (e) {
+    // Rotation already tried every key. A hard, described failure (quota exhausted on
+    // ALL keys, invalid config…) must reach the user with its explanation rather than
+    // silently falling back to the heavy path, which would hit the same wall.
+    if (e instanceof AiError) throw e;
+    console.warn("[identifyQuick] soft failure, falling back:", e instanceof Error ? e.message : e);
+    return null;
+  }
+}
+
+/**
+ * Shared HEAVY draft compute (no DB writes). Runs the full pipeline:
+ *   full-schema AI identify+copy → species section photos (fetch+re-host) →
+ *   conservation registry match → invasive card → render full draft HTML.
+ * Used by BOTH the one-shot `submitPlantDraft` (INSERT) and the two-phase
+ * `enrichDraft` (UPDATE) so the ~160-line pipeline lives in exactly one place.
+ * Caller uploads the user photo and passes its public `photoUrl`.
+ */
+async function buildDraftContent(opts: {
+  dataUrl: string;
+  photoUrl: string;
+  place: string;
+  lat: number | null;
+  lng: number | null;
+  /** Pin the species (enrich path) so the draft matches the card the user saw. */
+  speciesHint?: { title?: string; scientificName?: string } | null;
+  /** Web research digest (from enrichDraft联网调研 step), injected into AI prompt. */
+  webResearch?: { digest: string; sources: { title: string; uri: string }[] };
+}): Promise<{
+  meta: AiMeta;
+  usedModel: string;
+  usedProvider: string;
+  usage: AiTokenUsage;
+  html: string;
+  isInvasive: boolean;
+  gbifTaxonKey: number | null;
+}> {
+  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+  const { dataUrl, photoUrl, place, lat, lng, speciesHint, webResearch } = opts;
+
+  // Call AI to identify + generate copy (reads DB config server-side).
+  const { meta, model: usedModel, provider: usedProvider, usage } = await callAiIdentify(dataUrl, place, speciesHint, webResearch);
+
+  // Belt-and-suspenders: if a species was pinned, force the rendered name to match
+  // it even if the model quietly drifted, so the page title == the card title.
+  if (speciesHint?.title) meta.title = speciesHint.title;
+  if (speciesHint?.scientificName) meta.scientific_name = speciesHint.scientificName;
+
+  // Find real online field photos of the species for the body sections (the hero
+  // keeps the user's own photo). Re-host into our own bucket so the page doesn't
+  // hotlink foreign hosts (broken/slow from China). Non-fatal.
+  let sectionImages: string[] = [];
+  try {
+    const sci = (meta.scientific_name || "").trim().split(/\s+/).slice(0, 2).join(" ");
+    const term = sci || meta.common_name_en || meta.title || "";
+    if (term) {
+      const external = await fetchSpeciesPhotos(term, 5);
+      const rehosted = await rehostImages(external, "drafts/species/section");
+      sectionImages = rehosted.length ? rehosted : external;
+    }
+  } catch (e) {
+    console.warn("[buildDraftContent] species photo search failed:", e);
+  }
+
+  // ── Conservation registry match (国家/省级重点保护 · CITES · GTS · GRIIS) ──
+  let conservationBadgesList: PlantDraftFields["conservation"] = null;
+  let conservationCardObj: PlantDraftFields["conservation_card"] = null;
+  let griisHit: { degreeLabel: string; source: string; source_url: string | null } | null = null;
+  const sciFull = (meta.scientific_name || "").trim();
+  try {
+    if (sciFull) {
+      const listsRes = await supabaseAdmin
+        .from("conservation_lists")
+        .select("id,kind,name,province,version,source_note,source_url");
+      const lists = (listsRes.data ?? []) as any[];
+      const taxa: any[] = [];
+      for (let from = 0; ; from += 1000) {
+        const { data } = await supabaseAdmin
+          .from("conservation_taxa")
+          .select("list_id,scientific_name,chinese_name,normalized_name,status,rank,excluded_names")
+          .range(from, from + 999);
+        const rows = data ?? [];
+        taxa.push(...rows);
+        if (rows.length < 1000) break;
+      }
+      if (taxa.length) {
+        const { buildConservationMatcher, conservationBadges, GRIIS_DEGREES } = await import("./conservation");
+        const hit = buildConservationMatcher({ lists, taxa })(sciFull, meta.family || null);
+        const badges = conservationBadges(hit, lists);
+        if (badges.length) conservationBadgesList = badges;
+        const protectedEntries = [...hit.protectedLists.entries()];
+        if (protectedEntries.length) {
+          const protLists = protectedEntries.map(([id, status]) => {
+            const l = lists.find((x) => x.id === id);
+            return {
+              name: (l?.name as string) ?? "重点保护名录",
+              version: (l?.version as string) ?? null,
+              status: (status as string) ?? null,
+              url: (l?.source_url as string) ?? null,
+              province: (l?.province as string) ?? null,
+            };
+          });
+          const card = await generateConservationCard(meta.title || sciFull, meta.scientific_name || sciFull);
+          conservationCardObj = {
+            basis_zh: protLists
+              .map((p) => `${p.name}${p.version ? "（" + p.version + "）" : ""}${p.status ? " · " + p.status : ""}`)
+              .join("；"),
+            status_zh: card?.status_zh ?? "",
+            value_zh: card?.value_zh ?? "",
+            advice_zh: card?.advice_zh ?? "",
+            level: protLists.map((p) => p.status).find(Boolean) ?? null,
+            national: protLists.some((p) => !p.province),
+            sources: protLists.map((p) => ({ name: p.name, url: p.url })),
+          };
+        }
+        if (hit.griis) {
+          const gl = lists.find((l) => l.kind === "griis");
+          const deg = GRIIS_DEGREES.find((d) => d.value === hit.griis);
+          griisHit = {
+            degreeLabel: deg?.label ?? hit.griis,
+            source: gl ? `${gl.name}${gl.version ? "（" + gl.version + "）" : ""}` : "GRIIS 全球入侵物种数据库·中国",
+            source_url: gl?.source_url ?? null,
+          };
+        }
+      }
+    }
+  } catch (e) {
+    console.warn("[buildDraftContent] conservation match failed:", e);
+  }
+
+  // ── Invasive-species warning card ──
+  let invasiveCard: PlantDraftFields["invasive"] = null;
+  let isInvasive = false;
+  let gbifTaxonKey: number | null = null;
+  try {
+    const sciBinomial = sciFull.split(/\s+/).slice(0, 2).join(" ");
+    if (sciBinomial) {
+      const chk = await gbifCheckInvasive(sciBinomial);
+      if (chk) {
+        gbifTaxonKey = chk.taxonKey;
+        isInvasive = chk.isInvasive;
+      }
+      const cl = lookupChinaInvasive(sciFull || sciBinomial);
+      if (chk?.isInvasive || griisHit || cl) {
+        isInvasive = true;
+        const card = await generateInvasiveCard(meta.title || sciBinomial, meta.scientific_name || sciBinomial);
+        invasiveCard = {
+          status_zh: card?.status_zh ?? "",
+          harm_zh: card?.harm_zh ?? "",
+          control_zh: card?.control_zh ?? "",
+          degree: griisHit?.degreeLabel ?? null,
+          source: griisHit?.source ?? chk?.source ?? "GBIF · GRIIS 中国名录",
+          source_url: griisHit?.source_url ?? null,
+          china_list: cl
+            ? { batch: cl.batch, date: cl.date, publisher: cl.publisher, keyManaged: cl.keyManaged }
+            : null,
+        };
+      }
+    }
+  } catch (e) {
+    console.warn("[buildDraftContent] invasive check failed:", e);
+  }
+
+  const captureDate = new Date().toISOString().slice(0, 10);
+  const html = renderDraftHtml({
+    ...meta,
+    photo_url: photoUrl,
+    section_images: sectionImages,
+    invasive: invasiveCard,
+    conservation: conservationBadgesList,
+    conservation_card: conservationCardObj,
+    capture_place: place || "未知地点",
+    capture_lat: lat != null ? lat.toFixed(5) : "",
+    capture_lng: lng != null ? lng.toFixed(5) : "",
+    capture_date: captureDate,
+    ai_model: usedModel,
+  });
+
+  return { meta, usedModel, usedProvider, usage, html, isInvasive, gbifTaxonKey };
+}
+
+// Lite summary-card HTML for a phase-1 draft. Shows ALL of the user's own shots
+// (a gallery, newest first) so retakes visibly accumulate, plus the short summary.
+// ── 「疑似」单一信号源 ────────────────────────────────────────────────────────
+// 名称、正文、补拍横幅必须一致：要么都疑似，要么都不疑似。模型偶尔会 confidence 写
+// medium 却在 summary_zh 里说「疑似」（反之亦然），导致标题不带疑似但正文带、补拍不激活。
+// 这里把 meta 就地规范化为唯一真相：任一处露出疑似 → 全部疑似（confidence=low，激活补拍），
+// 并保证 summary 带疑似前缀、needs_more_photos_zh 非空（补拍横幅依赖它）。
+const TENTATIVE_RE = /^\s*（?\s*疑似\s*）?/;
+function stripTentativePrefix(s: string): string {
+  return (s || "").replace(TENTATIVE_RE, "").trim();
+}
+function normalizeIdentification(meta: AiMeta): void {
+  const summaryZh = (meta.summary_zh || "").toString();
+  const tentative =
+    meta.identification_confidence === "low" || TENTATIVE_RE.test(summaryZh.trim().slice(0, 6));
+  if (tentative) {
+    meta.identification_confidence = "low";
+    // summary 以「疑似」开头（剥掉已有前缀再统一加，避免「疑似疑似」）。
+    const body = stripTentativePrefix(summaryZh);
+    meta.summary_zh = body ? `疑似${body}` : "疑似（依据现有照片暂无法确诊到种）";
+    // 补拍横幅同时要求 needs_more_photos_zh 非空；模型漏填时补一句通用引导。
+    if (!(meta.needs_more_photos_zh || "").toString().trim()) {
+      meta.needs_more_photos_zh =
+        "① 凑近拍一朵完整的花，正面拍清花瓣数量和形状；② 把叶子翻过来拍背面（看清叶脉和有没有细毛）；③ 退后一步拍整棵植物的样子（看清高矮和分枝）；④ 有果实或种子的话也拍一张。";
+    }
+  } else {
+    // 非疑似：清掉正文里任何残留的疑似前缀，保持与「不疑似」一致。
+    if (TENTATIVE_RE.test(summaryZh.trim().slice(0, 6))) {
+      meta.summary_zh = stripTentativePrefix(summaryZh);
+    }
+  }
+}
+
+// The heavy multi-image科普草稿 is generated later, on demand, by enrichDraft.
+function buildSummaryCardHtml(opts: {
+  photos: string[];
+  title: string;
+  sci: string;
+  summaryZh: string;
+  family?: string | null;
+  genus?: string | null;
+  tentative?: boolean;
+}): string {
+  const { photos, sci, summaryZh, family, genus, tentative } = opts;
+  const cleanTitle = stripTentativePrefix(opts.title) || "待鉴定植物";
+  const displayTitle = tentative ? `疑似${cleanTitle}` : cleanTitle;
+  const list = photos.filter(Boolean);
+  const hero = list[0] || "";
+  const rest = list.slice(1);
+  const heroImg = hero
+    ? `<img src="${htmlEsc(hero)}" alt="${htmlEsc(displayTitle)}" style="width:100%;border-radius:12px;display:block"/>`
+    : "";
+  const gallery = rest.length
+    ? `<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(90px,1fr));gap:6px;margin-top:8px">` +
+      rest
+        .map(
+          (u) =>
+            `<img src="${htmlEsc(u)}" alt="${htmlEsc(displayTitle)}" style="width:100%;aspect-ratio:1/1;object-fit:cover;border-radius:8px;display:block"/>`,
+        )
+        .join("") +
+      `</div>` +
+      `<p style="color:#8a6b4a;font-size:12px;margin:.3em 0 0">共 ${list.length} 张你拍摄的照片</p>`
+    : "";
+  const famGen = [family, genus].map((s) => (s || "").trim()).filter(Boolean).join(" · ");
+  const famGenLine = famGen
+    ? `<p style="color:#2e7d46;font-size:14px;font-weight:600;letter-spacing:.02em;margin:.1em 0 .4em">${htmlEsc(famGen)}</p>`
+    : "";
+  return (
+    `<div style="max-width:680px;margin:0 auto;padding:8px 4px;font-family:'Noto Serif SC',serif;line-height:1.7">` +
+    heroImg +
+    gallery +
+    `<h1 style="margin:.6em 0 .15em${tentative ? ";color:#c8452f" : ""}">${htmlEsc(displayTitle)} <i style="font-weight:400;color:#6e4c28">${htmlEsc(sci)}</i></h1>` +
+    famGenLine +
+    `<p>${htmlEsc(summaryZh)}</p>` +
+    `<p style="color:#8a6b4a;font-size:13px">— 简介摘要卡（点击「让 AI 生成进一步介绍草稿」可生成含多张配图的完整科普草稿）</p>` +
+    `</div>`
+  );
+}
+
 const SubmitInput = z.object({
   photo_base64: z.string().min(100).max(8_000_000),
   photo_mime: z.string().regex(/^image\/(jpeg|jpg|png|webp)$/i).default("image/jpeg"),
   lat: z.number().nullable().optional(),
   lng: z.number().nullable().optional(),
   creator_label: z.string().max(80).optional(),
+  // 前端传递：当前登录用户的 ID，用于识别人显示（非访客）
+  logged_in_user_id: z.string().uuid().optional(),
+  // 补拍复核：这是同一株植物的第 N 次补拍。retake_count 决定识别铜叶 = 1 + retake_count
+  // （疑似恒 1）；≥3 时强制出结论（哪怕疑似）。species_hint 传上一轮的判断供复核。
+  retake_count: z.number().int().min(0).max(10).optional().default(0),
+  species_hint_title: z.string().max(200).optional(),
+  species_hint_sci: z.string().max(200).optional(),
+  // 补拍复核时携带：把新照片合并进这份既有草稿（不再新建一份），照片追加进 user_photos、
+  // 覆盖封面与摘要卡、刷新置信度/补拍建议。为空则走新建逻辑。
+  merge_draft_id: z.string().uuid().optional(),
 });
 
 export const submitPlantDraft = createServerFn({ method: "POST" })
@@ -1289,165 +2238,30 @@ export const submitPlantDraft = createServerFn({ method: "POST" })
     let place = "";
     const lat = data.lat ?? null;
     const lng = data.lng ?? null;
+    console.log(`[SubmitPlantDraft] Received coords: lat=${lat}, lng=${lng}`);
     if (lat != null && lng != null) {
       place = await reverseGeocode(lat, lng);
+      console.log(`[SubmitPlantDraft] Reverse-geocoded to: ${place}`);
+    } else {
+      console.warn("[SubmitPlantDraft] No coords provided, place will be empty");
     }
 
     // Build the data URL for the multimodal AI call.
     const dataUrl = `data:${data.photo_mime};base64,${data.photo_base64}`;
 
-    // Call AI to identify + generate copy (reads DB config server-side).
-    const { meta, model: usedModel, provider: usedProvider, usage } = await callAiIdentify(dataUrl, place);
-
-    // Upload the photo to Storage (drafts/ prefix is anon-writable).
+    // Upload the user photo to Storage first (drafts/ prefix is anon-writable), then
+    // run the shared heavy pipeline (identify → section photos → cards → full HTML).
     const buffer = Buffer.from(data.photo_base64, "base64");
     const ext = data.photo_mime.includes("png") ? "png" : data.photo_mime.includes("webp") ? "webp" : "jpg";
     const path = `drafts/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
     const { error: upErr } = await supabaseAdmin.storage
       .from("plant-images")
       .upload(path, buffer, { contentType: data.photo_mime, upsert: false });
-    if (upErr) throw new Error(`照片上传失败：${upErr.message}`);
+    if (upErr) throw new AiError("STORAGE_UPLOAD_FAILED", `照片上传失败（STORAGE_UPLOAD_FAILED）：无法把照片存入云端存储。原因：${upErr.message}。请检查网络后重试。`);
     const photoUrl = supabaseAdmin.storage.from("plant-images").getPublicUrl(path).data.publicUrl;
 
-    // Find real online field photos of the species for the body sections (the
-    // hero keeps the user's own photo). Prefer the Latin binomial (genus species)
-    // for the best hit rate; fall back to English/Chinese names. Non-fatal.
-    let sectionImages: string[] = [];
-    try {
-      const sci = (meta.scientific_name || "").trim().split(/\s+/).slice(0, 2).join(" ");
-      const term = sci || meta.common_name_en || meta.title || "";
-      if (term) sectionImages = await fetchSpeciesPhotos(term, 5);
-    } catch (e) {
-      console.warn("[SubmitPlantDraft] species photo search failed:", e);
-    }
-
-    // Invasive-alien-species check (GBIF → GRIIS China). When confirmed invasive,
-    // generate a three-part warning card rendered before Section I. Fully
-    // non-fatal: any failure just skips the card / flag. taxonKey/flag are also
-    // persisted so the /explore map can mark these with danger triangles.
-    // ── Conservation registry match (国家/省级重点保护 · CITES · GTS · GRIIS) ──
-    // Load the registries ONCE, paginating past PostgREST's 1000-row cap (GRIIS/GTS
-    // are seeded last, so they fall past row 1000 and would otherwise never match).
-    // The GRIIS hit feeds BOTH the invasive card (degree + precise citation) and the
-    // status-badge card. Fully non-fatal — unseeded tables just skip the cards.
-    let conservationBadgesList: PlantDraftFields["conservation"] = null;
-    let conservationCardObj: PlantDraftFields["conservation_card"] = null;
-    let griisHit: { degreeLabel: string; source: string; source_url: string | null } | null = null;
-    const sciFull = (meta.scientific_name || "").trim();
-    try {
-      if (sciFull) {
-        const listsRes = await supabaseAdmin
-          .from("conservation_lists")
-          .select("id,kind,name,province,version,source_note,source_url");
-        const lists = (listsRes.data ?? []) as any[];
-        const taxa: any[] = [];
-        for (let from = 0; ; from += 1000) {
-          const { data } = await supabaseAdmin
-            .from("conservation_taxa")
-            .select("list_id,scientific_name,chinese_name,normalized_name,status,rank,excluded_names")
-            .range(from, from + 999);
-          const rows = data ?? [];
-          taxa.push(...rows);
-          if (rows.length < 1000) break;
-        }
-        if (taxa.length) {
-          const { buildConservationMatcher, conservationBadges, GRIIS_DEGREES } = await import("./conservation");
-          const hit = buildConservationMatcher({ lists, taxa })(sciFull, meta.family || null);
-          const badges = conservationBadges(hit, lists);
-          if (badges.length) conservationBadgesList = badges;
-          // 重点保护 hit → full green card (判断依据 deterministic; narrative via LLM).
-          const protectedEntries = [...hit.protectedLists.entries()];
-          if (protectedEntries.length) {
-            const protLists = protectedEntries.map(([id, status]) => {
-              const l = lists.find((x) => x.id === id);
-              return {
-                name: (l?.name as string) ?? "重点保护名录",
-                version: (l?.version as string) ?? null,
-                status: (status as string) ?? null,
-                url: (l?.source_url as string) ?? null,
-                province: (l?.province as string) ?? null,
-              };
-            });
-            const card = await generateConservationCard(meta.title || sciFull, meta.scientific_name || sciFull);
-            conservationCardObj = {
-              basis_zh: protLists
-                .map((p) => `${p.name}${p.version ? "（" + p.version + "）" : ""}${p.status ? " · " + p.status : ""}`)
-                .join("；"),
-              status_zh: card?.status_zh ?? "",
-              value_zh: card?.value_zh ?? "",
-              advice_zh: card?.advice_zh ?? "",
-              level: protLists.map((p) => p.status).find(Boolean) ?? null,
-              national: protLists.some((p) => !p.province),
-              sources: protLists.map((p) => ({ name: p.name, url: p.url })),
-            };
-          }
-          if (hit.griis) {
-            const gl = lists.find((l) => l.kind === "griis");
-            const deg = GRIIS_DEGREES.find((d) => d.value === hit.griis);
-            griisHit = {
-              degreeLabel: deg?.label ?? hit.griis,
-              source: gl ? `${gl.name}${gl.version ? "（" + gl.version + "）" : ""}` : "GRIIS 全球入侵物种数据库·中国",
-              source_url: gl?.source_url ?? null,
-            };
-          }
-        }
-      }
-    } catch (e) {
-      console.warn("[SubmitPlantDraft] conservation match failed:", e);
-    }
-
-    // ── Invasive-species warning card ──
-    // Invasive if the live GBIF/GRIIS check says so OR the LOCAL GRIIS registry matches
-    // (the local list is authoritative for China, and gives the degree + citation).
-    let invasiveCard: PlantDraftFields["invasive"] = null;
-    let isInvasive = false;
-    let gbifTaxonKey: number | null = null;
-    try {
-      const sciBinomial = sciFull.split(/\s+/).slice(0, 2).join(" ");
-      if (sciBinomial) {
-        const chk = await gbifCheckInvasive(sciBinomial);
-        if (chk) {
-          gbifTaxonKey = chk.taxonKey;
-          isInvasive = chk.isInvasive;
-        }
-        // The four official national batches are authoritative for China; a hit here
-        // is enough on its own, and adds the 批次 + 重点管理 fact (deterministic).
-        const cl = lookupChinaInvasive(sciFull || sciBinomial);
-        if (chk?.isInvasive || griisHit || cl) {
-          isInvasive = true;
-          const card = await generateInvasiveCard(meta.title || sciBinomial, meta.scientific_name || sciBinomial);
-          invasiveCard = {
-            status_zh: card?.status_zh ?? "",
-            harm_zh: card?.harm_zh ?? "",
-            control_zh: card?.control_zh ?? "",
-            degree: griisHit?.degreeLabel ?? null,
-            source: griisHit?.source ?? chk?.source ?? "GBIF · GRIIS 中国名录",
-            source_url: griisHit?.source_url ?? null,
-            china_list: cl
-              ? { batch: cl.batch, date: cl.date, publisher: cl.publisher, keyManaged: cl.keyManaged }
-              : null,
-          };
-        }
-      }
-    } catch (e) {
-      console.warn("[SubmitPlantDraft] invasive check failed:", e);
-    }
-
-    // Compose HTML.
-    const captureDate = new Date().toISOString().slice(0, 10);
-    const html = renderDraftHtml({
-      ...meta,
-      photo_url: photoUrl,
-      section_images: sectionImages,
-      invasive: invasiveCard,
-      conservation: conservationBadgesList,
-      conservation_card: conservationCardObj,
-      capture_place: place || "未知地点",
-      capture_lat: lat != null ? lat.toFixed(5) : "",
-      capture_lng: lng != null ? lng.toFixed(5) : "",
-      capture_date: captureDate,
-      ai_model: usedModel,
-    });
+    const { meta, usedModel, usedProvider, usage, html, isInvasive, gbifTaxonKey } =
+      await buildDraftContent({ dataUrl, photoUrl, place, lat, lng });
 
     // glm-5v-turbo etc. sometimes return a partial JSON missing `title` (a NOT NULL
     // column). Fall back so a meaningful name always persists — and the usage log shows
@@ -1479,7 +2293,7 @@ export const submitPlantDraft = createServerFn({ method: "POST" })
       })
       .select("id")
       .single();
-    if (insErr) throw new Error(`保存草稿失败：${insErr.message}`);
+    if (insErr) throw new AiError("DRAFT_INSERT_FAILED", `保存草稿失败（DRAFT_INSERT_FAILED）：识别已完成，但写入数据库时出错。原因：${insErr.message}。`);
 
     // Log token usage. MUST be awaited: on Cloudflare Workers the isolate can be
     // torn down once the response is returned, so a fire-and-forget insert may never
@@ -1499,6 +2313,7 @@ export const submitPlantDraft = createServerFn({ method: "POST" })
         capture_lng: lng,
         draft_id: row.id,
         draft_title: safeTitle,
+        task_type: "enrich_draft", // Full draft generation with complete content
       });
       if (usageErr) console.warn("[UsageLog] Failed to insert ai_usage_logs:", usageErr.message);
     } catch (e) {
@@ -1523,6 +2338,511 @@ export const submitPlantDraft = createServerFn({ method: "POST" })
     return { draftId: row.id as string, place, isInvasive };
   });
 
+// Resolve the (optional) authed creator from the Bearer header → {id, label}.
+// Shared by the two-phase identify handlers; anon is allowed (label 访客).
+async function resolveCreator(
+  creatorLabelInput?: string,
+  loggedInUserId?: string,
+): Promise<{ dbCreatedBy: string | null; creatorLabel: string }> {
+  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+  let createdBy: string | null = null;
+  let creatorLabel = creatorLabelInput?.trim() || "访客";
+
+  // 优先：前端传的 logged_in_user_id（已登录用户从浏览器 session 读到的自己的 ID）
+  if (loggedInUserId) {
+    try {
+      const { data: prof } = await supabaseAdmin
+        .from("profiles")
+        .select("display_name")
+        .eq("id", loggedInUserId)
+        .maybeSingle();
+      if (prof?.display_name) {
+        createdBy = loggedInUserId;
+        creatorLabel = prof.display_name;
+      }
+    } catch (err) {
+      console.warn("[resolveCreator] Profile lookup via logged_in_user_id failed:", err);
+    }
+  }
+
+  // 兜底：尝试从 Authorization header 读（服务端渲染或其他调用路径）
+  if (!createdBy) {
+    try {
+      const { getRequestHeader } = await import("@tanstack/react-start/server");
+      const authHeader = getRequestHeader("Authorization");
+      if (authHeader?.startsWith("Bearer ")) {
+        const token = authHeader.slice(7);
+        const { data: u } = await supabaseAdmin.auth.getUser(token);
+        if (u.user) {
+          createdBy = u.user.id;
+          const { data: prof } = await supabaseAdmin.from("profiles").select("display_name").eq("id", u.user.id).maybeSingle();
+          if (prof?.display_name) creatorLabel = prof.display_name;
+        }
+      }
+    } catch (err) {
+      console.warn("[resolveCreator] Auth lookup failed/anon:", err);
+    }
+  }
+
+  const dbCreatedBy =
+    createdBy && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(createdBy) ? createdBy : null;
+  return { dbCreatedBy, creatorLabel };
+}
+
+const htmlEsc = (s: string) =>
+  s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c] ?? c));
+
+// ── Phase 1: fast identify → lightweight "summary card" draft ─────────────────
+// Uploads the user photo, runs the FAST identify (species + short summary +
+// confidence), and persists a lite draft (ai_payload._enriched=false) so the user
+// sees a card immediately. The heavy multi-image draft is generated later, on
+// demand, by enrichDraft. If the fast path is unavailable it falls back to the
+// full pipeline so this never hard-fails.
+export const quickIdentifyDraft = createServerFn({ method: "POST" })
+  .inputValidator((input) => SubmitInput.parse(input))
+  .handler(async ({ data }) => {
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { dbCreatedBy, creatorLabel } = await resolveCreator(data.creator_label, data.logged_in_user_id);
+
+    let place = "";
+    const lat = data.lat ?? null;
+    const lng = data.lng ?? null;
+    if (lat != null && lng != null) {
+      place = await reverseGeocode(lat, lng);
+      console.log(`[QuickIdentify] Reverse-geocoded to: ${place}`);
+    }
+
+    const dataUrl = `data:${data.photo_mime};base64,${data.photo_base64}`;
+
+    // Upload the user photo: it's the summary card's hero AND a re-identify source
+    // later (user can re-run enrich / re-upload from a better-signal spot).
+    const buffer = Buffer.from(data.photo_base64, "base64");
+    const ext = data.photo_mime.includes("png") ? "png" : data.photo_mime.includes("webp") ? "webp" : "jpg";
+    const path = `drafts/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
+    const { error: upErr } = await supabaseAdmin.storage
+      .from("plant-images")
+      .upload(path, buffer, { contentType: data.photo_mime, upsert: false });
+    if (upErr) throw new AiError("STORAGE_UPLOAD_FAILED", `照片上传失败（STORAGE_UPLOAD_FAILED）：无法把照片存入云端存储。原因：${upErr.message}。请检查网络后重试。`);
+    const photoUrl = supabaseAdmin.storage.from("plant-images").getPublicUrl(path).data.publicUrl;
+
+    let meta: AiMeta;
+    let usedModel: string;
+    let usedProvider: string;
+    let usage: AiTokenUsage;
+    let html: string;
+    let enriched: boolean;
+    let isInvasive = false;
+    let gbifTaxonKey: number | null = null;
+
+    const retakeCount = data.retake_count ?? 0;
+    const speciesHint =
+      (data.species_hint_title || data.species_hint_sci)
+        ? { title: data.species_hint_title, sci: data.species_hint_sci }
+        : null;
+
+    // Merge mode (补拍): load the existing draft's prior user photos so the new shot
+    // appends to the gallery, and so the share card can use the resolving shot as its
+    // cover. The NEW photo goes FIRST (it's the clearest / most recent, and the one
+    // that resolved the identification when we finally 升出 low).
+    let priorPhotos: string[] = [];
+    if (data.merge_draft_id) {
+      try {
+        const { data: prev } = await (supabaseAdmin as any)
+          .from("plant_drafts")
+          .select("user_photos, photo_url")
+          .eq("id", data.merge_draft_id)
+          .maybeSingle();
+        if (prev) {
+          const up = Array.isArray(prev.user_photos) ? (prev.user_photos as string[]).filter(Boolean) : [];
+          priorPhotos = up.length ? up : prev.photo_url ? [prev.photo_url as string] : [];
+        }
+      } catch (e) {
+        console.warn("[QuickIdentify] prior user_photos load failed (migration pending?):", e);
+      }
+    }
+    const allPhotos = [photoUrl, ...priorPhotos].filter(Boolean).slice(0, 12);
+
+    const quick = await identifyQuick(dataUrl, place, {
+      speciesHint,
+      retakeCount,
+      forceResult: retakeCount >= 3, // 补拍满 3 次必须出结论（哪怕疑似）
+    });
+    if (quick) {
+      meta = quick.meta;
+      usedModel = quick.model;
+      usedProvider = quick.provider;
+      usage = quick.usage;
+      enriched = false;
+      // 统一疑似信号：名称/正文/补拍横幅三者一致（详见 normalizeIdentification）。
+      normalizeIdentification(meta);
+      // Summary-card HTML with the full gallery of the user's own shots (newest first).
+      html = buildSummaryCardHtml({
+        photos: allPhotos,
+        title: meta.title || "",
+        sci: meta.scientific_name || "",
+        summaryZh: meta.summary_zh || "",
+        family: meta.family,
+        genus: meta.genus,
+        tentative: meta.identification_confidence === "low",
+      });
+    } else {
+      // Gemini quick path unavailable → full pipeline (slower but robust).
+      const full = await buildDraftContent({ dataUrl, photoUrl, place, lat, lng });
+      meta = full.meta;
+      usedModel = full.usedModel;
+      usedProvider = full.usedProvider;
+      usage = full.usage;
+      html = full.html;
+      isInvasive = full.isInvasive;
+      gbifTaxonKey = full.gbifTaxonKey;
+      enriched = true;
+    }
+
+    const safeTitle = (meta.title || meta.scientific_name || "待鉴定植物").toString().slice(0, 200);
+    const aiPayload = JSON.parse(JSON.stringify({ ...meta, _enriched: enriched }));
+
+    let draftId: string;
+    if (data.merge_draft_id) {
+      // ── 补拍合并：更新既有草稿，不新建。照片追加进 user_photos（新图在首、作封面）、
+      //    覆盖摘要卡、刷新置信度与补拍建议。合并后 submitted_for_review 保持不变
+      //    （用户之前提交过就还在队列/地图上；没提交就仍是私有草稿）。 ──
+      const { error: mergeErr } = await (supabaseAdmin as any)
+        .from("plant_drafts")
+        .update({
+          photo_url: photoUrl, // cover = the resolving shot
+          capture_lat: lat,
+          capture_lng: lng,
+          capture_place: place,
+          ai_model: usedModel,
+          ai_payload: aiPayload,
+          title: safeTitle,
+          scientific_name: meta.scientific_name || null,
+          common_name_en: meta.common_name_en || null,
+          common_names_zh: meta.common_names_zh || null,
+          family: meta.family || null,
+          genus: meta.genus || null,
+          summary: (meta.summary_zh || meta.summary_en || "").toString().slice(0, 600),
+          tags: meta.tags ?? [],
+          iucn_status: meta.iucn_status || null,
+          html_content: html,
+        })
+        .eq("id", data.merge_draft_id)
+        .neq("status", "approved"); // never rewrite an already-published draft
+      if (mergeErr) throw new AiError("DRAFT_UPDATE_FAILED", `合并补拍失败（DRAFT_UPDATE_FAILED）：识别已完成，但更新草稿时出错。原因：${mergeErr.message}。`);
+      draftId = data.merge_draft_id;
+      // Best-effort: persist retake_count + the accumulated photo gallery (graceful if
+      // the migration hasn't been applied — these two updates just no-op then).
+      try {
+        await (supabaseAdmin as any).from("plant_drafts").update({ retake_count: retakeCount }).eq("id", draftId);
+      } catch (e) {
+        console.warn("[QuickIdentify] retake_count update failed (migration pending?):", e);
+      }
+      try {
+        await (supabaseAdmin as any).from("plant_drafts").update({ user_photos: allPhotos }).eq("id", draftId);
+      } catch (e) {
+        console.warn("[QuickIdentify] user_photos update failed (migration pending?):", e);
+      }
+    } else {
+      const { data: row, error: insErr } = await supabaseAdmin
+        .from("plant_drafts")
+        .insert({
+          created_by: dbCreatedBy,
+          creator_label: creatorLabel,
+          photo_url: photoUrl,
+          capture_lat: lat,
+          capture_lng: lng,
+          capture_place: place,
+          ai_model: usedModel,
+          ai_payload: aiPayload,
+          title: safeTitle,
+          scientific_name: meta.scientific_name || null,
+          common_name_en: meta.common_name_en || null,
+          common_names_zh: meta.common_names_zh || null,
+          family: meta.family || null,
+          genus: meta.genus || null,
+          summary: (meta.summary_zh || meta.summary_en || "").toString().slice(0, 600),
+          tags: meta.tags ?? [],
+          iucn_status: meta.iucn_status || null,
+          html_content: html,
+        })
+        .select("id")
+        .single();
+      if (insErr) throw new AiError("DRAFT_INSERT_FAILED", `保存草稿失败（DRAFT_INSERT_FAILED）：识别已完成，但写入数据库时出错。原因：${insErr.message}。`);
+      draftId = row.id as string;
+
+      // Store retake_count + the initial user_photos in SEPARATE best-effort updates so
+      // the INSERT stays safe if this deploy landed before the migration (an unknown
+      // column would 400 the insert and break identification).
+      if (retakeCount > 0) {
+        try {
+          await (supabaseAdmin as any).from("plant_drafts").update({ retake_count: retakeCount }).eq("id", draftId);
+        } catch (e) {
+          console.warn("[QuickIdentify] retake_count update failed (migration pending?):", e);
+        }
+      }
+      try {
+        await (supabaseAdmin as any).from("plant_drafts").update({ user_photos: allPhotos }).eq("id", draftId);
+      } catch (e) {
+        console.warn("[QuickIdentify] user_photos update failed (migration pending?):", e);
+      }
+    }
+
+    try {
+      await (supabaseAdmin as any).from("ai_usage_logs").insert({
+        user_id: dbCreatedBy,
+        user_label: creatorLabel,
+        provider: usedProvider,
+        model: usedModel,
+        prompt_tokens: usage.prompt_tokens,
+        completion_tokens: usage.completion_tokens,
+        total_tokens: usage.total_tokens,
+        capture_place: place || null,
+        capture_lat: lat,
+        capture_lng: lng,
+        draft_id: draftId,
+        draft_title: safeTitle,
+        task_type: "quick_identify", // Quick summary card generation
+      });
+    } catch (e) {
+      console.warn("[QuickIdentify] usage log failed:", e);
+    }
+
+    if (enriched && (gbifTaxonKey != null || isInvasive)) {
+      try {
+        await (supabaseAdmin as any)
+          .from("plant_drafts")
+          .update({ is_invasive: isInvasive, gbif_taxon_key: gbifTaxonKey })
+          .eq("id", draftId);
+      } catch (e) {
+        console.warn("[QuickIdentify] invasive flag update failed:", e);
+      }
+    }
+
+    return {
+      draftId,
+      enriched,
+      place,
+      identification_confidence: (meta.identification_confidence as string) ?? null,
+      needs_more_photos_zh: (meta.needs_more_photos_zh as string) ?? "",
+      title: safeTitle,
+    };
+  });
+
+// ── Submit a draft into the review queue ──────────────────────────────────────
+// A freshly-identified draft is PRIVATE (submitted_for_review=false): it doesn't
+// appear in the AI review queue or on the 身边物种地图 while the user is still
+// refining it (retaking, enriching). Tapping「保存为待审批草稿」flips this flag,
+// which is the moment the species资料 becomes public. Graceful if the migration
+// hasn't been applied (column missing → the update silently no-ops).
+const SubmitReviewInput = z.object({ draft_id: z.string().uuid() });
+
+export const submitDraftForReviewFn = createServerFn({ method: "POST" })
+  .inputValidator((input) => SubmitReviewInput.parse(input))
+  .handler(async ({ data }) => {
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    try {
+      const { error } = await (supabaseAdmin as any)
+        .from("plant_drafts")
+        .update({ submitted_for_review: true })
+        .eq("id", data.draft_id);
+      if (error) throw error;
+      return { ok: true };
+    } catch (e) {
+      // Column missing (migration pending) → treat as success: without the column
+      // everything is already visible, so the button's intent is satisfied.
+      console.warn("[submitDraftForReview] update failed (migration pending?):", e);
+      return { ok: true, degraded: true };
+    }
+  });
+
+// ── Phase 2: enrich a lite draft into the full multi-image draft ──────────────
+// Loads the lite draft, re-fetches its stored photo, runs the heavy pipeline and
+// UPDATEs the row in place. Idempotent-ish: refuses to re-run once enriched, and
+// won't touch an already-approved (收录) entry.
+const EnrichInput = z.object({ draft_id: z.string().uuid() });
+
+export const enrichDraft = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input) => EnrichInput.parse(input))
+  .handler(async ({ data, context }) => {
+    const { userId } = context;
+    const email = (context.claims as { email?: string } | undefined)?.email ?? null;
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+
+    const { data: draftRow, error: loadErr } = await supabaseAdmin
+      .from("plant_drafts")
+      .select("id, photo_url, capture_lat, capture_lng, capture_place, ai_payload, status, title, scientific_name, common_name_en, common_names_zh, family, genus")
+      .eq("id", data.draft_id)
+      .maybeSingle();
+    const draft = draftRow as any;
+    if (loadErr || !draft) throw new AiError("DRAFT_NOT_FOUND", "生成失败（DRAFT_NOT_FOUND）：找不到这份草稿，可能已被删除。");
+    if (draft.status === "approved") throw new AiError("DRAFT_ALREADY_APPROVED", "生成失败（DRAFT_ALREADY_APPROVED）：这份草稿已通过审核并收录，不能再重新生成内容。");
+    if (draft.ai_payload?._enriched) return { draftId: draft.id as string, alreadyEnriched: true };
+
+    // 进一步草稿消耗 1 枚银叶（owner 无限）。先校验余额；真正扣叶放在生成成功之后，
+    // 避免生成失败仍扣叶。银叶来自贡献积分，因此该步骤要求登录。
+    // 已通过申请的编辑（editor/admin 角色）免银叶——他们是审稿人，生成属工作职责。
+    const leaves = await serverLeafBalance(userId, email);
+    const { data: roleRows } = await supabaseAdmin
+      .from("user_roles")
+      .select("role")
+      .eq("user_id", userId);
+    const isEditorUser = (roleRows ?? []).some((r: { role: string }) => r.role === "editor" || r.role === "admin");
+    const silverExempt = leaves.isOwner || isEditorUser;
+    if (!silverExempt && leaves.silverAvailable < 1) {
+      throw new AiError(
+        "SILVER_INSUFFICIENT",
+        `生成失败（SILVER_INSUFFICIENT）：生成进一步草稿需消耗 1 枚银叶，你当前可用银叶为 0（已获得 ${leaves.silver} 枚，已用 ${leaves.silverUsed} 枚）。每 10 枚铜叶兑 1 枚银叶——多识别、多修文换图即可累积。（通过申请成为编辑后，此操作免银叶。）`,
+      );
+    }
+
+    // Re-fetch the stored user photo → data URL for the multimodal call.
+    const photoUrl = draft.photo_url as string;
+    if (!photoUrl) throw new AiError("DRAFT_NO_PHOTO", "生成失败（DRAFT_NO_PHOTO）：这份草稿没有原图，无法重新送 AI 生成。请重新拍照识别。");
+    const r = await fetch(photoUrl);
+    if (!r.ok) throw new AiError("PHOTO_FETCH_FAILED", `生成失败（PHOTO_FETCH_FAILED）：无法从云端存储读取这张原图（HTTP ${r.status}）。可能是图片已被删除或存储服务暂时不可用，请稍后重试。`);
+    const ct = r.headers.get("content-type") || "image/jpeg";
+    const ab = await r.arrayBuffer();
+    const dataUrl = `data:${ct};base64,${Buffer.from(ab).toString("base64")}`;
+
+    const place = (draft.capture_place as string) || "";
+    const lat = (draft.capture_lat as number | null) ?? null;
+    const lng = (draft.capture_lng as number | null) ?? null;
+
+    // 【联网调研 step】在生成完整草稿前，先联网查询该物种的最新研究成果、保护状态、
+    // 分布更新等权威信息，提升内容的准确性和时效性（仅 Gemini 可用，其他 provider 跳过）。
+    let webResearch: { digest: string; sources: { title: string; uri: string }[] } | null = null;
+    const speciesName = draft.title || draft.scientific_name || "";
+    if (speciesName) {
+      const query = `${speciesName}（${draft.scientific_name || ""}）植物的最新研究进展、保护状态、分布范围、生态作用、栽培技术的权威资料（优先中国植物志、GBIF、IUCN、学术期刊）`;
+      webResearch = await xiaopGroundedSearch(query, null);
+      if (webResearch) {
+        console.log(`[EnrichDraft] Web research for "${speciesName}": ${webResearch.sources.length} sources, ${webResearch.digest.length} chars`);
+      }
+    }
+
+    // Pin the phase-1 species so the enriched draft can't be renamed to a different
+    // plant than the summary card the user already saw.
+    const { meta, usedModel, usedProvider, usage, html, isInvasive, gbifTaxonKey } = await buildDraftContent({
+      dataUrl,
+      photoUrl,
+      place,
+      lat,
+      lng,
+      speciesHint: { title: draft.title || undefined, scientificName: draft.scientific_name || undefined },
+      webResearch: webResearch || undefined, // 传递联网调研结果给内容生成函数
+    });
+
+    // Identity is LOCKED to phase-1 (with meta as fallback for anything phase-1 left
+    // blank). Guarantees card ↔ draft name consistency even if the model drifts.
+    const lockTitle = ((draft.title || meta.title || meta.scientific_name || "待鉴定植物").toString()).slice(0, 200);
+    const lockSci = draft.scientific_name || meta.scientific_name || null;
+    const lockFamily = draft.family || meta.family || null;
+    const lockGenus = draft.genus || meta.genus || null;
+    const lockEn = draft.common_name_en || meta.common_name_en || null;
+    const lockZh = draft.common_names_zh || meta.common_names_zh || null;
+    const aiPayload = JSON.parse(
+      JSON.stringify({
+        ...(draft.ai_payload || {}),
+        ...meta,
+        title: lockTitle,
+        scientific_name: lockSci ?? "",
+        family: lockFamily ?? "",
+        genus: lockGenus ?? "",
+        common_name_en: lockEn ?? "",
+        common_names_zh: lockZh ?? "",
+        _enriched: true,
+      }),
+    );
+
+    const { error: updErr } = await (supabaseAdmin as any)
+      .from("plant_drafts")
+      .update({
+        ai_model: usedModel,
+        ai_payload: aiPayload,
+        title: lockTitle,
+        scientific_name: lockSci,
+        common_name_en: lockEn,
+        common_names_zh: lockZh,
+        family: lockFamily,
+        genus: lockGenus,
+        summary: (meta.summary_zh || meta.summary_en || "").toString().slice(0, 600),
+        tags: meta.tags ?? [],
+        iucn_status: meta.iucn_status || null,
+        html_content: html,
+      })
+      .eq("id", draft.id);
+    if (updErr) throw new AiError("DRAFT_UPDATE_FAILED", `生成失败（DRAFT_UPDATE_FAILED）：内容已生成，但写回数据库时出错。原因：${updErr.message}。`);
+
+    // Record the ACTUAL enriching user (this fn requires auth), not a hardcoded
+    // "enrich" label — the usage table was showing 👻 enrich for everyone.
+    let enricherLabel = email?.split("@")[0] || "编辑";
+    try {
+      const { data: prof } = await (supabaseAdmin as any).from("profiles").select("display_name").eq("id", userId).maybeSingle();
+      if (prof?.display_name) enricherLabel = prof.display_name;
+    } catch { /* fall back to email prefix */ }
+    try {
+      await (supabaseAdmin as any).from("ai_usage_logs").insert({
+        user_id: userId,
+        user_label: `${enricherLabel}（进一步草稿）`,
+        provider: usedProvider,
+        model: usedModel,
+        prompt_tokens: usage.prompt_tokens,
+        completion_tokens: usage.completion_tokens,
+        total_tokens: usage.total_tokens,
+        capture_place: place || null,
+        capture_lat: lat,
+        capture_lng: lng,
+        draft_id: draft.id,
+        draft_title: lockTitle,
+        task_type: "enrich_draft", // Silver leaf full draft enrichment
+      });
+    } catch (e) {
+      console.warn("[EnrichDraft] usage log failed:", e);
+    }
+
+    if (gbifTaxonKey != null || isInvasive) {
+      try {
+        await (supabaseAdmin as any)
+          .from("plant_drafts")
+          .update({ is_invasive: isInvasive, gbif_taxon_key: gbifTaxonKey })
+          .eq("id", draft.id);
+      } catch (e) {
+        console.warn("[EnrichDraft] invasive flag update failed:", e);
+      }
+    }
+
+    // Charge the silver leaf LAST (content already exists) and only for non-owners.
+    // Marks the draft so a later 驳回 can refund it exactly once. Non-fatal: if the
+    // columns aren't migrated yet, enrich still succeeds (just uncharged) — logged.
+    let silverCharged = false;
+    if (!silverExempt) {
+      try {
+        const { data: spent } = await (supabaseAdmin as any)
+          .from("profiles")
+          .update({ silver_used: leaves.silverUsed + 1 })
+          .eq("id", userId)
+          .eq("silver_used", leaves.silverUsed) // optimistic-concurrency: no double spend
+          .select("id");
+        if (spent?.length) {
+          silverCharged = true;
+          await (supabaseAdmin as any).from("plant_drafts").update({ enrich_silver_spent: true }).eq("id", draft.id);
+        } else {
+          console.warn(`[EnrichDraft] silver not charged (concurrent update?) user ${userId} draft ${draft.id}`);
+        }
+      } catch (e) {
+        console.warn("[EnrichDraft] silver charge skipped (migration not applied?):", e instanceof Error ? e.message : e);
+      }
+    }
+
+    return {
+      draftId: draft.id as string,
+      isInvasive,
+      silverCharged,
+      silverRemaining: silverExempt ? null : Math.max(0, leaves.silverAvailable - (silverCharged ? 1 : 0)),
+    };
+  });
+
 // ── GBIF China occurrence overlay (design C: server-side proxy, no storage) ───
 // The /explore "只显示外来入侵物种分布" view lazy-loads broader China distribution
 // points for the invasive species on the map. Runs server-side so the request to
@@ -1533,6 +2853,380 @@ export const submitPlantDraft = createServerFn({ method: "POST" })
 const GbifOccInput = z.object({
   taxonKeys: z.array(z.number().int().positive()).max(20),
 });
+
+// ── 金叶：一键创建物种详细科普页 ───────────────────────────────────────────────
+// ccplants-v19 skill 的服务端移植（见 premium-page.ts 顶部注释）。三段式 LLM 生成
+// （避免单次输出超长被截断），事实全部来自服务端实查的名录数据。
+
+/** Server-side leaf balance. NEVER trust a client-supplied count. Mirrors the
+ *  read-time model in lib/leaves.ts, with the service-role client. The site
+ *  owner (arainjazz@gmail.com) has UNLIMITED gold + silver spends — silverAvailable
+ *  / goldAvailable come back as Infinity, so every gate passes for them. */
+async function serverLeafBalance(
+  userId: string,
+  email?: string | null,
+): Promise<{
+  isOwner: boolean;
+  bronze: number;
+  silver: number;
+  silverUsed: number;
+  silverAvailable: number;
+  gold: number;
+  goldUsed: number;
+  goldAvailable: number;
+}> {
+  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+  const { isOwnerEmail } = await import("./leaves");
+  const isOwner = isOwnerEmail(email);
+  const countRows = async (q: any): Promise<number> => {
+    const { count, error } = await q;
+    return error ? 0 : (count ?? 0);
+  };
+  const draftCount = (adopted?: boolean) => {
+    let q = (supabaseAdmin as any).from("plant_drafts").select("id", { count: "exact", head: true }).eq("created_by", userId);
+    if (adopted) q = q.eq("adopted", true);
+    return countRows(q);
+  };
+  // 识别铜叶（变量制，镜像 leaves.ts identifyBronze）：疑似恒 1；否则 1 + 补拍次数，采纳翻倍。
+  // retake_count 列缺失时回退到旧计数制（草稿数 + 采纳数），部署早于迁移也不崩。
+  const identifyBronze = async (): Promise<number> => {
+    const { data, error } = await (supabaseAdmin as any)
+      .from("plant_drafts")
+      .select("retake_count, adopted, conf:ai_payload->>identification_confidence")
+      .eq("created_by", userId);
+    if (error || !data) {
+      const [t, a] = await Promise.all([draftCount(), draftCount(true)]);
+      return t + a;
+    }
+    let sum = 0;
+    for (const row of data as Array<{ retake_count: number | null; adopted: boolean | null; conf: string | null }>) {
+      if (row.conf === "low") sum += 1;
+      else {
+        const base = 1 + (row.retake_count ?? 0);
+        sum += row.adopted ? base * 2 : base;
+      }
+    }
+    return sum;
+  };
+  const editCount = (kind: "text" | "image", adopted?: boolean) => {
+    let q = (supabaseAdmin as any)
+      .from("plant_edits")
+      .select("id", { count: "exact", head: true })
+      .eq("editor_id", userId)
+      .eq("kind", kind)
+      .eq("reverted", false);
+    if (adopted) q = q.eq("adopted", true);
+    return countRows(q);
+  };
+  const [idBronze, txT, txA, imT, imA, prof] = await Promise.all([
+    identifyBronze(),
+    editCount("text"),
+    editCount("text", true),
+    editCount("image"),
+    editCount("image", true),
+    // silver_used may not exist until the migration is applied — select degrades to
+    // null on error, so silverUsed falls back to 0 (no crash pre-migration).
+    (supabaseAdmin as any).from("profiles").select("gold_used, silver_used").eq("id", userId).maybeSingle(),
+  ]);
+  const bronze = idBronze + txT + txA + imT + imA; // adopted edits count double
+  const silver = Math.floor(bronze / 10);
+  const gold = Math.floor(silver / 10);
+  const goldUsed = (prof?.data?.gold_used as number | undefined) ?? 0;
+  const silverUsed = (prof?.data?.silver_used as number | undefined) ?? 0;
+  return {
+    isOwner,
+    bronze,
+    silver,
+    silverUsed,
+    silverAvailable: isOwner ? Infinity : Math.max(0, silver - silverUsed),
+    gold,
+    goldUsed,
+    goldAvailable: isOwner ? Infinity : Math.max(0, gold - goldUsed),
+  };
+}
+
+/** Query the real registries and assemble the ground-truth block + clickable sources. */
+async function gatherVerifiedFacts(draft: any): Promise<VerifiedFacts> {
+  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+  const sciFull = (draft.scientific_name || "").trim();
+  const sciBinomial = sciFull.split(/\s+/).slice(0, 2).join(" ");
+
+  let conservation: { kind: string; label: string }[] = [];
+  let protectedBasis: string | null = null;
+  let griisDegree: string | null = null;
+  const sources: { name: string; url: string }[] = [];
+
+  try {
+    if (sciFull) {
+      const listsRes = await supabaseAdmin
+        .from("conservation_lists")
+        .select("id,kind,name,province,version,source_note,source_url");
+      const lists = (listsRes.data ?? []) as any[];
+      const taxa: any[] = [];
+      for (let from = 0; ; from += 1000) {
+        const { data } = await supabaseAdmin
+          .from("conservation_taxa")
+          .select("list_id,scientific_name,chinese_name,normalized_name,status,rank,excluded_names")
+          .range(from, from + 999);
+        const rows = data ?? [];
+        taxa.push(...rows);
+        if (rows.length < 1000) break;
+      }
+      if (taxa.length) {
+        const { buildConservationMatcher, conservationBadges, GRIIS_DEGREES } = await import("./conservation");
+        const hit = buildConservationMatcher({ lists, taxa })(sciFull, draft.family || null);
+        conservation = conservationBadges(hit, lists) ?? [];
+        const protectedEntries = [...hit.protectedLists.entries()];
+        if (protectedEntries.length) {
+          protectedBasis = protectedEntries
+            .map(([id, status]) => {
+              const l = lists.find((x) => x.id === id);
+              if (l?.source_url) sources.push({ name: l.name as string, url: l.source_url as string });
+              return `${l?.name ?? "重点保护名录"}${l?.version ? `（${l.version}）` : ""}${status ? ` · ${status}` : ""}`;
+            })
+            .join("；");
+        }
+        if (hit.griis) {
+          const gl = lists.find((l) => l.kind === "griis");
+          griisDegree = GRIIS_DEGREES.find((d) => d.value === hit.griis)?.label ?? String(hit.griis);
+          if (gl?.source_url) sources.push({ name: gl.name as string, url: gl.source_url as string });
+        }
+      }
+    }
+  } catch (e) {
+    console.warn("[GoldPage] conservation lookup failed:", e);
+  }
+
+  let isInvasive = false;
+  let taxonKey: number | null = null;
+  try {
+    if (sciBinomial) {
+      const chk = await gbifCheckInvasive(sciBinomial);
+      if (chk) {
+        isInvasive = chk.isInvasive;
+        taxonKey = chk.taxonKey;
+      }
+    }
+  } catch (e) {
+    console.warn("[GoldPage] GBIF check failed:", e);
+  }
+  const chinaInvasive = lookupChinaInvasive(sciFull || sciBinomial);
+  if (chinaInvasive) isInvasive = true;
+
+  // Clickable, REAL sources only — never model-authored.
+  if (taxonKey) sources.push({ name: "GBIF Backbone Taxonomy", url: `https://www.gbif.org/species/${taxonKey}` });
+  if (sciBinomial) {
+    sources.push({ name: "Plants of the World Online (POWO)", url: `https://powo.science.kew.org/results?q=${encodeURIComponent(sciBinomial)}` });
+    sources.push({ name: "iNaturalist 观察记录", url: `https://www.inaturalist.org/search?q=${encodeURIComponent(sciBinomial)}` });
+    sources.push({ name: "Wikimedia Commons 图库", url: `https://commons.wikimedia.org/w/index.php?search=${encodeURIComponent(sciBinomial)}` });
+  }
+
+  const splitName = (s: string | null) => {
+    const t = (s || "").trim();
+    const m = t.match(/^([^\sA-Za-z]+)?\s*([A-Za-z].*)?$/);
+    return { zh: (m?.[1] ?? t).trim(), la: (m?.[2] ?? "").trim() };
+  };
+  const fam = splitName(draft.family);
+  const gen = splitName(draft.genus);
+
+  return {
+    title: draft.title || sciFull || "待鉴定植物",
+    scientificName: sciFull,
+    familyZh: fam.zh,
+    familyLa: fam.la,
+    genusZh: gen.zh,
+    genusLa: gen.la,
+    commonNamesZh: draft.common_names_zh || "",
+    commonNameEn: draft.common_name_en || "",
+    conservation,
+    protectedBasis,
+    griisDegree,
+    isInvasive,
+    chinaInvasive,
+    iucnStatus: draft.iucn_status || null,
+    capturePlace: draft.capture_place || null,
+    sources,
+  };
+}
+
+export const createGoldDetailPageFn = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  // `UserModelInput` is a const declared further down; reference it at REQUEST time
+  // (inside the callback) rather than at module-init, where it isn't assigned yet.
+  .inputValidator((input) => z.object({ draft_id: z.string().uuid(), userModel: UserModelInput }).parse(input))
+  .handler(async ({ data, context }) => {
+    const { userId } = context;
+    const email = (context.claims as { email?: string } | undefined)?.email ?? null;
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+
+    // 1. Gate on a SERVER-computed leaf balance. The owner is unlimited (Infinity).
+    const leaves = await serverLeafBalance(userId, email);
+    if (leaves.goldAvailable < 1) {
+      throw new AiError(
+        "GOLD_INSUFFICIENT",
+        `创建失败（GOLD_INSUFFICIENT）：你当前没有可用金叶（已获得 ${leaves.gold} 枚，已使用 ${leaves.goldUsed} 枚）。每 100 枚铜叶兑 1 枚金叶。`,
+      );
+    }
+
+    // 2. Load the draft.
+    const { data: draftRow, error: loadErr } = await supabaseAdmin
+      .from("plant_drafts")
+      .select("id, title, scientific_name, common_name_en, common_names_zh, family, genus, photo_url, capture_place, iucn_status, tags, summary")
+      .eq("id", data.draft_id)
+      .maybeSingle();
+    const draft = draftRow as any;
+    if (loadErr || !draft) throw new AiError("DRAFT_NOT_FOUND", "创建失败（DRAFT_NOT_FOUND）：找不到这份草稿，可能已被删除。");
+    if (!draft.scientific_name) {
+      throw new AiError("DRAFT_NO_SPECIES", "创建失败（DRAFT_NO_SPECIES）：这份草稿还没有确定的学名，无法生成详细科普页。请先确认物种。");
+    }
+
+    // 3. Ground-truth facts from the real registries.
+    const facts = await gatherVerifiedFacts(draft);
+
+    // 4. Fill the 9 body image slots (hero stays the user's own photo).
+    //    fetchSpeciesPhotos already diversifies by place/season/photographer;
+    //    rehostImages compresses (1280px webp) before storing in Supabase.
+    let images: string[] = [];
+    try {
+      const term = facts.scientificName.split(/\s+/).slice(0, 2).join(" ") || facts.commonNameEn || facts.title;
+      const external = await fetchSpeciesPhotos(term, 9);
+      images = await rehostImages(external, `plants/gold/${draft.id}`);
+    } catch (e) {
+      console.warn("[GoldPage] image fetch failed; slots will render as .broken:", e);
+    }
+
+    // Resolve model override (needed for web research calls below)
+    const override = toOverride(data.userModel);
+
+    // 【联网调研 step】金叶页面生成前，先联网查询该物种的最新研究、文献、保护动态，
+    // 分三个维度准备权威参考资料（形态生境、人文博物、生态演化），提升内容深度。
+    let webResearch1: { digest: string; sources: { title: string; uri: string }[] } | null = null;
+    let webResearch2: { digest: string; sources: { title: string; uri: string }[] } | null = null;
+    let webResearch3: { digest: string; sources: { title: string; uri: string }[] } | null = null;
+
+    const speciesFullName = `${facts.title}（${facts.scientificName}）`;
+
+    // Phase 1 调研：形态、生境、近缘种区分
+    const query1 = `${speciesFullName} 的形态特征、生境分布、近缘种区分要点、栽培养护的最新权威资料（优先中国植物志、Flora of China、园艺文献）`;
+    webResearch1 = await xiaopGroundedSearch(query1, override);
+    if (webResearch1) {
+      console.log(`[GoldPage Phase1] Web research: ${webResearch1.sources.length} sources`);
+    }
+
+    // Phase 2 调研：人文、民俗、文学、药用
+    const query2 = `${speciesFullName} 的人文历史、民俗用途、文学记载、本草典籍、食药用价值的权威资料（优先古籍数据库、民族植物学文献）`;
+    webResearch2 = await xiaopGroundedSearch(query2, override);
+    if (webResearch2) {
+      console.log(`[GoldPage Phase2] Web research: ${webResearch2.sources.length} sources`);
+    }
+
+    // Phase 3 调研：生态功能、入侵状态、最新科研
+    const query3 = `${speciesFullName} 的生态功能、入侵风险、保护管理、近期重要科研进展（优先 IUCN、GBIF、学术期刊）`;
+    webResearch3 = await xiaopGroundedSearch(query3, override);
+    if (webResearch3) {
+      console.log(`[GoldPage Phase3] Web research: ${webResearch3.sources.length} sources`);
+    }
+
+    // 5. Three LLM passes. One mega-call reliably blows the output-token ceiling and
+    //    comes back as truncated JSON, so each pass owns a bounded slice of the page.
+
+    // Helper to inject web research into system prompt
+    const withWebContext = (basePrompt: string, research: typeof webResearch1) => {
+      if (!research || !research.digest) return basePrompt;
+      const srcList = research.sources.length
+        ? "\n参考来源：\n" + research.sources.map((s, i) => `[${i + 1}] ${s.title || s.uri} — ${s.uri}`).join("\n")
+        : "";
+      return basePrompt + `\n\n【联网调研·权威参考资料】以下是该物种的最新权威信息，请据此确保内容准确、时效性强：\n${research.digest}${srcList}\n`;
+    };
+
+    const ask = async (system: string, schema: unknown, label: string) => {
+      const txt = await xiaopTextCall({
+        contents: [{ role: "user", parts: [{ text: `请为「${facts.title}（${facts.scientificName}）」生成本轮内容。` }] }],
+        system,
+        schema,
+        override,
+      });
+      try {
+        return JSON.parse(cleanJson(txt));
+      } catch {
+        throw new AiError(
+          `GOLD_BAD_JSON_${label}`,
+          `创建失败（GOLD_BAD_JSON_${label}）：模型返回的内容不是完整 JSON，通常是生成被截断。请重试；反复出现可在管理后台给小P蛙换一个更强的模型。`,
+        );
+      }
+    };
+
+    const p1 = await ask(withWebContext(premiumPrompt1(facts), webResearch1), PREMIUM_SCHEMA_1, "1");
+    const p2 = await ask(withWebContext(premiumPrompt2(facts), webResearch2), PREMIUM_SCHEMA_2, "2");
+    const p3 = await ask(withWebContext(premiumPrompt3(facts), webResearch3), PREMIUM_SCHEMA_3, "3");
+    const fields = { ...p1, ...p2, ...p3 } as PremiumFields;
+
+    // 6. Render + upload the HTML body.
+    const html = renderPremiumHtml(fields, facts, { heroUrl: draft.photo_url as string, images });
+    const htmlPath = `${userId}/gold-${draft.id}.html`;
+    const { error: upErr } = await supabaseAdmin.storage
+      .from("plant-html")
+      .upload(htmlPath, new Blob([html], { type: "text/html" }), { contentType: "text/html", upsert: true });
+    if (upErr) throw new AiError("HTML_UPLOAD_FAILED", `创建失败（HTML_UPLOAD_FAILED）：详页 HTML 上传失败。原因：${upErr.message}。`);
+    const htmlUrl = supabaseAdmin.storage.from("plant-html").getPublicUrl(htmlPath).data.publicUrl;
+
+    // 7. Unique slug, then insert the plants row.
+    let slug = slugify(facts.scientificName || facts.title || "");
+    if (!slug || slug.startsWith("p-")) slug = `gold-${draft.id.slice(0, 8)}`;
+    for (let i = 0; i < 5; i++) {
+      const { data: dup } = await supabaseAdmin.from("plants").select("id").eq("slug", slug).maybeSingle();
+      if (!dup) break;
+      slug = `${slug}-${Math.random().toString(36).slice(2, 5)}`;
+    }
+
+    const { data: plant, error: pErr } = await supabaseAdmin
+      .from("plants")
+      .insert({
+        slug,
+        title: facts.title,
+        scientific_name: facts.scientificName,
+        common_name_en: draft.common_name_en,
+        common_names_zh: draft.common_names_zh,
+        family: draft.family,
+        genus: draft.genus,
+        summary: (fields.intro_zh || draft.summary || "").toString().slice(0, 600),
+        cover_url: draft.photo_url,
+        content_type: "html",
+        html_url: htmlUrl,
+        tags: draft.tags ?? [],
+        author_id: userId,
+        iucn_status: draft.iucn_status,
+        source: "gold_oneclick",
+        body_text: visibleBodyText(html),
+      })
+      .select("id")
+      .single();
+    if (pErr) throw new AiError("PLANT_INSERT_FAILED", `创建失败（PLANT_INSERT_FAILED）：写入档案时出错。原因：${pErr.message}。`);
+
+    // 8. Spend the leaf — LAST, and only now that the page really exists. The owner
+    //    is unlimited, so never debit their account. The `.eq("gold_used", …)` guard
+    //    makes this optimistic-concurrency: two tabs racing can't spend twice.
+    if (!leaves.isOwner) {
+      const { data: spent, error: spendErr } = await (supabaseAdmin as any)
+        .from("profiles")
+        .update({ gold_used: leaves.goldUsed + 1 })
+        .eq("id", userId)
+        .eq("gold_used", leaves.goldUsed)
+        .select("id");
+      if (spendErr || !spent?.length) {
+        // The page exists and is valid; only the accounting failed. Don't fail the
+        // request (the user would lose the page) — log loudly for reconciliation.
+        console.error(`[GoldPage] LEAF NOT SPENT for user ${userId}, plant ${plant.id}:`, spendErr?.message ?? "concurrent update");
+      }
+    }
+
+    return {
+      plantId: plant.id as string,
+      slug,
+      // null = unlimited (owner). JSON can't carry Infinity, so the frontend shows ∞.
+      goldRemaining: leaves.isOwner ? null : Math.max(0, leaves.goldAvailable - 1),
+    };
+  });
 
 export const gbifChinaOccurrencesFn = createServerFn({ method: "POST" })
   .inputValidator((input) => GbifOccInput.parse(input))
@@ -1571,7 +3265,12 @@ export const gbifChinaOccurrencesFn = createServerFn({ method: "POST" })
   });
 
 // ─── Approve draft → publish into plants + record edit ──────────────────────
-const ApproveInput = z.object({ draftId: z.string().uuid() });
+// mergeTargetId 为空 = 首次收录：先查同物种是否已有条目，有则返回 conflict（不写库）由前端弹窗；
+// 传了 mergeTargetId = 编辑已在弹窗点「确认合并」：把本次拍摄记录并入该条目并加「注」。
+const ApproveInput = z.object({
+  draftId: z.string().uuid(),
+  mergeTargetId: z.string().uuid().optional(),
+});
 
 export const approvePlantDraft = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
@@ -1599,6 +3298,120 @@ export const approvePlantDraft = createServerFn({ method: "POST" })
     if (!draft) throw new Error("草稿不存在");
     if (draft.status === "approved" && draft.published_plant_id) {
       return { plantId: draft.published_plant_id as string };
+    }
+
+    // ── 识别人显示名（访客草稿 created_by 为 null → 用 creator_label）+ 采纳编辑名 ──
+    let identifierName = draft.creator_label || "访客";
+    if (draft.created_by) {
+      const { data: idProf } = await supabaseAdmin
+        .from("profiles").select("display_name").eq("id", draft.created_by).maybeSingle();
+      if (idProf?.display_name) identifierName = idProf.display_name;
+    }
+    const { data: editorProf } = await supabaseAdmin
+      .from("profiles").select("display_name").eq("id", dbUserId).maybeSingle();
+    const editorName = editorProf?.display_name ?? "编辑";
+
+    const esc = (s: string) =>
+      String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+    const key = speciesKey(draft.scientific_name);
+    const placeStr = draft.capture_place || "未知地点";
+    const dateStr = (String(draft.created_at || "")).slice(0, 10);
+
+    // ═══ 合并分支：编辑在弹窗点了「确认合并」→ 把本次观测并入已有条目 ═══
+    if (data.mergeTargetId) {
+      const { data: target } = await supabaseAdmin
+        .from("plants")
+        .select("id, slug, title, html_url, co_author_ids, co_author_names")
+        .eq("id", data.mergeTargetId)
+        .maybeSingle();
+      if (!target) throw new Error("要合并的目标条目不存在");
+      if (!target.html_url) throw new Error("目标条目非 HTML 页，暂不支持自动合并，请到该页面手动编辑添加");
+
+      // 0) 原子「认领」草稿：pending → approved（条件更新）。认领不到（已被上一次/并发请求处理）→
+      //    直接返回，杜绝重复合并把先前的卡片读-改-写冲掉（用户双击「确认合并」曾导致注1丢失）。
+      const { data: claimed } = await supabaseAdmin
+        .from("plant_drafts")
+        .update({ status: "approved", published_plant_id: target.id })
+        .eq("id", draft.id)
+        .neq("status", "approved")
+        .select("id");
+      if (!claimed || claimed.length === 0) {
+        return { plantId: target.id as string, slug: target.slug as string, merged: true as const, alreadyMerged: true as const };
+      }
+
+      // 1) 建 merge 修改记录行，拿到 id 作为「注」锚点。
+      const { data: maxRow } = await supabaseAdmin
+        .from("plant_edits")
+        .select("marker_n")
+        .eq("plant_id", target.id)
+        .order("marker_n", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      const markerN = (maxRow?.marker_n ?? 0) + 1;
+      const { data: editRow, error: eErr } = await supabaseAdmin
+        .from("plant_edits")
+        .insert({
+          plant_id: target.id,
+          editor_id: dbUserId,
+          editor_name: editorName,
+          kind: "merge",
+          marker_n: markerN,
+          source: "draft_merge",
+          summary: `补充观测：由 ${identifierName} 于 ${placeStr}（${dateStr}）识别，经 ${editorName} 采纳并入本条目`,
+        })
+        .select("id")
+        .single();
+      if (eErr) throw new Error(`记录合并日志失败：${eErr.message}`);
+
+      // 2) 拉目标 HTML，追加「补充观测」卡片（含指向 editRow.id 的「注 N」上标）。
+      //    卡片限宽、图片限高，避免在模板内容列之外被撑满整页；带 data-draft-id 作幂等兜底。
+      let targetHtml = "";
+      try { targetHtml = await (await fetch(target.html_url)).text(); } catch { /* 拉取失败则从空文档追加 */ }
+      const coord = (draft.capture_lat != null && draft.capture_lng != null)
+        ? `（${Number(draft.capture_lat).toFixed(5)}, ${Number(draft.capture_lng).toFixed(5)}）` : "";
+      const photoImg = draft.photo_url
+        ? `<figure style="margin:0 0 1rem;max-width:420px"><img src="${esc(draft.photo_url)}" style="display:block;width:auto;max-width:100%;max-height:420px;height:auto;border-radius:4px" alt=""></figure>` : "";
+      const card = `
+<section class="merged-observation" data-draft-id="${draft.id}" style="max-width:680px;margin:2.5rem auto;padding:1.25rem 0;border-top:2px solid #c0392b;">
+  <h3 style="font-size:1.15em;color:#c0392b;margin:0 0 .75rem;">补充观测记录<a class="lov-edit-mark" data-edit-id="${editRow.id}" data-edit-n="${markerN}" style="margin-left:6px;display:inline-block;font-size:10px;line-height:1;padding:2px 5px;background:#c0392b;color:#fff;border-radius:3px;cursor:pointer;text-decoration:none;font-weight:600;vertical-align:super;">注</a></h3>
+  ${photoImg}
+  <p style="margin:0;color:#333;font-size:.95em;">识别人：${esc(identifierName)} · 地点：${esc(placeStr)}${coord} · 时间：${esc(dateStr)}</p>
+</section>`;
+      // 幂等兜底：目标 HTML 若已含本草稿卡片则不重复追加。
+      const mergedHtml = targetHtml.includes(`data-draft-id="${draft.id}"`)
+        ? targetHtml
+        : (/<\/body>/i.test(targetHtml) ? targetHtml.replace(/<\/body>/i, `${card}</body>`) : targetHtml + card);
+
+      // 3) 上传新 HTML，更新目标 html_url + co-author。
+      const mergePath = `${dbUserId}/merge-${target.id}-${Date.now()}.html`;
+      const blob = new Blob([mergedHtml], { type: "text/html" });
+      const { error: upErr } = await supabaseAdmin.storage
+        .from("plant-html")
+        .upload(mergePath, blob, { contentType: "text/html", upsert: true });
+      if (upErr) throw new Error(`合并 HTML 上传失败：${upErr.message}`);
+      const newUrl = supabaseAdmin.storage.from("plant-html").getPublicUrl(mergePath).data.publicUrl;
+      const coIds = Array.from(new Set([...(target.co_author_ids ?? []), ...(draft.created_by ? [draft.created_by] : [])]));
+      const coNames = Array.from(new Set([...(target.co_author_names ?? []), identifierName]));
+      await supabaseAdmin.from("plants")
+        .update({ html_url: newUrl, co_author_ids: coIds, co_author_names: coNames })
+        .eq("id", target.id);
+
+      return { plantId: target.id as string, slug: target.slug as string, merged: true as const };
+    }
+
+    // ═══ 存在性检查：同物种是否已有条目 → 有则返回 conflict（不写库），由前端弹窗决定 ═══
+    if (key) {
+      const { data: allPlants } = await supabaseAdmin
+        .from("plants")
+        .select("id, slug, title, scientific_name, html_url");
+      const hit = (allPlants ?? []).find((p) => speciesKey(p.scientific_name) === key);
+      if (hit) {
+        return {
+          conflict: true as const,
+          target: { id: hit.id, slug: hit.slug, title: hit.title, scientific_name: hit.scientific_name },
+          whatsNew: `本次为「${draft.title}」的一次新观测：${placeStr} · ${dateStr}（识别人：${identifierName}）。合并后将作为「补充观测」卡片并入已有条目「${hit.title}」，并在页尾记录溯源。`,
+        };
+      }
     }
 
     // Build slug: prefer ASCII slug of scientific name, fall back to id.
@@ -1643,6 +3456,8 @@ export const approvePlantDraft = createServerFn({ method: "POST" })
         tags: draft.tags ?? [],
         author_id: dbUserId,
         iucn_status: draft.iucn_status,
+        source: "ai_identify",
+        body_text: visibleBodyText(String(draft.html_content || "")),
       })
       .select("id")
       .single();
@@ -1707,9 +3522,40 @@ export const rejectPlantDraft = createServerFn({ method: "POST" })
     // Log the rejection so the owner's edit log shows it (with a revert path).
     const { data: d } = await supabaseAdmin
       .from("plant_drafts")
-      .select("title")
+      .select("title, enrich_silver_spent, created_by")
       .eq("id", data.draftId)
       .maybeSingle();
+
+    // Refund the silver leaf if this draft's「进一步草稿」was charged one. Rationale:
+    // a rejected draft (图文与实拍不符) shouldn't cost the contributor — and refusing
+    // to charge for rejected work discourages submitting mismatched drafts for review.
+    // Guarded to refund AT MOST once (flip the flag atomically first). Non-fatal.
+    const draftMeta = d as { title?: string; enrich_silver_spent?: boolean; created_by?: string | null } | null;
+    if (draftMeta?.enrich_silver_spent && draftMeta.created_by) {
+      try {
+        const { data: cleared } = await (supabaseAdmin as any)
+          .from("plant_drafts")
+          .update({ enrich_silver_spent: false })
+          .eq("id", data.draftId)
+          .eq("enrich_silver_spent", true) // only the winner of this flip refunds
+          .select("id");
+        if (cleared?.length) {
+          const { data: p } = await (supabaseAdmin as any)
+            .from("profiles")
+            .select("silver_used")
+            .eq("id", draftMeta.created_by)
+            .maybeSingle();
+          const cur = (p?.silver_used as number | undefined) ?? 0;
+          await (supabaseAdmin as any)
+            .from("profiles")
+            .update({ silver_used: Math.max(0, cur - 1) })
+            .eq("id", draftMeta.created_by);
+          console.log(`[RejectDraft] refunded 1 silver leaf to ${draftMeta.created_by} for draft ${data.draftId}`);
+        }
+      } catch (e) {
+        console.warn("[RejectDraft] silver refund skipped (migration not applied?):", e instanceof Error ? e.message : e);
+      }
+    }
     const { data: prof } = await supabaseAdmin
       .from("profiles")
       .select("display_name")
@@ -1780,7 +3626,7 @@ async function loadXiaoPConfig(): Promise<AiProviderConfig | null> {
     if (!raw) return null;
     const cfg = typeof raw === "string" ? JSON.parse(raw) : raw;
     if (cfg?.provider && cfg?.apiKey && cfg?.model) {
-      cfg.apiKey = String(cfg.apiKey).replace(/\s+/g, "");
+      cfg.apiKey = normalizeApiKey(cfg.provider, cfg.apiKey);
       if (cfg.baseUrl) cfg.baseUrl = String(cfg.baseUrl).trim().replace(/\/+$/, "");
       return cfg as AiProviderConfig;
     }
@@ -1910,7 +3756,6 @@ async function geminiChat(
   maxRetry = 3,
   images?: InlineImage[],
 ): Promise<string> {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
   const generationConfig: Record<string, unknown> = schema
     ? { responseMimeType: "application/json", responseSchema: schema }
     : {};
@@ -1922,55 +3767,27 @@ async function geminiChat(
     const idx = lastUserIndex(contents);
     for (const im of images) gContents[idx].parts.push({ inlineData: { mimeType: im.mimeType, data: im.base64 } });
   }
-  let attempts = 0;
-  let resp: Response | null = null;
-  while (attempts < maxRetry) {
-    attempts++;
-    const controller = new AbortController();
-    // Vision questions can take >1min; a short timeout surfaced as a raw
-    // "This operation was aborted" in the chat panel.
-    const timer = setTimeout(() => controller.abort(), 120_000);
-    try {
-      resp = await fetch(url, {
-        method: "POST",
-        signal: controller.signal,
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: gContents,
-          systemInstruction: { parts: [{ text: system }] },
-          generationConfig,
-        }),
-      });
-      clearTimeout(timer);
-      if ((resp.status === 429 || resp.status === 503) && attempts < maxRetry) {
-        await new Promise((r) => setTimeout(r, attempts * 4000));
-        continue;
-      }
-      break;
-    } catch (err) {
-      clearTimeout(timer);
-      // A timeout means the model is just slow — don't re-queue another 2min wait.
-      if ((err as Error)?.name === "AbortError") {
-        throw new Error(
-          "小P 响应超时（等了 2 分钟）：模型思考较慢，带图提问尤其耗时。请重试一次；连续超时可换更快的视觉模型。",
-        );
-      }
-      if (attempts < maxRetry) {
-        await new Promise((r) => setTimeout(r, attempts * 4000));
-        continue;
-      }
-      throw err;
+
+  // Same key pool as identify. This path also backs 入侵卡 / 保护卡 generation, which
+  // fire right after the main draft call — exactly the burst that trips the free-tier
+  // per-minute limit on a single key. Rotation spreads them across projects.
+  // Vision questions can take >1min, hence the 120s per-attempt timeout.
+  try {
+    const res = await callGeminiWithRotation(splitGeminiKeys(apiKey), {
+      model,
+      timeoutMs: 120_000,
+      label: "小P",
+      body: { contents: gContents, systemInstruction: { parts: [{ text: system }] }, generationConfig },
+    });
+    const txt = res.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!txt) throw new Error("小P 未返回有效内容。");
+    return txt as string;
+  } catch (e) {
+    if (e instanceof AiError && e.code === "GEMINI_NETWORK" && /abort/i.test(e.message)) {
+      throw new Error("小P 响应超时（等了 2 分钟）：模型思考较慢，带图提问尤其耗时。请重试一次；连续超时可换更快的视觉模型。");
     }
+    throw e;
   }
-  if (!resp || !resp.ok) {
-    const status = resp ? resp.status : 500;
-    if (status === 503) throw new Error("小P 模型当前过载，请稍后再试。");
-    throw new Error(`小P 调用失败 (HTTP ${status})`);
-  }
-  const res = await resp.json();
-  const txt = res.candidates?.[0]?.content?.parts?.[0]?.text;
-  if (!txt) throw new Error("小P 未返回有效内容。");
-  return txt as string;
 }
 
 /** OpenAI-compatible chat (covers provider `openai` and `custom` relays; optional vision). */
@@ -1984,66 +3801,60 @@ async function openaiCompatChat(
   images?: InlineImage[],
 ): Promise<string> {
   const apiBase = (baseUrl || "https://api.openai.com/v1").replace(/\/+$/, "");
-  const idx = images?.length ? lastUserIndex(contents) : -1;
-  const messages: { role: string; content: unknown }[] = [
-    {
-      role: "system",
-      content: schema
-        ? `${system}\n\n只返回一个 JSON 对象，不要 markdown、不要多余文字。`
-        : system,
-    },
-    ...contents.map((c, i) => {
-      const text = c.parts.map((p) => p.text).join("\n");
-      const role = c.role === "model" ? "assistant" : "user";
-      if (i === idx && images?.length) {
-        return {
-          role,
-          content: [
-            { type: "text", text },
-            ...images.map((im) => ({
-              type: "image_url",
-              image_url: { url: `data:${im.mimeType};base64,${im.base64}` },
-            })),
-          ],
-        };
-      }
-      return { role, content: text };
-    }),
-  ];
-  // NOTE: deliberately DO NOT send response_format:json_object — some relays /
-  // reasoning models return an EMPTY reply when it's set (a lesson already learned
-  // for the identify pipeline). We instruct JSON in the system prompt + cleanJson() instead.
-  const body: Record<string, unknown> = { model, messages, max_tokens: 16000 };
-  // Network errors (the relay resetting on a large body) surface as a bare
-  // "fetch failed"; wrap with a timeout + one retry + a clearer message.
-  let resp: Response | null = null;
-  let lastErr: unknown = null;
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const controller = new AbortController();
-    // Reasoning / vision models (MiniMax-M3 etc.) routinely think for >1min on
-    // photo questions — a short timeout here surfaced as "This operation was aborted".
-    const timer = setTimeout(() => controller.abort(), 120_000);
-    try {
-      resp = await fetch(`${apiBase}/chat/completions`, {
-        method: "POST",
-        signal: controller.signal,
-        headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      });
-      clearTimeout(timer);
-      break;
-    } catch (err) {
-      clearTimeout(timer);
-      lastErr = err;
-      // A timeout means the model is just slow — retrying only doubles the wait.
-      if ((err as Error)?.name === "AbortError") break;
-      if (attempt === 0) {
-        await new Promise((r) => setTimeout(r, 1500));
-        continue;
+
+  // Build the OpenAI messages. `useImages` attaches the photo(s) to the last user
+  // turn as image_url parts — dropped on the text-only retry below.
+  const buildMessages = (useImages: boolean): { role: string; content: unknown }[] => {
+    const idx = useImages && images?.length ? lastUserIndex(contents) : -1;
+    return [
+      {
+        role: "system",
+        content: schema ? `${system}\n\n只返回一个 JSON 对象，不要 markdown、不要多余文字。` : system,
+      },
+      ...contents.map((c, i) => {
+        const text = c.parts.map((p) => p.text).join("\n");
+        const role = c.role === "model" ? "assistant" : "user";
+        if (i === idx && images?.length) {
+          return {
+            role,
+            content: [
+              { type: "text", text },
+              ...images.map((im) => ({ type: "image_url", image_url: { url: `data:${im.mimeType};base64,${im.base64}` } })),
+            ],
+          };
+        }
+        return { role, content: text };
+      }),
+    ];
+  };
+
+  // One request with its own network retry + timeout. Returns the Response, or
+  // throws a described network/timeout error.
+  const send = async (useImages: boolean): Promise<Response> => {
+    // NOTE: deliberately DO NOT send response_format:json_object — some relays /
+    // reasoning models return an EMPTY reply when it's set. We instruct JSON in the
+    // system prompt + cleanJson() instead.
+    const body: Record<string, unknown> = { model, messages: buildMessages(useImages), max_tokens: 16000 };
+    let lastErr: unknown = null;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 120_000);
+      try {
+        const r = await fetch(`${apiBase}/chat/completions`, {
+          method: "POST",
+          signal: controller.signal,
+          headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        clearTimeout(timer);
+        return r;
+      } catch (err) {
+        clearTimeout(timer);
+        lastErr = err;
+        if ((err as Error)?.name === "AbortError") break; // slow model — retry only doubles the wait
+        if (attempt === 0) { await new Promise((r) => setTimeout(r, 1500)); continue; }
       }
     }
-  }
-  if (!resp) {
     if ((lastErr as Error)?.name === "AbortError") {
       throw new Error(
         "小P 响应超时（等了 2 分钟）：当前模型思考较慢，带图提问尤其耗时。可以重试一次；" +
@@ -2054,6 +3865,17 @@ async function openaiCompatChat(
       `小P 连接中转失败（${lastErr instanceof Error ? lastErr.message : "网络错误"}）：` +
         `请检查中转地址/网络；整页改写体量较大时该中转可能超时，可在 /identify 把小P模型切回默认 Gemini 再试。`,
     );
+  };
+
+  let resp = await send(!!images?.length);
+  // Text-only models (e.g. DeepSeek deepseek-chat) reject the vision `image_url`
+  // part with a 400. Rather than fail the whole chat, retry once WITHOUT images so
+  // text conversation still works — the user just can't get image-based answers.
+  if (!resp.ok && images?.length) {
+    const t = await resp.clone().text();
+    if (/image_url|unknown variant|expected\s+`?text`?|does ?n['’]?t support image|not support.*image|multimodal|vision/i.test(t)) {
+      resp = await send(false);
+    }
   }
   if (!resp.ok) {
     const t = await resp.text();
@@ -2144,6 +3966,116 @@ async function xiaopTextCall(opts: {
   return openaiCompatChat(cfg.apiKey, cfg.baseUrl || "", cfg.model, opts.contents, opts.system, opts.schema, opts.images);
 }
 
+// ── 小P蛙 联网检索（Google 搜索 grounding，仅 Gemini）───────────────────────────
+// Grounding is INCOMPATIBLE with responseSchema (structured output), so we run it as
+// a SEPARATE free-text call and inject the digest + sources back into the structured
+// answer. Gemini-only; returns null for other providers or on any failure (graceful).
+
+/** Resolve the effective Gemini key/model for 小P (mirrors xiaopTextCall's gemini branch). */
+async function resolveXiaoPGemini(override: AiProviderConfig | null): Promise<{ apiKey: string; model: string } | null> {
+  const cfg = override && override.apiKey ? override : await loadXiaoPConfig();
+  const provider = cfg?.provider ?? "gemini";
+  if (provider !== "gemini") return null; // google_search grounding is Gemini-only
+  const apiKey = cfg?.provider === "gemini" && cfg.apiKey ? cfg.apiKey : process.env.GEMINI_API_KEY;
+  if (!apiKey) return null;
+  const model = cfg?.provider === "gemini" && cfg.model ? cfg.model : process.env.AI_MODEL || "gemini-2.5-flash";
+  return { apiKey, model };
+}
+
+async function xiaopGroundedSearch(
+  query: string,
+  override: AiProviderConfig | null,
+): Promise<{ digest: string; sources: { title: string; uri: string }[] } | null> {
+  const g = await resolveXiaoPGemini(override);
+  if (!g) return null;
+  try {
+    const data = await callGeminiWithRotation(splitGeminiKeys(g.apiKey), {
+      model: g.model,
+      timeoutMs: 30_000,
+      label: "小P-search",
+      body: {
+        contents: [
+          {
+            role: "user",
+            parts: [{ text: `请联网检索并用中文汇总与下面问题最相关的最新、可靠信息，给 3–6 条要点（含关键数据/结论/年份）：\n${query}` }],
+          },
+        ],
+        tools: [{ google_search: {} }],
+      },
+    });
+    const cand = data.candidates?.[0];
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const digest = (cand?.content?.parts || []).map((p: any) => p.text).filter(Boolean).join("\n").trim();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const chunks: any[] = cand?.groundingMetadata?.groundingChunks || [];
+    const sources = chunks
+      .map((c) => ({ title: String(c?.web?.title || "").trim(), uri: String(c?.web?.uri || "").trim() }))
+      .filter((s) => s.uri)
+      .slice(0, 6);
+    if (!digest) return null;
+    return { digest, sources };
+  } catch (e) {
+    console.warn("[xiaopGroundedSearch] failed (grounding maybe unsupported by key/model):", e instanceof Error ? e.message : e);
+    return null;
+  }
+}
+
+/**
+ * Run a 小P chat turn with OPTIONAL web grounding. First structured pass; if the
+ * model set needsWebSearch + webQuery, run a grounded search, then re-answer with the
+ * digest + sources injected, and append the source links to `reply`. Returns the
+ * final JSON string for the caller's parseAgentReply.
+ */
+async function xiaopAskWithGrounding(opts: {
+  contents: ChatContents;
+  system: string;
+  schema: unknown;
+  images?: InlineImage[];
+  override: AiProviderConfig | null;
+}): Promise<string> {
+  const first = await xiaopTextCall({ contents: opts.contents, system: opts.system, schema: opts.schema, images: opts.images, override: opts.override });
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let parsed: any;
+  try {
+    parsed = JSON.parse(cleanJson(first));
+  } catch {
+    return first; // unparseable → let the caller's parser deal with it
+  }
+  const wants = parsed?.needsWebSearch === true && String(parsed?.webQuery || "").trim();
+  if (!wants) return first;
+
+  const search = await xiaopGroundedSearch(String(parsed.webQuery).trim(), opts.override);
+  if (!search) return first; // grounding unavailable → keep the first answer
+
+  const srcBlock = search.sources.length
+    ? "\n参考来源：\n" + search.sources.map((s, i) => `[${i + 1}] ${s.title || s.uri} ${s.uri}`).join("\n")
+    : "";
+  const contents2: ChatContents = [
+    ...opts.contents,
+    {
+      role: "user",
+      parts: [{ text: `【✅ 联网检索结果】我已为你完成联网搜索，以下是权威的最新信息。请**直接用这些真实数据更新你的回答**，把 needsWebSearch 设为 false。\n\n${search.digest}${srcBlock}\n\n请据上面的检索结果给出准确、完整的答案。` }],
+    },
+  ];
+  const second = await xiaopTextCall({ contents: contents2, system: opts.system, schema: opts.schema, images: opts.images, override: opts.override });
+
+  // Guarantee the sources are visible even if the model omitted them.
+  if (search.sources.length) {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const p2: any = JSON.parse(cleanJson(second));
+      if (!/参考来源|来源[:：]|http/.test(p2.reply || "")) {
+        const lines = search.sources.map((s, i) => `[${i + 1}] ${s.title || s.uri}：${s.uri}`).join("\n");
+        p2.reply = `${p2.reply || ""}\n\n📎 联网检索来源：\n${lines}`;
+      }
+      return JSON.stringify(p2);
+    } catch {
+      return second;
+    }
+  }
+  return second;
+}
+
 // Per-user model config forwarded from the client (stored in their browser).
 const UserModelInput = z
   .object({
@@ -2159,7 +4091,7 @@ function toOverride(um: z.infer<typeof UserModelInput>): AiProviderConfig | null
   if (!um || !um.apiKey || !um.model) return null;
   return {
     provider: um.provider,
-    apiKey: String(um.apiKey).replace(/\s+/g, ""),
+    apiKey: normalizeApiKey(um.provider, um.apiKey),
     model: String(um.model).trim(),
     baseUrl: um.baseUrl ? String(um.baseUrl).trim().replace(/\/+$/, "") : undefined,
   };
@@ -2215,8 +4147,9 @@ export const askDraftAgentFn = createServerFn({ method: "POST" })
   ["Tribulus terrestris","Tripodion tetraphyllum"]。系统会联网（iNaturalist / GBIF / 维基共享）按每个词分别取若干照片、
   分组显示在对话里。**你具备这个能力，不要说"我无法联网/无法发图"**；reply 里正常说明你将给出参考图即可。
 - 如果只是答疑、讨论或信息不足以落地，上述布尔全部设为 false，editInstruction 留空、imageQueries 用空数组。
+- 如果准确回答需要【最新网络信息】（如某物种最新的保护级别/最新研究进展/新闻/时效性数据/市场行情等，且你的内置知识可能过时或不确定），把 needsWebSearch 设为 true，并在 webQuery 里给出一个简洁的检索词（可用拉丁学名）；**同时在 reply 中先给出基于你现有知识的初步回答，并明确说明「正在为你联网查询最新信息...」**，系统会自动联网并让你用真实结果更新答案。纯植物学常识不必联网，needsWebSearch 设为 false、webQuery 留空。
 回答控制在简明范围内，不要长篇大论。
-【输出格式·务必严格】只返回一个 JSON 对象，键名固定为：reply（字符串，你的中文回答）、canEdit（布尔）、editInstruction（字符串）、imageEdit（布尔）、imageQuery（字符串）、showImages（布尔）、imageQueries（字符串数组）。不要用 response 等其它键名，不要加 markdown 代码块或多余文字。`;
+【输出格式·务必严格】只返回一个 JSON 对象，键名固定为：reply（字符串，你的中文回答）、canEdit（布尔）、editInstruction（字符串）、imageEdit（布尔）、imageQuery（字符串）、showImages（布尔）、imageQueries（字符串数组）、needsWebSearch（布尔）、webQuery（字符串）。不要用 response 等其它键名，不要加 markdown 代码块或多余文字。`;
 
     const contents: { role: "user" | "model"; parts: { text: string }[] }[] = [
       {
@@ -2252,11 +4185,13 @@ export const askDraftAgentFn = createServerFn({ method: "POST" })
           items: { type: "string" },
           description: "若 showImages 为 true，要展示的每个物种的搜索词（优先拉丁学名）；对比多个物种时含每一个；否则空数组",
         },
+        needsWebSearch: { type: "boolean", description: "回答是否需要最新网络信息（时效性数据/最新研究/新闻等）" },
+        webQuery: { type: "string", description: "若 needsWebSearch 为 true，联网检索的搜索词；否则空字符串" },
       },
-      required: ["reply", "canEdit", "editInstruction", "imageEdit", "imageQuery", "showImages", "imageQueries"],
+      required: ["reply", "canEdit", "editInstruction", "imageEdit", "imageQuery", "showImages", "imageQueries", "needsWebSearch", "webQuery"],
     };
 
-    const txt = await xiaopTextCall({
+    const txt = await xiaopAskWithGrounding({
       contents,
       system,
       schema,
@@ -2395,8 +4330,9 @@ ${scopeLine}
   **对比多个物种时 imageQueries 要含每一个**（如 ["Tribulus terrestris","Tripodion tetraphyllum"]）。系统会联网按每个词分别取照片分组显示。
   **你具备这个能力，不要说"我无法联网/无法发图"**。
 - 否则上述布尔全部设为 false、editInstruction 留空、imageQueries 用空数组。
+- 如果准确回答需要【最新网络信息】（如某物种最新的保护级别/最新研究进展/新闻/时效性数据等，且你的内置知识可能过时），把 needsWebSearch 设为 true 并在 webQuery 给出简洁检索词（可用拉丁学名）；纯常识不必联网，设 false、webQuery 留空。
 回答简明。
-【输出格式·务必严格】只返回一个 JSON 对象，键名固定为：reply（字符串）、canEdit（布尔）、editInstruction（字符串）、imageEdit（布尔）、imageQuery（字符串）、showImages（布尔）、imageQueries（字符串数组）。不要用 response 等其它键名，不要加 markdown 代码块或多余文字。`;
+【输出格式·务必严格】只返回一个 JSON 对象，键名固定为：reply（字符串）、canEdit（布尔）、editInstruction（字符串）、imageEdit（布尔）、imageQuery（字符串）、showImages（布尔）、imageQueries（字符串数组）、needsWebSearch（布尔）、webQuery（字符串）。不要用 response 等其它键名，不要加 markdown 代码块或多余文字。`;
 
     const contents: ChatContents = [
       {
@@ -2425,11 +4361,13 @@ ${scopeLine}
         imageQuery: { type: "string" },
         showImages: { type: "boolean" },
         imageQueries: { type: "array", items: { type: "string" } },
+        needsWebSearch: { type: "boolean" },
+        webQuery: { type: "string" },
       },
-      required: ["reply", "canEdit", "editInstruction", "imageEdit", "imageQuery", "showImages", "imageQueries"],
+      required: ["reply", "canEdit", "editInstruction", "imageEdit", "imageQuery", "showImages", "imageQueries", "needsWebSearch", "webQuery"],
     };
 
-    const txt = await xiaopTextCall({
+    const txt = await xiaopAskWithGrounding({
       contents,
       system,
       schema,
@@ -2487,7 +4425,7 @@ ${scopeLine}
 
 const SaveXiaoPConfigInput = z.object({
   provider: z.enum(["gemini", "openai", "anthropic", "custom"]),
-  apiKey: z.string().min(1).max(1000),
+  apiKey: z.string().min(1).max(4000), // may hold a comma/newline separated Gemini key POOL
   model: z.string().min(1).max(200),
   baseUrl: z.string().url().optional().or(z.literal("")),
 });
@@ -2503,7 +4441,7 @@ export const saveXiaoPConfigFn = createServerFn({ method: "POST" })
 
     const configValue = {
       provider: data.provider,
-      apiKey: (data.apiKey ?? "").replace(/\s+/g, ""),
+      apiKey: normalizeApiKey(data.provider, data.apiKey),
       model: (data.model ?? "").trim(),
       baseUrl: (data.baseUrl ?? "").trim().replace(/\/+$/, "") || null,
       updatedAt: new Date().toISOString(),
@@ -2535,7 +4473,8 @@ export const listProviderModelsFn = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .inputValidator((input) => ListModelsInput.parse(input))
   .handler(async ({ data }): Promise<{ models: string[] }> => {
-    const key = data.apiKey.replace(/\s+/g, "");
+    // A Gemini pool can't go in a URL — probe with the first key (they share a model list).
+    const key = normalizeApiKey(data.provider, data.apiKey).split(",")[0];
     const base = (data.baseUrl || "").trim().replace(/\/+$/, "");
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 20_000);
@@ -2593,9 +4532,9 @@ export const getXiaoPConfigFn = createServerFn({ method: "GET" })
       .maybeSingle();
     if (!data?.value) return null;
     const cfg = typeof data.value === "string" ? JSON.parse(data.value) : data.value;
-    const masked = cfg.apiKey
-      ? `${"*".repeat(Math.max(0, cfg.apiKey.length - 6))}${cfg.apiKey.slice(-6)}`
-      : "";
+    const xkeys = cfg.apiKey ? String(cfg.apiKey).split(",").filter(Boolean) : [];
+    const xmask = (k: string) => (k.length <= 10 ? k : `${k.slice(0, 4)}…${k.slice(-4)}`);
+    const masked = xkeys.length > 1 ? `${xkeys.map(xmask).join(" · ")}（共 ${xkeys.length} 个 key）` : (xkeys[0] ? xmask(xkeys[0]) : "");
     return {
       provider: cfg.provider as string,
       model: cfg.model as string,
@@ -2831,6 +4770,17 @@ export const extractPlantMetaFn = createServerFn({ method: "POST" })
     const openaiKey = process.env.OPENAI_API_KEY;
     const lovableKey = process.env.LOVABLE_API_KEY;
 
+    // Pool = admin-configured Gemini keys (site_config) + the env key, deduped —
+    // batch extraction fires many requests, so rely on the rotating pool instead
+    // of a single env key that 429s after the first few.
+    const aiCfg = await loadAiConfig();
+    const geminiPool = Array.from(
+      new Set([
+        ...(aiCfg?.provider === "gemini" ? splitGeminiKeys(aiCfg.apiKey) : []),
+        ...splitGeminiKeys(geminiKey),
+      ]),
+    );
+
     const systemPrompt = `你是植物信息抽取助手。给定一个植物图鉴页面的纯文本，
 严格只通过 JSON 结构返回结果。规则：
 - title：植物中文名称。优先取页面 H1/标题/中文名，找不到留空。
@@ -2855,9 +4805,9 @@ export const extractPlantMetaFn = createServerFn({ method: "POST" })
 - summary：植物简介，150-250 字。优先抽取页面"简介/概述/描述/Introduction/Description"段落原文，去除标签；找不到则基于全文摘要。
 找不到的字段返回空字符串或空数组（habitat 例外，按上面规则填 "无记录"），不要编造。`;
 
-    if (geminiKey) {
-      let model = process.env.AI_MODEL || "gemini-2.5-flash";
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiKey}`;
+    if (geminiPool.length > 0) {
+      const model =
+        (aiCfg?.provider === "gemini" && aiCfg.model) || process.env.AI_MODEL || "gemini-2.5-flash";
       const schema = {
         type: "object",
         properties: {
@@ -2886,63 +4836,23 @@ export const extractPlantMetaFn = createServerFn({ method: "POST" })
         ]
       };
 
-      let attempts = 0;
-      const maxAttempts = 3;
-      let resp: Response | null = null;
-
-      while (attempts < maxAttempts) {
-        attempts++;
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), 30_000);
-        try {
-          resp = await fetch(url, {
-            method: "POST",
-            signal: controller.signal,
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              contents: [
-                { role: "user", parts: [{ text: `以下是页面正文文本：\n\n${text}` }] }
-              ],
-              systemInstruction: {
-                parts: [{ text: systemPrompt }]
-              },
-              generationConfig: {
-                responseMimeType: "application/json",
-                responseSchema: schema
-              }
-            })
-          });
-          clearTimeout(timer);
-
-          // 429 = rate limit, 503 = model overloaded — both transient, retry with backoff
-          if ((resp.status === 429 || resp.status === 503) && attempts < maxAttempts) {
-            const delay = attempts * 5000;
-            console.warn(`[AI Extract] Gemini API returned ${resp.status}. Retrying in ${delay / 1000}s... (Attempt ${attempts}/${maxAttempts})`);
-            await new Promise((resolve) => setTimeout(resolve, delay));
-            continue;
+      const res = await callGeminiWithRotation(geminiPool, {
+        model,
+        label: "AI Extract",
+        timeoutMs: 30_000,
+        body: {
+          contents: [
+            { role: "user", parts: [{ text: `以下是页面正文文本：\n\n${text}` }] }
+          ],
+          systemInstruction: {
+            parts: [{ text: systemPrompt }]
+          },
+          generationConfig: {
+            responseMimeType: "application/json",
+            responseSchema: schema
           }
-          break;
-        } catch (err) {
-          clearTimeout(timer);
-          if (attempts < maxAttempts) {
-            const delay = attempts * 5000;
-            console.warn(`[AI Extract] Fetch error, retrying in ${delay / 1000}s...:`, err);
-            await new Promise((resolve) => setTimeout(resolve, delay));
-            continue;
-          }
-          throw err;
-        }
-      }
-
-      if (!resp || !resp.ok) {
-        const status = resp ? resp.status : 500;
-        const t = resp ? await resp.text() : "网络请求失败";
-        console.error("Gemini API Error in extractPlantMetaFn:", status, t);
-        if (status === 503) throw new Error("Gemini 模型当前过载，已重试 3 次仍失败，请稍后再试");
-        throw new Error(`Gemini 提取失败 (HTTP ${status})`);
-      }
-
-      const res = await resp.json();
+        },
+      });
       const txt = res.candidates?.[0]?.content?.parts?.[0]?.text;
       if (!txt) throw new Error("Gemini 未返回有效文本");
       return JSON.parse(cleanJson(txt));
@@ -3050,6 +4960,60 @@ export const extractPlantMetaFn = createServerFn({ method: "POST" })
     throw new Error("AI 提取服务未配置。请在 Cloudflare 后台 Secrets 中设置 GEMINI_API_KEY 或 OPENAI_API_KEY。");
   });
 
+// ─── Skill 条目查重：学名前两词相同 + 正文可见文本相似度（读 DB body_text，零抓取）──
+const CheckSkillDupInput = z.object({
+  scientificName: z.string(),
+  // 新条目正文可见文本，由客户端从上传的 HTML 用 visibleBodyText() 算好传入（避免服务端抓 HTML）。
+  newBodyText: z.string(),
+  excludePlantId: z.string().uuid().optional(),
+});
+
+/**
+ * 判定一份待上传的 skill 条目是否与已有条目重复。
+ * 门槛：学名前两词相同（speciesKey）。命中候选后用各自库里存的 body_text 做 3-gram Jaccard 相似度，
+ * 取最相似者。band：>=60% = high（自动合并/去编辑）；<60% = low（平行存在/自动合并/去编辑）。
+ * 全程不抓 HTTP —— 候选文本来自 DB，新条目文本由客户端传入。
+ */
+export const checkSkillDuplicateFn = createServerFn({ method: "POST" })
+  .inputValidator((i) => CheckSkillDupInput.parse(i))
+  .handler(async ({ data }) => {
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const key = speciesKey(data.scientificName);
+    if (!key) return { match: null };
+
+    const { data: plants } = await supabaseAdmin
+      .from("plants")
+      .select("id, slug, title, scientific_name, body_text, html_url, co_author_names, author_id");
+    const candidates = (plants ?? []).filter(
+      (p) => p.id !== data.excludePlantId && p.body_text && speciesKey(p.scientific_name) === key,
+    );
+    if (candidates.length === 0) return { match: null };
+
+    const newSh = textShingles(data.newBodyText);
+    type Match = {
+      id: string; slug: string; title: string; scientific_name: string | null;
+      html_url: string | null; co_author_names: string[]; author_id: string;
+    };
+    let best: Match | null = null;
+    let bestSim = -1;
+    for (const c of candidates) {
+      const sim = jaccardSimilarity(newSh, textShingles(c.body_text as string));
+      if (sim > bestSim) {
+        bestSim = sim;
+        best = {
+          id: c.id, slug: c.slug, title: c.title, scientific_name: c.scientific_name,
+          html_url: c.html_url, co_author_names: c.co_author_names ?? [], author_id: c.author_id,
+        };
+      }
+    }
+    if (!best || bestSim < 0) return { match: null };
+    return {
+      match: best,
+      similarity: Math.round(bestSim * 1000) / 1000,
+      band: bestSim >= 0.6 ? "high" : "low",
+    };
+  });
+
 const SavePlantInput = z.object({
   id: z.string().uuid().optional(),
   payload: z.object({
@@ -3071,6 +5035,8 @@ const SavePlantInput = z.object({
     is_featured: z.boolean(),
     author_id: z.string(),
     parent_id: z.string().uuid().nullable().optional(),
+    // 正文可见文本，由客户端从上传的 HTML 用 visibleBodyText() 算好传入，供 skill 查重。
+    body_text: z.string().nullable().optional(),
   }),
   editorName: z.string(),
   editSummary: z.string().optional(),
@@ -3105,6 +5071,8 @@ export const savePlantFn = createServerFn({ method: "POST" })
       is_featured: payload.is_featured,
       author_id: dbAuthorId,
       parent_id: payload.parent_id || null,
+      // 仅当客户端传了正文文本才写 body_text（纯编辑不带文本时保持原值不动）。
+      ...(payload.body_text !== undefined ? { body_text: payload.body_text } : {}),
     };
 
     let plantId = id;
@@ -3221,7 +5189,7 @@ export const uploadAssetFn = createServerFn({ method: "POST" })
 
 const SaveAiConfigInput = z.object({
   provider: z.enum(["gemini", "openai", "anthropic", "custom"]),
-  apiKey: z.string().min(1).max(1000),
+  apiKey: z.string().min(1).max(4000), // may hold a comma/newline separated Gemini key POOL
   model: z.string().min(1).max(200),
   baseUrl: z.string().url().optional().or(z.literal("")),
 });
@@ -3243,7 +5211,7 @@ export const saveAiConfigFn = createServerFn({ method: "POST" })
     // copy-paste artifact) can't poison the config — that produced a silent
     // "Invalid token" 401 on every identify. Strip ALL whitespace from the key,
     // and trim + drop trailing slashes from the base URL (we append "/chat/completions").
-    const cleanKey = (data.apiKey ?? "").replace(/\s+/g, "");
+    const cleanKey = normalizeApiKey(data.provider, data.apiKey);
     const cleanBaseUrl = (data.baseUrl ?? "").trim().replace(/\/+$/, "");
     const configValue = {
       provider: data.provider,
@@ -3283,17 +5251,78 @@ export const getAiConfigFn = createServerFn({ method: "GET" })
 
     if (!data?.value) return null;
     const cfg = typeof data.value === "string" ? JSON.parse(data.value) : data.value;
-    // Mask the API key: show only last 6 chars
-    const masked = cfg.apiKey
-      ? `${"*".repeat(Math.max(0, cfg.apiKey.length - 6))}${cfg.apiKey.slice(-6)}`
-      : "";
+    // Mask each key (last 6 chars). A Gemini pool shows every key + the count, so an
+    // admin can see at a glance how many independent quota buckets are configured.
+    const keys = cfg.apiKey ? String(cfg.apiKey).split(",").filter(Boolean) : [];
+    // Short mask: prefix hint + last 4 — a long wall of asterisks wrecked the layout.
+    const maskOne = (k: string) => (k.length <= 10 ? k : `${k.slice(0, 4)}…${k.slice(-4)}`);
+    const masked = keys.length > 1 ? `${keys.map(maskOne).join(" · ")}（共 ${keys.length} 个 key，429 自动轮换）` : (keys[0] ? maskOne(keys[0]) : "");
     return {
       provider: cfg.provider as string,
       model: cfg.model as string,
       baseUrl: cfg.baseUrl as string | null,
       apiKeyMasked: masked,
+      keyCount: keys.length,
       updatedAt: cfg.updatedAt as string | null,
     };
+  });
+
+// ── Editor application approval (server-side, with email auto-confirm) ─────────
+// Approving an editor grants the role, marks the application approved, AND confirms
+// their email via the Supabase Admin API — so an approved editor can log in right
+// away instead of being blocked on "email not confirmed" (a common trap: approval
+// ≠ email verification, which normally requires clicking a link that often never
+// arrives). Email confirm needs the service role, hence a server function.
+const ApproveAppInput = z.object({ applicationId: z.string().uuid(), userId: z.string().uuid() });
+
+async function assertAdmin(supabase: any, adminId: string, action: string) {
+  const { data: roles } = await supabase.from("user_roles").select("role").eq("user_id", adminId);
+  if (!(roles?.some((r: { role: string }) => r.role === "admin") ?? false)) throw new Error(`仅管理员可${action}`);
+}
+
+export const approveApplicationFn = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input) => ApproveAppInput.parse(input))
+  .handler(async ({ data, context }) => {
+    const { supabase, userId: adminId } = context;
+    await assertAdmin(supabase, adminId, "审批编辑申请");
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+
+    // 1. grant editor role (idempotent)
+    const { error: roleErr } = await (supabaseAdmin as any).from("user_roles").insert({ user_id: data.userId, role: "editor" });
+    if (roleErr && !String(roleErr.message).toLowerCase().includes("duplicate")) throw roleErr;
+
+    // 2. mark the application approved
+    const { error: updErr } = await (supabaseAdmin as any)
+      .from("editor_applications")
+      .update({ status: "approved", reviewed_by: adminId, reviewed_at: new Date().toISOString(), reject_reason: null })
+      .eq("id", data.applicationId);
+    if (updErr) throw updErr;
+
+    // 3. confirm their email so login works immediately (non-fatal if it fails)
+    let emailConfirmed = false;
+    try {
+      const { error: confErr } = await (supabaseAdmin as any).auth.admin.updateUserById(data.userId, { email_confirm: true });
+      if (confErr) throw confErr;
+      emailConfirmed = true;
+    } catch (e) {
+      console.warn("[approveApplication] email confirm failed:", e);
+    }
+    return { ok: true, emailConfirmed };
+  });
+
+/** Admin-only: confirm an (already-approved) editor's email so they can log in. */
+const ConfirmEmailInput = z.object({ userId: z.string().uuid() });
+export const confirmUserEmailFn = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input) => ConfirmEmailInput.parse(input))
+  .handler(async ({ data, context }) => {
+    const { supabase, userId: adminId } = context;
+    await assertAdmin(supabase, adminId, "确认用户邮箱");
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { error } = await (supabaseAdmin as any).auth.admin.updateUserById(data.userId, { email_confirm: true });
+    if (error) throw new Error(`确认邮箱失败：${error.message}`);
+    return { ok: true };
   });
 
 /** Admin-only: clear AI config and revert to .env defaults. */
@@ -3353,7 +5382,7 @@ export const getPlantNetKeyFn = createServerFn({ method: "GET" })
     const cfg = typeof data.value === "string" ? JSON.parse(data.value) : data.value;
     const key: string = typeof cfg === "string" ? cfg : (cfg.apiKey ?? "");
     if (!key) return null;
-    const masked = `${"*".repeat(Math.max(0, key.length - 6))}${key.slice(-6)}`;
+    const masked = key.length <= 10 ? key : `${key.slice(0, 4)}…${key.slice(-4)}`;
     return { apiKeyMasked: masked, updatedAt: (typeof cfg === "object" ? cfg.updatedAt : null) ?? null };
   });
 

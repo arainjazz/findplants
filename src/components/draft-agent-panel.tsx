@@ -67,6 +67,12 @@ function saveChat(key: string | undefined, messages: ChatMsg[]) {
  * edit). An optional `scopes` list lets the editor focus the conversation on one
  * part of the page (annotation); otherwise it concerns the whole content.
  */
+// Shown to guests on every send: 小P蛙 is a registered-user feature (default model
+// for logged-in users; own-model config after login). Guests may open the window
+// but can't actually chat until they register/log in.
+const GUEST_NOTICE =
+  "只有注册用户可以使用默认配置模型来让小P蛙蹦跶（对话和编辑都可以）；注册并登录后，你还能在设置里配置自己的模型来驱动小P蛙的大脑。请先登录或注册后再来找我聊天吧～";
+
 export function XiaoPAgentPanel({
   greetingTitle,
   canApply,
@@ -75,6 +81,7 @@ export function XiaoPAgentPanel({
   apply,
   onImageReplace,
   storageKey,
+  isRegistered = true,
 }: {
   greetingTitle?: string | null;
   canApply: boolean;
@@ -85,6 +92,8 @@ export function XiaoPAgentPanel({
   /** Persist this page's conversation under this key so it survives leaving and
    *  re-entering the page (per-page memory). Omit to keep chat ephemeral. */
   storageKey?: string;
+  /** Logged-in? Guests can open the panel but every send returns GUEST_NOTICE. */
+  isRegistered?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const [messages, setMessages] = useState<ChatMsg[]>(() => loadChat(storageKey));
@@ -201,6 +210,17 @@ export function XiaoPAgentPanel({
   const send = async () => {
     const q = input.trim();
     if (!q || sending) return;
+    // Guests: accept the message into the transcript but reply with the notice —
+    // no LLM call, no default-model token spend.
+    if (!isRegistered) {
+      setMessages((prev) => [
+        ...prev,
+        { id: uid(), role: "user", text: q },
+        { id: uid(), role: "agent", text: GUEST_NOTICE },
+      ]);
+      setInput("");
+      return;
+    }
     const mySeq = ++seqRef.current;
     const userMsg: ChatMsg = { id: uid(), role: "user", text: q };
     const history: AgentHistory = messages.map((m) => ({

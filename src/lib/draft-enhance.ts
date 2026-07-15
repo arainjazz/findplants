@@ -30,6 +30,12 @@ const VIEWER_STYLE = `<style id="pp-viewer-style">
   .sec-rule .en{display:none;}
   .section-body p{font-size:15px;}
   .name-origin{padding:16px 16px;}
+  /* 入侵警示卡片头部在窄屏换行，避免「入侵等级」徽章被 overflow:hidden 裁掉。 */
+  .invasive-card .ic-head{flex-wrap:wrap;gap:8px 12px;padding:14px 16px;}
+  .invasive-card .ic-head h2{font-size:19px;}
+  .invasive-card .ic-badge{margin-left:0;order:3;flex-basis:100%;white-space:normal;}
+  .invasive-card .ic-body{padding:16px;}
+  .invasive-card .ic-national,.invasive-card .ic-cite{margin-left:16px;margin-right:16px;}
 }
 .pp-replaceable{position:relative;display:block;cursor:pointer;}
 .pp-replaceable img{cursor:pointer;}

@@ -116,6 +116,8 @@ function EditsPage() {
   const toggle = (k: string) => setCollapsed((c) => ({ ...c, [k]: !c[k] }));
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [bulkBusy, setBulkBusy] = useState(false);
+  // 点击图片修改记录里的缩略图 → 放大预览；任意位置点击关闭。
+  const [lightbox, setLightbox] = useState<string | null>(null);
 
   const toggleSelect = (id: string) =>
     setSelected((prev) => {
@@ -202,6 +204,18 @@ function EditsPage() {
       if (error) return toast.error(error.message);
       await markReverted(e.id);
       toast.success("已撤回博文发布");
+      qc.invalidateQueries({ queryKey: ["plant-edits"] });
+      qc.invalidateQueries({ queryKey: ["blog-posts"] });
+      qc.invalidateQueries({ queryKey: ["home-blog"] });
+      return;
+    }
+    if (e.kind === "blog_edit") {
+      if (!e.before_html) return toast.message("该编辑没有可恢复的修改前快照。");
+      if (!confirm("撤销这次博文编辑：将正文恢复到这次修改之前？")) return;
+      const { error } = await supabase.from("blog_posts").update({ content_html: e.before_html }).eq("id", e.block_path ?? "");
+      if (error) return toast.error(error.message);
+      await markReverted(e.id);
+      toast.success("已恢复到该次修改前的博文正文");
       qc.invalidateQueries({ queryKey: ["plant-edits"] });
       qc.invalidateQueries({ queryKey: ["blog-posts"] });
       qc.invalidateQueries({ queryKey: ["home-blog"] });
@@ -342,6 +356,7 @@ function EditsPage() {
                           onAdopt={() => onAdopt(e)}
                           selected={selected.has(e.id)}
                           onToggleSelect={() => toggleSelect(e.id)}
+                          onZoom={setLightbox}
                         />
                       ))}
                     </ul>
@@ -353,6 +368,20 @@ function EditsPage() {
         )}
       </main>
       <SiteFooter />
+
+      {/* 图片放大预览（点击缩略图打开，任意位置点击关闭）。 */}
+      {lightbox && (
+        <div
+          className="fixed inset-0 z-[90] bg-black/80 flex items-center justify-center p-4 cursor-zoom-out"
+          onClick={() => setLightbox(null)}
+        >
+          <img
+            src={lightbox}
+            alt="修改图片大图"
+            className="max-w-full max-h-full object-contain shadow-2xl"
+          />
+        </div>
+      )}
     </div>
   );
 }
@@ -366,6 +395,7 @@ function EditRow({
   onAdopt,
   selected,
   onToggleSelect,
+  onZoom,
 }: {
   edit: PlantEdit;
   plant: Plant | undefined;
@@ -375,6 +405,7 @@ function EditRow({
   onAdopt: () => void;
   selected: boolean;
   onToggleSelect: () => void;
+  onZoom: (url: string) => void;
 }) {
   const [showDiff, setShowDiff] = useState(false);
   const kindLabel: Record<string, string> = {
@@ -393,6 +424,7 @@ function EditRow({
     draft_approve: "草稿通过收录",
     draft_reject: "草稿驳回",
     blog_publish: "博文发布",
+    blog_edit: "博文编辑",
   };
   const kindColor: Record<string, string> = {
     text: "bg-leaf/15 text-leaf-deep",
@@ -410,6 +442,7 @@ function EditRow({
     draft_approve: "bg-leaf/15 text-leaf-deep",
     draft_reject: "bg-destructive/15 text-destructive",
     blog_publish: "bg-emerald-100 text-emerald-700",
+    blog_edit: "bg-emerald-50 text-emerald-700",
   };
 
   const isCatalog =
@@ -423,7 +456,8 @@ function EditRow({
     edit.kind === "draft_text" ||
     edit.kind === "draft_approve" ||
     edit.kind === "draft_reject" ||
-    edit.kind === "blog_publish";
+    edit.kind === "blog_publish" ||
+    edit.kind === "blog_edit";
 
   const srcLabel = sourceLabel(edit.source);
   const isAI = sourceIsAI(edit.source);
@@ -510,11 +544,11 @@ function EditRow({
         <div className="mt-0.5 grid sm:grid-cols-2 gap-1 text-[11px]">
           <div className="border border-rule px-1.5 py-1 bg-paper-deep/30">
             <span className="label text-ink-faint mr-1">前:</span>
-            <EditSnapshotPreview html={edit.before_html} kind={edit.kind} />
+            <EditSnapshotPreview html={edit.before_html} kind={edit.kind} onZoom={onZoom} />
           </div>
           <div className="border border-rule px-1.5 py-1 bg-paper-deep/30">
             <span className="label text-ink-faint mr-1">后:</span>
-            <EditSnapshotPreview html={edit.after_html} kind={edit.kind} />
+            <EditSnapshotPreview html={edit.after_html} kind={edit.kind} onZoom={onZoom} />
           </div>
         </div>
         {edit.kind !== "revert" && (edit.before_html || edit.after_html) && (
@@ -569,18 +603,25 @@ function EditRow({
   );
 }
 
-function EditSnapshotPreview({ html, kind }: { html: string | null; kind: PlantEdit["kind"] }) {
+function EditSnapshotPreview({ html, kind, onZoom }: { html: string | null; kind: PlantEdit["kind"]; onZoom?: (url: string) => void }) {
   const thumb = imagePreview(html);
   const text = textPreview(html, kind === "image" ? 20 : 20);
   return (
     <span className="inline-flex max-w-full items-center gap-1 align-top">
       {thumb && (
-        <img
-          src={thumb}
-          alt="修改图片缩略图"
-          loading="lazy"
-          className="h-8 w-8 shrink-0 border border-rule object-cover"
-        />
+        <button
+          type="button"
+          onClick={() => onZoom?.(thumb)}
+          title="点击查看大图"
+          className="shrink-0 cursor-zoom-in"
+        >
+          <img
+            src={thumb}
+            alt="修改图片缩略图"
+            loading="lazy"
+            className="h-8 w-8 border border-rule object-cover hover:ring-2 hover:ring-vermilion/60"
+          />
+        </button>
       )}
       <span className="line-clamp-2 break-words">{text}</span>
     </span>

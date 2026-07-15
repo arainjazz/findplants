@@ -87,7 +87,8 @@ export type PlantEdit = {
     | "draft_approve"
     | "draft_reject"
     | "ai_page_edit"
-    | "blog_publish";
+    | "blog_publish"
+    | "blog_edit";
   marker_n: number;
   block_path: string | null;
   before_html: string | null;
@@ -226,6 +227,49 @@ export async function fetchEditsForPlant(plantId: string) {
     .order("created_at", { ascending: false });
   if (error) throw error;
   return (data ?? []) as PlantEdit[];
+}
+
+export type OriginProvenance = {
+  /** 最早识别者显示名（登录用户取 display_name，访客草稿取 creator_label）。 */
+  identifierName: string;
+  /** 识别地点（草稿 capture_place，可能为空）。 */
+  place: string | null;
+  /** 识别时间（最早那条草稿的 created_at）。 */
+  identifiedAt: string;
+};
+
+/**
+ * 溯源：某「AI 识别条目」最早是由哪位用户、在何地、何时识别的。
+ * 采纳草稿后草稿不删除（status→approved, published_plant_id 指向条目），故可回溯。
+ * 取指向该条目的最早一条草稿。采纳编辑/时间不在这里取——由页面用现有
+ * `plantEdits` 的 `create` 行获得（editor_name 已是解析好的名字，省一次查询）。
+ */
+export async function fetchOriginProvenance(plantId: string): Promise<OriginProvenance | null> {
+  const { data: draft, error } = await supabase
+    .from("plant_drafts")
+    .select("created_by, creator_label, capture_place, created_at")
+    .eq("published_plant_id", plantId)
+    .order("created_at", { ascending: true })
+    .limit(1)
+    .maybeSingle();
+  if (error) throw error;
+  if (!draft) return null;
+
+  let identifierName = draft.creator_label || "访客";
+  if (draft.created_by) {
+    const { data: prof } = await supabase
+      .from("profiles")
+      .select("display_name")
+      .eq("id", draft.created_by)
+      .maybeSingle();
+    if (prof?.display_name) identifierName = prof.display_name;
+  }
+
+  return {
+    identifierName,
+    place: draft.capture_place ?? null,
+    identifiedAt: draft.created_at,
+  };
 }
 
 /** Change log for a draft. Draft edit rows are tagged `block_path = draft:<id>`

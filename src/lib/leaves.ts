@@ -41,7 +41,9 @@ export type LeafStats = {
   silver: number; // 银叶
   gold: number; // 金叶 (earned, total)
   goldUsed: number; // 已用金叶
-  goldAvailable: number; // 可用金叶
+  goldAvailable: number; // 可用金叶 (Infinity for owner)
+  silverUsed: number; // 已用银叶（进一步草稿消耗）
+  silverAvailable: number; // 可用银叶 (Infinity for owner)
   level: LeafLevel;
   isOwner: boolean;
 };
@@ -61,6 +63,34 @@ const draftCount = (userId: string, adopted?: boolean) => {
   if (adopted) q = q.eq("adopted", true);
   return countRows(q);
 };
+
+/**
+ * 识别铜叶（变量制）：每份草稿的价值 = 疑似(low)恒 1；否则 1 + 补拍次数(retake_count)，
+ * 采纳(adopted)再翻倍。整体求和。若 retake_count 列尚未迁移 → 优雅回退到旧的计数制
+ * （草稿数 + 采纳数，等价于每份 +1、采纳 +1），保证部署早于迁移也不崩。
+ */
+async function identifyBronze(userId: string): Promise<number> {
+  const { data, error } = await supabase
+    .from("plant_drafts")
+    .select("retake_count, adopted, conf:ai_payload->>identification_confidence")
+    .eq("created_by", userId);
+  if (error || !data) {
+    // Column missing / query failed → legacy count-based value.
+    const [total, adopted] = await Promise.all([draftCount(userId), draftCount(userId, true)]);
+    return total + adopted;
+  }
+  let sum = 0;
+  for (const row of data as Array<{ retake_count: number | null; adopted: boolean | null; conf: string | null }>) {
+    const tentative = row.conf === "low";
+    if (tentative) {
+      sum += 1; // 疑似恒 +1，不随补拍/采纳增加
+    } else {
+      const base = 1 + (row.retake_count ?? 0);
+      sum += row.adopted ? base * 2 : base;
+    }
+  }
+  return sum;
+}
 
 const editCount = (userId: string, kind: "text" | "image", adopted?: boolean) => {
   let q = supabase
@@ -98,18 +128,16 @@ export async function setAdopted(
 export async function computeLeaves(userId: string, email?: string | null): Promise<LeafStats> {
   const isOwner = isOwnerEmail(email);
 
-  const [idTotal, idAdopted, textTotal, textAdopted, imageTotal, imageAdopted, prof] = await Promise.all([
-    draftCount(userId),
-    draftCount(userId, true),
+  const [identify, textTotal, textAdopted, imageTotal, imageAdopted, prof] = await Promise.all([
+    identifyBronze(userId),
     editCount(userId, "text"),
     editCount(userId, "text", true),
     editCount(userId, "image"),
     editCount(userId, "image", true),
-    supabase.from("profiles").select("gold_used").eq("id", userId).maybeSingle(),
+    supabase.from("profiles").select("gold_used, silver_used").eq("id", userId).maybeSingle(),
   ]);
 
   // Each adopted contribution counts twice → base + adopted.
-  const identify = idTotal + idAdopted;
   const text = textTotal + textAdopted;
   const image = imageTotal + imageAdopted;
   const bronze = identify + text + image;
@@ -117,7 +145,11 @@ export async function computeLeaves(userId: string, email?: string | null): Prom
   const gold = Math.floor(silver / 10);
 
   const goldUsed = (prof.data?.gold_used as number | undefined) ?? 0;
-  const goldAvailable = Math.max(0, gold - goldUsed);
+  const silverUsed = (prof.data?.silver_used as number | undefined) ?? 0;
+  // The owner spends unlimited silver + gold → Infinity available (gating passes
+  // and the UI formats it as ∞). Everyone else is earned-minus-used.
+  const goldAvailable = isOwner ? Infinity : Math.max(0, gold - goldUsed);
+  const silverAvailable = isOwner ? Infinity : Math.max(0, silver - silverUsed);
 
   let level: LeafLevel = "none";
   if (isOwner || gold >= 10) level = "senior";
@@ -125,5 +157,5 @@ export async function computeLeaves(userId: string, email?: string | null): Prom
   else if (silver >= 1) level = "silver";
   else if (bronze >= 1) level = "bronze";
 
-  return { identify, text, image, bronze, silver, gold, goldUsed, goldAvailable, level, isOwner };
+  return { identify, text, image, bronze, silver, gold, goldUsed, goldAvailable, silverUsed, silverAvailable, level, isOwner };
 }

@@ -195,21 +195,23 @@ function PlantsList() {
   }, [searchVal]);
 
   const familyOptions = useMemo(() => {
-    const s = new Set<string>();
+    const m = new Map<string, number>();
     for (const p of plantsMetadata) {
       if (genus && p.genus?.trim() !== genus) continue;
-      if (p.family?.trim()) s.add(p.family.trim());
+      const v = p.family?.trim();
+      if (v) m.set(v, (m.get(v) ?? 0) + 1);
     }
-    return Array.from(s).sort().map((v) => ({ value: v, label: v }));
+    return Array.from(m.keys()).sort().map((v) => ({ value: v, label: `${v}（${m.get(v)}）` }));
   }, [plantsMetadata, genus]);
 
   const genusOptions = useMemo(() => {
-    const s = new Set<string>();
+    const m = new Map<string, number>();
     for (const p of plantsMetadata) {
       if (family && p.family?.trim() !== family) continue;
-      if (p.genus?.trim()) s.add(p.genus.trim());
+      const v = p.genus?.trim();
+      if (v) m.set(v, (m.get(v) ?? 0) + 1);
     }
-    return Array.from(s).sort().map((v) => ({ value: v, label: v }));
+    return Array.from(m.keys()).sort().map((v) => ({ value: v, label: `${v}（${m.get(v)}）` }));
   }, [plantsMetadata, family]);
 
   const iucnCounts = useMemo(() => {
