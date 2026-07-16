@@ -15,8 +15,11 @@ _Read this FIRST and update it LAST, every session._
   **国家二级保护 · 内蒙古省级保护 · CITES 附录II** 三签齐全、颜色分级正确（保护绿/CITES 紫）✅（已截图）；
   console **0 error** ✅。**该页学名带命名人 `Ma, 1960`（AI 原文为斜体）→ 顺带证明 markdown 剥离修复线上是活的。**
 - **仍未验证**（本次也无法验证，需登录/Gemini 真识别）：简介摘要卡的卡签、profile / admin 两页。
-- **📌 待办**：[CLAUDE.md:21](CLAUDE.md) 仍写着 `AI_MODEL = gemini-2.5-flash`，**已过时**（实际 gemini-3-flash-preview），
-  已向用户提出、尚未答复 → 下次确认后改。
+- **✅ 已改**：[CLAUDE.md](CLAUDE.md) Stack 段的 `AI_MODEL` 过时值已更正为 `gemini-3-flash-preview`（commit `742d577`），
+  并写明**不要「恢复」成 2.5-flash**（preview 模型在生产上看着像事故、容易被好心改回去，改回去=识别在轮换 key 上 404）
+  + 指明 DB `site_config.ai_model_config` 才是线上生效值、wrangler.jsonc 只是兜底默认。
+- **顺带核对（无需改）**：`identify.tsx` / `xiaop-user-model.ts` 里的 `gemini-2.5-*` 是**下拉选项列表**条目，
+  `defaultModel` 已是 gemini-3-flash-preview → (续) 说的「默认值同步换」属实，代码无残留问题。
 
 ## ✅ 2026-07-16 (续3) — 杂交学名归一化（代码 + 库内数据，均已验证）
 接续 (续2) #3 里挂着的「另立任务」。**根因不止一处，两侧都坏**：
