@@ -18,7 +18,11 @@ and **tags**.
   react-hook-form + zod. Scaffolded with Lovable (`@lovable.dev/...`).
 - **Backend:** Supabase (Postgres + Auth + Storage, RLS). URL in `wrangler.jsonc`
   (`SUPABASE_URL`).
-- **AI:** Gemini (`AI_MODEL = gemini-2.5-flash`) for identify / plant content.
+- **AI:** Gemini (`AI_MODEL = gemini-3-flash-preview`) for identify / plant content.
+  Do not "restore" this to `gemini-2.5-flash` — Google stopped serving 2.5-flash to
+  newly-issued keys (404), so the old value breaks identify on any rotated key. The
+  live value also lives in `site_config.ai_model_config` (DB, takes effect without a
+  deploy); `wrangler.jsonc` is only the fallback default.
 - **Photos:** `exifr` reads EXIF (incl. GPS) from uploaded images.
 - **Hosting:** Cloudflare Workers via Wrangler → custom domain plantspedia.club.
 - **Package manager:** Bun (`bun.lock`).
