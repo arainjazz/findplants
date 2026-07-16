@@ -1,7 +1,22 @@
 # Plantspedia — Working State  (single source of truth)
 
-_Last updated: 2026-07-16 — by Claude (续3：杂交学名归一化 DONE，含库内 3 行回填)_
+_Last updated: 2026-07-16 — by Claude (续3：杂交学名归一化 DONE + ✅ 已部署，(续2) 5 项一并上线)_
 _Read this FIRST and update it LAST, every session._
+
+## 🚀 2026-07-16 部署记录 — Version `9aa87f8e-1378-4efd-807e-21a8f4514d2b`
+**本次部署把 (续2) 的 5 项优化一并送上线**（它们此前标 NOT deployed）——因为 `npm run build`
+**打包的是整个工作树、不是 git HEAD**，22 个未提交文件必然搭车。已事先确认并获用户同意。
+- **wrangler.jsonc 核对结论（部署前的前置检查）**：未提交改动**只有 `AI_MODEL: gemini-2.5-flash →
+  gemini-3-flash-preview`**，部署配置（Workers + 两个自定义域）完好、未被碰。
+  **⚠️ 关键：这行必须带上**——(续) 已查明 Google 对新 key 停用了 gemini-2.5-flash（404），
+  线上早已跑 gemini-3-flash-preview；若不带此改动部署会**回退致识别功能 404 崩掉**。
+  部署输出已确认 `env.AI_MODEL ("gemini-3-flash-preview")` ✅。
+- **线上验证**：plantspedia.club / www 均 **200** ✅；肉苁蓉详情页卡签实测
+  **国家二级保护 · 内蒙古省级保护 · CITES 附录II** 三签齐全、颜色分级正确（保护绿/CITES 紫）✅（已截图）；
+  console **0 error** ✅。**该页学名带命名人 `Ma, 1960`（AI 原文为斜体）→ 顺带证明 markdown 剥离修复线上是活的。**
+- **仍未验证**（本次也无法验证，需登录/Gemini 真识别）：简介摘要卡的卡签、profile / admin 两页。
+- **📌 待办**：[CLAUDE.md:21](CLAUDE.md) 仍写着 `AI_MODEL = gemini-2.5-flash`，**已过时**（实际 gemini-3-flash-preview），
+  已向用户提出、尚未答复 → 下次确认后改。
 
 ## ✅ 2026-07-16 (续3) — 杂交学名归一化（代码 + 库内数据，均已验证）
 接续 (续2) #3 里挂着的「另立任务」。**根因不止一处，两侧都坏**：
