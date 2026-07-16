@@ -56,21 +56,39 @@ export type CatalogSuggestion = {
  * Normalize a scientific name for fuzzy matching.
  * Strips authority (trailing " L.", " (Author) Author", years), keeps first 2 tokens
  * (genus + species). Lower-cased, whitespace-collapsed.
+ *
+ * The hybrid marker (× / a standalone "x", attached or spaced, on either the genus
+ * or the epithet) is dropped rather than kept as a token: "Populus × irtyschensis"
+ * and "×Chitalpa tashkentensis" normalize to "populus irtyschensis" /
+ * "chitalpa tashkentensis". Nothospecies epithets are unique within their genus, so
+ * dropping the marker cannot merge two different taxa — whereas keeping it truncated
+ * every hybrid in a genus to the same "<genus> x" key.
+ *
+ * conservation_taxa.normalized_name is a stored column matched against this output,
+ * and the seed generators in scratch/ mirror this function. Any change here must be
+ * mirrored there and backfilled into the column.
  */
 export function normalizeSciName(s: string | null | undefined): string {
   if (!s) return "";
-  let v = s
+  const v = s
     .normalize("NFKD") // fold diacritics: Isoëtes -> Isoetes, Houpoëa -> Houpoea
     .replace(/[̀-ͯ]/g, "")
+    // Strip markdown emphasis. The AI writes scientific names in italics
+    // (`*Cistanche deserticola* Ma, 1960`), and plant_drafts stores them verbatim —
+    // without this the asterisks ride into the token and the name matches NOTHING in
+    // conservation_taxa / catalog_entries, silently disabling the protected/CITES/GRIIS
+    // flags (and the map's invasive marker) for every AI draft.
+    .replace(/[*_]/g, "")
     .replace(/\([^)]*\)/g, " ") // remove parenthesised authorities
-    .replace(/[×]/g, "x")
+    .replace(/[×✕⨯]/g, " ") // hybrid marker: also splits the attached "×canadensis" form
     .replace(/\s+/g, " ")
     .trim()
     .toLowerCase();
-  const tokens = v.split(" ").filter(Boolean);
+  // Drop standalone "x" tokens — the ASCII spelling of the same hybrid marker.
+  const tokens = v.split(" ").filter((t) => t && t !== "x");
   // keep first 2 tokens (genus + species epithet) when present
-  if (tokens.length >= 2) v = `${tokens[0]} ${tokens[1]}`;
-  return v;
+  if (tokens.length >= 2) return `${tokens[0]} ${tokens[1]}`;
+  return tokens[0] ?? "";
 }
 
 /**
