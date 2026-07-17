@@ -119,6 +119,47 @@ export async function fetchAllCatalogs() {
   return (data ?? []) as RegionalCatalog[];
 }
 
+/** A catalog plus its entry count and the entry names themselves. */
+export type MyCatalog = RegionalCatalog & { count: number; entryNames: string[] };
+
+/**
+ * The catalogs one editor added, enriched with entry counts + the entry names, so a
+ * keyword can be matched against what's INSIDE a catalog (not just its region label).
+ *
+ * Shared by 编辑台 and 我的主页 — they use the SAME react-query key ["my-catalogs", uid],
+ * so they must also agree on the shape; two different shapes under one key means whichever
+ * page loads first decides what the other one gets.
+ */
+export async function fetchMyCatalogs(uid: string): Promise<MyCatalog[]> {
+  const { data: cats, error } = await supabase
+    .from("regional_catalogs")
+    .select("*")
+    .eq("created_by", uid)
+    .order("created_at", { ascending: false });
+  if (error) throw error;
+  const list = (cats ?? []) as RegionalCatalog[];
+  const ids = list.map((c) => c.id);
+  const counts: Record<string, number> = {};
+  const entryNames: Record<string, string[]> = {};
+  if (ids.length) {
+    const { data: es } = await supabase
+      .from("catalog_entries")
+      .select("catalog_id,scientific_name,chinese_name")
+      .in("catalog_id", ids);
+    for (const e of es ?? []) {
+      counts[e.catalog_id] = (counts[e.catalog_id] ?? 0) + 1;
+      (entryNames[e.catalog_id] ??= []).push(
+        [e.chinese_name, e.scientific_name].filter(Boolean).join(" "),
+      );
+    }
+  }
+  return list.map((c) => ({
+    ...c,
+    count: counts[c.id] ?? 0,
+    entryNames: entryNames[c.id] ?? [],
+  }));
+}
+
 export async function fetchCatalog(id: string) {
   const { data, error } = await supabase
     .from("regional_catalogs")
@@ -140,9 +181,7 @@ export async function fetchEntries(catalogId: string) {
 }
 
 export async function fetchAllEntries() {
-  const { data, error } = await supabase
-    .from("catalog_entries")
-    .select("*");
+  const { data, error } = await supabase.from("catalog_entries").select("*");
   if (error) throw error;
   return (data ?? []) as CatalogEntry[];
 }
@@ -158,7 +197,9 @@ export async function fetchSuggestionsForCatalogs(catalogIds: string[]) {
   return (data ?? []) as CatalogSuggestion[];
 }
 
-export async function createSuggestion(input: Omit<CatalogSuggestion, "id" | "created_at" | "status">) {
+export async function createSuggestion(
+  input: Omit<CatalogSuggestion, "id" | "created_at" | "status">,
+) {
   const { error } = await supabase.from("catalog_suggestions").insert({ ...input, status: "open" });
   if (error) throw error;
 }
@@ -180,7 +221,9 @@ export function regionLabel(c: Pick<RegionalCatalog, "province" | "city" | "coun
  *   "Butomus umbellatus 花蔺"
  *   "花蔺,Butomus umbellatus"
  */
-export function parseCatalogText(raw: string): { scientific_name: string; chinese_name: string | null }[] {
+export function parseCatalogText(
+  raw: string,
+): { scientific_name: string; chinese_name: string | null }[] {
   const lines = raw
     .split(/[\r\n]+/)
     .map((s) => s.trim())
@@ -305,7 +348,9 @@ export async function appendEntries(
 
   // 2. Drop entries whose Latin name already exists in this catalog.
   const existing = await fetchEntries(catalogId);
-  const existingKeys = new Set(existing.map((e) => normalizeSciName(e.scientific_name)).filter(Boolean));
+  const existingKeys = new Set(
+    existing.map((e) => normalizeSciName(e.scientific_name)).filter(Boolean),
+  );
   const newEntries = inputDeduped.filter((e) => {
     const k = normalizeSciName(e.scientific_name);
     return !k || !existingKeys.has(k);

@@ -278,7 +278,7 @@ i,em{color:var(--gold);}
   </section>
 
   <section class="hero">
-    <div class="img-slot"><img src="{{photo_url}}" alt="{{title}} 拍摄照片"/></div>
+    <div class="img-slot"><img src="{{photo_url}}" alt="{{title}} 拍摄照片"/>{{tentative_note}}</div>
     <div>
       <h2 style="font-size:18px;font-weight:600;color:var(--ink);margin-bottom:12px;letter-spacing:0.1em;">拍摄记录 · Field Capture</h2>
       <div class="field-capture">
@@ -295,6 +295,48 @@ i,em{color:var(--gold);}
 
   <div class="sec-rule">
     <span class="sec-num"><i>I</i></span>
+    <h2>形态特征</h2>
+    <span class="en">Morphological Characters</span>
+    <div class="sec-line"></div>
+  </div>
+  <div class="section-body section-with-img">
+    <div>
+      <p>{{morphology_zh}}</p>
+      <p class="en-p">{{morphology_en}}</p>
+    </div>
+    <img class="sec-img"{{sec_img_2_mark}} src="{{sec_img_2}}" alt="{{title}} 形态特征"/>
+  </div>
+
+  <div class="sec-rule">
+    <span class="sec-num"><i>II</i></span>
+    <h2>生境与分布</h2>
+    <span class="en">Habitat &amp; Distribution</span>
+    <div class="sec-line"></div>
+  </div>
+  <div class="section-body section-with-img">
+    <div>
+      <p>{{habitat_zh}}</p>
+      <p class="en-p">{{habitat_en}}</p>
+    </div>
+    <img class="sec-img"{{sec_img_3_mark}} src="{{sec_img_3}}" alt="{{title}} 生境与分布"/>
+  </div>
+
+  <div class="sec-rule">
+    <span class="sec-num"><i>III</i></span>
+    <h2>植物人文</h2>
+    <span class="en">Plants Humanities</span>
+    <div class="sec-line"></div>
+  </div>
+  <div class="section-body section-with-img">
+    <div>
+      <p>{{culture_zh}}</p>
+      <p class="en-p">{{culture_en}}</p>
+    </div>
+    <img class="sec-img"{{sec_img_4_mark}} src="{{sec_img_4}}" alt="{{title}} 植物人文"/>
+  </div>
+
+  <div class="sec-rule">
+    <span class="sec-num"><i>IV</i></span>
     <h2>名称溯源</h2>
     <span class="en">Name Origin</span>
     <div class="sec-line"></div>
@@ -309,61 +351,19 @@ i,em{color:var(--gold);}
   </div>
 
   <div class="sec-rule">
-    <span class="sec-num"><i>II</i></span>
-    <h2>形态特征</h2>
-    <span class="en">Morphological Characters</span>
-    <div class="sec-line"></div>
-  </div>
-  <div class="section-body section-with-img">
-    <div>
-      <p>{{morphology_zh}}</p>
-      <p class="en-p">{{morphology_en}}</p>
-    </div>
-    <img class="sec-img"{{sec_img_2_mark}} src="{{sec_img_2}}" alt="{{title}} 形态特征"/>
-  </div>
-
-  <div class="sec-rule">
-    <span class="sec-num"><i>III</i></span>
-    <h2>生境与分布</h2>
-    <span class="en">Habitat &amp; Distribution</span>
-    <div class="sec-line"></div>
-  </div>
-  <div class="section-body section-with-img">
-    <div>
-      <p>{{habitat_zh}}</p>
-      <p class="en-p">{{habitat_en}}</p>
-    </div>
-    <img class="sec-img"{{sec_img_3_mark}} src="{{sec_img_3}}" alt="{{title}} 生境与分布"/>
-  </div>
-
-  <div class="sec-rule">
-    <span class="sec-num"><i>IV</i></span>
-    <h2>植物人文</h2>
-    <span class="en">Plants Humanities</span>
-    <div class="sec-line"></div>
-  </div>
-  <div class="section-body section-with-img">
-    <div>
-      <p>{{culture_zh}}</p>
-      <p class="en-p">{{culture_en}}</p>
-    </div>
-    <img class="sec-img"{{sec_img_4_mark}} src="{{sec_img_4}}" alt="{{title}} 植物人文"/>
-  </div>
-
-  <div class="sec-rule">
     <span class="sec-num"><i>V</i></span>
-    <h2>养护建议</h2>
-    <span class="en">Care Tips</span>
+    <h2>生长条件</h2>
+    <span class="en">Growth Conditions</span>
     <div class="sec-line"></div>
   </div>
   <div class="care-facts">{{care_facts_rows}}</div>
   <div class="section-body section-with-img">
     <div>
-      <span class="care-why">为什么这样养护 · Rationale</span>
+      <span class="care-why">生长条件与养护依据 · Rationale</span>
       <p>{{care_tips_zh}}</p>
       <p class="en-p">{{care_tips_en}}</p>
     </div>
-    <img class="sec-img"{{sec_img_5_mark}} src="{{sec_img_5}}" alt="{{title}} 养护建议"/>
+    <img class="sec-img"{{sec_img_5_mark}} src="{{sec_img_5}}" alt="{{title}} 生长条件"/>
   </div>
 
   <div class="footer-rule">
@@ -448,7 +448,9 @@ export function renderDraftHtml(fields: PlantDraftFields): string {
     : esc(cc?.basis_zh || "国家/省级重点保护野生植物名录");
   const chipsRow = nonProtChips.length
     ? `<div class="cc-chips">` +
-      nonProtChips.map((b) => `<span class="cc-chip cc-${esc(b.kind)}">${esc(b.label)}</span>`).join("") +
+      nonProtChips
+        .map((b) => `<span class="cc-chip cc-${esc(b.kind)}">${esc(b.label)}</span>`)
+        .join("") +
       `</div>`
     : "";
   let conservationCard = "";
@@ -484,7 +486,9 @@ export function renderDraftHtml(fields: PlantDraftFields): string {
       `<div><span class="cc-kicker">Conservation &amp; Registry Status · 保护与名录状态</span>` +
       `<h2>保护与名录收录</h2></div></div>` +
       `<div class="cc-body">` +
-      consBadges.map((b) => `<span class="cc-chip cc-${esc(b.kind)}">${esc(b.label)}</span>`).join("") +
+      consBadges
+        .map((b) => `<span class="cc-chip cc-${esc(b.kind)}">${esc(b.label)}</span>`)
+        .join("") +
       `</div></section>`;
   }
   // Field-capture notes (拍摄记录): analysis of the user's photo + the basis for
@@ -499,6 +503,14 @@ export function renderDraftHtml(fields: PlantDraftFields): string {
       : esc(fields.summary_zh || "")
         ? `<p>${esc(fields.summary_zh || "")}</p>`
         : "";
+  // When the identification is still tentative (low confidence — e.g. 3 补拍 done but
+  // the species couldn't be confirmed), caption the field-capture photo so it's clear
+  // the write-up rests on a 疑似 ID rather than a confirmed one.
+  const isTentative =
+    fields.identification_confidence === "low" || /^\s*（?\s*疑似/.test(fields.summary_zh || "");
+  const tentativeNote = isTentative
+    ? `<p class="tentative-note" style="margin-top:8px;font-size:12px;color:var(--ink-faint,#8a988f);text-align:center;line-height:1.5;">（基于疑似识别创建资料）</p>`
+    : "";
   const titleDisplay = fields.common_name_en || fields.title;
   // Section illustrations: use the online species photos when available; any
   // missing slot falls back to the user's photo and keeps the "replaceable
@@ -529,6 +541,7 @@ export function renderDraftHtml(fields: PlantDraftFields): string {
     summary_zh: esc(fields.summary_zh || ""),
     summary_en: esc(fields.summary_en || ""),
     field_capture_notes: fieldCaptureNotes,
+    tentative_note: tentativeNote,
     name_origin_zh: esc(fields.name_origin_zh || ""),
     name_origin_en: esc(fields.name_origin_en || ""),
     morphology_zh: esc(fields.morphology_zh || ""),

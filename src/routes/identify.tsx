@@ -1,6 +1,6 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useServerFn } from "@tanstack/react-start";
 import { SiteHeader, SiteFooter } from "@/components/site-header";
 import { CameraIdentify } from "@/components/camera-identify";
@@ -24,17 +24,28 @@ import { toast } from "sonner";
 
 export const Route = createFileRoute("/identify")({
   // Retake context carried from a draft's「去补拍」: retake=第几次补拍, st=物种中文名, ss=学名。
-  validateSearch: (search: Record<string, unknown>): { retake?: number; st?: string; ss?: string; nmp?: string; md?: string } => ({
-    retake: search.retake != null && Number(search.retake) > 0 ? Math.min(10, Math.floor(Number(search.retake))) : undefined,
+  // pick=1 → 让用户在「打开相机」和「选择相册图片」之间自己选（不自动弹相机）。走「草稿内容
+  // 和我的观察不符」进来时用；「按提示去补拍」仍然直接弹相机（少一次点击）。
+  validateSearch: (
+    search: Record<string, unknown>,
+  ): { retake?: number; st?: string; ss?: string; nmp?: string; md?: string; pick?: number } => ({
+    retake:
+      search.retake != null && Number(search.retake) > 0
+        ? Math.min(10, Math.floor(Number(search.retake)))
+        : undefined,
     st: typeof search.st === "string" ? search.st.slice(0, 200) : undefined,
     ss: typeof search.ss === "string" ? search.ss.slice(0, 200) : undefined,
     nmp: typeof search.nmp === "string" ? search.nmp.slice(0, 300) : undefined,
     md: typeof search.md === "string" ? search.md.slice(0, 64) : undefined,
+    pick: Number(search.pick) === 1 ? 1 : undefined,
   }),
   head: () => ({
     meta: [
       { title: "AI 识别植物 · Plantspedia" },
-      { name: "description", content: "上传或拍摄一张植物照片，由 AI 识别物种并自动生成中英双语草稿。" },
+      {
+        name: "description",
+        content: "上传或拍摄一张植物照片，由 AI 识别物种并自动生成中英双语草稿。",
+      },
     ],
   }),
   component: IdentifyPage,
@@ -60,8 +71,15 @@ const PROVIDERS: ProviderMeta[] = [
     label: "Google Gemini",
     icon: "🔵",
     placeholder: "AQ.xxx... 或 AIzaSy...",
-    defaultModel: "gemini-2.5-flash",
-    models: ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.5-flash-lite", "gemini-3-flash-preview", "gemini-3-pro-preview", "gemini-3.1-pro-preview"],
+    defaultModel: "gemini-3-flash-preview",
+    models: [
+      "gemini-3-flash-preview",
+      "gemini-3-pro-preview",
+      "gemini-3.1-pro-preview",
+      "gemini-2.5-flash",
+      "gemini-2.5-pro",
+      "gemini-2.5-flash-lite",
+    ],
     needsBaseUrl: false,
   },
   {
@@ -143,7 +161,9 @@ function PlantNetPanel() {
     <div className="mb-6 animate-in fade-in slide-in-from-top-2 duration-300">
       {/* Header row */}
       <div className="flex items-center gap-3 mb-2">
-        <span className="text-[11px] font-semibold tracking-widest uppercase text-ink-faint">管理员 · 专业识别引擎 Pl@ntNet</span>
+        <span className="text-[11px] font-semibold tracking-widest uppercase text-ink-faint">
+          管理员 · 专业识别引擎 Pl@ntNet
+        </span>
         <div className="flex-1 h-px bg-rule/50" />
         {isLoading ? (
           <span className="text-[11px] text-ink-faint">加载中…</span>
@@ -166,7 +186,7 @@ function PlantNetPanel() {
           className="inline-flex items-center gap-2 text-xs font-medium px-3 py-1.5 rounded-lg border border-rule bg-paper hover:bg-ink hover:text-background transition-all cursor-pointer"
         >
           <LeafIcon className="w-3.5 h-3.5" />
-          {isOpen ? "收起" : (active ? "修改 Key" : "配置 Pl@ntNet")}
+          {isOpen ? "收起" : active ? "修改 Key" : "配置 Pl@ntNet"}
         </button>
         {active && (
           <button
@@ -184,10 +204,15 @@ function PlantNetPanel() {
         <div className="mt-3 p-4 rounded-2xl border border-emerald-500/30 bg-emerald-500/5 space-y-4 animate-in fade-in slide-in-from-top-1 duration-200">
           <div className="flex gap-2 p-2.5 rounded-lg bg-emerald-50 border border-emerald-200 text-[11px] text-emerald-800 leading-relaxed">
             <span>🌿</span>
-            <span>启用后，拍照识别会先由 Pl@ntNet 专业定种（带置信度），再交给上方所选大模型撰写双语草稿——全站立即生效，无需重新部署。</span>
+            <span>
+              启用后，拍照识别会先由 Pl@ntNet
+              专业定种（带置信度），再交给上方所选大模型撰写双语草稿——全站立即生效，无需重新部署。
+            </span>
           </div>
           <div>
-            <label className="block text-xs font-semibold text-ink-soft mb-1.5">Pl@ntNet API Key</label>
+            <label className="block text-xs font-semibold text-ink-soft mb-1.5">
+              Pl@ntNet API Key
+            </label>
             <div className="relative">
               <input
                 type={showKey ? "text" : "password"}
@@ -201,10 +226,16 @@ function PlantNetPanel() {
                 onClick={() => setShowKey((v) => !v)}
                 className="absolute right-2 top-1/2 -translate-y-1/2 text-ink-faint hover:text-ink transition-colors cursor-pointer"
               >
-                {showKey ? <EyeOffIcon className="w-3.5 h-3.5" /> : <EyeIcon className="w-3.5 h-3.5" />}
+                {showKey ? (
+                  <EyeOffIcon className="w-3.5 h-3.5" />
+                ) : (
+                  <EyeIcon className="w-3.5 h-3.5" />
+                )}
               </button>
             </div>
-            <p className="mt-1 text-[11px] text-ink-faint">在 my.plantnet.org 免费注册获取（每日 500 次额度）。Key 加密存储在服务端数据库。</p>
+            <p className="mt-1 text-[11px] text-ink-faint">
+              在 my.plantnet.org 免费注册获取（每日 500 次额度）。Key 加密存储在服务端数据库。
+            </p>
           </div>
           <div className="flex gap-2">
             <button
@@ -231,16 +262,19 @@ function PlantNetPanel() {
 
 function AdminModelPanel() {
   const qc = useQueryClient();
-  const [isOpen, setIsOpen] = useState(true);  // 默认展开，直接显示配置
+  const [isOpen, setIsOpen] = useState(false); // 默认折叠（点「修改配置」展开）
   const [provider, setProvider] = useState<Provider>("gemini");
   // One input PER key — clearer than a single comma-separated field (which was easy
   // to mistype). Joined with "," only at save/fetch time; the server pools them.
   const [keys, setKeys] = useState<string[]>([""]);
-  const joinedKey = keys.map((k) => k.trim()).filter(Boolean).join(",");
-  const [model, setModel] = useState("gemini-2.5-flash");
+  const joinedKey = keys
+    .map((k) => k.trim())
+    .filter(Boolean)
+    .join(",");
+  const [model, setModel] = useState("gemini-3-flash-preview");
   const [customModel, setCustomModel] = useState("");
   const [baseUrl, setBaseUrl] = useState("https://api.openai.com/v1");
-  const [showKey, setShowKey] = useState(false);
+  const [showKey, setShowKey] = useState(true); // owner 需看到完整 key 来拖动排序，默认显示
   // Live-fetched model IDs (from the key's real list-models endpoint). Overrides
   // the static presets so a new-format key can pick a model that actually exists.
   const [fetchedModels, setFetchedModels] = useState<string[]>([]);
@@ -257,6 +291,21 @@ function AdminModelPanel() {
     queryFn: () => getFn({ data: undefined }),
     retry: false,
   });
+
+  // Seed the editable form from the saved config (once) so the owner sees ALL
+  // configured keys + the current model/provider/baseUrl and can drag-reorder key
+  // priority, rather than starting from a blank form. Keys come back in full from the
+  // admin-only getter; shown in plain text (showKey defaults on).
+  const seededRef = useRef(false);
+  useEffect(() => {
+    if (seededRef.current || !activeConfig) return;
+    seededRef.current = true;
+    setProvider(activeConfig.provider as Provider);
+    const savedKeys = (activeConfig.apiKeys ?? []).filter(Boolean);
+    if (savedKeys.length) setKeys(savedKeys);
+    if (activeConfig.model) setModel(activeConfig.model);
+    if (activeConfig.baseUrl) setBaseUrl(activeConfig.baseUrl);
+  }, [activeConfig]);
 
   const saveMutation = useMutation({
     mutationFn: async () => {
@@ -347,14 +396,17 @@ function AdminModelPanel() {
     <div className="mb-6 animate-in fade-in slide-in-from-top-2 duration-300">
       {/* Header row */}
       <div className="flex items-center gap-3 mb-2">
-        <span className="text-[11px] font-semibold tracking-widest uppercase text-ink-faint">管理员 · AI 模型控制台</span>
+        <span className="text-[11px] font-semibold tracking-widest uppercase text-ink-faint">
+          管理员 · AI 模型控制台
+        </span>
         <div className="flex-1 h-px bg-rule/50" />
         {isLoading ? (
           <span className="text-[11px] text-ink-faint">加载中…</span>
         ) : activeConfig ? (
           <span className="inline-flex items-center gap-1.5 text-[11px] font-semibold px-2.5 py-1 rounded-full bg-emerald-500/10 text-emerald-600 border border-emerald-500/25">
             <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
-            {providerIcon(activeConfig.provider)} {providerLabel(activeConfig.provider)} · {activeConfig.model}
+            {providerIcon(activeConfig.provider)} {providerLabel(activeConfig.provider)} ·{" "}
+            {activeConfig.model}
           </span>
         ) : (
           <span className="inline-flex items-center gap-1.5 text-[11px] text-ink-faint px-2.5 py-1 rounded-full border border-rule/50">
@@ -371,7 +423,7 @@ function AdminModelPanel() {
           className="inline-flex items-center gap-2 text-xs font-medium px-3 py-1.5 rounded-lg border border-rule bg-paper hover:bg-ink hover:text-background transition-all cursor-pointer"
         >
           <WrenchIcon className="w-3.5 h-3.5" />
-          {isOpen ? "收起" : (activeConfig ? "修改配置" : "配置模型")}
+          {isOpen ? "收起" : activeConfig ? "修改配置" : "配置模型"}
         </button>
 
         {activeConfig && (
@@ -395,11 +447,12 @@ function AdminModelPanel() {
       {/* Expanded panel */}
       {isOpen && (
         <div className="mt-3 p-4 rounded-2xl border border-amber-500/30 bg-amber-500/5 space-y-4 animate-in fade-in slide-in-from-top-1 duration-200">
-
           {/* Notice */}
           <div className="flex gap-2 p-2.5 rounded-lg bg-amber-50 border border-amber-200 text-[11px] text-amber-800 leading-relaxed">
             <span>🌐</span>
-            <span>保存后全站立即生效——所有用户（含手机端访客）的 AI 识别都将使用您选择的模型。</span>
+            <span>
+              保存后全站立即生效——所有用户（含手机端访客）的 AI 识别都将使用您选择的模型。
+            </span>
           </div>
 
           {/* Provider tabs */}
@@ -433,7 +486,11 @@ function AdminModelPanel() {
                 onClick={() => setShowKey((v) => !v)}
                 className="text-[11px] text-ink-faint hover:text-ink transition-colors cursor-pointer inline-flex items-center gap-1"
               >
-                {showKey ? <EyeOffIcon className="w-3.5 h-3.5" /> : <EyeIcon className="w-3.5 h-3.5" />}
+                {showKey ? (
+                  <EyeOffIcon className="w-3.5 h-3.5" />
+                ) : (
+                  <EyeIcon className="w-3.5 h-3.5" />
+                )}
                 {showKey ? "隐藏" : "显示"}
               </button>
             </div>
@@ -470,16 +527,31 @@ function AdminModelPanel() {
                   className={`flex items-center gap-2 ${keys.length > 1 ? "cursor-move" : ""} group`}
                 >
                   {keys.length > 1 && (
-                    <div className="shrink-0 text-ink-faint group-hover:text-ink transition-colors" title="拖动调整优先级">
-                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 8h16M4 16h16" />
+                    <div
+                      className="shrink-0 text-ink-faint group-hover:text-ink transition-colors"
+                      title="拖动调整优先级"
+                    >
+                      <svg
+                        className="w-4 h-4"
+                        fill="none"
+                        stroke="currentColor"
+                        viewBox="0 0 24 24"
+                      >
+                        <path
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          strokeWidth={2}
+                          d="M4 8h16M4 16h16"
+                        />
                       </svg>
                     </div>
                   )}
                   <input
                     type={showKey ? "text" : "password"}
                     value={k}
-                    onChange={(e) => setKeys((arr) => arr.map((x, j) => (j === i ? e.target.value : x)))}
+                    onChange={(e) =>
+                      setKeys((arr) => arr.map((x, j) => (j === i ? e.target.value : x)))
+                    }
                     placeholder={`${meta.placeholder}${keys.length > 1 ? `（优先级 ${i + 1}）` : ""}`}
                     className="flex-1 min-w-0 px-3 py-2 text-xs rounded-lg border border-rule bg-background font-mono focus:outline-none focus:border-amber-400 transition-colors"
                   />
@@ -504,8 +576,9 @@ function AdminModelPanel() {
               ＋ 再加一个 API Key
             </button>
             <p className="mt-1.5 text-[11px] text-ink-faint leading-relaxed">
-              ⚠️ Key 完整显示在此页面，请注意屏幕分享时遮挡。Key 加密存储在服务端。
-              多个 key 按顺序优先使用；Gemini 限流时（429）自动换下一个，OpenAI/Anthropic/自定义接口也支持轮换。
+              ⚠️ Key 完整显示在此页面，请注意屏幕分享时遮挡。Key 加密存储在服务端。 多个 key
+              按顺序优先使用；Gemini
+              限流时（429）自动换下一个，OpenAI/Anthropic/自定义接口也支持轮换。
             </p>
           </div>
 
@@ -514,7 +587,9 @@ function AdminModelPanel() {
             <div>
               <label className="block text-xs font-semibold text-ink-soft mb-1.5">
                 API Base URL
-                <span className="ml-1.5 font-normal text-ink-faint">（中转 / 代理 / 自定义接口）</span>
+                <span className="ml-1.5 font-normal text-ink-faint">
+                  （中转 / 代理 / 自定义接口）
+                </span>
               </label>
               <input
                 id="admin-ai-base-url"
@@ -567,7 +642,9 @@ function AdminModelPanel() {
                 className="w-full px-3 py-2 text-xs rounded-lg border border-rule bg-background focus:outline-none focus:border-amber-400 transition-colors cursor-pointer"
               >
                 {optionModels.map((m) => (
-                  <option key={m} value={m}>{m}</option>
+                  <option key={m} value={m}>
+                    {m}
+                  </option>
                 ))}
                 <option value="__custom__">✏️ 手动输入其他模型名…</option>
               </select>
@@ -583,17 +660,26 @@ function AdminModelPanel() {
               />
             )}
             {fetchedModels.length > 0 && (
-              <p className="mt-1 text-[11px] text-emerald-600">✓ 已按你的 Key 列出 {fetchedModels.length} 个可用模型，请从中选一个</p>
+              <p className="mt-1 text-[11px] text-emerald-600">
+                ✓ 已按你的 Key 列出 {fetchedModels.length} 个可用模型，请从中选一个
+              </p>
             )}
             <p className="mt-1 text-[11px] text-ink-faint leading-relaxed">
-              旧模型名（如 gemini-2.5-flash）对新申请的 key 可能已停用而报 404。点「拉取可用模型」按你的 key 列出真实可用的模型再选。
+              旧模型名（如 gemini-2.5-flash）对新申请的 key 可能已停用而报
+              404。点「拉取可用模型」按你的 key 列出真实可用的模型再选。
             </p>
           </div>
 
           {/* Preview */}
           <div className="p-2.5 rounded-lg bg-background border border-rule/50 text-[11px] text-ink-soft font-mono">
-            Provider: <strong>{provider}</strong> &nbsp;|&nbsp; Model: <strong>{effectiveModel || "（未填）"}</strong>
-            {meta.needsBaseUrl && baseUrl && <> &nbsp;|&nbsp; URL: <strong>{baseUrl}</strong></>}
+            Provider: <strong>{provider}</strong> &nbsp;|&nbsp; Model:{" "}
+            <strong>{effectiveModel || "（未填）"}</strong>
+            {meta.needsBaseUrl && baseUrl && (
+              <>
+                {" "}
+                &nbsp;|&nbsp; URL: <strong>{baseUrl}</strong>
+              </>
+            )}
           </div>
 
           {/* Actions */}
@@ -623,8 +709,11 @@ function AdminModelPanel() {
 
 function IdentifyPage() {
   const { user } = useAuth();
-  const { retake, st, ss, nmp, md } = Route.useSearch();
-  const retakeCtx = retake && retake > 0 ? { count: retake, title: st, sci: ss, advice: nmp, mergeDraftId: md } : null;
+  const { retake, st, ss, nmp, md, pick } = Route.useSearch();
+  const retakeCtx =
+    retake && retake > 0
+      ? { count: retake, title: st, sci: ss, advice: nmp, mergeDraftId: md, pick: pick === 1 }
+      : null;
 
   const { data: role = null } = useQuery({
     queryKey: ["user-role", user?.id],
@@ -653,9 +742,12 @@ function IdentifyPage() {
       <main className="mx-auto max-w-6xl px-6 py-10 flex-1 w-full">
         <header className="mb-8 border-b-2 border-ink pb-6">
           <p className="label text-vermilion mb-2">AI copilot · Plantspedia</p>
-          <h1 className="font-display text-3xl md:text-5xl font-bold tracking-tight">AI 识别植物</h1>
+          <h1 className="font-display text-3xl md:text-5xl font-bold tracking-tight">
+            AI 识别植物
+          </h1>
           <p className="text-ink-soft mt-3 max-w-none">
-            拍一张照片或从相册选择，AI 会自动识别物种并生成一份中英双语科普草稿，等待编辑审核后正式收录。
+            拍一张照片或从相册选择，AI
+            会自动识别物种并生成一份中英双语科普草稿，等待编辑审核后正式收录。
           </p>
         </header>
 
@@ -675,7 +767,9 @@ function IdentifyPage() {
             <div className="flex items-baseline justify-between mb-4">
               <div>
                 <p className="label text-vermilion">待审草稿 · Pending AI Drafts</p>
-                <p className="text-xs text-ink-faint mt-1">仅编辑与管理员可见，点击右上角红色按钮进入详情审核</p>
+                <p className="text-xs text-ink-faint mt-1">
+                  仅编辑与管理员可见，点击右上角红色按钮进入详情审核
+                </p>
               </div>
               <span className="text-xs text-ink-faint">{drafts.length} 份待审</span>
             </div>
@@ -702,7 +796,9 @@ function IdentifyPage() {
             {!user && (
               <>
                 {" · "}
-                <Link to="/login" className="hover:text-vermilion underline">编辑登录</Link>
+                <Link to="/login" className="hover:text-vermilion underline">
+                  编辑登录
+                </Link>
               </>
             )}
           </p>
@@ -722,13 +818,16 @@ function AdminUsagePanel() {
 
   const { data, isLoading, refetch } = useQuery({
     queryKey: ["ai-usage", page],
-    queryFn: () =>
-      fetchFn({ data: { limit: PAGE_SIZE, offset: page * PAGE_SIZE } }),
+    queryFn: () => fetchFn({ data: { limit: PAGE_SIZE, offset: page * PAGE_SIZE } }),
     retry: false,
   });
 
   const fmt = (n: number) =>
-    n >= 1_000_000 ? `${(n / 1_000_000).toFixed(2)}M` : n >= 1_000 ? `${(n / 1_000).toFixed(1)}K` : String(n);
+    n >= 1_000_000
+      ? `${(n / 1_000_000).toFixed(2)}M`
+      : n >= 1_000
+        ? `${(n / 1_000).toFixed(1)}K`
+        : String(n);
 
   const providerColor: Record<string, string> = {
     gemini: "text-blue-600 bg-blue-50 border-blue-200",
@@ -743,7 +842,9 @@ function AdminUsagePanel() {
       <div className="flex items-baseline justify-between mb-4">
         <div>
           <p className="label text-vermilion">AI 用量统计 · Token Usage</p>
-          <p className="text-xs text-ink-faint mt-1">记录每次识别消耗的 token 量、使用者、地点与草稿内容</p>
+          <p className="text-xs text-ink-faint mt-1">
+            记录每次识别消耗的 token 量、使用者、地点与草稿内容
+          </p>
         </div>
         <button
           onClick={() => refetch()}
@@ -761,16 +862,20 @@ function AdminUsagePanel() {
             <p className="text-[11px] text-ink-faint mt-1">总识别次数</p>
           </div>
           <div className="p-3 rounded-xl border border-rule bg-paper/60 text-center">
-            <p className="text-2xl font-bold font-mono text-vermilion">{fmt(data.stats.total_tokens)}</p>
+            <p className="text-2xl font-bold font-mono text-vermilion">
+              {fmt(data.stats.total_tokens)}
+            </p>
             <p className="text-[11px] text-ink-faint mt-1">累计 Tokens</p>
           </div>
-          {Object.entries(data.stats.by_provider).slice(0, 2).map(([p, s]) => (
-            <div key={p} className="p-3 rounded-xl border border-rule bg-paper/60 text-center">
-              <p className="text-2xl font-bold font-mono">{s.calls}</p>
-              <p className="text-[11px] text-ink-faint mt-1">{p} 调用</p>
-              <p className="text-[10px] text-ink-faint">{fmt(s.tokens)} tokens</p>
-            </div>
-          ))}
+          {Object.entries(data.stats.by_provider)
+            .slice(0, 2)
+            .map(([p, s]) => (
+              <div key={p} className="p-3 rounded-xl border border-rule bg-paper/60 text-center">
+                <p className="text-2xl font-bold font-mono">{s.calls}</p>
+                <p className="text-[11px] text-ink-faint mt-1">{p} 调用</p>
+                <p className="text-[10px] text-ink-faint">{fmt(s.tokens)} tokens</p>
+              </div>
+            ))}
         </div>
       )}
 
@@ -780,9 +885,14 @@ function AdminUsagePanel() {
           {Object.entries(data.stats.by_model)
             .sort((a, b) => b[1].tokens - a[1].tokens)
             .map(([m, s]) => (
-              <span key={m} className="inline-flex items-center gap-1.5 text-[11px] px-2 py-1 rounded-full border border-rule bg-paper font-mono">
+              <span
+                key={m}
+                className="inline-flex items-center gap-1.5 text-[11px] px-2 py-1 rounded-full border border-rule bg-paper font-mono"
+              >
                 <strong>{m}</strong>
-                <span className="text-ink-faint">· {s.calls}次 · {fmt(s.tokens)} tok</span>
+                <span className="text-ink-faint">
+                  · {s.calls}次 · {fmt(s.tokens)} tok
+                </span>
               </span>
             ))}
         </div>
@@ -800,42 +910,89 @@ function AdminUsagePanel() {
           <table className="w-full text-xs">
             <thead className="bg-paper-deep/60 border-b border-rule">
               <tr>
-                {["时间", "用户", "地点", "模型", "服务商", "输入", "输出", "合计", "草稿"].map((h) => (
-                  <th key={h} className="px-3 py-2.5 text-left font-semibold text-ink-soft whitespace-nowrap">{h}</th>
-                ))}
+                {["时间", "用户", "地点", "模型", "服务商", "输入", "输出", "合计", "草稿"].map(
+                  (h) => (
+                    <th
+                      key={h}
+                      className="px-3 py-2.5 text-left font-semibold text-ink-soft whitespace-nowrap"
+                    >
+                      {h}
+                    </th>
+                  ),
+                )}
               </tr>
             </thead>
             <tbody>
               {(data.rows as Array<Record<string, unknown>>).map((r, i) => (
-                <tr key={String(r.id)} className={`border-b border-rule/50 hover:bg-paper/40 transition-colors ${i % 2 === 0 ? "" : "bg-paper/20"}`}>
+                <tr
+                  key={String(r.id)}
+                  className={`border-b border-rule/50 hover:bg-paper/40 transition-colors ${i % 2 === 0 ? "" : "bg-paper/20"}`}
+                >
                   <td className="px-3 py-2 text-ink-faint whitespace-nowrap font-mono">
-                    {new Date(String(r.created_at)).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" })}
+                    {new Date(String(r.created_at)).toLocaleString("zh-CN", {
+                      month: "2-digit",
+                      day: "2-digit",
+                      hour: "2-digit",
+                      minute: "2-digit",
+                    })}
                   </td>
-                  <td className="px-3 py-2 whitespace-nowrap max-w-[100px] truncate" title={String(r.user_label ?? "")}>
-                    <span className={`inline-flex items-center gap-1 ${r.user_id ? "text-ink" : "text-ink-faint"}`}>
+                  <td
+                    className="px-3 py-2 whitespace-nowrap max-w-[100px] truncate"
+                    title={String(r.user_label ?? "")}
+                  >
+                    <span
+                      className={`inline-flex items-center gap-1 ${r.user_id ? "text-ink" : "text-ink-faint"}`}
+                    >
                       {r.user_id ? "👤" : "👻"} {String(r.user_label ?? "访客")}
                     </span>
                   </td>
-                  <td className="px-3 py-2 text-ink-soft max-w-[120px] truncate" title={String(r.capture_place ?? "")}>
-                    {r.capture_place ? displayPlace(String(r.capture_place)) : <span className="text-ink-faint">—</span>}
+                  <td
+                    className="px-3 py-2 text-ink-soft max-w-[120px] truncate"
+                    title={String(r.capture_place ?? "")}
+                  >
+                    {r.capture_place ? (
+                      displayPlace(String(r.capture_place))
+                    ) : (
+                      <span className="text-ink-faint">—</span>
+                    )}
                   </td>
-                  <td className="px-3 py-2 font-mono text-ink-soft max-w-[140px] truncate" title={String(r.model ?? "")}>
+                  <td
+                    className="px-3 py-2 font-mono text-ink-soft max-w-[140px] truncate"
+                    title={String(r.model ?? "")}
+                  >
                     {String(r.model ?? "—")}
                   </td>
                   <td className="px-3 py-2">
-                    <span className={`inline-block px-1.5 py-0.5 rounded text-[10px] font-semibold border ${providerColor[String(r.provider)] ?? "text-ink-faint bg-rule/10 border-rule"}`}>
+                    <span
+                      className={`inline-block px-1.5 py-0.5 rounded text-[10px] font-semibold border ${providerColor[String(r.provider)] ?? "text-ink-faint bg-rule/10 border-rule"}`}
+                    >
                       {String(r.provider ?? "—")}
                     </span>
                   </td>
-                  <td className="px-3 py-2 font-mono text-right text-ink-soft">{fmt(Number(r.prompt_tokens ?? 0))}</td>
-                  <td className="px-3 py-2 font-mono text-right text-ink-soft">{fmt(Number(r.completion_tokens ?? 0))}</td>
-                  <td className="px-3 py-2 font-mono text-right font-bold text-vermilion">{fmt(Number(r.total_tokens ?? 0))}</td>
-                  <td className="px-3 py-2 max-w-[120px] truncate" title={String(r.draft_title ?? "")}>
+                  <td className="px-3 py-2 font-mono text-right text-ink-soft">
+                    {fmt(Number(r.prompt_tokens ?? 0))}
+                  </td>
+                  <td className="px-3 py-2 font-mono text-right text-ink-soft">
+                    {fmt(Number(r.completion_tokens ?? 0))}
+                  </td>
+                  <td className="px-3 py-2 font-mono text-right font-bold text-vermilion">
+                    {fmt(Number(r.total_tokens ?? 0))}
+                  </td>
+                  <td
+                    className="px-3 py-2 max-w-[120px] truncate"
+                    title={String(r.draft_title ?? "")}
+                  >
                     {r.draft_id ? (
-                      <Link to="/drafts/$id" params={{ id: String(r.draft_id) }} className="hover:text-vermilion underline">
+                      <Link
+                        to="/drafts/$id"
+                        params={{ id: String(r.draft_id) }}
+                        className="hover:text-vermilion underline"
+                      >
                         {String(r.draft_title ?? r.draft_id).slice(0, 12)}…
                       </Link>
-                    ) : <span className="text-ink-faint">—</span>}
+                    ) : (
+                      <span className="text-ink-faint">—</span>
+                    )}
                   </td>
                 </tr>
               ))}
@@ -856,7 +1013,9 @@ function AdminUsagePanel() {
             >
               上一页
             </button>
-            <span className="text-xs text-ink-faint px-2 py-1.5">第 {page + 1} / {Math.ceil(data.total / PAGE_SIZE)} 页</span>
+            <span className="text-xs text-ink-faint px-2 py-1.5">
+              第 {page + 1} / {Math.ceil(data.total / PAGE_SIZE)} 页
+            </span>
             <button
               disabled={(page + 1) * PAGE_SIZE >= data.total}
               onClick={() => setPage((p) => p + 1)}
@@ -875,8 +1034,16 @@ function AdminUsagePanel() {
 
 function WrenchIcon({ className }: { className?: string }) {
   return (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"
-      strokeLinecap="round" strokeLinejoin="round" className={className} aria-hidden="true">
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden="true"
+    >
       <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z" />
     </svg>
   );
@@ -884,8 +1051,16 @@ function WrenchIcon({ className }: { className?: string }) {
 
 function XCircleIcon({ className }: { className?: string }) {
   return (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"
-      strokeLinecap="round" strokeLinejoin="round" className={className} aria-hidden="true">
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden="true"
+    >
       <circle cx="12" cy="12" r="10" />
       <path d="m15 9-6 6" />
       <path d="m9 9 6 6" />
@@ -895,8 +1070,16 @@ function XCircleIcon({ className }: { className?: string }) {
 
 function LeafIcon({ className }: { className?: string }) {
   return (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"
-      strokeLinecap="round" strokeLinejoin="round" className={className} aria-hidden="true">
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden="true"
+    >
       <path d="M11 20A7 7 0 0 1 9.8 6.1C15.5 5 17 4.48 19 2c1 2 2 4.18 2 8 0 5.5-4.78 10-10 10Z" />
       <path d="M2 21c0-3 1.85-5.36 5.08-6" />
     </svg>
@@ -905,8 +1088,16 @@ function LeafIcon({ className }: { className?: string }) {
 
 function EyeIcon({ className }: { className?: string }) {
   return (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"
-      strokeLinecap="round" strokeLinejoin="round" className={className} aria-hidden="true">
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden="true"
+    >
       <path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z" />
       <circle cx="12" cy="12" r="3" />
     </svg>
@@ -915,8 +1106,16 @@ function EyeIcon({ className }: { className?: string }) {
 
 function EyeOffIcon({ className }: { className?: string }) {
   return (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"
-      strokeLinecap="round" strokeLinejoin="round" className={className} aria-hidden="true">
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden="true"
+    >
       <path d="M9.88 9.88a3 3 0 1 0 4.24 4.24" />
       <path d="M10.73 5.08A10.43 10.43 0 0 1 12 5c7 0 10 7 10 7a13.16 13.16 0 0 1-1.67 2.68" />
       <path d="M6.61 6.61A13.526 13.526 0 0 0 2 12s3 7 10 7a9.74 9.74 0 0 0 5.39-1.61" />

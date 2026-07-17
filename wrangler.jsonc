@@ -15,6 +15,6 @@
   "vars": {
     "SUPABASE_URL": "https://ianlasfsfuaibqldkfyb.supabase.co",
     "SUPABASE_PUBLISHABLE_KEY": "sb_publishable_uYxfH-YXkYmJqbcSupkDYA_3bVvoHHg",
-    "AI_MODEL": "gemini-2.5-flash"
+    "AI_MODEL": "gemini-3-flash-preview"
   }
 }

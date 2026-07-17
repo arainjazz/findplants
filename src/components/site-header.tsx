@@ -199,9 +199,9 @@ export function SiteHeader() {
           <Link to="/plants" className="hover:text-vermilion transition-colors" activeProps={{ className: "font-semibold" }}>已收录档案检索</Link>
           <Link to="/explore" className="hover:text-vermilion transition-colors" activeProps={{ className: "font-semibold" }}>身边物种地图</Link>
           <a href="/plant-image-search.html" className="hover:text-vermilion transition-colors">植物搜图</a>
-          <Link to="/blog" className="hover:text-vermilion transition-colors" activeProps={{ className: "font-semibold" }}>编辑博客</Link>
+          <Link to="/blog" className="hover:text-vermilion transition-colors" activeProps={{ className: "font-semibold" }}>博客 blogs</Link>
           <Link to="/projects" className="hover:text-vermilion transition-colors" activeProps={{ className: "font-semibold" }}>项目预告与成果</Link>
-          <Link to="/edits" className="hover:text-vermilion transition-colors" activeProps={{ className: "font-semibold" }}>修改记录</Link>
+          <Link to="/edits" className="hover:text-vermilion transition-colors" activeProps={{ className: "font-semibold" }}>Log</Link>
           {user && isAdmin && (
             <Link to="/admin/applications" className="relative hover:text-vermilion transition-colors" title="编辑申请审核">
               编辑申请
@@ -220,7 +220,7 @@ export function SiteHeader() {
               )}
             </Link>
           )}
-          {user && <Link to="/admin" className="hover:text-vermilion transition-colors">管理</Link>}
+          {user && <Link to="/admin" className="hover:text-vermilion transition-colors">添加/编辑内容</Link>}
           {user && isAdmin && <AdminExportButton />}
         </nav>
 
@@ -272,9 +272,9 @@ export function SiteHeader() {
           <Link to="/plants" onClick={() => setMenuOpen(false)} className="hover:text-vermilion">已收录档案检索</Link>
           <Link to="/explore" onClick={() => setMenuOpen(false)} className="hover:text-vermilion">身边物种地图</Link>
           <a href="/plant-image-search.html" onClick={() => setMenuOpen(false)} className="hover:text-vermilion">植物搜图</a>
-          <Link to="/blog" onClick={() => setMenuOpen(false)} className="hover:text-vermilion">编辑博客</Link>
+          <Link to="/blog" onClick={() => setMenuOpen(false)} className="hover:text-vermilion">博客 blogs</Link>
           <Link to="/projects" onClick={() => setMenuOpen(false)} className="hover:text-vermilion">项目预告与成果</Link>
-          <Link to="/edits" onClick={() => setMenuOpen(false)} className="hover:text-vermilion">修改记录</Link>
+          <Link to="/edits" onClick={() => setMenuOpen(false)} className="hover:text-vermilion">Log</Link>
           {user && isAdmin && (
             <Link to="/admin/applications" onClick={() => setMenuOpen(false)} className="hover:text-vermilion">
               编辑申请{pendingCount > 0 && <span className="ml-2 bg-vermilion text-background text-[10px] px-1.5 py-0.5 rounded-full">{pendingCount}</span>}
@@ -288,7 +288,7 @@ export function SiteHeader() {
               )}
             </Link>
           )}
-          {user && <Link to="/admin" onClick={() => setMenuOpen(false)} className="hover:text-vermilion">管理</Link>}
+          {user && <Link to="/admin" onClick={() => setMenuOpen(false)} className="hover:text-vermilion">添加/编辑内容</Link>}
           <div className="border-t border-ink/20 mt-1 pt-3 flex flex-col gap-2">
             {user ? (
               <button

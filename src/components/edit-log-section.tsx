@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import type { PlantEdit } from "@/lib/edits";
+import { useEffect, useMemo, useState } from "react";
+import { logCategory, type LogCategory, type PlantEdit } from "@/lib/edits";
 
 const KIND_LABEL: Record<string, string> = {
   text: "修改文字",
@@ -70,10 +70,15 @@ export function EditLogSection({
     setFlashId(focusEditId);
     // 等列表因 open=true 渲染出来后再滚动。
     const t1 = setTimeout(() => {
-      document.getElementById(`note-${focusEditId}`)?.scrollIntoView({ behavior: "smooth", block: "center" });
+      document
+        .getElementById(`note-${focusEditId}`)
+        ?.scrollIntoView({ behavior: "smooth", block: "center" });
     }, 60);
     const t2 = setTimeout(() => setFlashId(null), 2400);
-    return () => { clearTimeout(t1); clearTimeout(t2); };
+    return () => {
+      clearTimeout(t1);
+      clearTimeout(t2);
+    };
   }, [focusEditId]);
 
   const canRevert = (e: PlantEdit) =>
@@ -82,6 +87,22 @@ export function EditLogSection({
     e.kind !== "revert" &&
     !e.reverted &&
     (!!e.before_html || ["text", "image", "html_save"].includes(e.kind));
+
+  // 两大类：创建记录（产生了新内容）/ 修改记录（对已有页面的改动）。点标题切换。
+  const [tab, setTab] = useState<LogCategory>("modify");
+  const groups = useMemo(() => {
+    const g: Record<LogCategory, PlantEdit[]> = { create: [], modify: [] };
+    for (const e of edits) g[logCategory(e.kind)].push(e);
+    return g;
+  }, [edits]);
+  const shown = groups[tab];
+
+  // 「注 N」定位到某条记录时，自动切到它所在的那一类，否则展开后看不到它。
+  useEffect(() => {
+    if (!focusEditId) return;
+    const target = edits.find((e) => e.id === focusEditId);
+    if (target) setTab(logCategory(target.kind));
+  }, [focusEditId, edits]);
 
   return (
     <section className="mt-10 border-t border-rule pt-4">
@@ -104,7 +125,7 @@ export function EditLogSection({
         >
           <polyline points="9 18 15 12 9 6" />
         </svg>
-        <span className="label text-vermilion">修改记录 · Change log</span>
+        <span className="label text-vermilion">Log</span>
         <span className="text-xs text-ink-faint">（{edits.length}）</span>
         <span className="ml-auto text-[11px] text-ink-faint group-hover:text-ink">
           {open ? "收起" : "展开"}
@@ -113,11 +134,31 @@ export function EditLogSection({
 
       {open && (
         <div className="mt-3">
-          {edits.length === 0 ? (
-            <p className="text-xs text-ink-faint py-4">暂无修改记录。</p>
+          <div className="flex items-center gap-4 border-b border-rule mb-2">
+            {(["modify", "create"] as const).map((c) => (
+              <button
+                key={c}
+                type="button"
+                onClick={() => setTab(c)}
+                className={`pb-1.5 -mb-px border-b-2 text-sm font-semibold transition-colors cursor-pointer ${
+                  tab === c
+                    ? "border-vermilion text-vermilion"
+                    : "border-transparent text-ink-faint hover:text-ink"
+                }`}
+              >
+                {c === "modify" ? "修改记录" : "创建记录"}
+                <span className="ml-1 text-[11px] font-normal opacity-70">{groups[c].length}</span>
+              </button>
+            ))}
+            <span className="ml-auto text-[10px] text-ink-faint">点击标题切换</span>
+          </div>
+          {shown.length === 0 ? (
+            <p className="text-xs text-ink-faint py-4">
+              {tab === "modify" ? "暂无修改记录。" : "暂无创建记录。"}
+            </p>
           ) : (
             <ul className="divide-y divide-rule-soft border-y border-rule">
-              {edits.map((e) => (
+              {shown.map((e) => (
                 <li
                   key={e.id}
                   id={`note-${e.id}`}
@@ -132,12 +173,16 @@ export function EditLogSection({
                         : "border-rule text-ink-faint"
                     }`}
                   >
-                    {e.kind === "ai_page_edit" || e.source === "xiaop_agent" ? "小P蛙" : kindLabel(e.kind)}
+                    {e.kind === "ai_page_edit" || e.source === "xiaop_agent"
+                      ? "小P蛙"
+                      : kindLabel(e.kind)}
                   </span>
                   <div className="min-w-0 flex-1">
                     <p className="text-ink leading-snug break-words">
                       {e.summary || kindLabel(e.kind)}
-                      {e.reverted && <span className="ml-2 text-[10px] text-ink-faint">（已撤销）</span>}
+                      {e.reverted && (
+                        <span className="ml-2 text-[10px] text-ink-faint">（已撤销）</span>
+                      )}
                     </p>
                     <p className="text-[11px] text-ink-faint mt-0.5">
                       {e.editor_name || "—"} · {fmt(e.created_at)}

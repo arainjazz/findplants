@@ -28,6 +28,8 @@ export type ConservationList = {
   province: string | null;
   source_note: string | null;
   source_url: string | null;
+  /** 添加这份名录的编辑；播种的 11 份名录为 null（无添加人 → 只有 admin 能删）。 */
+  created_by: string | null;
 };
 
 export type ConservationTaxon = {
@@ -50,7 +52,7 @@ export type ConservationData = { lists: ConservationList[]; taxa: ConservationTa
 export async function fetchConservationData(): Promise<ConservationData> {
   const listsRes = await supabase
     .from("conservation_lists")
-    .select("id,kind,name,province,source_note,source_url");
+    .select("id,kind,name,province,source_note,source_url,created_by");
   if (listsRes.error) throw listsRes.error;
   // conservation_taxa exceeds PostgREST's default 1000-row cap (2000+ rows across
   // national/provincial/CITES/GTS/GRIIS). Page through ALL rows — otherwise the
@@ -112,7 +114,10 @@ export function buildConservationMatcher(data: ConservationData) {
     else if (kind === "griis") hit.griis = t.status;
   };
 
-  return (scientificName: string | null | undefined, familyLatin?: string | null): ConservationHit => {
+  return (
+    scientificName: string | null | undefined,
+    familyLatin?: string | null,
+  ): ConservationHit => {
     const hit: ConservationHit = { protectedLists: new Map() };
     const norm = normalizeSciName(scientificName);
     if (!norm) return hit;
@@ -221,4 +226,96 @@ export function conservationBadges(
   }
   // GRIIS intentionally omitted — it renders in a separate invasive-species warning card
   return badges;
+}
+
+// ── Registry chips (统一卡签) ─────────────────────────────────────────────────
+// Every surface that shows a plant (简介摘要卡 / 草稿页 / 分享卡 / 详情页) renders the
+// SAME set of chips, one per registry hit, so a species reads identically everywhere.
+//
+// Deliberately separate from conservationBadges() above: that one feeds the green
+// 「保护与名录收录」card and must keep excluding GRIIS (which owns a standalone warning
+// card). These chips are the at-a-glance row and DO include GRIIS.
+
+export type RegistryChipKind = "protected" | "cites" | "gts" | "griis" | "catalog" | "tag";
+
+export type RegistryChip = {
+  kind: RegistryChipKind;
+  /** Short chip text, e.g.「国家二级保护」「CITES 附录II」「入侵物种」. */
+  label: string;
+  /** Longer text for tooltips / the detail page. */
+  title?: string;
+};
+
+/** GRIIS degree → short chip label. Only the two harmful degrees read as a warning. */
+function griisChipLabel(degree: string): string {
+  const o = GRIIS_DEGREES.find((x) => x.value === degree);
+  switch (degree) {
+    case "widespreadInvasive":
+      return "高危入侵";
+    case "invasive":
+      return "入侵物种";
+    case "established":
+      return "外来·已建群";
+    case "casual":
+      return "外来·偶现";
+    default:
+      return o?.label ?? degree;
+  }
+}
+
+/**
+ * Build the chip row for one plant. `catalogNames` / `tags` are passed in because they
+ * come from different tables (regional_catalogs / plant_tags) than the conservation
+ * registries. Returns [] when the plant matched nothing — callers render no row at all.
+ */
+export function registryChips(
+  hit: ConservationHit,
+  lists: ConservationList[],
+  extra?: { catalogNames?: string[]; tags?: string[] },
+): RegistryChip[] {
+  const listById = new Map(lists.map((l) => [l.id, l]));
+  const chips: RegistryChip[] = [];
+
+  for (const [listId, status] of hit.protectedLists) {
+    const l = listById.get(listId);
+    const nm = l?.name ?? "重点保护名录";
+    // Real data shape: name =「国家（2021）」/「内蒙古（2009）」, province =「国家」/「内蒙古」,
+    // status =「一级」/「二级」 → chip reads 「国家二级保护」/「内蒙古二级保护」.
+    const short = [l?.province ?? "", status, "保护"].filter(Boolean).join("");
+    chips.push({
+      kind: "protected",
+      label: short || nm,
+      title: `重点保护野生植物名录 ${nm}${status ? " · " + status : ""}`,
+    });
+  }
+  if (hit.cites) {
+    const o = CITES_APPENDICES.find((x) => x.value === hit.cites);
+    chips.push({
+      kind: "cites",
+      label: o?.label ?? `CITES 附录${hit.cites}`,
+      title: `华盛顿公约 CITES 贸易管制 · 附录${hit.cites}`,
+    });
+  }
+  if (hit.gts) {
+    const o = GTS_CATEGORIES.find((x) => x.value === hit.gts);
+    chips.push({
+      kind: "gts",
+      label: `GTS ${o?.label ?? hit.gts}`,
+      title: `GTS 全球树木红色名录 · ${o?.label ?? hit.gts}`,
+    });
+  }
+  if (hit.griis) {
+    chips.push({
+      kind: "griis",
+      label: griisChipLabel(hit.griis),
+      title: `GRIIS 全球外来与入侵物种名录 · ${GRIIS_DEGREES.find((x) => x.value === hit.griis)?.label ?? hit.griis}`,
+    });
+  }
+  for (const c of extra?.catalogNames ?? []) {
+    chips.push({ kind: "catalog", label: c, title: `已收录于地区植物名录：${c}` });
+  }
+  for (const t of extra?.tags ?? []) {
+    chips.push({ kind: "tag", label: t, title: `标签：${t}` });
+  }
+  return chips;
 }

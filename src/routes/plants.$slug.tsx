@@ -17,6 +17,9 @@ import { embedVideosInHtml } from "@/lib/embed";
 import { ImageSearchDialog } from "@/components/html-doc-editor";
 import { ReplaceImageFlow } from "@/components/replace-image-flow";
 import { ShareButton } from "@/components/share-button";
+import { ShareCardButton } from "@/components/share-card-button";
+import { RegistryChips } from "@/components/registry-chips";
+import { useRegistryChips } from "@/lib/use-registry-chips";
 import { supabase } from "@/integrations/supabase/client";
 import { FolderOpen, Link2, Image as ImageIcon, Globe } from "lucide-react";
 
@@ -80,6 +83,13 @@ function PlantDetail() {
     queryKey: ["plant-edits", plant?.id],
     queryFn: () => fetchEditsForPlant(plant!.id),
     enabled: !!plant?.id,
+  });
+
+  // 重点保护 / CITES / GTS / GRIIS / 地区名录 / tag 卡签（与草稿页、分享卡同源）。
+  const registryChipList = useRegistryChips({
+    scientific_name: plant?.scientific_name,
+    family: plant?.family,
+    tags: plant?.tags,
   });
 
   // 溯源表头：「AI 识别条目」显示「最早识别人/地点/时间」，从最早那条来源草稿回溯。
@@ -416,6 +426,30 @@ function PlantDetail() {
     (plant.co_author_ids ?? []).includes(user.id)
   );
 
+  // Share-card content for the published entry. leafEarned is intentionally omitted
+  // (no identify-round context here → the card skips the「本轮铜叶」line). Rendered
+  // only when there's a cover photo to put on the card.
+  const shareCardNode = plant.cover_url ? (
+    <ShareCardButton
+      card={{
+        title: plant.title,
+        scientificName: plant.scientific_name,
+        commonNameEn: plant.common_name_en,
+        commonNamesZh: plant.common_names_zh,
+        family: plant.family,
+        genus: plant.genus,
+        summary: plant.summary,
+        photoUrl: plant.cover_url,
+        discovererName: author?.display_name ?? "Plantspedia",
+        chips: registryChipList,
+      }}
+    />
+  ) : null;
+
+  const chipsNode = registryChipList.length ? (
+    <RegistryChips chips={registryChipList} linkTags />
+  ) : null;
+
   const fmtDate = (ts: string) => {
     try {
       return new Date(ts).toLocaleDateString("zh-CN", { year: "numeric", month: "2-digit", day: "2-digit" });
@@ -524,6 +558,7 @@ function PlantDetail() {
             <Link to="/" className="label hover:text-vermilion">← 返回首页</Link>
             <p className="label">{plant.scientific_name || plant.title}</p>
             <div className="flex items-center gap-2">
+              {shareCardNode}
               <ShareButton title={plant.title} summary={plant.summary} />
               {canEdit && (
                 <Link to="/admin/edit/$id" params={{ id: plant.id }} className="label hover:text-vermilion">编辑 →</Link>
@@ -531,6 +566,11 @@ function PlantDetail() {
             </div>
           </div>
         </div>
+        {chipsNode && (
+          <div className="border-b border-rule bg-background">
+            <div className="mx-auto max-w-6xl px-6 py-2.5">{chipsNode}</div>
+          </div>
+        )}
         <main className="flex-1">
           {htmlDoc ? (
             <iframe
@@ -652,13 +692,17 @@ function PlantDetail() {
       <main className="mx-auto max-w-3xl px-6 py-12 flex-1 w-full">
         <div className="flex items-center justify-between">
           <Link to="/" className="label hover:text-vermilion">← 返回首页</Link>
-          <ShareButton title={plant.title} summary={plant.summary} />
+          <div className="flex items-center gap-2">
+            {shareCardNode}
+            <ShareButton title={plant.title} summary={plant.summary} />
+          </div>
         </div>
         <article className="mt-6">
           <header className="border-b border-ink pb-6 mb-8">
             <p className="label text-vermilion mb-2">Specimen Entry</p>
             <h1 className="font-display text-5xl md:text-6xl font-bold leading-tight">{plant.title}</h1>
             {plant.scientific_name && <p className="italic text-ink-faint mt-3 text-xl font-serif">{plant.scientific_name}</p>}
+            {chipsNode && <div className="mt-4">{chipsNode}</div>}
             <dl className="mt-6 grid grid-cols-2 sm:grid-cols-4 gap-4 text-sm">
               {plant.family && <Meta label="科属" value={plant.family} />}
               {plant.habitat && <Meta label="生境" value={plant.habitat} />}
@@ -701,13 +745,8 @@ function PlantDetail() {
             <p className="text-ink-faint">（暂无正文）</p>
           )}
 
-          {plant.tags?.length > 0 && (
-            <div className="mt-10 pt-6 border-t border-rule flex flex-wrap gap-2">
-              {plant.tags.map((t) => (
-                <span key={t} className="label border border-rule px-2 py-1">{t}</span>
-              ))}
-            </div>
-          )}
+          {/* tag 不在此重复列出——它们已作为卡签随 重点保护/CITES/GTS/GRIIS/地区名录
+              一起显示在标题下方的 chipsNode 里（可点击跳 /tags）。 */}
           {attributionFooter}
           <EditLogSection
             edits={plantEdits}

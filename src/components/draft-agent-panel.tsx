@@ -464,7 +464,7 @@ export function XiaoPAgentPanel({
                 {userModel ? (
                   <>当前使用你配置的「<span className="text-leaf-deep font-medium">{userModel.model}</span>」作为我的大脑</>
                 ) : (
-                  "默认使用 Gemini 2.5 Flash 来作为我的大脑"
+                  "默认使用 Gemini 3 Flash 来作为我的大脑"
                 )}
                 ，如果你发现内容什么问题我可以帮你调查，帮你修改（修改前会让你点「采纳并保存」）。如果你想使用你自己的智能模型，可以点击右下方的齿轮图标进行配置。准确的换图操作请在输入框的下方进行。
               </div>

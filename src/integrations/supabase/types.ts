@@ -277,6 +277,7 @@ export type Database = {
       conservation_lists: {
         Row: {
           created_at: string
+          created_by: string | null
           effective_date: string | null
           id: string
           kind: string
@@ -288,6 +289,7 @@ export type Database = {
         }
         Insert: {
           created_at?: string
+          created_by?: string | null
           effective_date?: string | null
           id?: string
           kind: string
@@ -299,6 +301,7 @@ export type Database = {
         }
         Update: {
           created_at?: string
+          created_by?: string | null
           effective_date?: string | null
           id?: string
           kind?: string

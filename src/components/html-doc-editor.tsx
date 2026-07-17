@@ -1,4 +1,12 @@
-import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
+import {
+  forwardRef,
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { compressImage, extForMime } from "@/lib/image-compress";
 import { createPortal } from "react-dom";
 import { FolderOpen, Clipboard, Link2, Globe, Pencil, ExternalLink, Trash2 } from "lucide-react";
@@ -69,6 +77,20 @@ export const HtmlDocEditor = forwardRef<HtmlDocEditorHandle, Props>(function Htm
   const [wikiOpen, setWikiOpen] = useState(false);
   const cacheKey = `html-doc-editor:${htmlUrl}`;
 
+  /** Best-effort draft cache write. sessionStorage is ~5MB; a large edited doc can
+   *  overflow it and throw QuotaExceededError. That must NOT abort the edit action
+   *  itself (image replace / insert / formatting) — the cache is only a crash-recovery
+   *  convenience, so swallow the failure. (Matches the guarded initial-load/typing
+   *  effects; the image-mutation helpers below previously called setItem unguarded.) */
+  const persistDocCache = (idoc: Document | null | undefined) => {
+    if (!idoc) return;
+    try {
+      sessionStorage.setItem(cacheKey, "<!DOCTYPE html>\n" + idoc.documentElement.outerHTML);
+    } catch {
+      // quota exceeded / storage disabled — recovery cache is optional
+    }
+  };
+
   /** Snapshot block.outerHTML BEFORE the very first dirty event lands. */
   const snapshotBlock = useCallback((block: HTMLElement | null) => {
     if (!block) return;
@@ -82,14 +104,17 @@ export const HtmlDocEditor = forwardRef<HtmlDocEditorHandle, Props>(function Htm
     }
   }, []);
 
-  const markDirty = useCallback((node: Node | null, kind: string) => {
-    const block = nearestBlock(node);
-    if (!block) return;
-    snapshotBlock(block);
-    const info = dirtyBlocksRef.current.get(block)!;
-    info.kinds.add(kind);
-    info.at = Date.now();
-  }, [snapshotBlock]);
+  const markDirty = useCallback(
+    (node: Node | null, kind: string) => {
+      const block = nearestBlock(node);
+      if (!block) return;
+      snapshotBlock(block);
+      const info = dirtyBlocksRef.current.get(block)!;
+      info.kinds.add(kind);
+      info.at = Date.now();
+    },
+    [snapshotBlock],
+  );
 
   // Fetch original HTML (or restore cached edits) ----------------------------
   useEffect(() => {
@@ -159,7 +184,11 @@ export const HtmlDocEditor = forwardRef<HtmlDocEditorHandle, Props>(function Htm
     // Use designMode in addition to contenteditable — more reliable across
     // iframes/srcDoc reloads, and lets the user click anywhere (including
     // empty space inside complex original layouts) to start editing.
-    try { idoc.designMode = "on"; } catch { /* ignore */ }
+    try {
+      idoc.designMode = "on";
+    } catch {
+      /* ignore */
+    }
     // Inject editor-only CSS that:
     //  - keeps existing edit markers visible but never blocks clicks/right-click
     //    on the underlying image or text;
@@ -196,9 +225,10 @@ export const HtmlDocEditor = forwardRef<HtmlDocEditorHandle, Props>(function Htm
       // would otherwise miss the image entirely.
       let img =
         (target?.closest?.("img,svg") as HTMLElement | null) ??
-        (target?.closest?.("figure,picture,a") as HTMLElement | null)?.querySelector?.(
+        ((target?.closest?.("figure,picture,a") as HTMLElement | null)?.querySelector?.(
           "img,svg",
-        ) as HTMLElement | null ?? null;
+        ) as HTMLElement | null) ??
+        null;
       if (!img) {
         const block = nearestBlock(target);
         img = (block?.querySelector?.("img,svg") as HTMLElement | null) ?? null;
@@ -318,10 +348,7 @@ export const HtmlDocEditor = forwardRef<HtmlDocEditorHandle, Props>(function Htm
     markDirty(el, "image");
     // Trigger a synthetic input event so caching effect picks it up.
     el.dispatchEvent(new Event("input", { bubbles: true }));
-    const idoc = iframeRef.current?.contentDocument;
-    if (idoc) {
-      sessionStorage.setItem(cacheKey, "<!DOCTYPE html>\n" + idoc.documentElement.outerHTML);
-    }
+    persistDocCache(iframeRef.current?.contentDocument);
   };
 
   const runDocCommand = (command: string, value?: string) => {
@@ -332,7 +359,7 @@ export const HtmlDocEditor = forwardRef<HtmlDocEditorHandle, Props>(function Htm
     idoc.body?.focus();
     idoc.execCommand(command, false, value);
     markDirty(sel?.anchorNode ?? idoc.body, command.startsWith("justify") ? "text" : "text");
-    sessionStorage.setItem(cacheKey, "<!DOCTYPE html>\n" + idoc.documentElement.outerHTML);
+    persistDocCache(idoc);
   };
 
   const insertImageByUrl = (src: string, alt = "") => {
@@ -347,7 +374,7 @@ export const HtmlDocEditor = forwardRef<HtmlDocEditorHandle, Props>(function Htm
       `<img src="${escapeAttr(src)}" alt="${escapeAttr(alt)}" style="max-width:100%;height:auto;" />`,
     );
     markDirty(sel?.anchorNode ?? idoc.body, "image");
-    sessionStorage.setItem(cacheKey, "<!DOCTYPE html>\n" + idoc.documentElement.outerHTML);
+    persistDocCache(idoc);
   };
 
   const onPickInsertFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -440,8 +467,7 @@ export const HtmlDocEditor = forwardRef<HtmlDocEditorHandle, Props>(function Htm
       const commentsBlock = buildCommentsSection(commentsHtml, docClone);
       docClone.body.appendChild(commentsBlock);
 
-      const fullDoc =
-        "<!DOCTYPE html>\n" + docClone.documentElement.outerHTML;
+      const fullDoc = "<!DOCTYPE html>\n" + docClone.documentElement.outerHTML;
       const blob = new Blob([fullDoc], { type: "text/html" });
       const path = `${user.id}/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.html`;
       const { error } = await supabase.storage.from("plant-html").upload(path, blob, {
@@ -494,16 +520,16 @@ export const HtmlDocEditor = forwardRef<HtmlDocEditorHandle, Props>(function Htm
       ) : (
         <div className="border border-ink bg-background">
           <div className="sticky top-0 z-30 bg-background">
-          <HtmlEditToolbar
-            onCommand={runDocCommand}
-            onPickImage={() => insertFileRef.current?.click()}
-            onImageUrl={() => {
-              const url = window.prompt("图片地址 URL：", "https://");
-              if (!url?.trim()) return;
-              const alt = window.prompt("图片说明文字（alt）：", "") ?? "";
-              insertImageByUrl(url.trim(), alt);
-            }}
-          />
+            <HtmlEditToolbar
+              onCommand={runDocCommand}
+              onPickImage={() => insertFileRef.current?.click()}
+              onImageUrl={() => {
+                const url = window.prompt("图片地址 URL：", "https://");
+                if (!url?.trim()) return;
+                const alt = window.prompt("图片说明文字（alt）：", "") ?? "";
+                insertImageByUrl(url.trim(), alt);
+              }}
+            />
           </div>
           <iframe
             ref={iframeRef}
@@ -512,7 +538,12 @@ export const HtmlDocEditor = forwardRef<HtmlDocEditorHandle, Props>(function Htm
             onLoad={onIframeLoad}
             sandbox="allow-same-origin allow-scripts"
             className="w-full"
-            style={{ height: "calc(100vh - 240px)", minHeight: 520, border: "none", display: "block" }}
+            style={{
+              height: "calc(100vh - 240px)",
+              minHeight: 520,
+              border: "none",
+              display: "block",
+            }}
           />
         </div>
       )}
@@ -663,7 +694,15 @@ function HtmlEditToolbar({
   onPickImage: () => void;
   onImageUrl: () => void;
 }) {
-  const Btn = ({ label, title, onClick }: { label: string; title: string; onClick: () => void }) => (
+  const Btn = ({
+    label,
+    title,
+    onClick,
+  }: {
+    label: string;
+    title: string;
+    onClick: () => void;
+  }) => (
     <button
       type="button"
       title={title}
@@ -712,10 +751,14 @@ function HtmlEditToolbar({
       <span className="mx-1 h-5 w-px bg-rule" />
       <Btn label="• 列表" title="无序列表" onClick={() => onCommand("insertUnorderedList")} />
       <Btn label="1. 列表" title="有序列表" onClick={() => onCommand("insertOrderedList")} />
-      <Btn label="链接" title="添加链接" onClick={() => {
-        const url = window.prompt("链接地址：", "https://");
-        if (url?.trim()) onCommand("createLink", url.trim());
-      }} />
+      <Btn
+        label="链接"
+        title="添加链接"
+        onClick={() => {
+          const url = window.prompt("链接地址：", "https://");
+          if (url?.trim()) onCommand("createLink", url.trim());
+        }}
+      />
       <Btn label="本地图" title="添加本地图片" onClick={onPickImage} />
       <Btn label="URL图" title="添加图片 URL" onClick={onImageUrl} />
       <span className="mx-1 h-5 w-px bg-rule" />
@@ -788,15 +831,48 @@ function ImageContextMenu({
       <div className="px-3 py-1.5 text-[10px] uppercase tracking-wider text-ink-faint border-b border-rule">
         图片操作
       </div>
-      <Item onClick={onReplaceLocal}><span className="inline-flex items-center gap-2"><FolderOpen className="w-4 h-4" />替换为本地图片</span></Item>
-      <Item onClick={onReplaceFromClipboard}><span className="inline-flex items-center gap-2"><Clipboard className="w-4 h-4" />从剪贴板粘贴替换</span></Item>
-      <Item onClick={onReplaceUrl}><span className="inline-flex items-center gap-2"><Link2 className="w-4 h-4" />粘贴图片地址 URL 替换</span></Item>
-      <Item onClick={onSearchWiki}><span className="inline-flex items-center gap-2"><Globe className="w-4 h-4" />在线搜索替换图片（iNaturalist / Wikimedia）</span></Item>
-      <Item onClick={onEditAlt}><span className="inline-flex items-center gap-2"><Pencil className="w-4 h-4" />修改说明文字</span></Item>
-      <Item onClick={onOpenInNewTab}><span className="inline-flex items-center gap-2"><ExternalLink className="w-4 h-4" />新标签打开原图</span></Item>
+      <Item onClick={onReplaceLocal}>
+        <span className="inline-flex items-center gap-2">
+          <FolderOpen className="w-4 h-4" />
+          替换为本地图片
+        </span>
+      </Item>
+      <Item onClick={onReplaceFromClipboard}>
+        <span className="inline-flex items-center gap-2">
+          <Clipboard className="w-4 h-4" />
+          从剪贴板粘贴替换
+        </span>
+      </Item>
+      <Item onClick={onReplaceUrl}>
+        <span className="inline-flex items-center gap-2">
+          <Link2 className="w-4 h-4" />
+          粘贴图片地址 URL 替换
+        </span>
+      </Item>
+      <Item onClick={onSearchWiki}>
+        <span className="inline-flex items-center gap-2">
+          <Globe className="w-4 h-4" />
+          在线搜索替换图片（iNaturalist / Wikimedia）
+        </span>
+      </Item>
+      <Item onClick={onEditAlt}>
+        <span className="inline-flex items-center gap-2">
+          <Pencil className="w-4 h-4" />
+          修改说明文字
+        </span>
+      </Item>
+      <Item onClick={onOpenInNewTab}>
+        <span className="inline-flex items-center gap-2">
+          <ExternalLink className="w-4 h-4" />
+          新标签打开原图
+        </span>
+      </Item>
       <div className="border-t border-rule my-1" />
       <Item onClick={onDelete} danger>
-        <span className="inline-flex items-center gap-2"><Trash2 className="w-4 h-4" />删除图片</span>
+        <span className="inline-flex items-center gap-2">
+          <Trash2 className="w-4 h-4" />
+          删除图片
+        </span>
       </Item>
       <button
         type="button"
@@ -965,19 +1041,19 @@ export function applyEditMarkers(
     const sup = el.ownerDocument!.createElement("sup");
     sup.className = "lov-edit-mark";
     sup.setAttribute("data-edit-n", String(maxN));
-    const editId = (typeof crypto !== "undefined" && crypto.randomUUID)
-      ? crypto.randomUUID()
-      : `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+    const editId =
+      typeof crypto !== "undefined" && crypto.randomUUID
+        ? crypto.randomUUID()
+        : `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
     sup.setAttribute("data-edit-id", editId);
     sup.setAttribute("data-before-html", encodeSnapshotAttr(info.beforeHtml));
     const date = new Date(info.at);
     const stamp = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")} ${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
-    const kindStr = Array.from(info.kinds).map((k) => kindLabel[k] ?? k).join(" / ");
+    const kindStr = Array.from(info.kinds)
+      .map((k) => kindLabel[k] ?? k)
+      .join(" / ");
     const beforeText = textPreview(info.beforeHtml);
-    sup.setAttribute(
-      "data-tip",
-      `编辑：${by} · ${stamp} · ${kindStr}\n修改前：${beforeText}`,
-    );
+    sup.setAttribute("data-tip", `编辑：${by} · ${stamp} · ${kindStr}\n修改前：${beforeText}`);
     sup.textContent = `[${maxN}]`;
     row.appendChild(sup);
 
@@ -1130,7 +1206,9 @@ async function searchGBIF(term: string): Promise<ImgHit[]> {
   const params = new URLSearchParams({ mediaType: "StillImage", limit: "30" });
   if (speciesKey) params.set("taxonKey", String(speciesKey));
   else params.set("q", term);
-  const j = await fetch("https://api.gbif.org/v1/occurrence/search?" + params).then((r) => r.json());
+  const j = await fetch("https://api.gbif.org/v1/occurrence/search?" + params).then((r) =>
+    r.json(),
+  );
   const out: ImgHit[] = [];
   for (const occ of j?.results ?? []) {
     for (const media of occ?.media ?? []) {
@@ -1209,32 +1287,29 @@ export function ImageSearchDialog({
     inputRef.current?.select();
   }, []);
 
-  const search = useCallback(
-    async (term: string, src: ImgSource) => {
-      const text = term.trim();
-      if (!text) {
-        setHits([]);
-        return;
-      }
-      setLoading(true);
-      setErr(null);
-      try {
-        const out =
-          src === "iNaturalist"
-            ? await searchINaturalist(text)
-            : src === "Wikimedia Commons"
-              ? await searchWikimedia(text)
-              : await searchGBIF(text);
-        setHits(out);
-        if (out.length === 0) setErr("没有找到匹配的图片，换一个关键词或切换图源试试");
-      } catch (e) {
-        setErr((e as Error).message || "搜索失败");
-      } finally {
-        setLoading(false);
-      }
-    },
-    [],
-  );
+  const search = useCallback(async (term: string, src: ImgSource) => {
+    const text = term.trim();
+    if (!text) {
+      setHits([]);
+      return;
+    }
+    setLoading(true);
+    setErr(null);
+    try {
+      const out =
+        src === "iNaturalist"
+          ? await searchINaturalist(text)
+          : src === "Wikimedia Commons"
+            ? await searchWikimedia(text)
+            : await searchGBIF(text);
+      setHits(out);
+      if (out.length === 0) setErr("没有找到匹配的图片，换一个关键词或切换图源试试");
+    } catch (e) {
+      setErr((e as Error).message || "搜索失败");
+    } finally {
+      setLoading(false);
+    }
+  }, []);
 
   const onKey = (e: React.KeyboardEvent<HTMLInputElement>) => {
     if (e.key === "Enter") {
@@ -1343,7 +1418,9 @@ export function ImageSearchDialog({
             </div>
           )}
           <p className="text-[11px] text-ink-faint">
-            提示：建议一次只用<strong className="text-ink-soft">一类</strong>关键词（拉丁学名 / 英文俗名 / 中文常用名）命中率更高。iNaturalist 适合物种照片（自动按学名匹配 taxon），Wikimedia Commons 适合插画 / 历史图谱。请遵循各自的版权与署名要求。
+            提示：建议一次只用<strong className="text-ink-soft">一类</strong>关键词（拉丁学名 /
+            英文俗名 / 中文常用名）命中率更高。iNaturalist 适合物种照片（自动按学名匹配
+            taxon），Wikimedia Commons 适合插画 / 历史图谱。请遵循各自的版权与署名要求。
           </p>
         </div>
         <div className="flex-1 overflow-auto p-4">
@@ -1366,9 +1443,7 @@ export function ImageSearchDialog({
                   loading="lazy"
                   className="w-full h-32 object-contain bg-background"
                 />
-                <div className="px-2 py-1.5 text-[11px] line-clamp-2 leading-snug">
-                  {h.title}
-                </div>
+                <div className="px-2 py-1.5 text-[11px] line-clamp-2 leading-snug">{h.title}</div>
               </button>
             ))}
           </div>

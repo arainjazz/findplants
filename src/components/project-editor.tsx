@@ -53,8 +53,11 @@ export function ProjectEditor({ initial }: { initial?: Project }) {
     }
   };
 
-  const requiredMissing = () => {
+  const requiredMissing = (publish: boolean) => {
     if (!title.trim()) return "请输入项目标题";
+    // 预告与成果页的展示风格是 发起人+封面海报+时间+地点+主题+摘要 —— 缺海报那张卡就是空的。
+    // 但只在**发布**时卡：草稿可以先把文字存下来、海报后补。
+    if (publish && !coverUrl.trim()) return "请添加封面海报（发布必填）";
     if (!projectDate) return "请选择项目时间（必填）";
     if (!location.trim()) return "请填写项目地点（必填）";
     if (!theme.trim()) return "请填写主题（必填）";
@@ -64,7 +67,7 @@ export function ProjectEditor({ initial }: { initial?: Project }) {
 
   const save = async (publish: boolean) => {
     if (!user) return toast.error("请先登录");
-    const miss = requiredMissing();
+    const miss = requiredMissing(publish);
     if (miss) return toast.error(miss);
     setBusy(true);
     try {
@@ -110,7 +113,7 @@ export function ProjectEditor({ initial }: { initial?: Project }) {
         </div>
       ) : (
         <button onClick={() => coverInputRef.current?.click()} className="mb-6 text-xs text-ink-faint border border-dashed border-rule rounded-lg px-3 py-2 hover:border-ink hover:text-ink transition-colors">
-          + 添加封面图（可选）
+          + 添加封面海报（发布必填）
         </button>
       )}
       <input ref={coverInputRef} type="file" accept="image/*" className="hidden" onChange={(e) => { const f = e.target.files?.[0]; if (f) uploadCover(f); e.target.value = ""; }} />

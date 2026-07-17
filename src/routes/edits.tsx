@@ -3,7 +3,16 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useState } from "react";
 import { supabase } from "@/integrations/supabase/client";
 import { SiteHeader, SiteFooter } from "@/components/site-header";
-import { fetchAllEdits, fetchEditsForUser, isCurrentUserAdmin, revertEdit, type PlantEdit } from "@/lib/edits";
+import {
+  fetchAllEdits,
+  fetchDerivedCreations,
+  fetchEditsForUser,
+  isCurrentUserAdmin,
+  logCategory,
+  revertEdit,
+  type LogCategory,
+  type PlantEdit,
+} from "@/lib/edits";
 import { revertCatalogEdit } from "@/lib/catalogs";
 import { fetchAllPlants, type Plant } from "@/lib/plants";
 import { useAuth } from "@/hooks/use-auth";
@@ -14,8 +23,8 @@ import { isOwnerEmail, setAdopted } from "@/lib/leaves";
 export const Route = createFileRoute("/edits")({
   head: () => ({
     meta: [
-      { title: "修改记录 · Plantspedia" },
-      { name: "description", content: "查看社区编辑对各条目所做的全部修改记录。" },
+      { title: "Log · Plantspedia" },
+      { name: "description", content: "查看社区的创建记录与修改记录。" },
     ],
   }),
   component: EditsPage,
@@ -28,6 +37,7 @@ function EditsPage() {
   const qc = useQueryClient();
   const [groupBy, setGroupBy] = useState<GroupBy>("time");
   const [filter, setFilter] = useState("");
+  const [tab, setTab] = useState<LogCategory>("modify");
 
   const { data: isAdmin = false } = useQuery({
     queryKey: ["is-admin", user?.id],
@@ -52,14 +62,25 @@ function EditsPage() {
     refetchOnWindowFocus: true,
   });
 
+  // 创建记录里 plant_edits 拿不到的部分（AI 草稿 / 博客 / 项目 / 评论）——从源表重建。
+  // 见 fetchDerivedCreations 的注释：这些 kind 被 DB CHECK 约束挡在门外，从未写进日志。
+  const { data: derived = [] } = useQuery({
+    queryKey: ["derived-creations", isAdmin, user?.id ?? "anon"],
+    queryFn: () =>
+      isAdmin
+        ? fetchDerivedCreations()
+        : user
+          ? fetchDerivedCreations(user.id)
+          : Promise.resolve([]),
+    enabled: !!user,
+  });
+
   // Realtime: any insert/update on plant_edits invalidates the list
   useEffect(() => {
     const ch = supabase
       .channel("plant_edits-feed")
-      .on(
-        "postgres_changes",
-        { event: "*", schema: "public", table: "plant_edits" },
-        () => qc.invalidateQueries({ queryKey: ["plant-edits"] }),
+      .on("postgres_changes", { event: "*", schema: "public", table: "plant_edits" }, () =>
+        qc.invalidateQueries({ queryKey: ["plant-edits"] }),
       )
       .subscribe();
     return () => {
@@ -74,10 +95,22 @@ function EditsPage() {
     return m;
   }, [plants]);
 
+  // 创建记录 = plant_edits 里的创建类 kind + 从源表重建的（草稿/博客/项目/评论）。
+  // 修改记录 = plant_edits 里的改动类 kind。
+  const createRows = useMemo(
+    () =>
+      [...edits.filter((e) => logCategory(e.kind) === "create"), ...derived].sort(
+        (a, b) => +new Date(b.created_at) - +new Date(a.created_at),
+      ),
+    [edits, derived],
+  );
+  const modifyRows = useMemo(() => edits.filter((e) => logCategory(e.kind) === "modify"), [edits]);
+  const tabRows = tab === "create" ? createRows : modifyRows;
+
   const filtered = useMemo(() => {
     const t = filter.trim().toLowerCase();
-    if (!t) return edits;
-    return edits.filter((e) => {
+    if (!t) return tabRows;
+    return tabRows.filter((e) => {
       const p = plantById.get(e.plant_id);
       const hay = [
         e.editor_name,
@@ -92,7 +125,7 @@ function EditsPage() {
         .toLowerCase();
       return hay.includes(t);
     });
-  }, [edits, filter, plantById]);
+  }, [tabRows, filter, plantById]);
 
   const grouped = useMemo(() => {
     const map = new Map<string, PlantEdit[]>();
@@ -122,7 +155,8 @@ function EditsPage() {
   const toggleSelect = (id: string) =>
     setSelected((prev) => {
       const next = new Set(prev);
-      if (next.has(id)) next.delete(id); else next.add(id);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
       return next;
     });
 
@@ -130,21 +164,29 @@ function EditsPage() {
     if (!user || selected.size === 0) return;
     if (!confirm(`确定批量撤销选中的 ${selected.size} 条修改？`)) return;
     setBulkBusy(true);
-    let ok = 0, fail = 0;
+    let ok = 0,
+      fail = 0;
     for (const e of filtered) {
       if (!selected.has(e.id) || e.reverted) continue;
+      if (e.id.startsWith("derived:")) continue; // 重建行不是真实日志，无可撤销
       try {
         if (e.kind === "catalog_create" || e.kind === "catalog_append") {
           const adminName = (user.user_metadata?.full_name as string) || user.email || "admin";
           await revertCatalogEdit({
-            editId: e.id, kind: e.kind, catalog_id: e.catalog_id,
-            entry_ids: e.entry_ids ?? null, adminId: user.id, adminName,
+            editId: e.id,
+            kind: e.kind,
+            catalog_id: e.catalog_id,
+            entry_ids: e.entry_ids ?? null,
+            adminId: user.id,
+            adminName,
           });
         } else if (e.kind !== "revert") {
           await revertEdit(e, user.id);
         }
         ok++;
-      } catch { fail++; }
+      } catch {
+        fail++;
+      }
     }
     setBulkBusy(false);
     setSelected(new Set());
@@ -158,9 +200,11 @@ function EditsPage() {
   const selectAllInGroup = (items: PlantEdit[], on: boolean) =>
     setSelected((prev) => {
       const next = new Set(prev);
-      for (const it of items) if (!it.reverted && it.kind !== "revert") {
-        if (on) next.add(it.id); else next.delete(it.id);
-      }
+      for (const it of items)
+        if (!it.reverted && it.kind !== "revert") {
+          if (on) next.add(it.id);
+          else next.delete(it.id);
+        }
       return next;
     });
 
@@ -190,7 +234,10 @@ function EditsPage() {
     }
     if (e.kind === "draft_reject") {
       if (!confirm("撤销驳回：将该 AI 草稿恢复为「待审核」？")) return;
-      const { error } = await supabase.from("plant_drafts").update({ status: "pending" }).eq("id", e.block_path ?? "");
+      const { error } = await supabase
+        .from("plant_drafts")
+        .update({ status: "pending" })
+        .eq("id", e.block_path ?? "");
       if (error) return toast.error(error.message);
       await markReverted(e.id);
       toast.success("已撤销驳回，草稿恢复为待审核");
@@ -200,7 +247,10 @@ function EditsPage() {
     }
     if (e.kind === "blog_publish") {
       if (!confirm("撤回该博文的发布（设为未发布草稿）？")) return;
-      const { error } = await supabase.from("blog_posts").update({ published: false }).eq("id", e.block_path ?? "");
+      const { error } = await supabase
+        .from("blog_posts")
+        .update({ published: false })
+        .eq("id", e.block_path ?? "");
       if (error) return toast.error(error.message);
       await markReverted(e.id);
       toast.success("已撤回博文发布");
@@ -212,7 +262,10 @@ function EditsPage() {
     if (e.kind === "blog_edit") {
       if (!e.before_html) return toast.message("该编辑没有可恢复的修改前快照。");
       if (!confirm("撤销这次博文编辑：将正文恢复到这次修改之前？")) return;
-      const { error } = await supabase.from("blog_posts").update({ content_html: e.before_html }).eq("id", e.block_path ?? "");
+      const { error } = await supabase
+        .from("blog_posts")
+        .update({ content_html: e.before_html })
+        .eq("id", e.block_path ?? "");
       if (error) return toast.error(error.message);
       await markReverted(e.id);
       toast.success("已恢复到该次修改前的博文正文");
@@ -227,7 +280,12 @@ function EditsPage() {
     }
     if (e.kind === "catalog_create" || e.kind === "catalog_append") {
       const label = e.kind === "catalog_create" ? "整个目录及其条目" : "该次追加的全部条目";
-      if (!confirm(`确定撤销该${e.kind === "catalog_create" ? "新目录" : "目录补充"}？将删除${label}。`)) return;
+      if (
+        !confirm(
+          `确定撤销该${e.kind === "catalog_create" ? "新目录" : "目录补充"}？将删除${label}。`,
+        )
+      )
+        return;
       try {
         const adminName = (user.user_metadata?.full_name as string) || user.email || "admin";
         await revertCatalogEdit({
@@ -267,15 +325,37 @@ function EditsPage() {
       <SiteHeader />
       <main className="mx-auto max-w-5xl px-6 py-10 flex-1 w-full">
         <div className="border-b-2 border-ink pb-6 mb-6">
-          <p className="label text-vermilion mb-2">Community Log · 社区编辑日志</p>
-          <h1 className="font-display text-5xl font-bold">修改记录</h1>
+          <p className="label text-vermilion mb-2">Community Log · 社区日志</p>
+          <h1 className="font-display text-5xl font-bold">Log</h1>
           <p className="text-ink-faint mt-2">
             {isAdmin
-              ? "你以网站所有者身份登录，可查看全部编辑者的修改，并撤销任意一条。"
+              ? "你以网站所有者身份登录，可查看全部编辑者的记录，并撤销任意一条修改。"
               : user
-                ? "这里是你本人的修改记录，包含被所有者撤销或驳回的条目。"
-                : "登录后可查看你本人的修改记录。"}
+                ? "这里是你本人的记录，包含被所有者撤销或驳回的条目。"
+                : "登录后可查看你本人的记录。"}
           </p>
+        </div>
+
+        {/* 两大类：修改记录 / 创建记录。点标题切换。 */}
+        <div className="flex items-center gap-5 border-b border-rule mb-5">
+          {(["modify", "create"] as const).map((c) => (
+            <button
+              key={c}
+              type="button"
+              onClick={() => setTab(c)}
+              className={`pb-2 -mb-px border-b-2 font-display text-lg font-semibold transition-colors cursor-pointer ${
+                tab === c
+                  ? "border-vermilion text-vermilion"
+                  : "border-transparent text-ink-faint hover:text-ink"
+              }`}
+            >
+              {c === "modify" ? "修改记录" : "创建记录"}
+              <span className="ml-1.5 text-xs font-normal opacity-70">
+                {c === "modify" ? modifyRows.length : createRows.length}
+              </span>
+            </button>
+          ))}
+          <span className="ml-auto text-[11px] text-ink-faint">点击标题切换</span>
         </div>
 
         <div className="flex flex-wrap gap-3 items-center mb-6">
@@ -311,7 +391,12 @@ function EditsPage() {
         {!user ? (
           <div className="py-12 text-center">
             <p className="text-ink-faint mb-3">登录后可查看你本人的修改记录。</p>
-            <Link to="/login" className="inline-block border border-ink px-4 py-2 hover:bg-ink hover:text-background transition-colors">去登录</Link>
+            <Link
+              to="/login"
+              className="inline-block border border-ink px-4 py-2 hover:bg-ink hover:text-background transition-colors"
+            >
+              去登录
+            </Link>
           </div>
         ) : isLoading ? (
           <p className="text-ink-faint">载入中…</p>
@@ -330,15 +415,25 @@ function EditsPage() {
                     <h2 className="font-display text-xl font-semibold">
                       <span className="inline-block w-4 text-ink-faint">{isOpen ? "▾" : "▸"}</span>
                       {g.key}{" "}
-                      <span className="text-xs text-ink-faint font-normal">· {g.items.length} 条</span>
+                      <span className="text-xs text-ink-faint font-normal">
+                        · {g.items.length} 条
+                      </span>
                     </h2>
                   </button>
                   {isOpen && isAdmin && (
                     <div className="flex gap-3 text-xs mb-2 px-2">
-                      <button type="button" onClick={() => selectAllInGroup(g.items, true)} className="text-vermilion hover:underline">
+                      <button
+                        type="button"
+                        onClick={() => selectAllInGroup(g.items, true)}
+                        className="text-vermilion hover:underline"
+                      >
                         全选本组
                       </button>
-                      <button type="button" onClick={() => selectAllInGroup(g.items, false)} className="text-ink-faint hover:underline">
+                      <button
+                        type="button"
+                        onClick={() => selectAllInGroup(g.items, false)}
+                        className="text-ink-faint hover:underline"
+                      >
                         取消本组
                       </button>
                     </div>
@@ -445,6 +540,10 @@ function EditRow({
     blog_edit: "bg-emerald-50 text-emerald-700",
   };
 
+  // 从源表重建的创建记录（fetchDerivedCreations）不是真实 plant_edits 行——没有快照可恢复，
+  // 其 id 也不存在于表里。必须屏蔽掉「撤销」与批量勾选，否则会去撤一条不存在的记录。
+  const isDerived = edit.id.startsWith("derived:");
+
   const isCatalog =
     edit.kind === "catalog_create" ||
     edit.kind === "catalog_append" ||
@@ -461,27 +560,28 @@ function EditRow({
 
   const srcLabel = sourceLabel(edit.source);
   const isAI = sourceIsAI(edit.source);
-  const SourceBadge =
-    edit.source ? (
-      <span
-        title={edit.source}
-        className={`px-1.5 py-0.5 rounded text-[10px] shrink-0 ${
-          isAI
-            ? "bg-[oklch(0.55_0.18_280)]/15 text-[oklch(0.45_0.18_280)]"
-            : "bg-ink/10 text-ink-soft"
-        }`}
-      >
-        {srcLabel}
-      </span>
-    ) : null;
+  const SourceBadge = edit.source ? (
+    <span
+      title={edit.source}
+      className={`px-1.5 py-0.5 rounded text-[10px] shrink-0 ${
+        isAI
+          ? "bg-[oklch(0.55_0.18_280)]/15 text-[oklch(0.45_0.18_280)]"
+          : "bg-ink/10 text-ink-soft"
+      }`}
+    >
+      {srcLabel}
+    </span>
+  ) : null;
 
   if (isCatalog) {
     return (
       <li className="py-1.5 flex items-start gap-2 text-xs">
-        {isAdmin && !edit.reverted && edit.kind !== "revert" && (
+        {isAdmin && !edit.reverted && edit.kind !== "revert" && !isDerived && (
           <input type="checkbox" checked={selected} onChange={onToggleSelect} className="mt-1" />
         )}
-        <span className={`px-1.5 py-0.5 rounded text-[10px] font-semibold shrink-0 ${kindColor[edit.kind] ?? ""}`}>
+        <span
+          className={`px-1.5 py-0.5 rounded text-[10px] font-semibold shrink-0 ${kindColor[edit.kind] ?? ""}`}
+        >
           {kindLabel[edit.kind] ?? edit.kind}
         </span>
         <div className="flex-1 min-w-0">
@@ -491,12 +591,14 @@ function EditRow({
             </span>
             {SourceBadge}
             {edit.reverted && (
-              <span className="text-[10px] px-1 py-0 bg-destructive/15 text-destructive rounded">已撤销</span>
+              <span className="text-[10px] px-1 py-0 bg-destructive/15 text-destructive rounded">
+                已撤销
+              </span>
             )}
           </div>
           <p className="mt-0.5 text-sm">{edit.summary ?? "（无摘要）"}</p>
         </div>
-        {isAdmin && !edit.reverted && (
+        {isAdmin && !edit.reverted && !isDerived && (
           <button
             onClick={onRevert}
             className="shrink-0 text-[11px] border border-destructive text-destructive hover:bg-destructive hover:text-background px-1.5 py-0.5"
@@ -513,7 +615,9 @@ function EditRow({
       {isAdmin && !edit.reverted && edit.kind !== "revert" && (
         <input type="checkbox" checked={selected} onChange={onToggleSelect} className="mt-1" />
       )}
-      <span className={`px-1.5 py-0.5 rounded text-[10px] font-semibold shrink-0 ${kindColor[edit.kind] ?? ""}`}>
+      <span
+        className={`px-1.5 py-0.5 rounded text-[10px] font-semibold shrink-0 ${kindColor[edit.kind] ?? ""}`}
+      >
         {kindLabel[edit.kind] ?? edit.kind}
       </span>
       <div className="flex-1 min-w-0">
@@ -579,31 +683,37 @@ function EditRow({
           {edit.adopted ? "已采纳 ✓" : "采纳"}
         </button>
       )}
-      {isAdmin && edit.kind !== "revert" && (() => {
-        const restoring = edit.reverted;
-        return (
-          <button
-            onClick={onRevert}
-            title={
-              restoring
-                ? "恢复到修改后的内容"
-                : "撤销此修改，回到修改前内容"
-            }
-            className={`shrink-0 text-[11px] border px-1.5 py-0.5 transition-colors ${
-              restoring
-                ? "border-leaf text-leaf-deep hover:bg-leaf hover:text-background"
-                : "border-destructive text-destructive hover:bg-destructive hover:text-background"
-            }`}
-          >
-            {restoring ? "恢复" : "撤销"}
-          </button>
-        );
-      })()}
+      {isAdmin &&
+        edit.kind !== "revert" &&
+        (() => {
+          const restoring = edit.reverted;
+          return (
+            <button
+              onClick={onRevert}
+              title={restoring ? "恢复到修改后的内容" : "撤销此修改，回到修改前内容"}
+              className={`shrink-0 text-[11px] border px-1.5 py-0.5 transition-colors ${
+                restoring
+                  ? "border-leaf text-leaf-deep hover:bg-leaf hover:text-background"
+                  : "border-destructive text-destructive hover:bg-destructive hover:text-background"
+              }`}
+            >
+              {restoring ? "恢复" : "撤销"}
+            </button>
+          );
+        })()}
     </li>
   );
 }
 
-function EditSnapshotPreview({ html, kind, onZoom }: { html: string | null; kind: PlantEdit["kind"]; onZoom?: (url: string) => void }) {
+function EditSnapshotPreview({
+  html,
+  kind,
+  onZoom,
+}: {
+  html: string | null;
+  kind: PlantEdit["kind"];
+  onZoom?: (url: string) => void;
+}) {
   const thumb = imagePreview(html);
   const text = textPreview(html, kind === "image" ? 20 : 20);
   return (
@@ -707,7 +817,13 @@ function diffLines(oldStr: string, newStr: string): DiffLine[] {
   return diff;
 }
 
-function GitDiffViewer({ beforeHtml, afterHtml }: { beforeHtml: string | null; afterHtml: string | null }) {
+function GitDiffViewer({
+  beforeHtml,
+  afterHtml,
+}: {
+  beforeHtml: string | null;
+  afterHtml: string | null;
+}) {
   const diff = useMemo(() => {
     return diffLines(beforeHtml || "", afterHtml || "");
   }, [beforeHtml, afterHtml]);
@@ -752,4 +868,3 @@ function GitDiffViewer({ beforeHtml, afterHtml }: { beforeHtml: string | null; a
     </div>
   );
 }
-

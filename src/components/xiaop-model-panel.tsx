@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
 import {
@@ -30,8 +30,15 @@ const PROVIDERS: ProviderMeta[] = [
     label: "Google Gemini",
     icon: "🔵",
     placeholder: "AQ.xxx... 或 AIzaSy...",
-    defaultModel: "gemini-2.5-flash",
-    models: ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.5-flash-lite", "gemini-3-flash-preview", "gemini-3-pro-preview", "gemini-3.1-pro-preview"],
+    defaultModel: "gemini-3-flash-preview",
+    models: [
+      "gemini-3-flash-preview",
+      "gemini-3-pro-preview",
+      "gemini-3.1-pro-preview",
+      "gemini-2.5-flash",
+      "gemini-2.5-pro",
+      "gemini-2.5-flash-lite",
+    ],
     needsBaseUrl: false,
   },
   {
@@ -85,11 +92,14 @@ export function XiaoPModelPanel() {
   const [provider, setProvider] = useState<Provider>("gemini");
   // One input PER key — same pattern as AdminModelPanel for consistency
   const [keys, setKeys] = useState<string[]>([""]);
-  const joinedKey = keys.map((k) => k.trim()).filter(Boolean).join(",");
-  const [model, setModel] = useState("gemini-2.5-flash");
+  const joinedKey = keys
+    .map((k) => k.trim())
+    .filter(Boolean)
+    .join(",");
+  const [model, setModel] = useState("gemini-3-flash-preview");
   const [customModel, setCustomModel] = useState("");
   const [baseUrl, setBaseUrl] = useState("https://api.openai.com/v1");
-  const [showKey, setShowKey] = useState(false);
+  const [showKey, setShowKey] = useState(true); // owner 需看到完整 key 拖动排序，默认显示
   // Live-fetched model IDs (from the provider's list-models endpoint). When set,
   // they replace the hard-coded preset list in the dropdown.
   const [fetchedModels, setFetchedModels] = useState<string[]>([]);
@@ -105,6 +115,19 @@ export function XiaoPModelPanel() {
     queryFn: () => getFn({ data: undefined }),
     retry: false,
   });
+
+  // Seed the editable form from the saved config (once) so the owner sees ALL
+  // configured keys + model/provider and can drag-reorder key priority.
+  const seededRef = useRef(false);
+  useEffect(() => {
+    if (seededRef.current || !activeConfig) return;
+    seededRef.current = true;
+    setProvider(activeConfig.provider as Provider);
+    const savedKeys = (activeConfig.apiKeys ?? []).filter(Boolean);
+    if (savedKeys.length) setKeys(savedKeys);
+    if (activeConfig.model) setModel(activeConfig.model);
+    if (activeConfig.baseUrl) setBaseUrl(activeConfig.baseUrl);
+  }, [activeConfig]);
 
   const saveMutation = useMutation({
     mutationFn: async () => {
@@ -197,7 +220,8 @@ export function XiaoPModelPanel() {
         ) : activeConfig ? (
           <span className="inline-flex items-center gap-1.5 text-[11px] font-semibold px-2.5 py-1 rounded-full bg-leaf/10 text-leaf-deep border border-leaf/25">
             <span className="w-1.5 h-1.5 rounded-full bg-leaf animate-pulse" />
-            {providerIcon(activeConfig.provider)} {providerLabel(activeConfig.provider)} · {activeConfig.model}
+            {providerIcon(activeConfig.provider)} {providerLabel(activeConfig.provider)} ·{" "}
+            {activeConfig.model}
           </span>
         ) : (
           <span className="inline-flex items-center gap-1.5 text-[11px] text-ink-faint px-2.5 py-1 rounded-full border border-rule/50">
@@ -224,14 +248,20 @@ export function XiaoPModelPanel() {
             {clearMutation.isPending ? "清除中…" : "恢复默认 Gemini"}
           </button>
         )}
-        {activeConfig && <span className="text-[11px] text-ink-faint">Key：{activeConfig.apiKeyMasked}</span>}
+        {activeConfig && (
+          <span className="text-[11px] text-ink-faint">Key：{activeConfig.apiKeyMasked}</span>
+        )}
       </div>
 
       {isOpen && (
         <div className="mt-3 p-4 rounded-2xl border border-leaf/30 bg-leaf/5 space-y-4 animate-in fade-in slide-in-from-top-1 duration-200">
           <div className="flex gap-2 p-2.5 rounded-lg bg-leaf/10 border border-leaf/20 text-[11px] text-leaf-deep leading-relaxed">
             <span>🐸</span>
-            <span>此处仅设置「小P蛙 AI agent」对话与改写所用的大模型；与识别管线模型相互独立。不配置则默认使用 .env 的 Gemini。</span>
+            <span>
+              此处仅设置「小P蛙 AI
+              agent」对话与改写所用的大模型；与识别管线模型相互独立。不配置则默认使用 .env 的
+              Gemini。
+            </span>
           </div>
 
           <div>
@@ -242,7 +272,9 @@ export function XiaoPModelPanel() {
                   key={p.id}
                   onClick={() => handleProviderChange(p.id)}
                   className={`py-2 px-3 rounded-lg text-xs font-bold border transition-all cursor-pointer text-left ${
-                    provider === p.id ? "bg-ink text-background border-ink" : "bg-paper text-ink-soft border-rule hover:border-ink/50"
+                    provider === p.id
+                      ? "bg-ink text-background border-ink"
+                      : "bg-paper text-ink-soft border-rule hover:border-ink/50"
                   }`}
                 >
                   {p.icon} {p.label}
@@ -261,7 +293,11 @@ export function XiaoPModelPanel() {
                 onClick={() => setShowKey((v) => !v)}
                 className="text-[11px] text-ink-faint hover:text-ink transition-colors cursor-pointer inline-flex items-center gap-1"
               >
-                {showKey ? <EyeOffIcon className="w-3.5 h-3.5" /> : <EyeIcon className="w-3.5 h-3.5" />}
+                {showKey ? (
+                  <EyeOffIcon className="w-3.5 h-3.5" />
+                ) : (
+                  <EyeIcon className="w-3.5 h-3.5" />
+                )}
                 {showKey ? "隐藏" : "显示"}
               </button>
             </div>
@@ -298,16 +334,31 @@ export function XiaoPModelPanel() {
                   className={`flex items-center gap-2 ${keys.length > 1 ? "cursor-move" : ""} group`}
                 >
                   {keys.length > 1 && (
-                    <div className="shrink-0 text-ink-faint group-hover:text-ink transition-colors" title="拖动调整优先级">
-                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 8h16M4 16h16" />
+                    <div
+                      className="shrink-0 text-ink-faint group-hover:text-ink transition-colors"
+                      title="拖动调整优先级"
+                    >
+                      <svg
+                        className="w-4 h-4"
+                        fill="none"
+                        stroke="currentColor"
+                        viewBox="0 0 24 24"
+                      >
+                        <path
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          strokeWidth={2}
+                          d="M4 8h16M4 16h16"
+                        />
                       </svg>
                     </div>
                   )}
                   <input
                     type={showKey ? "text" : "password"}
                     value={k}
-                    onChange={(e) => setKeys((arr) => arr.map((x, j) => (j === i ? e.target.value : x)))}
+                    onChange={(e) =>
+                      setKeys((arr) => arr.map((x, j) => (j === i ? e.target.value : x)))
+                    }
                     placeholder={`${meta.placeholder}${keys.length > 1 ? `（优先级 ${i + 1}）` : ""}`}
                     className="flex-1 min-w-0 px-3 py-2 text-xs rounded-lg border border-rule bg-background font-mono focus:outline-none focus:border-leaf transition-colors"
                   />
@@ -332,8 +383,8 @@ export function XiaoPModelPanel() {
               ＋ 再加一个 API Key
             </button>
             <p className="mt-1 text-[11px] text-ink-faint">
-              ⚠️ Key 完整显示在此页面，请注意屏幕分享时遮挡。Key 加密存储在服务端。
-              多个 key 按顺序优先使用；Gemini 限流时（429）自动换下一个。
+              ⚠️ Key 完整显示在此页面，请注意屏幕分享时遮挡。Key 加密存储在服务端。 多个 key
+              按顺序优先使用；Gemini 限流时（429）自动换下一个。
             </p>
           </div>
 
@@ -341,7 +392,10 @@ export function XiaoPModelPanel() {
           {meta.needsBaseUrl ? (
             <div>
               <label className="block text-xs font-semibold text-ink-soft mb-1.5">
-                API Base URL <span className="ml-1.5 font-normal text-ink-faint">（中转 / 代理 / 自定义接口）</span>
+                API Base URL{" "}
+                <span className="ml-1.5 font-normal text-ink-faint">
+                  （中转 / 代理 / 自定义接口）
+                </span>
               </label>
               <input
                 type="text"
@@ -396,7 +450,9 @@ export function XiaoPModelPanel() {
                 className="w-full px-3 py-2 text-xs rounded-lg border border-rule bg-background focus:outline-none focus:border-leaf transition-colors cursor-pointer"
               >
                 {optionModels.map((m) => (
-                  <option key={m} value={m}>{m}</option>
+                  <option key={m} value={m}>
+                    {m}
+                  </option>
                 ))}
                 <option value="__custom__">✏️ 手动输入其他模型名…</option>
               </select>
@@ -411,13 +467,21 @@ export function XiaoPModelPanel() {
               />
             )}
             {fetchedModels.length > 0 && (
-              <p className="mt-1 text-[11px] text-leaf-deep">✓ 已按你的 Key 列出 {fetchedModels.length} 个可用模型</p>
+              <p className="mt-1 text-[11px] text-leaf-deep">
+                ✓ 已按你的 Key 列出 {fetchedModels.length} 个可用模型
+              </p>
             )}
           </div>
 
           <div className="p-2.5 rounded-lg bg-background border border-rule/50 text-[11px] text-ink-soft font-mono">
-            Provider: <strong>{provider}</strong> &nbsp;|&nbsp; Model: <strong>{effectiveModel || "（未填）"}</strong>
-            {meta.needsBaseUrl && baseUrl && <> &nbsp;|&nbsp; URL: <strong>{baseUrl}</strong></>}
+            Provider: <strong>{provider}</strong> &nbsp;|&nbsp; Model:{" "}
+            <strong>{effectiveModel || "（未填）"}</strong>
+            {meta.needsBaseUrl && baseUrl && (
+              <>
+                {" "}
+                &nbsp;|&nbsp; URL: <strong>{baseUrl}</strong>
+              </>
+            )}
           </div>
 
           <div className="flex gap-2">
@@ -443,7 +507,16 @@ export function XiaoPModelPanel() {
 
 function RefreshIcon({ className }: { className?: string }) {
   return (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className} aria-hidden="true">
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden="true"
+    >
       <path d="M3 12a9 9 0 0 1 15-6.7L21 8" />
       <path d="M21 3v5h-5" />
       <path d="M21 12a9 9 0 0 1-15 6.7L3 16" />
@@ -454,7 +527,16 @@ function RefreshIcon({ className }: { className?: string }) {
 
 function WrenchIcon({ className }: { className?: string }) {
   return (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className} aria-hidden="true">
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden="true"
+    >
       <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z" />
     </svg>
   );
@@ -462,7 +544,16 @@ function WrenchIcon({ className }: { className?: string }) {
 
 function XCircleIcon({ className }: { className?: string }) {
   return (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className} aria-hidden="true">
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden="true"
+    >
       <circle cx="12" cy="12" r="10" />
       <path d="m15 9-6 6M9 9l6 6" />
     </svg>
@@ -471,7 +562,16 @@ function XCircleIcon({ className }: { className?: string }) {
 
 function EyeIcon({ className }: { className?: string }) {
   return (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className} aria-hidden="true">
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden="true"
+    >
       <path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z" />
       <circle cx="12" cy="12" r="3" />
     </svg>
@@ -480,7 +580,16 @@ function EyeIcon({ className }: { className?: string }) {
 
 function EyeOffIcon({ className }: { className?: string }) {
   return (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className} aria-hidden="true">
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden="true"
+    >
       <path d="M9.88 9.88a3 3 0 1 0 4.24 4.24" />
       <path d="M10.73 5.08A10.43 10.43 0 0 1 12 5c7 0 10 7 10 7a13.16 13.16 0 0 1-1.67 2.68" />
       <path d="M6.61 6.61A13.526 13.526 0 0 0 2 12s3 7 10 7a9.74 9.74 0 0 0 5.39-1.61" />

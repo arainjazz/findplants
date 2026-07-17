@@ -14,7 +14,10 @@ export type EditorApplication = {
 };
 
 export async function fetchApplications(status?: "pending" | "approved" | "rejected") {
-  let q = supabase.from("editor_applications").select("*").order("created_at", { ascending: false });
+  let q = supabase
+    .from("editor_applications")
+    .select("*")
+    .order("created_at", { ascending: false });
   if (status) q = q.eq("status", status);
   const { data, error } = await q;
   if (error) throw error;
@@ -132,11 +135,184 @@ function cssPath(el: Element | null): string | null {
     const tag = cur.tagName.toLowerCase();
     const parentEl: HTMLElement | null = cur.parentElement;
     if (!parentEl) break;
-    const siblings = (Array.from(parentEl.children) as Element[]).filter((child) => child.tagName === cur!.tagName);
+    const siblings = (Array.from(parentEl.children) as Element[]).filter(
+      (child) => child.tagName === cur!.tagName,
+    );
     parts.unshift(`${tag}:nth-of-type(${siblings.indexOf(cur) + 1})`);
     cur = parentEl;
   }
   return parts.join(" > ") || null;
+}
+
+// ── Log 分类：创建记录 vs 修改记录 ────────────────────────────────────────────
+// 「创建记录」= 产生了一份新内容（新条目 / 新草稿 / 新博文 / 新项目 / 新评论 / 新名录 /
+// 新标签）；「修改记录」= 对已有页面的编辑改动。两者在 Log 里点标题切换。
+
+export type LogCategory = "create" | "modify";
+
+const CREATE_KINDS = new Set<PlantEdit["kind"]>([
+  "create", // skill 上传/批量创建的植物详页（含金叶一键，source 里区分）
+  "catalog_create",
+  "tag_create",
+  "blog_publish",
+  "draft_approve", // 采纳草稿 = 产生了一条正式收录条目
+]);
+
+/** Which Log tab an edit row belongs to. Anything not a known creation is a 修改. */
+export function logCategory(kind: PlantEdit["kind"]): LogCategory {
+  return CREATE_KINDS.has(kind) ? "create" : "modify";
+}
+
+/**
+ * Creation records that plant_edits does NOT contain, rebuilt from the source tables.
+ *
+ * Why this exists: `plant_edits.kind` has a narrow DB CHECK constraint that silently
+ * rejects blog_publish / draft_* / ai_page_edit rows (the inserts are `.catch`-swallowed),
+ * and AI drafts / projects / comments were never logged as edits at all. Verified against
+ * the live table: only create / html_save / draft_approve / text / image / draft_reject /
+ * merge rows actually exist. So the 创建记录 tab reads the real objects instead of a log
+ * that was never written — which also means the history is complete retroactively.
+ *
+ * Returns PlantEdit-shaped rows (synthetic ids prefixed so they're never mistaken for
+ * real log rows — they carry no snapshot and must not offer 撤销).
+ */
+export type DerivedCreation = PlantEdit & {
+  /** Always true — marks a row assembled here rather than read from plant_edits. */
+  derived: true;
+  /** Where this creation lives, for the row's link. */
+  target: { kind: "draft" | "blog" | "project" | "comment" | "plant"; id: string; slug?: string };
+};
+
+export async function fetchDerivedCreations(userId?: string): Promise<DerivedCreation[]> {
+  const mk = (
+    id: string,
+    kind: PlantEdit["kind"],
+    created_at: string,
+    editor_id: string | null,
+    editor_name: string | null,
+    summary: string,
+    target: DerivedCreation["target"],
+    source: string | null = null,
+  ): DerivedCreation =>
+    ({
+      id: `derived:${id}`,
+      plant_id: target.kind === "plant" ? target.id : "",
+      editor_id: editor_id ?? "",
+      editor_name,
+      kind,
+      marker_n: 0,
+      block_path: null,
+      before_html: null,
+      after_html: null,
+      summary,
+      catalog_id: null,
+      entry_ids: null,
+      source,
+      reverted: false,
+      reverted_by: null,
+      reverted_at: null,
+      created_at,
+      derived: true,
+      target,
+    }) as DerivedCreation;
+
+  const out: DerivedCreation[] = [];
+  const only = <T extends { [k: string]: any }>(rows: T[] | null, col: string) =>
+    userId ? (rows ?? []).filter((r) => r[col] === userId) : (rows ?? []);
+
+  // AI 识别草稿（= 待审简介卡；未采纳的草稿也算一次创建）
+  try {
+    const { data } = await supabase
+      .from("plant_drafts")
+      .select("id,title,created_at,created_by,creator_label,status")
+      .order("created_at", { ascending: false });
+    for (const d of only(data, "created_by")) {
+      out.push(
+        mk(
+          d.id,
+          "create",
+          d.created_at,
+          d.created_by,
+          d.creator_label,
+          `AI 识别草稿「${d.title}」`,
+          { kind: "draft", id: d.id },
+          "ai_identify",
+        ),
+      );
+    }
+  } catch {
+    /* table/columns missing → skip this source */
+  }
+
+  // 博客
+  try {
+    const { data } = await supabase
+      .from("blog_posts")
+      .select("id,slug,title,created_at,author_id,author_name,published");
+    for (const b of only(data, "author_id")) {
+      out.push(
+        mk(
+          b.id,
+          "blog_publish",
+          b.created_at,
+          b.author_id,
+          b.author_name,
+          `${b.published ? "发布" : "创建"}博文「${b.title}」`,
+          { kind: "blog", id: b.id, slug: b.slug },
+        ),
+      );
+    }
+  } catch {
+    /* skip */
+  }
+
+  // 项目
+  try {
+    const { data } = await supabase
+      .from("projects")
+      .select("id,title,created_at,author_id,author_name,published");
+    for (const p of only(data, "author_id")) {
+      out.push(
+        mk(
+          p.id,
+          "create",
+          p.created_at,
+          p.author_id,
+          p.author_name,
+          `${p.published ? "发布" : "创建"}项目「${p.title}」`,
+          { kind: "project", id: p.id },
+          "project",
+        ),
+      );
+    }
+  } catch {
+    /* skip */
+  }
+
+  // 评论
+  try {
+    const { data } = await supabase
+      .from("plant_comments")
+      .select("id,body,created_at,author_id,author_name,plant_id");
+    for (const c of only(data, "author_id")) {
+      out.push(
+        mk(
+          c.id,
+          "create",
+          c.created_at,
+          c.author_id,
+          c.author_name,
+          `发表评论：${String(c.body ?? "").slice(0, 40)}`,
+          { kind: "comment", id: c.plant_id },
+          "comment",
+        ),
+      );
+    }
+  } catch {
+    /* skip */
+  }
+
+  return out.sort((a, b) => +new Date(b.created_at) - +new Date(a.created_at));
 }
 
 export async function fetchAllEdits() {
@@ -173,7 +349,8 @@ async function recoverMissingHtmlMarkerEdits(existingIds: Set<string>): Promise<
         const stamp = tip.match(/(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2})/);
         const host = mark.closest("[data-edit-mark-host]") as HTMLElement | null;
         const before = decodeSnapshotAttr(mark.getAttribute("data-before-html"));
-        const after = decodeSnapshotAttr(mark.getAttribute("data-after-html")) ?? host?.outerHTML ?? null;
+        const after =
+          decodeSnapshotAttr(mark.getAttribute("data-after-html")) ?? host?.outerHTML ?? null;
         out.push({
           id,
           plant_id: plant.id as string,
@@ -191,7 +368,9 @@ async function recoverMissingHtmlMarkerEdits(existingIds: Set<string>): Promise<
           reverted: false,
           reverted_by: null,
           reverted_at: null,
-          created_at: stamp ? `${stamp[1]}-${stamp[2]}-${stamp[3]}T${stamp[4]}:${stamp[5]}:00+08:00` : new Date().toISOString(),
+          created_at: stamp
+            ? `${stamp[1]}-${stamp[2]}-${stamp[3]}T${stamp[4]}:${stamp[5]}:00+08:00`
+            : new Date().toISOString(),
         });
         existingIds.add(id);
       });
@@ -285,11 +464,7 @@ export async function fetchEditsForDraft(draftId: string) {
 }
 
 export async function fetchEditById(id: string) {
-  const { data, error } = await supabase
-    .from("plant_edits")
-    .select("*")
-    .eq("id", id)
-    .maybeSingle();
+  const { data, error } = await supabase.from("plant_edits").select("*").eq("id", id).maybeSingle();
   if (error) throw error;
   return data as PlantEdit | null;
 }
@@ -311,11 +486,7 @@ export async function isCurrentUserAdmin(userId: string | undefined | null) {
  * we swap back to `after_html` (restore). Locates the host via the
  * `data-edit-id` marker first, then falls back to `block_path` (cssPath).
  */
-export async function revertEdit(
-  edit: PlantEdit,
-  currentUserId: string,
-  bucket = "plant-html",
-) {
+export async function revertEdit(edit: PlantEdit, currentUserId: string, bucket = "plant-html") {
   // 1. Look up plant html url
   const { data: plant, error: pErr } = await supabase
     .from("plants")
@@ -333,24 +504,26 @@ export async function revertEdit(
   const marker = doc.querySelector(`[data-edit-id="${cssEscape(edit.id)}"]`);
   let host: Element | null = marker?.closest("[data-edit-mark-host]") ?? null;
   if (!host && edit.block_path) {
-    try { host = doc.querySelector(edit.block_path); } catch { host = null; }
+    try {
+      host = doc.querySelector(edit.block_path);
+    } catch {
+      host = null;
+    }
   }
   if (!host) throw new Error("找不到该修改对应的内容块（页面可能已被覆盖）");
 
   // 4. Decide direction: undo vs restore
   const restoring = edit.reverted;
-  const embeddedBefore = marker ? decodeSnapshotAttr(marker.getAttribute("data-before-html")) : null;
+  const embeddedBefore = marker
+    ? decodeSnapshotAttr(marker.getAttribute("data-before-html"))
+    : null;
   const embeddedAfter = marker ? decodeSnapshotAttr(marker.getAttribute("data-after-html")) : null;
   const currentHtml = host.outerHTML;
   const beforeSnapshot = edit.before_html || embeddedBefore;
   const afterSnapshot = edit.after_html || embeddedAfter || currentHtml;
   const snapshot = restoring ? afterSnapshot : beforeSnapshot;
   if (!snapshot) {
-    throw new Error(
-      restoring
-        ? "缺少“修改后”快照，无法恢复"
-        : "缺少“修改前”快照，无法撤销",
-    );
+    throw new Error(restoring ? "缺少“修改后”快照，无法恢复" : "缺少“修改前”快照，无法撤销");
   }
   const wrap = doc.createElement("div");
   wrap.innerHTML = snapshot;
