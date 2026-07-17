@@ -1,7 +1,25 @@
 # Plantspedia — Working State  (single source of truth)
 
-_Last updated: 2026-07-17 — by Claude (续7：分享卡版式 + 补拍计数缓存根因 + 非视觉建议过滤；tsc=0，⚠️ NOT deployed)_
+_Last updated: 2026-07-17 — by Claude (续7：分享卡版式 + 补拍计数缓存根因 + 非视觉建议过滤；tsc=0，✅ 已部署 d6267774)_
 _Read this FIRST and update it LAST, every session._
+
+## ✅ 2026-07-17 部署记录（版本 d6267774-bb9e-4570-b167-1d07ef80fde9）
+- **已上线**：续7 全部 5 项 + **前几次会话积压的全部改动**（续2~续6）。两个 commit：
+  `be87c76`（续7）+ `c717d5b`（积压收尾）。部署前工作区已清空 → 线上 = main。
+- **顺带修好的线上问题**：`wrangler.jsonc` 的 `AI_MODEL` 之前一直是本地未提交状态，
+  这次才真正上线为 `gemini-3-flash-preview`（线上此前跑的仍是旧配置）。
+- **⚠️ 部署第一次失败**：assets 传完（60 files），最后创建 Worker 版本那步 `fetch failed`
+  （GFW 掐流，见 memory）。**关键教训：那次失败后线上仍是旧版**——用
+  `wrangler deployments list` 对时间戳确认，别看 "Uploaded 60 files" 就以为成了。
+  第 2 次重试成功（161s）。apex 域名 curl 偶发 000 也是同一网络问题，重试即 200。
+- **已实测**：线上 `plantspedia.club/identify?retake=2` 截图确认双按钮 / 无取景框 /
+  不自动弹相机 / 「摸一摸」条被滤掉并重编号 / 「第二次补拍」文案 ✅。
+- **仍未验证（上线了但没测过）**：
+  1. **补拍计数修复**（续7 #1）——需真机补拍一次确认「本轮铜叶 +2」「第二次补拍」。
+  2. **积压里 /profile 与 /admin 那批**（新建入口、目录就地编辑、项目海报必填）——
+     需登录，从未实测，现已直接面向用户。
+  3. migration `20260716140000_conservation_lists_created_by.sql` **仍未应用**
+     （需 dashboard 手动跑；不影响当前行为：11 份名录 created_by 全 NULL、且无 UI 新建）。
 
 ## 🚧 2026-07-17 (续7) — 用户 5 项（tsc=0；/identify + 分享卡 canvas 已实测）
 1. **🐛 根因：补拍后「本轮铜叶 +N」和补拍计数全都倒回上一轮** —— 这是用户点名的两项
