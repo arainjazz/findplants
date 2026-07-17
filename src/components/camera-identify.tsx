@@ -1,7 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 import { useServerFn } from "@tanstack/react-start";
 import { useNavigate } from "@tanstack/react-router";
+import { useQueryClient } from "@tanstack/react-query";
 import { quickIdentifyDraft } from "@/lib/identify-plant.functions";
+import { keepVisualAdvice } from "@/lib/retake-advice";
 import { useAuth } from "@/hooks/use-auth";
 import { toast } from "sonner";
 
@@ -16,8 +18,17 @@ const LOADING_STEPS = [
 ];
 
 /** 补拍复核上下文：从草稿页「去补拍」带来，count=本次是第几次补拍（≥3 服务端强制出结论）。
- *  advice=首次识别给出的「需要补拍哪些部位」具体建议（needs_more_photos_zh）。 */
-export type RetakeContext = { count: number; title?: string; sci?: string; advice?: string; mergeDraftId?: string };
+ *  advice=首次识别给出的「需要补拍哪些部位」具体建议（needs_more_photos_zh）。
+ *  pick=true 时不自动弹相机，让用户在「打开相机」和「选择相册图片」之间自己选
+ *  （走「草稿内容和我的观察不符」进来的场景——用户手里可能已经有更合适的照片了）。 */
+export type RetakeContext = {
+  count: number;
+  title?: string;
+  sci?: string;
+  advice?: string;
+  mergeDraftId?: string;
+  pick?: boolean;
+};
 
 // Ordinal label for the retake counter. 3 is the last allowed retake (server forces
 // a final result at count ≥ 3), so it reads「最后一次补拍」.
@@ -28,6 +39,9 @@ function retakeOrdinal(count: number): string {
 
 export function CameraIdentify({ retake: retakeCtx = null }: { retake?: RetakeContext | null } = {}) {
   const retakeMode = !!retakeCtx;
+  // 上一轮的补拍建议，滤掉「摸一摸 / 闻一闻」这类拍不出来的条目：库里的旧草稿存的还是
+  // prompt 加禁令之前的文案，照搬出来只会让用户白跑一趟（他们只能回传照片）。
+  const visualAdvice = keepVisualAdvice(retakeCtx?.advice);
   const { user } = useAuth(); // 获取当前登录用户
   const [phase, setPhase] = useState<Phase>("idle");
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
@@ -55,11 +69,16 @@ export function CameraIdentify({ retake: retakeCtx = null }: { retake?: RetakeCo
   // permission) — reading EXIF needs no permission prompt.
   const exifCoordsRef = useRef<{ lat: number; lng: number } | null>(null);
   const navigate = useNavigate();
+  const qc = useQueryClient();
   const submit = useServerFn(quickIdentifyDraft);
   // The user's ORIGINAL (uncompressed) file — kept so "保存原图到相册" saves the good
   // copy. A web-camera capture is NOT auto-saved to the iPhone album, so this button
   // is the user's escape hatch to keep the shot (re-identify later from good signal).
   const originalFileRef = useRef<File | null>(null);
+
+  // 补拍等待选照片时，取景框和快门整块藏起来：横幅上已经给了「打开相机 / 上传相册」两个
+  // 按钮，下面再摆一个可点的取景框+快门，用户就得猜该点哪个。选完照片后照常显示预览。
+  const hideViewfinder = retakeMode && phase === "idle";
 
   useEffect(() => {
     return () => {
@@ -198,18 +217,10 @@ export function CameraIdentify({ retake: retakeCtx = null }: { retake?: RetakeCo
     };
   }, []);
 
-  // Retake mode: opening from the draft page's「去补拍」lands here to re-shoot the
-  // SAME plant. Auto-open the camera immediately (the tap that navigated here still
-  // counts as transient user activation on a client-side route change, so the picker
-  // usually opens with no extra tap; if the browser blocks it, the prominent「打开相机
-  // 补拍」button below is the one-tap fallback).
-  const autoOpenRef = useRef(false);
-  useEffect(() => {
-    if (!retakeMode || autoOpenRef.current) return;
-    autoOpenRef.current = true;
-    openCamera();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [retakeMode]);
+  // 补拍模式下**不自动弹相机**：用户手里可能已经有更合适的照片了，相机弹出来会盖住
+  // 「打开相机补拍 / 上传相册补拍」这两个按钮，等于替用户做了选择。两个入口一起摆出来、
+  // 由用户点，是这里唯一的进入方式。（RetakeContext.pick 因此不再影响行为，保留只为兼容
+  // 已发出去的 /identify?pick=1 链接。）
 
   // Retake mode: once a shot is captured, go straight into identification (no manual
   // "AI识别" tap). Reset on each retake so every re-shot auto-identifies.
@@ -411,6 +422,15 @@ export function CameraIdentify({ retake: retakeCtx = null }: { retake?: RetakeCo
       });
       toast.success("已生成简介摘要卡，正在跳转…");
       const newId = (res as { draftId: string }).draftId;
+
+      // 补拍合并回同一份草稿时，/drafts/$id 会命中 React Query 缓存（staleTime=5min、
+      // 不 refetchOnWindowFocus）→ 页面渲染的是**补拍前**的旧草稿：retake_count 还是 0、
+      // ai_payload 还是上一轮的「疑似」。分享卡是 draft 一到就自动生成的，于是「本轮铜叶 +N」
+      // 按 N=1 画出去、关卡后的补拍横幅也倒回「第一次补拍」。必须先把缓存丢掉，让页面拿新数据。
+      // leaves 同理：本轮铜叶刚变，叶章统计不能用旧值。
+      qc.removeQueries({ queryKey: ["draft", newId] });
+      if (user?.id) qc.removeQueries({ queryKey: ["leaves", user.id] });
+
       // Signal the draft page to auto-open the share card as the first screen.
       try {
         sessionStorage.setItem("plantspedia:justIdentified", newId);
@@ -442,29 +462,42 @@ export function CameraIdentify({ retake: retakeCtx = null }: { retake?: RetakeCo
           <p className="text-sm font-semibold text-amber-700 leading-snug">
             正在补拍复核{retakeCtx?.title ? `「${retakeCtx.title}」` : ""}（{retakeOrdinal(retakeCtx?.count ?? 1)}）
           </p>
-          {retakeCtx?.advice?.trim() && (
+          {visualAdvice && (
             <div className="text-left mx-auto max-w-[300px] rounded-lg bg-background/60 border border-amber-500/25 px-2.5 py-2">
               <p className="text-[11px] font-semibold text-amber-700 mb-0.5">上次识别建议补拍：</p>
-              <p className="text-[11px] text-ink-soft leading-relaxed whitespace-pre-line">{retakeCtx.advice}</p>
+              <p className="text-[11px] text-ink-soft leading-relaxed whitespace-pre-line">{visualAdvice}</p>
             </div>
           )}
           <p className="text-[11px] text-ink-faint leading-relaxed">
-            请对准<strong>同一株植物</strong>按上面建议补拍更清晰的照片，<strong>尽量不要同时拍到多种植物</strong>，拍完会自动重新识别。
+            请对准<strong>同一株植物</strong>按上面建议补拍更清晰的照片，<strong>尽量不要同时拍到多种植物</strong>，选好照片后会自动重新识别。
             {(retakeCtx?.count ?? 0) >= 3 && "本次为第 3 次补拍，将直接给出最终结论。"}
           </p>
-          <button
-            onClick={openCamera}
-            className="inline-flex items-center gap-1.5 bg-amber-600 text-background px-5 py-2 text-sm font-semibold rounded-full hover:bg-amber-500 transition-colors cursor-pointer"
-          >
-            <CameraIcon className="w-4 h-4" />
-            打开相机补拍
-          </button>
+          {/* 补拍的**唯一**两个入口：现拍 or 用相册里已有的照片。两条路都走同一个 onSubmit，
+              都按 retakeCtx.count 记作这一次补拍（次数来自上下文，与照片来源无关）。
+              下面的取景框在补拍时是藏起来的 —— 两处都能点会让人不知道该点哪个。 */}
+          <div className="flex flex-col gap-2 pt-0.5">
+            <button
+              onClick={openCamera}
+              className="inline-flex items-center justify-center gap-1.5 bg-amber-600 text-background px-5 py-2.5 text-sm font-semibold rounded-full hover:bg-amber-500 transition-colors cursor-pointer"
+            >
+              <CameraIcon className="w-4 h-4" />
+              打开相机补拍
+            </button>
+            <button
+              onClick={openAlbum}
+              className="inline-flex items-center justify-center gap-1.5 border border-amber-600 text-amber-700 px-5 py-2.5 text-sm font-semibold rounded-full hover:bg-amber-600 hover:text-background transition-colors cursor-pointer"
+            >
+              <GalleryIcon className="w-4 h-4" />
+              上传相册补拍
+            </button>
+          </div>
+          <p className="text-[10px] text-ink-faint">两种方式都记作一次补拍（{retakeOrdinal(retakeCtx?.count ?? 1)}）</p>
         </div>
       )}
 
       {/* 1. Viewfinder area — outer centers the frame so a portrait shot stays
           centred; the inner frame's border hugs the real image 画幅. */}
-      <div className="w-full flex justify-center">
+      <div className={`w-full flex justify-center ${hideViewfinder ? "hidden" : ""}`}>
       <div
         className="scanner-view rounded-2xl relative overflow-hidden bg-background border border-rule/35 shadow-inner"
         style={frameStyle(phase, imgAspect)}
@@ -651,8 +684,9 @@ export function CameraIdentify({ retake: retakeCtx = null }: { retake?: RetakeCo
         </div>
       )}
 
-      {/* 2. Control bar */}
-      <div className="mt-4 pt-2">
+      {/* 2. Control bar — hidden alongside the viewfinder while a retake is waiting for
+          a photo (the two banner buttons are the only entry point then). */}
+      <div className={`mt-4 pt-2 ${hideViewfinder ? "hidden" : ""}`}>
         {phase === "idle" ? (
           <div className="flex items-center justify-between px-6">
             {/* Gallery Upload Button */}

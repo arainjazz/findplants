@@ -1,7 +1,138 @@
 # Plantspedia — Working State  (single source of truth)
 
-_Last updated: 2026-07-16 — by Claude (续3：杂交学名归一化 DONE + ✅ 已部署，(续2) 5 项一并上线)_
+_Last updated: 2026-07-17 — by Claude (续7：分享卡版式 + 补拍计数缓存根因 + 非视觉建议过滤；tsc=0，⚠️ NOT deployed)_
 _Read this FIRST and update it LAST, every session._
+
+## 🚧 2026-07-17 (续7) — 用户 5 项（tsc=0；/identify + 分享卡 canvas 已实测）
+1. **🐛 根因：补拍后「本轮铜叶 +N」和补拍计数全都倒回上一轮** —— 这是用户点名的两项
+   （「n 的统计一定要对」「关闭分享卡后补拍计数一定要准确」）的**同一个原因**：
+   [router.tsx:9](src/router.tsx:9) 设了 `staleTime: 5min` + `refetchOnWindowFocus: false`。
+   补拍是**合并回同一份草稿**（merge_draft_id）→ 跳回 `/drafts/$id` 时 query key `["draft", id]`
+   **命中缓存、根本不 refetch** → 页面拿到的是补拍前的旧草稿（`retake_count` 还是 0、ai_payload
+   还是上一轮的「疑似」）。分享卡是 draft 一到就自动生成的，于是按 N=1 画出去，关卡后的补拍
+   横幅也倒回「第一次补拍」。
+   - **改法**（[camera-identify.tsx](src/components/camera-identify.tsx) `onSubmit`）：跳转前
+     `qc.removeQueries(["draft", newId])` + `removeQueries(["leaves", uid])`。用 remove 不用
+     invalidate：invalidate 仍会先渲染旧数据再刷新，分享卡照样会用旧值画一次。
+   - **⚠️ 未端到端实测**：跑通需真识别（Gemini key + 相机）。根因是从 staleTime 配置推出来的，
+     计数公式本身（`earned = tentative ? 1 : 1 + retake_count`）与服务端 `identifyBronze` 一致，
+     早就是对的 —— **错的是喂给它的数据**。建议用户真机补拍一次确认。
+2. **✅ 分享卡版式**（[share-card.ts](src/lib/share-card.ts)）：头像 80→**120**（+50%）；
+   「X 发现了一种新植物」与「本轮铜叶+N / 叶章统计」行距 38→**54**；**摘要改为居中坐在
+   发现者区与页尾分割线之间、上下留白等距**（不再是「接着往下排」）。
+   - **实测**：浏览器里真跑 `renderShareCard`，把 PNG 画回 canvas **逐行扫描量白** →
+     摘要上方 98px / 下方 95px（3px 来自字高估算，肉眼无感）✅。已测「疑似+访客+短摘要」
+     与「正常+登录+长摘要」两种版面 ✅（已截图）。
+   - **⚠️ 排版是「两头钉死、照片吸收余量」**：页尾固定、摘要按行数预留、照片吃剩余空间
+     （420 下限）。**改任一块高度都要同步 `photoBudget`**，否则摘要会被挤掉。
+3. **✅ 补拍不再自动弹相机 + 取景框藏起来**：用户原话「目前的设计容易让人困惑不知道该点哪里」。
+   横幅给**两个按钮**（打开相机补拍 / 上传相册补拍，竖排），`hideViewfinder = retakeMode &&
+   phase==="idle"` 把取景框+快门整块藏掉；选完照片后照常显示预览。
+   - **自动弹相机的逻辑整个删掉了**（原来只有 `pick=1` 才不弹）—— 弹出来会盖住那两个按钮，
+     等于替用户做了选择。`RetakeContext.pick` 现在**不再影响行为**，保留只为兼容已发出的链接。
+4. **✅ 非视觉补拍建议（摸一摸 / 闻一闻）双端拦截**：新建
+   [retake-advice.ts](src/lib/retake-advice.ts)（生成端与展示端**同源**）。
+   - prompt 两处（快速识别 + 完整草稿）都加了硬性禁令；但 prompt 会漂 → 再加确定性过滤
+     `keepVisualAdvice()`：按 ①②③ 拆条、整条丢掉非视觉的、**重编号**（否则留下「① …；④ …」
+     的窟窿序号，看着像 bug）。
+   - **展示端也过一遍**（草稿页横幅 + /identify 建议框）：**库里的旧草稿仍存着旧文案**，
+     只改 prompt 管不到它们。
+   - **🐛 差点踩的坑（已实测发现并修）**：`尝` 会误杀「**尝试**换个角度拍」这类正当建议 →
+     改 `尝(?!试)`；末条被丢掉后前一条的「；」会孤零零留在结尾 → 一并收掉。
+     浏览器里对 8 个用例逐个验过 ✅。
+- **验证**：tsc=0 ✅；lint 改动文件**无新增**（camera-identify 115 = 改前基线，share-card /
+  drafts.$id / retake-advice 均 0）。`/identify?retake=1|2|3` 浏览器实测：双按钮 ✅、取景框不出现 ✅、
+  相机没自动弹 ✅、第一次/第二次/最后一次补拍文案 ✅、「摸一摸」条被滤掉且重编号为 ①② ✅；
+  普通 `/identify`（非补拍）取景框+快门照常 ✅（均已截图）。
+- **未验证**：真机补拍端到端（见 #1）、/drafts/$id 需登录 + 真草稿。
+
+## 🚧 2026-07-16 (续6) — 用户 4 项（tsc=0；/identify + 分享逻辑已实测）
+1. **✅ 项目封面海报改为「仅发布必填」**（用户 AskUserQuestion 明确选了「草稿可空」）：
+   `requiredMissing(publish)` —— 只有 publish 才校验 cover，按钮文案改「+ 添加封面海报（发布必填）」。
+2. **✅ 保护名录删除按编辑归属**（新 migration
+   [20260716140000_conservation_lists_created_by.sql](supabase/migrations/20260716140000_conservation_lists_created_by.sql)）：
+   `conservation_lists` 加 `created_by`；RLS 保留 admin(owner) 全权 + 新增「created_by = auth.uid()」策略。
+   前端 `canDeleteConsList(l) = isAdmin || l.created_by === user.id`，与 RLS 同源。
+   - **⚠️ 必须手动应用**（hosted 项目、无本地 CLI → dashboard 跑 SQL）。types.ts 已手改加 created_by。
+   - **📌 现实约束**：现有 11 份名录都是播种的、`created_by` 为 NULL → **实际仍只有 admin 能删**。
+     且**目前没有任何 UI 能新建保护名录** → 归属策略暂时是「为将来预留」，不是马上可见的行为变化。
+3. **✅ 分享卡同时带图 + 链接**（[share-card.ts](src/lib/share-card.ts) `shareOrSaveImage`）：
+   - **根因（(续2)#1 的修复没覆盖到的情形）**：旧码只在平台**当场拒绝** payload 时才把链接折进 text。
+     但微信/小红书/短信/邮箱是**接收端静默吞掉 `url`、share() 照样 resolve** → 检测不到、也无从回退。
+   - **改法**：链接**同时**放 `url` 和 caption text（故意重复）。裸 URL 在 caption 里能活下来，
+     这些 App 都会自动转链接。代价：认 `url` 的目标会看到链接出现两次。另加剪贴板兜底 + toast 文案。
+   - **实测**（浏览器内 stub navigator.share/canShare，真跑 share-card.ts）：A 全放行→url 字段 ✅
+     且链接在 text 里 ✅；B 拒绝 url→链接仍在 text ✅；C 用户取消→cancelled、不误落下载 ✅。
+   - **⚠️ 仍无法验证**：微信/小红书**真机上到底会不会连 caption 一起吞**——那是它们分享扩展的行为，
+     站方控制不了。这次是「最大化命中率 + 剪贴板兜底」，不是保证。
+4. **✅ AI 草稿岔路口 + 补拍双入口**：
+   - **前提澄清**：草稿**本来就不会自动进待审批**（`submitted_for_review` 才是闸门，drafts.$id.tsx:340）。
+     所以这项实质是「把另一条岔路补上」。
+   - [drafts.$id.tsx](src/routes/drafts.$id.tsx)：简介卡下方从单按钮改为两个——「保存为待审批草稿」
+     +「草稿内容和我的观察不符」（→ /identify?retake=N&md=id&**pick=1**）。**对每份草稿都给**，
+     不像上面的补拍横幅只在 AI 自称「疑似」时出现（AI 笃定却认错，恰恰最该让用户纠正）。3 次上限同源。
+   - [camera-identify.tsx](src/components/camera-identify.tsx)：补拍横幅加第二个按钮
+     「选择相册图片补充判断」（复用既有 `openAlbum` + `GalleryIcon`）。**两条路都走同一个 onSubmit、
+     retake_count 取自 retakeCtx → 天然都记一次补拍**，无需额外改动。
+   - **新 search 参数 `pick=1`**：不自动弹相机（否则相机会盖住那两个按钮）。**「按提示去补拍」老路径
+     不带 pick → 仍自动弹相机**，保持原有少一次点击的体验；两条路径的横幅都有双按钮。
+- **验证**：tsc=0 ✅；lint 改动文件**无新增**（camera-identify 113 / project-editor 13 是 HEAD 既有
+  prettier 噪音，改前改后一致；其余改动文件 0）。`/identify?retake=1&pick=1` **浏览器实测**：
+  双按钮 + 建议框 + 「两种方式都记作一次补拍（第一次补拍）」+ **相机没有自动弹** ✅（已截图）；
+  `retake=3` 无 pick → 双按钮 + 「最后一次补拍」文案 ✅。
+- **未验证**：/drafts/$id 岔路口（需真草稿 + 登录）、真机分享到微信/小红书、migration 未应用。
+
+## 🚧 2026-07-16 (续5) — 用户 6 项（tsc=0；/blog 已实测，登录后的页面未测）
+1. **✅ 导航「编辑内容」→「添加/编辑内容」**（site-header ×2 + admin h1）。
+2. **✅ 导航「编辑博客」→「博客 blogs」**（site-header ×2）。**顺带同步了 /blog 的 h1 与 meta title**
+   ——用户只点名导航，但「编辑博客」在标题位读作动词，留着会和导航打架。
+3. **✅ /blog 按编辑姓名归类**（[blog.index.tsx](src/routes/blog.index.tsx)）：`author_name` 分组，
+   组内保持原时间倒序；**组的排序用「篇数多的在前、同数按姓名」**，不用最新发文时间——否则每发一篇
+   列表顺序就跳。条目里的作者名删掉了（已是分组标题，否则同名重复一遍）。
+4. **✅ 我的主页每栏加「+ 新建」入口**（[profile.tsx](src/routes/profile.tsx)）：博文→写新博文、
+   项目→发布新项目、skill→上传新的 skill 条目、地方目录→新增地方目录、tag→+ 新 tag 标签。
+   - **⚠️ 结构改动**：`WorksSection` 的表头原本整行是一个 `<button>`；按钮不能嵌套按钮 →
+     改成 `<div>` 包「折叠 button（flex-1）+ action」。加新栏时别把 action 塞回 button 里。
+5. **✅ 地方目录就地增删改**：把 admin 的 `CatalogRow` **抽成共享组件**
+   [catalog-row.tsx](src/components/catalog-row.tsx)，profile 与 admin 同用（展开→删条目/追加）。
+   - **🐛 顺手修掉一个潜伏 bug**：profile 和 admin **共用 query key `["my-catalogs", uid]`
+     但返回两种不同形状**（profile 返回裸 `RegionalCatalog[]`，admin 返回带 `count`/`entryNames` 的）。
+     谁先加载谁决定缓存 → 若 profile 先跑，admin 的 `c.entryNames.filter` 会 **throw**（白屏）。
+     已统一抽成 `catalogs.ts → fetchMyCatalogs(uid)`（`MyCatalog` 类型），两处同源。
+6. **✅ 项目封面改必填**（[project-editor.tsx](src/components/project-editor.tsx)）：
+   「+ 添加封面图（可选）」→「+ 添加封面海报（必填）」，`requiredMissing()` 加 cover 校验
+   （紧跟标题之后）。**注意：`save()` 存草稿也走 requiredMissing** → 存草稿现在同样要求海报，
+   与既有的时间/地点/主题/发起人必填行为一致。
+- **验证**：`tsc --noEmit` = 0 ✅；`/blog` **浏览器实测**：标题「博客 blogs」、导航「博客 blogs」、
+  按作者「吉木 2 篇」分组、条目只剩日期 ✅（已截图）。**库里目前只有 1 位作者** → 多组排序未获真实数据验证。
+  **未测**：/profile 与 /admin 都要登录，Claude 不能代输密码 → 新建入口、CatalogRow 就地编辑、
+  项目海报必填**均需用户自测**。
+
+## 🚧 2026-07-16 (续4) — 编辑台（/admin）改版（tsc=0；⚠️ 未部署、未登录实测）
+用户一次提 5 项，全部落在 [admin.index.tsx](src/routes/_authenticated/admin.index.tsx) +
+[site-header.tsx](src/components/site-header.tsx)：
+1. **✅ 导航「添加新内容」→「编辑内容」**（site-header 桌面版 + 移动菜单各一处；admin 页 h1 同步）。
+2. **✅「条目列表」→「内容列表」**。
+3. **✅ 国家重点 / 地方保护目录并入「地区植物目录」栏**：这两类**不在** `regional_catalogs` 里，
+   而是 `conservation_lists` 里 `kind='protected'` 的行（国家2021 + 内蒙古/海南/云南/四川/广东/贵州/福建）。
+   新增 `ConservationListRow`（可展开读物种、按 `protectedListRank` 国家在前）。数据走既有
+   query key `["conservation-data"]` → 全站只拉一次、吃缓存。
+4. **✅ 新栏「国际生物多样性保护」** = `conservation_lists` 里 CITES / GRIIS / GTS 三份；
+   类别下拉同步加 `global` 选项。
+5. **✅ 所有栏默认折叠**：`CollapsibleSection` 初始 `open=false`，新增 `autoOpen`（关键词在该栏
+   命中才展开）+ `scrollTo`（第一个命中栏 `scrollIntoView`）；清空搜索会重新折叠。
+- **⚠️ 删除权限的既有约束（用户要求「添加这些目录的编辑也可以在这里删除」→ 只能做到 admin）**：
+  `conservation_lists` **没有 `created_by` 列**，名录是 migration 播种的、**不存在「添加它的编辑」**；
+  且 RLS 是 `Admins manage conservation lists`（admin-only 写）。故删除按钮 `canDelete={isAdmin}`。
+  若要按编辑归属，需先加 `created_by` 列 + 改 RLS（**已向用户提出，待答复**）。
+- **删除语义**：删名录 = 删 `conservation_lists` 行，`conservation_taxa` 有 ON DELETE CASCADE
+  → 物种行一并没；confirm 文案已写明「全站卡签与检索都会失去该名录」。
+- **渲染上限**：国家（2021）单份 ~1000 taxa → 展开只画前 `CONS_ROW_CAP=200` 条并提示总数；
+  有关键词时展开视图**只列命中的**物种（否则命中项被埋）。名录是播种参考数据 → 展开视图**只读**
+  （不像 regional_catalogs 那样能逐条删/追加）。
+- **验证到哪一步**：`tsc --noEmit` = 0 ✅；vite 转译该路由模块 200、console 0 error ✅。
+  **未做**：/admin 是 `_authenticated`，需登录才能看，Claude 不能代输密码 → **UI 未实测**，
+  需用户自己登录后核对（尤其：折叠/搜索跳转、保护名录行、删除按钮可见性）。
 
 ## 🚀 2026-07-16 部署记录 — Version `9aa87f8e-1378-4efd-807e-21a8f4514d2b`
 **本次部署把 (续2) 的 5 项优化一并送上线**（它们此前标 NOT deployed）——因为 `npm run build`
