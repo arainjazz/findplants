@@ -284,7 +284,9 @@ export function CameraIdentify({ retake: retakeCtx = null }: { retake?: RetakeCo
     let url: string;
     try {
       const { compressImage } = await import("@/lib/image-compress");
-      const compressed = await compressImage(file, 1200, 1200, 0.75);
+      // 必须输出 JPEG：Pl@ntNet 只收 JPEG/PNG，压成默认的 WebP 会被它 400 拒收，
+      // 导致专业定种整条链路静默失效（用量表里只剩 gemini）。体积让位于可识别性。
+      const compressed = await compressImage(file, 1200, 1200, 0.75, "image/jpeg");
       capturedBlobRef.current = compressed;
       if (previewUrl) URL.revokeObjectURL(previewUrl);
       url = URL.createObjectURL(compressed);
