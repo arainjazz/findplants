@@ -1,7 +1,56 @@
 # Plantspedia — Working State  (single source of truth)
 
-_Last updated: 2026-07-17 — by Claude (续7：分享卡版式 + 补拍计数缓存根因 + 非视觉建议过滤；tsc=0，✅ 已部署 d6267774)_
+_Last updated: 2026-07-18 — by Claude (续8：分享卡去名录标签 + 疑似关卡跳补拍 + 不符按钮移到enrich后 + enrich自动提交 + 星号清洗；tsc=0，✅ 已部署 6e9a105c + SQL已跑）_
 _Read this FIRST and update it LAST, every session._
+
+## ✅ 2026-07-18 部署 + SQL 记录（版本 6e9a105c-59a5-44b9-a0a3-6f66708edfe5）
+- **已上线**：续8 全部 5 项（分享卡去名录标签 / 疑似关卡跳补拍 / 不符按钮移到enrich后 /
+  enrich自动提交 / 星号清洗写入端+读取端）。
+- **SQL 已跑**（用户在 Dashboard 执行 [scratch/cleanup_markdown_and_stuck_drafts.sql](scratch/cleanup_markdown_and_stuck_drafts.sql)，
+  报 Success）：存量 plant_drafts/plants 字段星号已清、正文 `*Latin*`→`<em>`、2 份卡死草稿
+  （高山榕/圆果黄耆）已补 submitted_for_review=true 进队列。→ 队列/地图/审批复制等所有面现已一致。
+- **⚠️ 部署仍是第一次 fetch failed、第二次成功**（GFW 老问题，见 [[deploy-workflow]]）。照例用
+  deployments list 对时间戳确认第一次真没上（还停在 07-17T06:44），别看输出想当然。
+- **线上实测**：plantspedia.club 韭菜草稿页确认 `葱属 Allium` / `Allium tuberosum…` 无星号 ✅
+  （读的是刚跑完 SQL 的库，字段本身也干净了）。
+- **仍未验证**：真机 enrich 端到端（确认新 enrich 自动进队列）—— 需登录+花银叶，留给用户。
+
+## 🚧 2026-07-18 (续8) — 用户 3 项 + 2 个连带修复（tsc=0；真实草稿已实测；⚠️ 未部署）
+全部落在 [drafts.$id.tsx](src/routes/drafts.$id.tsx) + [identify-plant.functions.ts](src/lib/identify-plant.functions.ts)
++ 新建 [strip-markdown.ts](src/lib/strip-markdown.ts) + [drafts.ts](src/lib/drafts.ts)/[plants.ts](src/lib/plants.ts) 读取端。
+1. **✅ 识别分享卡不再印名录卡签**：`onMakeCard` 里**删掉 `chips: registryChipList`**。
+   理由（用户）：卡签按物种匹配名录，但一次识别只知道「照片里可能是什么」——内蒙古拍到的未必是
+   内蒙古野生植物，可能是园艺栽培/花店盆栽；疑似时连种都没定。印在会转发出去的卡上=替用户断言。
+   **只动识别卡**；/plants 详情页的分享卡仍留卡签（那里物种确定、编辑审过）。
+2. **✅ 疑似关卡直接跳补拍**：新增 `cardAutoOpened` state（仅「识别完自动弹的卡」为 true，
+   用户事后手点「生成分享卡」不算）。`jumpToRetakeOnClose = cardAutoOpened && draftTentative &&
+   retakeCount<3`。`closeCard` 里若命中就 `navigate` 去 `/identify?retake&…&pick=1`（补拍建议+两种方式）。
+   卡上加预告文案 + 「关闭」按钮变「去补拍」，避免点关闭却被莫名甩走。**真实草稿 c1583858 端到端实测**：
+   关卡→直接进补拍界面、带真实建议、第一次补拍、双按钮 ✅。
+3. **✅「草稿内容和我的观察不符」从简介卡移到 enrich 后**：拆成两个 section——`notEnriched` 只留
+   「保存为待审批草稿」；`!notEnriched && !submittedForReview` 才出「不符」按钮。理由（用户）：快速简介卡
+   只有几行，用户无从判断「符不符」，得先点「让AI生成进一步草稿」看到成篇内容才有依据。文案改「读下面的
+   完整草稿时…」。**实测**：未enrich草稿(韭菜)只有保存按钮 ✅；已enrich(圆果黄耆)才出不符按钮 ✅。
+4. **✅（连带修复 A）enrich 自动进待审队列**：[identify-plant.functions.ts](src/lib/identify-plant.functions.ts)
+   enrichDraft 的 update 加 `submitted_for_review: true`。**根因**：UI 一直承诺 enrich 后「自动进入
+   待审批草稿库」，但只有「保存为待审批」按钮翻这字段、而它 enrich 后就消失 → **enrich 过的草稿永远
+   进不了队列，用户白花 1 枚银叶**。真实数据里已有 **2 份卡死**（高山榕/圆果黄耆，status=pending 但
+   submitted_for_review=false）。此改只管**未来** enrich；存量 2 份要跑 SQL（见下）。
+5. **✅（连带修复 B）markdown 星号清洗**：模型把 `*Allium tuberosum*`（学名字段）、`葱属 *Allium*`
+   （属字段）、正文里的 `*Ficus lyrata*` 全写成字面星号。真实污染面：**22/43 草稿字段脏 + 8/8 已enrich
+   草稿正文脏 + 2 物种字段 + 摘要若干**。
+   - 新建 [strip-markdown.ts](src/lib/strip-markdown.ts)：`stripInlineMarkdown`（字段去 `* _ ``）/
+     `stripMetaMarkdown`（批量清一个 AiMeta）/`markdownEmphasisToHtml`（正文 `*Latin*`→`<em>`，拉丁名本就斜体）。
+   - **写入端**：quick 路径 `normalizeIdentification` 开头 + full 路径 `buildDraftContent`（callAiIdentify 后
+     清字段、renderDraftHtml 后转 `<em>`）。**读取端防御**：`fetchDraftById` + `fetchPlantBySlug` 就地清
+     存量脏数据（详情页+分享卡立即干净，**无需迁移**）。
+   - **11 个边界用例浏览器实测全过**：杂交号 `×`/乘号 `3 * 4`/`**加粗**` 都不误伤；圆果黄耆正文 13 处
+     `*Astragalus*`→`<em>` ✅、字段星号清零 ✅；韭菜卡片 `Allium tuberosum` 无星号 ✅。
+- **⚠️ 需用户在 Dashboard 跑 SQL**（读取端只清了详情页/分享卡两个面；队列/地图/审批复制 draft→plant
+  仍读原始 DB）：[scratch/cleanup_markdown_and_stuck_drafts.sql](scratch/cleanup_markdown_and_stuck_drafts.sql)
+  —— 洗 plant_drafts/plants 字段 + 正文 `*Latin*`→`<em>` + 补救 2 份卡死草稿。幂等，可先跑 SELECT 看影响面。
+- **验证**：tsc=0 ✅；lint 改动文件**无新增**（drafts.ts 8 / plants.ts 18 = HEAD 既有基线；strip-markdown 0）。
+- **未验证 / 待办**：真机 enrich 端到端（确认自动进队列）；SQL 未跑；本轮**未部署**。
 
 ## ✅ 2026-07-17 部署记录（版本 d6267774-bb9e-4570-b167-1d07ef80fde9）
 - **已上线**：续7 全部 5 项 + **前几次会话积压的全部改动**（续2~续6）。两个 commit：

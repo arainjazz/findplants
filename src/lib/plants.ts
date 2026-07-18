@@ -1,4 +1,5 @@
 import { supabase } from "@/integrations/supabase/client";
+import { stripInlineMarkdown } from "./strip-markdown";
 
 export type Plant = {
   id: string;
@@ -121,7 +122,19 @@ export async function fetchPlantBySlug(slug: string) {
     .eq("slug", slug)
     .maybeSingle();
   if (error) throw error;
-  return data as Plant | null;
+  if (!data) return null;
+  // 存量数据里少数 plants 的学名/属名/摘要仍带模型写进去的 markdown 星号（`*Sonchus*`）。
+  // 这些字段当纯文本渲染，读取时就地去掉。html_url 指向的是编辑发布的正式页面，不动。
+  const p = data as Plant;
+  const s = (v: string | null) => (v == null ? v : stripInlineMarkdown(v));
+  p.title = stripInlineMarkdown(p.title);
+  p.scientific_name = s(p.scientific_name);
+  p.common_name_en = s(p.common_name_en);
+  p.common_names_zh = s(p.common_names_zh);
+  p.family = s(p.family);
+  p.genus = s(p.genus);
+  p.summary = s(p.summary);
+  return p;
 }
 
 export async function fetchAuthor(authorId: string) {

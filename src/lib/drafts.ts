@@ -1,4 +1,30 @@
 import { supabase } from "@/integrations/supabase/client";
+import { stripInlineMarkdown, markdownEmphasisToHtml } from "./strip-markdown";
+
+/**
+ * 防御性清洗：库里**已有**的草稿字段仍带着模型写进去的 markdown（`*Allium*`、正文里的
+ * `*Ficus lyrata*`）。写入端已修，但存量数据只能在读取时就地清 —— 纯文本字段去星号，
+ * 正文 HTML 里的 `*Latin*` 转 <em>。新识别的草稿本就干净，再清一遍是幂等的。
+ */
+function cleanDraftForDisplay(d: PlantDraft): PlantDraft {
+  const s = (v: string | null | undefined) => (v == null ? v : stripInlineMarkdown(v));
+  d.title = stripInlineMarkdown(d.title);
+  d.scientific_name = s(d.scientific_name) ?? null;
+  d.family = s(d.family) ?? null;
+  d.genus = s(d.genus) ?? null;
+  d.common_name_en = s(d.common_name_en) ?? null;
+  d.common_names_zh = s(d.common_names_zh);
+  d.summary = s(d.summary) ?? null;
+  if (d.html_content) d.html_content = markdownEmphasisToHtml(d.html_content);
+  // 分享卡会在顶层列为空时回落到 ai_payload 的镜像字段，一并清掉。
+  const p = d.ai_payload as Record<string, unknown> | null | undefined;
+  if (p && typeof p === "object") {
+    for (const k of ["scientific_name", "family", "genus", "common_names_zh", "summary_zh"]) {
+      if (typeof p[k] === "string") p[k] = stripInlineMarkdown(p[k] as string);
+    }
+  }
+  return d;
+}
 
 export type PlantDraft = {
   id: string;
@@ -132,5 +158,5 @@ export async function fetchDraftById(id: string): Promise<PlantDraft | null> {
     .eq("id", id)
     .maybeSingle();
   if (error) throw error;
-  return data as PlantDraft | null;
+  return data ? cleanDraftForDisplay(data as PlantDraft) : null;
 }

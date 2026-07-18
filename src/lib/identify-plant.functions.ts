@@ -15,6 +15,7 @@ import {
 } from "./premium-page";
 import { lookupChinaInvasive } from "./china-invasive-list";
 import { keepVisualAdvice, DEFAULT_VISUAL_ADVICE } from "./retake-advice";
+import { stripMetaMarkdown, markdownEmphasisToHtml } from "./strip-markdown";
 import { slugify, speciesKey, visibleBodyText, textShingles, jaccardSimilarity } from "./plants";
 
 const AI_MODEL = "google/gemini-2.5-pro";
@@ -2357,6 +2358,10 @@ async function buildDraftContent(opts: {
     usage,
   } = await callAiIdentify(dataUrl, place, speciesHint, webResearch);
 
+  // 去掉模型写进字段的 markdown 强调符（学名/属名/俗名/摘要都是当纯文本渲染的）。
+  // 正文 html 里的 `*Latin*` 另行转 <em>（见下方 html 组装处）。
+  stripMetaMarkdown(meta);
+
   // Belt-and-suspenders: if a species was pinned, force the rendered name to match
   // it even if the model quietly drifted, so the page title == the card title.
   if (speciesHint?.title) meta.title = speciesHint.title;
@@ -2490,7 +2495,7 @@ async function buildDraftContent(opts: {
   }
 
   const captureDate = new Date().toISOString().slice(0, 10);
-  const html = renderDraftHtml({
+  const rawHtml = renderDraftHtml({
     ...meta,
     photo_url: photoUrl,
     section_images: sectionImages,
@@ -2503,6 +2508,9 @@ async function buildDraftContent(opts: {
     capture_date: captureDate,
     ai_model: usedModel,
   });
+  // 正文里模型爱把拉丁名写成 markdown 斜体 `*Ficus lyrata*`，原样渲染就是字面星号。
+  // 在最终 HTML 上统一转 <em>，一次覆盖所有分区（形态/分布/人文…），不用逐字段列举。
+  const html = markdownEmphasisToHtml(rawHtml);
 
   return { meta, usedModel, usedProvider, usage, html, isInvasive, gbifTaxonKey };
 }
@@ -2520,6 +2528,9 @@ function stripTentativePrefix(s: string): string {
 }
 
 function normalizeIdentification(meta: AiMeta): void {
+  // 先去掉模型写进字段的 markdown 强调符（`*Allium*` / `葱属 *Allium*`）—— 这些字段当纯文本
+  // 渲染，星号会原样露出来。要在「疑似前缀」逻辑之前跑，否则 `疑似` 会加在残留的 * 后面。
+  stripMetaMarkdown(meta);
   const summaryZh = (meta.summary_zh || "").toString();
   const tentative =
     meta.identification_confidence === "low" || TENTATIVE_RE.test(summaryZh.trim().slice(0, 6));
@@ -3347,6 +3358,11 @@ export const enrichDraft = createServerFn({ method: "POST" })
         tags: meta.tags ?? [],
         iucn_status: meta.iucn_status || null,
         html_content: html,
+        // 生成完整草稿 = 正式提交审核。UI 一直承诺「自动进入待审批草稿库」，但在此之前
+        // 只有「保存为待审批草稿」按钮会翻这个字段，而那个按钮 enrich 后就消失了 ——
+        // 于是 enrich 过的草稿永远进不了队列，用户白花 1 枚银叶还以为交了。
+        // （fetchPendingDrafts 按 submitted_for_review=true 筛，见 drafts.ts。）
+        submitted_for_review: true,
       })
       .eq("id", draft.id);
     if (updErr)

@@ -82,6 +82,8 @@ function DraftPage() {
   const [draftHeight, setDraftHeight] = useState<number | null>(null);
   const [cardBusy, setCardBusy] = useState(false);
   const [cardUrl, setCardUrl] = useState<string | null>(null);
+  // 这张卡是不是「识别完自动弹出来的」（而非用户事后点按钮生成的）。决定关卡后要不要送去补拍。
+  const [cardAutoOpened, setCardAutoOpened] = useState(false);
   const cardBlobRef = useRef<Blob | null>(null);
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const editorRef = useRef<HtmlDocEditorHandle>(null);
@@ -417,7 +419,11 @@ function DraftPage() {
         photoUrl: draft.photo_url,
         discovererName,
         discovererAvatar: creatorProfile?.avatar_url || null,
-        chips: registryChipList,
+        // 名录卡签（重点保护 / 地区名录 / tag…）**故意不传给识别分享卡**：卡签是按物种匹配
+        // 名录的，但一次识别只知道「这张照片里可能是什么」——在内蒙古拍到的未必是内蒙古的
+        // 野生植物，可能是园艺栽培或花店里的盆栽；疑似时连物种本身都还没定。把这些标签印在
+        // 一张会被转发出去的卡上，等于替用户断言了他没断言的事。草稿页/详情页仍照常显示
+        // （那里有上下文，且详情页是编辑审过的）。
         leafEarned: earned,
         leafBronze: leaves?.bronze ?? null,
         leafSilver: leaves?.silver ?? null,
@@ -451,12 +457,35 @@ function DraftPage() {
     else if (how === "shared") toast.success("已打开分享面板（链接已复制备用）");
   };
 
+  /** 关掉分享卡后是否直接送去补拍：识别刚出结果、结论是疑似、且还有补拍次数。
+   *  只认「识别完自动弹出来的那张卡」——用户事后自己点「生成分享卡」是想分享，
+   *  那时候把人拽走是耍流氓（他也未必找得回来）。 */
+  const jumpToRetakeOnClose = cardAutoOpened && draftTentative && retakeCount < 3;
+
+  const goRetake = () => {
+    navigate({
+      to: "/identify",
+      search: {
+        retake: retakeCount + 1,
+        st: draft?.title,
+        ss: draft?.scientific_name ?? undefined,
+        nmp: retakeAdvice.slice(0, 300) || undefined,
+        md: id,
+        pick: 1,
+      },
+    });
+  };
+
   const closeCard = () => {
+    const jump = jumpToRetakeOnClose;
     setCardUrl((prev) => {
       if (prev) URL.revokeObjectURL(prev);
       return null;
     });
     cardBlobRef.current = null;
+    setCardAutoOpened(false);
+    // 疑似 → 不把人丢在草稿页上让他自己找「去补拍」，直接进补拍界面（建议 + 两种补拍方式）。
+    if (jump) goRetake();
   };
 
   // Guest → login/register, then return to THIS draft with the card re-opened.
@@ -561,6 +590,7 @@ function DraftPage() {
     if (user && !leaves) return; // wait for stats before rendering
     autoCardFiredRef.current = true;
     sessionStorage.removeItem("plantspedia:justIdentified");
+    setCardAutoOpened(true);
     void onMakeCard({ silent: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [draft, leaves, user, id]);
@@ -910,10 +940,11 @@ function DraftPage() {
               </section>
             )}
 
-            {/* AI 出草稿后的岔路口：紧贴简介摘要卡正下方。草稿在此之前是私有的（submitted_for_review
-                = false），两个按钮让用户自己定夺：认可 → 提交审核；不认可 → 去补拍。
-                「不符」对每份草稿都给，不像上面的补拍横幅只在 AI 自称「疑似」时才出现——AI 说得笃定
-                但认错物种，恰恰是最该让用户纠正的情况。补拍上限 3 次与横幅同源。 */}
+            {/* 简介摘要卡下方：草稿在此之前是私有的（submitted_for_review = false），这里让用户
+                把它正式送进审核流程。
+                注意「草稿内容和我的观察不符」**不在这里** —— 快速简介卡只有寥寥几行，用户根本
+                无从判断「符不符」；要等他点了「让 AI 生成进一步介绍草稿」、看到成篇的内容之后，
+                这个判断才有依据。那个按钮因此挪到了下面的 !notEnriched 分支。 */}
             {notEnriched && !isEditing && (
               <section className="mx-auto max-w-5xl px-6 mt-4">
                 <div className="flex flex-wrap justify-center gap-3">
@@ -931,33 +962,43 @@ function DraftPage() {
                           : "保存为待审批草稿"}
                     </span>
                   </button>
-                  {!submittedForReview &&
-                    (retakeCount < 3 ? (
-                      <Link
-                        to="/identify"
-                        search={{
-                          retake: retakeCount + 1,
-                          st: draft.title,
-                          ss: draft.scientific_name ?? undefined,
-                          nmp: retakeAdvice.slice(0, 300) || undefined,
-                          md: id,
-                          pick: 1,
-                        }}
-                        className="inline-flex items-center gap-2 border-2 border-amber-600 text-amber-700 px-8 py-3 text-base font-bold rounded-full hover:bg-amber-600 hover:text-background transition-colors cursor-pointer"
-                      >
-                        <CameraIcon className="w-5 h-5" />
-                        草稿内容和我的观察不符
-                      </Link>
-                    ) : (
-                      <span className="inline-flex items-center px-4 py-3 text-sm text-ink-faint">
-                        已用完 3 次补拍机会
-                      </span>
-                    ))}
                 </div>
-                {!submittedForReview && retakeCount < 3 && (
+              </section>
+            )}
+
+            {/* 完整草稿的岔路口：只有在用户点过「让 AI 生成进一步介绍草稿」、AI 写出成篇内容
+                之后才出现（notEnriched=false）。此时他才读得到足以判断「AI 是不是认错了」的
+                内容。不受「疑似」限制 —— AI 说得笃定却认错物种，恰恰最该让用户纠正。
+                补拍上限 3 次与上方补拍横幅同源。 */}
+            {!notEnriched && !isEditing && !submittedForReview && (
+              <section className="mx-auto max-w-5xl px-6 mt-4">
+                <div className="flex flex-wrap justify-center gap-3">
+                  {retakeCount < 3 ? (
+                    <Link
+                      to="/identify"
+                      search={{
+                        retake: retakeCount + 1,
+                        st: draft.title,
+                        ss: draft.scientific_name ?? undefined,
+                        nmp: retakeAdvice.slice(0, 300) || undefined,
+                        md: id,
+                        pick: 1,
+                      }}
+                      className="inline-flex items-center gap-2 border-2 border-amber-600 text-amber-700 px-8 py-3 text-base font-bold rounded-full hover:bg-amber-600 hover:text-background transition-colors cursor-pointer"
+                    >
+                      <CameraIcon className="w-5 h-5" />
+                      草稿内容和我的观察不符
+                    </Link>
+                  ) : (
+                    <span className="inline-flex items-center px-4 py-3 text-sm text-ink-faint">
+                      已用完 3 次补拍机会
+                    </span>
+                  )}
+                </div>
+                {retakeCount < 3 && (
                   <p className="mt-2 text-center text-[11px] text-ink-faint">
-                    觉得 AI 认错了？点右边去补拍——可以现拍，也可以从相册选已有照片（
-                    {retakeOrdinalLabel(retakeCount + 1)}）。
+                    读下面的完整草稿时，觉得 AI 认错了物种？点上面这个按钮去补拍——可以现拍，
+                    也可以从相册选已有照片（{retakeOrdinalLabel(retakeCount + 1)}）。
                   </p>
                 )}
               </section>
@@ -1342,6 +1383,13 @@ function DraftPage() {
               手机上点「分享 / 存相册」会调起系统分享面板，可直接发到微信、小红书、微博等；
               也可长按上图保存。
             </p>
+            {/* 疑似：关卡后会直接进补拍界面 —— 先说清楚，别让「关闭」把人莫名其妙送走。 */}
+            {jumpToRetakeOnClose && (
+              <p className="text-[11px] text-amber-700 mt-2 text-center leading-relaxed font-medium">
+                本次结论为<strong>疑似</strong>，关掉这张卡会直接进入补拍界面（
+                {retakeOrdinalLabel(retakeCount + 1)}）。
+              </p>
+            )}
             {/* Guests: log in / register to start banking leaves. Returns to this card. */}
             {!user && (
               <button
@@ -1362,9 +1410,20 @@ function DraftPage() {
               </button>
               <button
                 onClick={closeCard}
-                className="border border-rule text-ink-faint px-4 py-2.5 text-sm hover:border-ink hover:text-ink transition-colors cursor-pointer rounded-sm"
+                className={
+                  jumpToRetakeOnClose
+                    ? "border-2 border-amber-600 text-amber-700 px-4 py-2.5 text-sm font-semibold hover:bg-amber-600 hover:text-background transition-colors cursor-pointer rounded-sm inline-flex items-center gap-1.5 shrink-0"
+                    : "border border-rule text-ink-faint px-4 py-2.5 text-sm hover:border-ink hover:text-ink transition-colors cursor-pointer rounded-sm"
+                }
               >
-                关闭
+                {jumpToRetakeOnClose ? (
+                  <>
+                    <CameraIcon className="w-4 h-4" />
+                    去补拍
+                  </>
+                ) : (
+                  "关闭"
+                )}
               </button>
             </div>
           </div>
