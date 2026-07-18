@@ -448,13 +448,13 @@ function DraftPage() {
     const filename = `plantspedia-${(draft?.scientific_name || draft?.title || "plant")
       .replace(/[^\w一-龥-]+/g, "_")
       .slice(0, 40)}.png`;
-    const how = await shareOrSaveImage(blob, filename, {
-      url: window.location.href,
-      text: `我在 Plantspedia 识别了「${draft?.title}」，点开链接看看这株植物吧 🌿`,
-      title: `Plantspedia · ${draft?.title}`,
-    });
-    if (how === "downloaded") toast.success("已保存图片（链接已复制到剪贴板）");
-    else if (how === "shared") toast.success("已打开分享面板（链接已复制备用）");
+    // 识别分享卡**只发图、不带链接**：卡面本身已经印了 plantspedia.club，再塞一份链接
+    // 只会帮倒忙 —— 微信/小红书的分享扩展一看到链接就把这次分享判定成「分享网页」，
+    // 渲染成链接卡片并丢掉图片，而这张卡的全部价值就是那张图。
+    // 不传 opts → 不写剪贴板、不拼文案，系统面板里直接就是「存储图像」。
+    const how = await shareOrSaveImage(blob, filename);
+    if (how === "downloaded") toast.success("图片已保存");
+    else if (how === "shared") toast.success("选「存储图像」即可存入相册");
   };
 
   /** 关掉分享卡后是否直接送去补拍：识别刚出结果、结论是疑似、且还有补拍次数。
@@ -476,14 +476,20 @@ function DraftPage() {
     });
   };
 
-  const closeCard = () => {
-    const jump = jumpToRetakeOnClose;
+  /** 只收起分享卡，不做任何跳转。`cardAutoOpened=false` 是关键：置回后即使用户之后再手动
+   *  点「生成分享卡」，也不会被关卡二次拽去补拍。「放弃补拍」直接复用它。 */
+  const closeCardOnly = () => {
     setCardUrl((prev) => {
       if (prev) URL.revokeObjectURL(prev);
       return null;
     });
     cardBlobRef.current = null;
     setCardAutoOpened(false);
+  };
+
+  const closeCard = () => {
+    const jump = jumpToRetakeOnClose;
+    closeCardOnly();
     // 疑似 → 不把人丢在草稿页上让他自己找「去补拍」，直接进补拍界面（建议 + 两种补拍方式）。
     if (jump) goRetake();
   };
@@ -1380,14 +1386,14 @@ function DraftPage() {
               className="w-full h-auto border border-rule rounded-md shadow-sm"
             />
             <p className="text-[11px] text-ink-faint mt-2 text-center leading-relaxed">
-              手机上点「分享 / 存相册」会调起系统分享面板，可直接发到微信、小红书、微博等；
-              也可长按上图保存。
+              手机上点「保存到相册」会调起系统面板，选「存储图像」即可存入相册，也可直接发到
+              微信、小红书；长按上图同样能保存。分享出去的<strong>只有这张图片</strong>，不带链接。
             </p>
             {/* 疑似：关卡后会直接进补拍界面 —— 先说清楚，别让「关闭」把人莫名其妙送走。 */}
             {jumpToRetakeOnClose && (
               <p className="text-[11px] text-amber-700 mt-2 text-center leading-relaxed font-medium">
-                本次结论为<strong>疑似</strong>，关掉这张卡会直接进入补拍界面（
-                {retakeOrdinalLabel(retakeCount + 1)}）。
+                本次结论为<strong>疑似</strong>，点「去补拍」会进入补拍界面（
+                {retakeOrdinalLabel(retakeCount + 1)}）；不想补拍可点下方「放弃补拍」。
               </p>
             )}
             {/* Guests: log in / register to start banking leaves. Returns to this card. */}
@@ -1406,7 +1412,7 @@ function DraftPage() {
                 className="flex-1 bg-leaf-deep text-background px-4 py-2.5 text-sm font-semibold hover:bg-leaf transition-colors inline-flex items-center justify-center gap-1.5 cursor-pointer rounded-sm"
               >
                 <ShareIcon className="w-4 h-4" />
-                分享 / 存相册
+                保存到相册
               </button>
               <button
                 onClick={closeCard}
@@ -1426,6 +1432,15 @@ function DraftPage() {
                 )}
               </button>
             </div>
+            {/* 补拍是建议、不是强制 —— 给一条明确的退出路径，否则疑似结果等于把人锁在补拍循环里。 */}
+            {jumpToRetakeOnClose && (
+              <button
+                onClick={closeCardOnly}
+                className="mt-2 w-full text-[12px] text-ink-faint hover:text-ink underline underline-offset-2 transition-colors cursor-pointer py-1"
+              >
+                放弃补拍，直接看简介摘要卡
+              </button>
+            )}
           </div>
         </div>
       )}
