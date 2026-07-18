@@ -1,7 +1,164 @@
 # Plantspedia — Working State  (single source of truth)
 
-_Last updated: 2026-07-18 — by Claude (续9：Pl@ntNet 接回 phase-1 一线 + 豆包 vision 疑似复核 + 管理员配置面板；tsc=0，⚠️ 未部署/未端到端实测）_
+_Last updated: 2026-07-18 — by Claude (续10：引擎自检 + 用量可观测性修复 + 分享卡纯图 + 放弃补拍；tsc=0，✅ 已部署 211770f2）_
 _Read this FIRST and update it LAST, every session._
+
+## ✅ 2026-07-18（续14）二次复核模型改造为**厂商无关** + 模型选择器（已部署 69b5b919）
+用户要求「不要局限于豆包，我要能自由配置任何模型；填 key + url，然后拉取模型（只展示有图形能力的）」，
+并预告可能换 qwen 系列。
+
+- **核心判断：不需要引入 dashscope SDK**。Qwen 有 OpenAI 兼容端点
+  `https://dashscope.aliyuncs.com/compatible-mode/v1`，`qwen-vl-max` 用一样的 image_url 格式 →
+  现有 OpenAI 兼容调用直接能跑。**换厂商只改 apiKey/baseUrl/model 三个字段，不用改代码。**
+- **全面去豆包化**（符号 + 文案）：`loadDoubaoConfig→loadSecondOpinionConfig`、
+  `doubaoIdentify→secondOpinionIdentify`、`doubaoPrimaryVerdict→secondOpinionPrimaryVerdict`、
+  `listDoubaoModelsFn→listVisionModelsFn`、`*DoubaoConfigFn→*SecondOpinionConfigFn`、
+  `DoubaoPanel→SecondOpinionPanel`。**provider 标签也改了**：
+  `doubao-primary→vision-primary`、`doubao-adopted→review-adopted`、`doubao-declined→review-declined`。
+  自检返回字段 `doubao→review`（前端同步）。`primaryEngine` 的 `"doubao"→"vision"`。
+- **配置 key 迁移无痛**：新 key `second_opinion_config`，但 load/get **回退读旧的
+  `doubao_vision_config`**，用户已存的配置继续生效、不用重填；clear 则**新旧都删**
+  （只删新的会让旧的被回退命中 → 表现成「点了停用还在跑」）。
+- **🔑 模型选择器的关键设计：探测必须用真图，不能用纯文本 ping**。
+  新增常量 `VISION_PROBE_JPEG_B64`（32×32 绿色圆点 JPEG，约 1KB base64，内联在源码里）。
+  纯文本 ping 只能测出「模型存不存在」，**测不出它能不能看图** —— 而本功能的全部意义就是
+  「只列出真有图形能力的模型」。现在每个候选都真发一次带图请求：
+  200=支持图片✓、404=未开通、401/403=鉴权失败、其它非200=模型在但不吃图（多半纯文本模型）。
+- `isVisionModelCandidate` 通用化：覆盖 vision/vl/omni/multimodal、gpt-4o、glm-\d+v、claude、
+  gemini、豆包 seed 系列；黑名单排除生图/视频/3D/向量/语音/翻译。并发 6、候选上限 24。
+- **面板加厂商预设**（`VISION_VENDOR_PRESETS`）：火山方舟 / 阿里 DashScope / OpenAI / 智谱，
+  一键填 baseUrl，免去翻各家文档。`ep-` 接入点仍需手填（列接入点要控制面权限，数据面 key 拿不到）。
+- **验证**：tsc=0 ✅；dev(5199) 加载无 console/服务端报错 ✅；已部署 `69b5b919`（07-18T14:53:50Z）
+  —— 上一轮那次 `fetch failed` 阻塞已自行恢复，本次一次成功。
+- **待用户验证**：点「拉取可用模型」看实测结果。按之前实测，火山方舟这个账号大概率仍全是 404
+  （需创建 ep- 接入点）；**可直接改用 DashScope + qwen-vl-max 试**，预设已内置。
+
+## 🚧 2026-07-18（续13）豆包模型选择器 —— 代码完成、tsc=0，⚠️ **部署被网络阻塞，未上线**
+用户反馈「手填模型 ID 老填错，能不能改成填 key 后拉取可用模型」。已实现，但**没能部署**。
+
+- **实现**：新增 `listDoubaoModelsFn`（[identify-plant.functions.ts](src/lib/identify-plant.functions.ts)）
+  + 面板「拉取可用模型」按钮（[identify.tsx](src/routes/identify.tsx)）。
+  - **关键设计：不能只列目录**。实测过 `GET /api/v3/models` 返回 200 + 126 个模型，但逐个调用
+    **全部 404** —— 目录里有 ≠ 账号已开通。所以对视觉候选（`isDoubaoVisionCandidate` 过滤掉
+    生图/视频/3D/向量/翻译等）**逐个发一次 max_tokens=1 的纯文本请求实测**，绿色=真能调、
+    灰色划掉=404，只有绿色可点选。
+  - 探测判定：404 → 不可用；401/403 → 鉴权失败；**200 或 400 等非 404 → 算可用**
+    （400 说明模型认下了请求、只是参数不合口味，模型是存在的）。
+  - 并发 6 个一批，候选上限 24 个。
+  - **`ep-` 推理接入点不会出现在列表里**（那是模型目录，列接入点要控制面权限），
+    面板已明确提示「自建接入点请手动粘贴」。
+  - 一个可用的都没有时，hint 直接引导：去方舟控制台「在线推理」创建推理接入点。
+- **验证**：tsc=0 ✅；dev(5199) `/identify` 加载无 console/服务端报错 ✅。
+- **🔴 BLOCKER：部署失败 3 次全是 `fetch failed`**（连 `wrangler deployments list` 都失败
+  → 说明此刻本机到 Cloudflare 完全不通，是 GFW/VPN 问题，**不是代码问题**，见
+  [[deploy-workflow]]/[[session-econnreset-root-cause]]）。已按 CLAUDE.md 的 retry cap 停止，未循环。
+  - **线上仍是 `315ca7fe`**（含 Pl@ntNet WebP 修复 + 自检样本图修复），本次模型选择器**未上线**。
+  - **恢复办法**：网络通畅后重跑 `npm run build && ./node_modules/.bin/wrangler deploy`，
+    然后照例用 `wrangler deployments list` 对时间戳确认真的上了（别看输出想当然）。
+
+## ✅ 2026-07-18（续12）Pl@ntNet 已修复上线并验证生效；豆包卡在账号未开通（部署 315ca7fe）
+- **🎉 Pl@ntNet 修好了，线上已验证**：用户换 key 后新识别的用量记录 provider 出现
+  **`plantnet+gemini-quick`** —— 说明 WebP→JPEG 那个修复真正生效，专业定种首次接入常规链路。
+  （注：用户其实**不必换 Pl@ntNet key**，旧 key 一直是好的，根因自始至终是图片格式。）
+- **🔴 豆包：账号未开通任何模型，不是模型 ID 写错**。用新 ARK key（46 字符，格式正确）实测：
+  - `GET /api/v3/models` 返回 **200 + 126 个模型**（含 `doubao-1-5-vision-pro-32k-250115`）
+    → **说明 API Key 本身有效**，这个列表是**目录**、不代表已开通。
+  - 逐个实测 6 个视觉模型（`doubao-1-5-vision-pro-32k-250115` / `doubao-vision-pro-32k-241028` /
+    `doubao-seed-1-6-vision-250815` / `doubao-1.5-vision-lite-250315` / `doubao-seed-1-6-flash-250828`
+    等）→ **全部 `HTTP 404 InvalidEndpointOrModel.NotFound`**。
+  - 结论：该账号需要在方舟控制台**开通模型**或**创建推理接入点（ep-…）**，然后把 `ep-…` 填进面板。
+    这不是代码问题，改代码无解。（`doubao-1.5-vision-pro-250328` 因本地代理异常两次未测到，
+    但同族全 404，预期一致。）
+- **自检样本图 bug（用户自己指出的，已修）**：自检取的样本是站内历史图（多为 **WebP**），
+  于是撞上刚加的 415 防御、报「不支持的图片格式」，等于测不到 key。已改为**只挑 URL 以
+  .jpg/.jpeg/.png 结尾的记录**（各表取最近 40 条筛选），且**优先查 plant_drafts**
+  （识别链路已强制 JPEG，新图必定命中）；找不到时提示「先识别一张照片再来自检」。
+- **教训**：自检类功能必须保证「测试样本本身满足被测服务的约束」，否则自检结果会误导——
+  这次就出现了「Pl@ntNet 实际已修好，自检却报红」的假阴性。
+- **验证**：tsc=0 ✅；已部署 `315ca7fe`（07-18T11:30:34Z）。
+  **待用户验证**：豆包创建 ep- 接入点后重测；Pl@ntNet 自检应转 ✅（实际早已在线上工作）。
+
+## 🔴 2026-07-18（续11）根因大发现 — Pl@ntNet 从没成功过，原因是 **WebP**（已修，部署 9c4e9fbd）
+用户追问「豆包和 Pl@ntNet 到底参没参与」，实测数据库 + 真实 key 直连，两个引擎**各自死于不同原因**：
+
+1. **🔴 Pl@ntNet 死于图片格式（代码 bug，已修）**
+   - 实测：拿站内真图直连 Pl@ntNet → `HTTP 400 {"message":"Unsupported file type for image[0] (jpeg or png)"}`
+   - 根因：[image-compress.ts](src/lib/image-compress.ts) 的 `compressImage` **默认输出 WebP**
+     （现代浏览器都支持，所以恒为 WebP），而 **Pl@ntNet 只接受 JPEG/PNG**。
+     → 每一张识别照片都被 400 拒收 → **Pl@ntNet 自接进来那天起一次都没成功过**，
+     用量表里自然只剩 gemini。
+   - **关键推论：Pl@ntNet key 是好的** —— 返回的是 400（格式错）不是 401（认证错），
+     说明服务器接受了 key。别去换 key，白费功夫。
+   - 修法：① `compressImage` 新增第 5 个参数 `preferType`，识别链路传 `"image/jpeg"`
+     （[camera-identify.tsx](src/components/camera-identify.tsx) 那处 `compressImage(file,1200,1200,0.75,"image/jpeg")`）；
+     ② 强制转码时**绕过**两个「偷懒退回原文件」分支（小文件<200KB 直接返回、转码后变大就退回）
+     —— 否则格式会被退回 WebP，白修；③ `plantNetIdentify` 开头加防御：非 jpeg/png 直接短路
+     返回 status=415，不白发注定 400 的请求。
+   - 代价：识别图从 WebP 转 JPEG，体积约翻倍（实测样本 50KB→94KB）。值得 —— 换回专业定种。
+
+2. **🔴 豆包死于 key 无效（用户配置问题，需用户自己换）**
+   - 实测：`HTTP 401 {"code":"AuthenticationError","message":"the API key or AK/SK ... is missing or invalid"}`
+   - 库里存的 apiKey **长 158 字符**，而方舟 ARK API Key 通常是 UUID 形态（约 36 字符）。
+     几乎可以断定用户填成了 **IAM 的 AK/SK**（他最初就说「有 access key 和 api key」）。
+   - 面板已加提示：AK/SK 会报 AuthenticationError、正确的 key 约 36 字符。
+
+3. **「后台看不到已填的 key」= 误会，不是 bug**：数据都在 site_config（实测 4 行俱全，
+   `doubao_vision_config` 07-18T09:34 保存成功）。只是出于安全**已保存的 key 不回填输入框**，
+   用户看到空框以为没存上。面板已加说明：看上方状态条「已启用」即可。
+
+4. **自检自己也有 bug（已修）**：取样本图查的是 `plants.photo_url`，但 plants 表的图片字段
+   叫 **`cover_url`**（`photo_url` 是 plant_drafts 的）→ 400 column does not exist →
+   报「无法取得测试样本照片」。已改为 `cover_url` + fallback 到 plant_drafts，
+   且**把真实 DB 错误带进界面**（原来吞成一句笼统提示，掩盖了根因，教训）。
+   自检还升级为能区分：key 无效(401/403) / 额度用尽(429) / 格式不支持(415) /
+   HTTP200 但认不出图（这也算 key 通过）/ 豆包「纯文本通但看图失败=不是视觉模型」。
+
+- **诊断脚本**：[scratch/diagnose_engine_config.py](scratch/diagnose_engine_config.py)（查 site_config
+  实际存了什么 + plants 图字段 + 最近 provider 分布；从 .env 读 key，不打印明文）。
+- **⚠️ 安全**：排查时一次异常堆栈把 Pl@ntNet key 明文打了出来（该 API 设计上把 key 放 URL query 里）。
+  已建议用户去 my.plantnet.org 轮换。另注：`scratch/backfill_admin.py` 里**硬编码了 service-role key**，
+  但该文件未被 git 跟踪（已核实 key 从未进入 git 历史），仍建议清理。
+- **验证**：tsc=0 ✅；已部署 `9c4e9fbd`（07-18T11:04:52Z）。**待用户验证**：换成正确的 ARK API Key 后
+  点「自检两个引擎」，Pl@ntNet 应变 ✅、豆包应变 ✅；随后新识别的 provider 应出现 `plantnet+gemini-quick`。
+
+## ✅ 2026-07-18 部署记录（版本 211770f2-5a1e-4afc-8a13-c8bcb73d6569）
+- **已上线**：续10 全部 5 项。部署前基线是 `512b1658`（07-18T09:18Z，并发会话把**续9 的
+  Pl@ntNet/豆包复核**连同它自己的三项修复一起上线的那次），新版本 07-18T10:28:51Z、100% 流量。
+- **本次部署第一次就成功**（没触发 GFW 那个 fetch failed 老问题）。仍照例用
+  `wrangler deployments list` 对了时间戳确认真的上了，没看输出想当然。
+- **线上验证**：plantspedia.club/identify 加载正常、无 console 报错 ✅。
+- **⚠️ 仍未端到端验证**（都需要 admin 登录 / 真实识别，留给用户）：「自检两个引擎」按钮实际点击、
+  疑似→豆包复核、分享卡纯图、放弃补拍。**建议第一步就点自检**，它会直接告诉你两个 key 的真实状态。
+- **⚠️ 手机上若仍看到旧 UI** = PWA service worker 缓存，不是部署失败（见 [[pwa-service-worker-caching]]）。
+- **未提交**：本轮改动已部署但**还没 commit**（部署打包的是工作区，不需要 commit）。
+
+## 🚧 2026-07-18（续10）— 引擎自检 + 用量可观测性修复 + 分享卡纯图 + 放弃补拍（tsc=0；✅ 已部署 211770f2）
+用户上线续9 后反馈「用量记录只有 gemini，豆包和 Pl@ntNet 是不是没参与？」——**排查结论：大概率
+是正常的，但当时确实看不出来**。三个原因，前两个是我的缺陷：
+1. **Pl@ntNet 不消耗 token**，本来就不会在 ai_usage_logs 里有独立记录；
+2. **（已修）provider 字段不体现一线引擎** —— Pl@ntNet 成功时 `usedProvider` 仍是 `gemini-quick`，
+   管理员无从判断它是否参与。现在拼成 `plantnet+gemini-quick` / `doubao-primary+gemini-quick` /
+   `…+doubao-adopted` / `…+doubao-declined`，一眼看穿整条链路；
+3. 豆包**只在「疑似」时才调用**，用户那三条都成功定种（非疑似）→ 豆包不参与是符合预期的。
+- **（已修 bug）豆包复核未采纳时 token 被丢弃**：`usage = addUsage(...)` 原本只在 `resolved`
+  分支里，导致被否决的复核变成一笔查不到的隐形开销。现已移到 `if (second)` 内，无论采纳与否都计入。
+- **新增引擎自检** `testIdentifyEnginesFn` + 面板「自检两个引擎」按钮：取**站内一张真实植物照片**
+  跑完整链路（Pl@ntNet 走 plantNetIdentify、豆包走 doubaoPrimaryVerdict），而不是只 ping key ——
+  纯文本 ping 会让「key 有效但模型不是多模态」这个最常见的配置错误蒙混过关。返回各自成功/失败 +
+  错误详情 + 额度标记状态。
+- **药用紫草重复两条**：前端有 `phase==="submitting"` 按钮禁用，双击重复提交基本不可能；两条相隔
+  2 分钟且中间夹着另一次识别（羽状短柄草），几乎可以断定是**用户自己识别了两次**而非一次写两条日志。
+  且两条 prompt_tokens 完全相同（1.8K）**排除了补拍**（补拍会多带旧图、prompt 明显变大）。
+  诊断 SQL：[scratch/diagnose_duplicate_identify.sql](scratch/diagnose_duplicate_identify.sql)
+  （看 draft_id 是否相同即可定性；另附按 provider 分组统计，可直接确认新链路有没有跑起来）。
+- **分享卡改为纯图片**（[drafts.$id.tsx](src/routes/drafts.$id.tsx)）：`onShareCard` 不再传
+  `{url,text,title}` → `shareOrSaveImage` 自然不写剪贴板、不拼文案，系统面板里直接是「存储图像」。
+  按钮「分享 / 存相册」→「保存到相册」。**只改识别卡**；`share-card-button.tsx`（详情页通用分享）未动。
+- **补拍关卡加「放弃补拍」**：抽出 `closeCardOnly()`（只收卡、不跳转，且置 `cardAutoOpened=false`
+  以免之后再被二次拽走），`closeCard()` 复用它。疑似卡片下方新增「放弃补拍，直接看简介摘要卡」，
+  预告文案同步改写。理由：补拍是建议不是强制，原来疑似等于把人锁在补拍循环里。
+- **验证**：tsc=0 ✅；dev(5199) 加载无服务端报错 ✅。**未验证**：自检按钮实际点击（需 admin 登录）、
+  豆包端到端；**未部署**。
 
 ## ✅ 2026-07-18（续10）— 出卡提速 + 手机端图片溢出 + 分享无图（tsc=0；**已部署 512b1658**）
 **部署记录**：续9（Pl@ntNet 一线 + 豆包复核 + 管理员面板）与续10 **一起上线**，版本
