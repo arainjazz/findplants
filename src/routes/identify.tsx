@@ -18,9 +18,11 @@ import {
   savePlantNetKeyFn,
   getPlantNetKeyFn,
   clearPlantNetKeyFn,
-  saveDoubaoConfigFn,
-  getDoubaoConfigFn,
-  clearDoubaoConfigFn,
+  saveSecondOpinionConfigFn,
+  getSecondOpinionConfigFn,
+  clearSecondOpinionConfigFn,
+  testIdentifyEnginesFn,
+  listVisionModelsFn,
 } from "@/lib/identify-plant.functions";
 import { XiaoPModelPanel } from "@/components/xiaop-model-panel";
 import { toast } from "sonner";
@@ -261,13 +263,38 @@ function PlantNetPanel() {
   );
 }
 
-// ── Admin 豆包二次复核 Panel ──────────────────────────────────────────────────
-// 识别判为「疑似」时，先让豆包视觉模型复核一遍；它有把握就直接出确诊卡、跳过补拍，
-// 它同样没把握才进补拍。用的是火山方舟 ARK API Key（不是 IAM 的 AK/SK）。
+// ── Admin 二次复核模型 Panel ──────────────────────────────────────────────────
+// 识别判为「疑似」时，先让第二个视觉模型复核一遍；它有把握就直接出确诊卡、跳过补拍，
+// 它同样没把握才进补拍。**厂商无关**：任何提供 OpenAI 兼容 /chat/completions 的服务都能用，
+// 换厂商只改 apiKey + baseUrl + model 三个字段，不用改代码。
 
-const DOUBAO_BASE_PLACEHOLDER = "https://ark.cn-beijing.volces.com/api/v3";
+const SECOND_OPINION_BASE_PLACEHOLDER = "https://ark.cn-beijing.volces.com/api/v3";
 
-function DoubaoPanel() {
+/** 常见厂商的 OpenAI 兼容端点预设 —— 免得管理员去翻各家文档找 base URL。 */
+const VISION_VENDOR_PRESETS: { label: string; baseUrl: string; hint: string }[] = [
+  {
+    label: "火山方舟(豆包)",
+    baseUrl: "https://ark.cn-beijing.volces.com/api/v3",
+    hint: "模型如 doubao-*-vision-*；账号未开通直调时填推理接入点 ep-…",
+  },
+  {
+    label: "阿里 DashScope(通义千问)",
+    baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    hint: "模型如 qwen-vl-max / qwen-vl-plus",
+  },
+  {
+    label: "OpenAI",
+    baseUrl: "https://api.openai.com/v1",
+    hint: "模型如 gpt-4o",
+  },
+  {
+    label: "智谱 GLM",
+    baseUrl: "https://open.bigmodel.cn/api/paas/v4",
+    hint: "模型如 glm-4v / glm-4.5v",
+  },
+];
+
+function SecondOpinionPanel() {
   const qc = useQueryClient();
   const [isOpen, setIsOpen] = useState(false);
   const [apiKey, setApiKey] = useState("");
@@ -275,19 +302,61 @@ function DoubaoPanel() {
   const [baseUrl, setBaseUrl] = useState("");
   const [showKey, setShowKey] = useState(false);
 
-  const saveFn = useServerFn(saveDoubaoConfigFn);
-  const getFn = useServerFn(getDoubaoConfigFn);
-  const clearFn = useServerFn(clearDoubaoConfigFn);
+  const saveFn = useServerFn(saveSecondOpinionConfigFn);
+  const getFn = useServerFn(getSecondOpinionConfigFn);
+  const clearFn = useServerFn(clearSecondOpinionConfigFn);
+  const testFn = useServerFn(testIdentifyEnginesFn);
+
+  type EngineTest = {
+    plantnet: { ok: boolean; detail: string };
+    review: { ok: boolean; detail: string };
+    plantNetQuotaFlagged: boolean;
+    sample: string;
+  };
+  const [testResult, setTestResult] = useState<EngineTest | null>(null);
+
+  const testMutation = useMutation({
+    mutationFn: async () => (await testFn({ data: undefined })) as EngineTest,
+    onSuccess: (r) => setTestResult(r),
+    onError: (e: Error) => toast.error(e.message),
+  });
+
+  const modelsFn = useServerFn(listVisionModelsFn);
+  type ModelList = {
+    ok: boolean;
+    total: number;
+    hint: string;
+    models: { id: string; callable: boolean; note: string }[];
+  };
+  const [modelList, setModelList] = useState<ModelList | null>(null);
+
+  const modelsMutation = useMutation({
+    // 用输入框里的值（还没保存也能试），留空则回退到库里已存的配置。
+    mutationFn: async () =>
+      (await modelsFn({
+        data: {
+          apiKey: apiKey.replace(/\s+/g, "") || undefined,
+          baseUrl: baseUrl.trim() || undefined,
+        },
+      })) as ModelList,
+    onSuccess: (r) => {
+      setModelList(r);
+      const usable = r.models.filter((m) => m.callable).length;
+      if (usable) toast.success(`实测到 ${usable} 个可用的视觉模型`);
+      else toast.warning("没有可直接调用的视觉模型，需创建推理接入点（ep-…）");
+    },
+    onError: (e: Error) => toast.error(e.message),
+  });
 
   const { data: active, isLoading } = useQuery({
-    queryKey: ["doubao-config"],
+    queryKey: ["second-opinion-config"],
     queryFn: () => getFn({ data: undefined }),
     retry: false,
   });
 
   const saveMutation = useMutation({
     mutationFn: async () => {
-      if (!apiKey.trim()) throw new Error("请填写方舟 ARK API Key");
+      if (!apiKey.trim()) throw new Error("请填写 API Key");
       if (!model.trim()) throw new Error("请填写模型 ID 或推理接入点 ID");
       await saveFn({
         data: {
@@ -298,8 +367,8 @@ function DoubaoPanel() {
       });
     },
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["doubao-config"] });
-      toast.success("✅ 豆包二次复核已启用——疑似结果会先复核再决定是否补拍");
+      qc.invalidateQueries({ queryKey: ["second-opinion-config"] });
+      toast.success("✅ 二次复核已启用——疑似结果会先复核再决定是否补拍");
       setIsOpen(false);
       setApiKey("");
     },
@@ -309,8 +378,8 @@ function DoubaoPanel() {
   const clearMutation = useMutation({
     mutationFn: () => clearFn({ data: undefined }),
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["doubao-config"] });
-      toast.success("已停用豆包复核（疑似结果直接进补拍）");
+      qc.invalidateQueries({ queryKey: ["second-opinion-config"] });
+      toast.success("已停用二次复核（疑似结果直接进补拍）");
     },
     onError: (e: Error) => toast.error(e.message),
   });
@@ -319,7 +388,7 @@ function DoubaoPanel() {
     <div className="mb-6 animate-in fade-in slide-in-from-top-2 duration-300">
       <div className="flex items-center gap-3 mb-2">
         <span className="text-[11px] font-semibold tracking-widest uppercase text-ink-faint">
-          管理员 · 疑似复核 豆包 Vision
+          管理员 · 疑似复核模型（可换任意厂商）
         </span>
         <div className="flex-1 h-px bg-rule/50" />
         {isLoading ? (
@@ -342,7 +411,14 @@ function DoubaoPanel() {
           className="inline-flex items-center gap-2 text-xs font-medium px-3 py-1.5 rounded-lg border border-rule bg-paper hover:bg-ink hover:text-background transition-all cursor-pointer"
         >
           <LeafIcon className="w-3.5 h-3.5" />
-          {isOpen ? "收起" : active ? "修改配置" : "配置豆包复核"}
+          {isOpen ? "收起" : active ? "修改配置" : "配置复核模型"}
+        </button>
+        <button
+          onClick={() => testMutation.mutate()}
+          disabled={testMutation.isPending}
+          className="inline-flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg border border-rule bg-paper hover:bg-ink hover:text-background transition-all cursor-pointer disabled:opacity-50"
+        >
+          {testMutation.isPending ? "自检中…" : "自检两个引擎"}
         </button>
         {active && (
           <button
@@ -355,20 +431,57 @@ function DoubaoPanel() {
         )}
       </div>
 
+      {/* 自检结果：用站内一张真实植物照片跑完整链路，而非只 ping key */}
+      {testResult && (
+        <div className="mt-3 p-3 rounded-xl border border-rule bg-paper space-y-2 text-[11px] leading-relaxed">
+          <div className="font-semibold text-ink-soft">
+            引擎自检结果{testResult.sample ? `（样本：${testResult.sample}）` : ""}
+          </div>
+          {(
+            [
+              ["Pl@ntNet", testResult.plantnet],
+              ["二次复核模型", testResult.review],
+            ] as const
+          ).map(([label, r]) => (
+            <div key={label} className="flex gap-2">
+              <span className={r.ok ? "text-emerald-600" : "text-destructive"}>
+                {r.ok ? "✅" : "❌"}
+              </span>
+              <span>
+                <b>{label}</b>：{r.detail}
+              </span>
+            </div>
+          ))}
+          {testResult.plantNetQuotaFlagged && (
+            <div className="pt-1 text-amber-700">
+              ⚠️ Pl@ntNet 当前被标记为「额度已用尽」，识别正由二次复核模型顶一线；额度重置后最迟 1
+              小时自动切回。
+            </div>
+          )}
+          <div className="pt-1 text-ink-faint">
+            提示：Pl@ntNet 不消耗 token，所以它<b>不会</b>在用量统计里出现独立记录；它是否参与要看
+            provider 列的前缀（如 <code>plantnet+gemini-quick</code>）。
+          </div>
+        </div>
+      )}
+
       {isOpen && (
         <div className="mt-3 p-4 rounded-2xl border border-sky-500/30 bg-sky-500/5 space-y-4 animate-in fade-in slide-in-from-top-1 duration-200">
           <div className="flex gap-2 p-2.5 rounded-lg bg-sky-50 border border-sky-200 text-[11px] text-sky-900 leading-relaxed">
             <span>🔍</span>
             <span>
-              启用后豆包承担<b>两个角色</b>：①<b>疑似复核</b>——识别判为「疑似」时先让豆包独立复核，
+              这个模型承担<b>两个角色</b>：①<b>疑似复核</b>——识别判为「疑似」时先让它独立复核，
               它有把握就直接出确诊卡、<b>跳过补拍</b>（可确认也可纠正物种），它同样没把握才引导用户补拍；
-              ②<b>顶替 Pl@ntNet</b>——Pl@ntNet 每日免费额度（500 次）用尽后，自动改由豆包承担一线专业定种，
-              额度次日重置后自动切回。角色 ① 只在疑似时才调用，不拖慢正常识别。全站立即生效，无需重新部署。
+              ②<b>顶替 Pl@ntNet</b>——Pl@ntNet 每日免费额度（500 次）用尽后，自动改由它承担一线专业定种，
+              额度重置后自动切回。角色 ① 只在疑似时才调用，不拖慢正常识别。全站立即生效，无需重新部署。
+              <br />
+              <b>厂商无关</b>：任何提供 OpenAI 兼容 <code>/chat/completions</code> 的服务都能用
+              （方舟豆包 / 通义千问 / OpenAI / 智谱…），换厂商只改下面三个字段，不用改代码。
             </span>
           </div>
           <div>
             <label className="block text-xs font-semibold text-ink-soft mb-1.5">
-              方舟 ARK API Key
+              API Key
             </label>
             <div className="relative">
               <input
@@ -391,37 +504,103 @@ function DoubaoPanel() {
               </button>
             </div>
             <p className="mt-1 text-[11px] text-ink-faint">
-              用推理（数据面）的 <b>API Key</b>，不是 IAM 的 Access Key/Secret Key。Key 存在服务端数据库。
+              用<b>推理（数据面）</b>的 API Key。各家控制台的 AK/SK（Access Key / Secret Key）是
+              管理面签名用的，填进来会报 <code>AuthenticationError</code>。方舟的 API Key 约 36
+              字符；粘进来一百多字符的多半是填错了。
+            </p>
+            <p className="mt-1 text-[11px] text-amber-700">
+              注：出于安全，已保存的 Key <b>不会回填</b>到这个输入框（框里是空的属正常）。上方状态条
+              显示「已启用」就说明库里存着；要换 Key 直接填新的覆盖即可。
             </p>
           </div>
           <div>
             <label className="block text-xs font-semibold text-ink-soft mb-1.5">
-              模型 ID / 推理接入点 ID
+              API Base（OpenAI 兼容端点）
             </label>
-            <input
-              value={model}
-              onChange={(e) => setModel(e.target.value)}
-              placeholder="doubao-1-5-vision-pro-32k-250115 或 ep-2025xxxx-xxxxx"
-              className="w-full px-3 py-2 text-xs rounded-lg border border-rule bg-background font-mono focus:outline-none focus:border-sky-400 transition-colors"
-            />
-            <p className="mt-1 text-[11px] text-ink-faint">
-              必须是<b>多模态（视觉）</b>模型，纯文本模型无法复核照片。注意方舟模型名用<b>连字符</b>
-              （doubao-1-5-…，不是 doubao-1.5-…）。若报 InvalidEndpointOrModel.NotFound，
-              说明该模型未在当前账号/地区开通，改填推理接入点 ID（ep-…）。
-            </p>
-          </div>
-          <div>
-            <label className="block text-xs font-semibold text-ink-soft mb-1.5">
-              API Base（可选）
-            </label>
+            {/* 厂商预设：免得管理员去翻各家文档找兼容端点地址 */}
+            <div className="flex flex-wrap gap-1.5 mb-1.5">
+              {VISION_VENDOR_PRESETS.map((v) => (
+                <button
+                  key={v.label}
+                  type="button"
+                  title={v.hint}
+                  onClick={() => setBaseUrl(v.baseUrl)}
+                  className={
+                    "text-[11px] px-2 py-1 rounded-md border transition-all cursor-pointer " +
+                    (baseUrl.replace(/\/+$/, "") === v.baseUrl
+                      ? "bg-sky-500 text-white border-sky-500"
+                      : "border-rule text-ink-soft hover:border-sky-400 hover:text-sky-700")
+                  }
+                >
+                  {v.label}
+                </button>
+              ))}
+            </div>
             <input
               value={baseUrl}
               onChange={(e) => setBaseUrl(e.target.value)}
-              placeholder={DOUBAO_BASE_PLACEHOLDER}
+              placeholder={SECOND_OPINION_BASE_PLACEHOLDER}
               className="w-full px-3 py-2 text-xs rounded-lg border border-rule bg-background font-mono focus:outline-none focus:border-sky-400 transition-colors"
             />
             <p className="mt-1 text-[11px] text-ink-faint">
-              留空即用 {DOUBAO_BASE_PLACEHOLDER}（OpenAI 兼容接口）。
+              点上方预设一键填入，也可手填任意 OpenAI 兼容端点。留空即用{" "}
+              {SECOND_OPINION_BASE_PLACEHOLDER}。
+            </p>
+          </div>
+
+          {/* 拉取 + 实测：目录里有 ≠ 你的账号能调用，所以每个候选都真发一次请求验证 */}
+          <div>
+            <div className="flex items-center gap-2 mb-1.5">
+              <label className="block text-xs font-semibold text-ink-soft">模型</label>
+              <button
+                type="button"
+                onClick={() => modelsMutation.mutate()}
+                disabled={modelsMutation.isPending}
+                className="text-[11px] px-2 py-1 rounded-md border border-sky-400 text-sky-700 hover:bg-sky-500 hover:text-white transition-all cursor-pointer disabled:opacity-50"
+              >
+                {modelsMutation.isPending ? "拉取并实测中…" : "拉取可用模型"}
+              </button>
+            </div>
+
+            {modelList && (
+              <div className="mb-2 p-2.5 rounded-lg border border-rule bg-background space-y-2">
+                <p className="text-[11px] text-ink-soft leading-relaxed">{modelList.hint}</p>
+                {modelList.models.length > 0 && (
+                  <div className="max-h-48 overflow-y-auto space-y-1">
+                    {modelList.models.map((m) => (
+                      <button
+                        key={m.id}
+                        type="button"
+                        disabled={!m.callable}
+                        onClick={() => setModel(m.id)}
+                        className={
+                          "w-full text-left px-2 py-1.5 rounded-md text-[11px] font-mono transition-all " +
+                          (m.callable
+                            ? model === m.id
+                              ? "bg-sky-500 text-white cursor-pointer"
+                              : "border border-emerald-500/40 bg-emerald-500/5 text-emerald-800 hover:bg-emerald-500/15 cursor-pointer"
+                            : "border border-rule/50 text-ink-faint line-through cursor-not-allowed opacity-60")
+                        }
+                      >
+                        {m.callable ? "✅" : "❌"} {m.id}
+                        <span className="not-italic font-sans ml-1 opacity-75">（{m.note}）</span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            <input
+              value={model}
+              onChange={(e) => setModel(e.target.value)}
+              placeholder="点上方绿色项选用，或手填 ep-2025xxxx-xxxxx"
+              className="w-full px-3 py-2 text-xs rounded-lg border border-rule bg-background font-mono focus:outline-none focus:border-sky-400 transition-colors"
+            />
+            <p className="mt-1 text-[11px] text-ink-faint">
+              必须是<b>多模态（视觉）</b>模型，纯文本模型无法复核照片。
+              <b>推理接入点（ep-…）不会出现在上面的列表里</b>（那是模型目录，接入点要用控制台权限才能列出），
+              自己创建的接入点请手动粘贴到这个框。
             </p>
           </div>
           <div className="flex gap-2">
@@ -943,7 +1122,7 @@ function IdentifyPage() {
 
         {/* Admin-only professional plant-ID engine (Pl@ntNet) */}
         {isAdmin && <PlantNetPanel />}
-        {isAdmin && <DoubaoPanel />}
+        {isAdmin && <SecondOpinionPanel />}
 
         {/* Admin-only 小P蛙 agent model config */}
         {isAdmin && <XiaoPModelPanel />}

@@ -728,7 +728,7 @@ type PlantNetVerdict = {
 
 // ─── Pl@ntNet 免费额度（500 次/天）耗尽的持久标记 ────────────────────────────
 // Workers 是无状态的（每个 isolate 各自的内存缓存不可靠），所以把「已耗尽」写进
-// site_config。命中标记时直接跳过 Pl@ntNet、改用豆包顶一线，省掉一次必定 429 的往返。
+// site_config。命中标记时直接跳过 Pl@ntNet、改用二次复核模型顶一线，省掉一次必定 429 的往返。
 // 用时间戳 + 1 小时窗口而不是「按 UTC 日期」：Pl@ntNet 的重置时区没有明确文档，
 // 猜错时区会导致整天不恢复；1 小时窗口最多每小时浪费一次 429（不消耗额度），
 // 且额度重置后最迟 1 小时自动恢复。
@@ -766,7 +766,7 @@ async function markPlantNetQuotaExhausted(): Promise<void> {
       },
       { onConflict: "key" },
     );
-    console.warn("[Pl@ntNet] 429 每日额度已用尽 → 标记状态，改由豆包顶一线识别");
+    console.warn("[Pl@ntNet] 429 每日额度已用尽 → 标记状态，改由二次复核模型顶一线识别");
   } catch (e) {
     console.warn("[Pl@ntNet] quota-state write failed:", e);
   }
@@ -779,11 +779,33 @@ async function markPlantNetQuotaExhausted(): Promise<void> {
 async function plantNetIdentify(
   photoDataUrl: string,
   apiKey: string,
-): Promise<{ verdict: PlantNetVerdict | null; quotaExhausted: boolean }> {
+): Promise<{
+  verdict: PlantNetVerdict | null;
+  quotaExhausted: boolean;
+  /** HTTP 状态码（0 = 请求本身抛异常）。自检靠它区分「key 无效」和「图认不出来」。 */
+  status: number;
+  /** 非 2xx 时的响应体片段，用于把真实原因带到自检界面。 */
+  body: string;
+}> {
   const m = photoDataUrl.match(/^data:([^;]+);base64,(.+)$/);
   const mime = m?.[1] ?? "image/jpeg";
   const b64 = m?.[2] ?? photoDataUrl;
-  const ext = mime.includes("png") ? "png" : mime.includes("webp") ? "webp" : "jpg";
+  // Pl@ntNet 只接受 JPEG / PNG。收到 WebP 会 400「Unsupported file type」——
+  // 而前端 compressImage 默认输出的正是 WebP，这曾让专业定种整条链路静默失效。
+  // 识别链路已改为强制 JPEG（compressImage 的 preferType），这里再兜一道：
+  // 遇到不支持的格式直接短路，不白发一次注定 400 的请求，并把原因明确暴露给自检。
+  if (!/(jpeg|jpg|png)/i.test(mime)) {
+    console.warn(
+      `[Pl@ntNet] 跳过：不支持的图片格式 ${mime}（只收 JPEG/PNG）。识别链路应在前端压成 JPEG。`,
+    );
+    return {
+      verdict: null,
+      quotaExhausted: false,
+      status: 415,
+      body: `不支持的图片格式 ${mime}，Pl@ntNet 只接受 JPEG/PNG`,
+    };
+  }
+  const ext = mime.includes("png") ? "png" : "jpg";
   const bytes = Buffer.from(b64, "base64");
 
   const form = new FormData();
@@ -804,18 +826,22 @@ async function plantNetIdentify(
     clearTimeout(timer);
   }
   if (!resp.ok) {
-    console.warn("[Pl@ntNet] HTTP", resp.status, (await resp.text().catch(() => "")).slice(0, 200));
-    // 429 = 每日免费额度（500 次）用尽。只有这一种状态值得持久标记并交棒给豆包；
+    const body = (await resp.text().catch(() => "")).slice(0, 200);
+    console.warn("[Pl@ntNet] HTTP", resp.status, body);
+    // 429 = 每日免费额度（500 次）用尽。只有这一种状态值得持久标记并交棒给二次复核模型；
     // 401/403 之类是 key 配置问题，本次失败即可，不该让 Pl@ntNet 被长期跳过。
-    return { verdict: null, quotaExhausted: resp.status === 429 };
+    return { verdict: null, quotaExhausted: resp.status === 429, status: resp.status, body };
   }
   const data = await resp.json();
   const results = Array.isArray(data.results) ? data.results : [];
   const top = results[0];
   const sci = top?.species?.scientificNameWithoutAuthor ?? top?.species?.scientificName ?? "";
-  if (!sci) return { verdict: null, quotaExhausted: false };
+  // HTTP 200 但没有可用判定 = key 有效、只是这张图认不出来。自检要能区分这两种情况。
+  if (!sci) return { verdict: null, quotaExhausted: false, status: resp.status, body: "" };
   return {
     quotaExhausted: false,
+    status: resp.status,
+    body: "",
     verdict: {
       scientific_name: sci,
       family: top.species?.family?.scientificNameWithoutAuthor ?? "",
@@ -830,46 +856,65 @@ async function plantNetIdentify(
   };
 }
 
-// ─── 豆包 doubao-1.5-vision-pro 二次复核（火山方舟 Ark，OpenAI 兼容）────────────
+// ─── 二次复核视觉模型（任意 OpenAI 兼容厂商）──────────────────────────────────
 // 只在 phase-1（Pl@ntNet + Gemini）判为「疑似」时才咨询的第二个多模态模型。它返回与
 // identifyQuick 相同的摘要卡字段，所以一个有把握的判定可以整卡替换 phase-1 结果
 // （确认或纠正皆走同一条路径），从而跳过补拍；它若同样没把握，则维持疑似 → 照常补拍。
-// 注意：推理用的是方舟 **ARK API Key**（数据面 Bearer），不是 IAM 的 AK/SK（管理面签名用）。
-type DoubaoConfig = { apiKey: string; model: string; baseUrl: string };
+//
+// **厂商无关**：只要求对方提供 OpenAI 兼容的 /chat/completions（image_url 传图）。已知可用：
+//   · 火山方舟(二次复核模型)  https://ark.cn-beijing.volces.com/api/v3        模型 doubao-*-vision-* / ep-*
+//   · 阿里 DashScope  https://dashscope.aliyuncs.com/compatible-mode/v1  模型 qwen-vl-max / qwen-vl-plus
+//   · OpenAI          https://api.openai.com/v1                        模型 gpt-4o 等
+// 因此换厂商只需在管理面板改 apiKey + baseUrl + model，无需改代码。
+// 注意各家 Key 都要用**推理（数据面）Key**，不是控制台的 AK/SK。
+type SecondOpinionConfig = { apiKey: string; model: string; baseUrl: string };
 
-const DOUBAO_DEFAULT_BASE = "https://ark.cn-beijing.volces.com/api/v3";
+const SECOND_OPINION_DEFAULT_BASE = "https://ark.cn-beijing.volces.com/api/v3";
 
-/** Read the Doubao vision config from site_config (admin-set, no deploy needed); fall back to .env. */
-async function loadDoubaoConfig(): Promise<DoubaoConfig | null> {
+/** 32×32 的极小 JPEG，用来探测某个模型**是否真的具备图像能力** —— 纯文本 ping 只能测出
+ *  模型存不存在，测不出它能不能看图。约 1KB base64，探测成本可忽略。 */
+const VISION_PROBE_JPEG_B64 =
+  "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAA0JCgsKCA0LCgsODg0PEyAVExISEyccHhcgLikxMC4pLSwzOko+MzZGNywtQFdBRkxOUlNSMj5aYVpQYEpRUk//2wBDAQ4ODhMREyYVFSZPNS01T09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0//wAARCAAgACADASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwCCpYreWbPlIWA79BRbRedcJHnAJ5+lbyIsaBEACjoK4W7HGkYUtrPCu6SMgevWoa6QgEEEAg9Qaw76AQXBVfukZHtSUrg0NtJRDcpI3QHn+VbwIIBBBB6EVzdWLe8mgXapBX0YdKJK4Jm7WJqEyzXJKEFVG3I70TX88ybCVVT12jrVWiMbA2f/2Q==";
+
+/** 读二次复核模型配置：优先新 key `second_opinion_config`，回退旧的 `doubao_vision_config`
+ *  （早期只支持二次复核模型时用的名字），最后回退环境变量。旧配置无需迁移即可继续生效。 */
+async function loadSecondOpinionConfig(): Promise<SecondOpinionConfig | null> {
   try {
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     const { data } = await (supabaseAdmin as any)
       .from("site_config")
-      .select("value")
-      .eq("key", "doubao_vision_config")
-      .maybeSingle();
-    const raw = (data as { value?: unknown } | null)?.value;
+      .select("key, value")
+      .in("key", ["second_opinion_config", "doubao_vision_config"]);
+    const rows: any[] = Array.isArray(data) ? data : [];
+    const pick =
+      rows.find((r) => r.key === "second_opinion_config") ??
+      rows.find((r) => r.key === "doubao_vision_config");
+    const raw = pick?.value;
     if (raw) {
       const cfg = typeof raw === "string" ? JSON.parse(raw) : raw;
       const apiKey = String(cfg?.apiKey ?? "").replace(/\s+/g, "");
       const model = String(cfg?.model ?? "").trim();
       if (apiKey && model) {
         const baseUrl =
-          String(cfg?.baseUrl ?? DOUBAO_DEFAULT_BASE)
+          String(cfg?.baseUrl ?? SECOND_OPINION_DEFAULT_BASE)
             .trim()
-            .replace(/\/+$/, "") || DOUBAO_DEFAULT_BASE;
+            .replace(/\/+$/, "") || SECOND_OPINION_DEFAULT_BASE;
         return { apiKey, model, baseUrl };
       }
     }
   } catch (e) {
-    console.warn("[Doubao] Failed to load doubao_vision_config from site_config:", e);
+    console.warn("[SecondOpinion] Failed to load config from site_config:", e);
   }
-  const envKey = (process.env.DOUBAO_API_KEY ?? "").replace(/\s+/g, "");
-  const envModel = (process.env.DOUBAO_MODEL ?? "").trim();
+  const envKey = (process.env.SECOND_OPINION_API_KEY ?? process.env.DOUBAO_API_KEY ?? "").replace(
+    /\s+/g,
+    "",
+  );
+  const envModel = (process.env.SECOND_OPINION_MODEL ?? process.env.DOUBAO_MODEL ?? "").trim();
   if (envKey && envModel) {
     const baseUrl =
-      (process.env.DOUBAO_API_BASE ?? DOUBAO_DEFAULT_BASE).trim().replace(/\/+$/, "") ||
-      DOUBAO_DEFAULT_BASE;
+      (process.env.SECOND_OPINION_API_BASE ?? process.env.DOUBAO_API_BASE ?? SECOND_OPINION_DEFAULT_BASE)
+        .trim()
+        .replace(/\/+$/, "") || SECOND_OPINION_DEFAULT_BASE;
     return { apiKey: envKey, model: envModel, baseUrl };
   }
   return null;
@@ -878,13 +923,13 @@ async function loadDoubaoConfig(): Promise<DoubaoConfig | null> {
 /** Second-opinion identify via Doubao. Returns the SAME quick-card fields as identifyQuick
  *  (so a confident verdict can replace the phase-1 card wholesale), or null on any failure /
  *  missing config — in which case the caller keeps the 疑似 result and routes to 补拍. */
-async function doubaoIdentify(
+async function secondOpinionIdentify(
   photoDataUrl: string,
   priorPhotos: InlineImage[],
   hintPlace: string,
   ctx: { candidate?: string | null; plantNetHint?: string | null },
 ): Promise<{ meta: AiMeta; model: string; usage: AiTokenUsage } | null> {
-  const cfg = await loadDoubaoConfig();
+  const cfg = await loadSecondOpinionConfig();
   if (!cfg) return null;
 
   const prior = priorPhotos.slice(0, 4);
@@ -937,7 +982,7 @@ async function doubaoIdentify(
       signal: controller.signal,
     });
     if (!resp.ok) {
-      console.warn("[Doubao] HTTP", resp.status, (await resp.text().catch(() => "")).slice(0, 300));
+      console.warn("[SecondOpinion] HTTP", resp.status, (await resp.text().catch(() => "")).slice(0, 300));
       return null;
     }
     const data = await resp.json();
@@ -956,21 +1001,21 @@ async function doubaoIdentify(
     };
   } catch (e) {
     // Non-fatal by design: a failed second opinion just means we keep the 疑似 verdict.
-    console.warn("[Doubao] second opinion failed:", e instanceof Error ? e.message : e);
+    console.warn("[SecondOpinion] second opinion failed:", e instanceof Error ? e.message : e);
     return null;
   } finally {
     clearTimeout(timer);
   }
 }
 
-/** 豆包顶替 Pl@ntNet 做「一线专业定种」——只在 Pl@ntNet 不可用（每日 500 次免费额度用尽 /
+/** 二次复核模型顶替 Pl@ntNet 做「一线专业定种」——只在 Pl@ntNet 不可用（每日 500 次免费额度用尽 /
  *  未配 key / 请求失败）时调用。刻意只要极少字段：产物只是喂给 Gemini 的定种基准 hint，不需要
- *  成篇内容，所以比 doubaoIdentify（完整摘要卡）快得多也便宜得多。失败返回 null → 退回纯 Gemini。*/
-async function doubaoPrimaryVerdict(
+ *  成篇内容，所以比 secondOpinionIdentify（完整摘要卡）快得多也便宜得多。失败返回 null → 退回纯 Gemini。*/
+async function secondOpinionPrimaryVerdict(
   photoDataUrl: string,
   priorPhotos: InlineImage[],
 ): Promise<{ hint: string; label: string; usage: AiTokenUsage; model: string } | null> {
-  const cfg = await loadDoubaoConfig();
+  const cfg = await loadSecondOpinionConfig();
   if (!cfg) return null;
 
   const prior = priorPhotos.slice(0, 4);
@@ -1013,7 +1058,7 @@ async function doubaoPrimaryVerdict(
     });
     if (!resp.ok) {
       console.warn(
-        "[Doubao] primary verdict HTTP",
+        "[SecondOpinion] primary verdict HTTP",
         resp.status,
         (await resp.text().catch(() => "")).slice(0, 300),
       );
@@ -1037,7 +1082,7 @@ async function doubaoPrimaryVerdict(
     return {
       label: `${sci}@${pct}%`,
       hint:
-        `【专业识别判定（豆包视觉 · Pl@ntNet 额度用尽时顶替）】最可能物种：${sci}` +
+        `【专业识别判定（二次复核模型视觉 · Pl@ntNet 额度用尽时顶替）】最可能物种：${sci}` +
         `${v.family ? `（科 ${v.family}${v.genus ? ` / 属 ${v.genus}` : ""}）` : ""}` +
         `，置信度 ${pct}%。${cands.length ? `备选：${cands.join("、")}。` : ""}` +
         `请以此判定为基准核对照片；若置信度偏低（低于 30%）或与照片明显不符，` +
@@ -1050,7 +1095,7 @@ async function doubaoPrimaryVerdict(
       },
     };
   } catch (e) {
-    console.warn("[Doubao] primary verdict failed:", e instanceof Error ? e.message : e);
+    console.warn("[SecondOpinion] primary verdict failed:", e instanceof Error ? e.message : e);
     return null;
   } finally {
     clearTimeout(timer);
@@ -1219,7 +1264,7 @@ async function callAiIdentify(
   if (plantNetKey && !pinned) {
     const pnRes = await plantNetIdentify(photoDataUrl, plantNetKey).catch((e) => {
       console.warn("[Pl@ntNet] identify failed; continuing with LLM-only:", e);
-      return { verdict: null, quotaExhausted: false };
+      return { verdict: null, quotaExhausted: false, status: 0, body: "" };
     });
     if (pnRes.quotaExhausted) await markPlantNetQuotaExhausted();
     const pn = pnRes.verdict;
@@ -3247,7 +3292,7 @@ export const quickIdentifyDraft = createServerFn({ method: "POST" })
     let enriched: boolean;
     let isInvasive = false;
     let gbifTaxonKey: number | null = null;
-    // 豆包二次复核的留痕（仅当复核真的改变了结论时非 null），写进 ai_payload 供复盘。
+    // 二次复核的留痕（仅当复核真的改变了结论时非 null），写进 ai_payload 供复盘。
     let secondOpinion: {
       by: string;
       model: string;
@@ -3308,27 +3353,27 @@ export const quickIdentifyDraft = createServerFn({ method: "POST" })
 
     // ── Stage 0（phase-1）：专业识别引擎作为一线信号 ────────────────────────────
     // 先做一次专业定种，判定作为「定种基准」提示喂给 Gemini —— Gemini 的置信度因此吸收了
-    // 这个信号（低分或与照片明显不符 → 倾向标「疑似」→ 触发下方豆包复核），无需再单独维护
+    // 这个信号（低分或与照片明显不符 → 倾向标「疑似」→ 触发下方二次复核），无需再单独维护
     // 一个脆弱的分数阈值门。此前这条链路只在 callAiIdentify（重路径）里跑，而拍照走的是本
     // 快路径，等于专业识别一直没参与常规识别 —— 这里把它接回一线。
     //
     // 一线引擎降级链：
     //   Pl@ntNet（免费额度 500 次/天）
-    //     → 额度用尽 / 未配 key / 请求失败 → 豆包视觉顶替
-    //       → 豆包也不可用 → 退回纯 Gemini（旧行为）
+    //     → 额度用尽 / 未配 key / 请求失败 → 二次复核模型视觉顶替
+    //       → 二次复核模型也不可用 → 退回纯 Gemini（旧行为）
     // 额度耗尽（HTTP 429）会被持久标记进 site_config.plantnet_quota_state，之后的请求直接
     // 跳过 Pl@ntNet，不用每次都撞一发必定 429 的往返；1 小时后自动重试，额度一重置就切回。
     let plantNetHint: string | undefined;
     let primaryLabel = "none";
-    let primaryEngine: "plantnet" | "doubao" | "none" = "none";
-    let doubaoPrimary: { usage: AiTokenUsage; model: string } | null = null;
+    let primaryEngine: "plantnet" | "vision" | "none" = "none";
+    let secondPrimary: { usage: AiTokenUsage; model: string } | null = null;
     const plantNetKey = await loadPlantNetKey();
     const quotaKnownExhausted = plantNetKey ? await isPlantNetQuotaExhausted() : false;
 
     if (plantNetKey && !quotaKnownExhausted) {
       const pnRes = await plantNetIdentify(dataUrl, plantNetKey).catch((e) => {
         console.warn("[Pl@ntNet] quick-path identify failed; falling back:", e);
-        return { verdict: null, quotaExhausted: false };
+        return { verdict: null, quotaExhausted: false, status: 0, body: "" };
       });
       if (pnRes.quotaExhausted) await markPlantNetQuotaExhausted();
       const pn = pnRes.verdict;
@@ -3345,14 +3390,14 @@ export const quickIdentifyDraft = createServerFn({ method: "POST" })
       }
     }
 
-    // Pl@ntNet 没能给出判定（额度用尽 / 未配 key / 请求失败）→ 豆包顶上一线专业定种。
+    // Pl@ntNet 没能给出判定（额度用尽 / 未配 key / 请求失败）→ 二次复核模型顶上一线专业定种。
     if (!plantNetHint) {
-      const dv = await doubaoPrimaryVerdict(dataUrl, priorInline);
+      const dv = await secondOpinionPrimaryVerdict(dataUrl, priorInline);
       if (dv) {
-        primaryEngine = "doubao";
-        primaryLabel = `${dv.label}（豆包顶替）`;
+        primaryEngine = "vision";
+        primaryLabel = `${dv.label}（二次复核模型顶替）`;
         plantNetHint = dv.hint;
-        doubaoPrimary = { usage: dv.usage, model: dv.model };
+        secondPrimary = { usage: dv.usage, model: dv.model };
       }
     }
     console.log(
@@ -3387,36 +3432,44 @@ export const quickIdentifyDraft = createServerFn({ method: "POST" })
       usedProvider = quick.provider;
       usage = quick.usage;
       enriched = false;
-      // 豆包顶一线时它的 token 也要计入本次识别的用量。
-      if (doubaoPrimary) {
-        usage = addUsage(usage, doubaoPrimary.usage);
-        usedProvider = `${usedProvider}+doubao-primary`;
-        usedModel = `${usedModel}+${doubaoPrimary.model}`;
+      // 一线引擎必须体现在 provider 里 —— 否则用量表永远只显示 "gemini-quick"，管理员
+      // 根本无从判断专业识别到底参与了没有（这正是上线后第一时间被问到的问题）。
+      // 注意：Pl@ntNet 不消耗 token，所以它只体现在 provider 名里、不会有独立的 token
+      // 记录，这是正常现象，不代表它没工作。
+      if (primaryEngine === "plantnet") {
+        usedProvider = `plantnet+${usedProvider}`;
+      } else if (secondPrimary) {
+        usage = addUsage(usage, secondPrimary.usage);
+        usedProvider = `vision-primary+${usedProvider}`;
+        usedModel = `${secondPrimary.model}+${usedModel}`;
       }
       // 统一疑似信号：名称/正文/补拍横幅三者一致（详见 normalizeIdentification）。
       normalizeIdentification(meta);
 
-      // ── 豆包 doubao-1.5-vision-pro 二次复核 ──────────────────────────────────
+      // ── 二次复核视觉模型 ──────────────────────────────────
       // 仅在 phase-1 判为「疑似」且仍有补拍名额时，才咨询第二个视觉模型：它有把握 → 整卡
       // 采纳（确认或纠正物种）→ 直接出确诊卡、跳过补拍；它同样没把握 → 维持疑似 → 照常进
-      // 补拍。补拍满 3 次不再复核（那已是强制出终局结论的关卡）。未配置豆包 / 请求失败 →
-      // doubaoIdentify 返回 null → 行为与改动前完全一致。
-      // primaryEngine==="doubao" 时跳过：一线已经是豆包看过这张图了，同一个模型再看一遍
+      // 补拍。补拍满 3 次不再复核（那已是强制出终局结论的关卡）。未配置二次复核模型 / 请求失败 →
+      // secondOpinionIdentify 返回 null → 行为与改动前完全一致。
+      // primaryEngine==="vision" 时跳过：一线已经是二次复核模型看过这张图了，同一个模型再看一遍
       // 基本不会得出不同结论，白花一次调用 —— 直接照常进补拍。
       if (
         meta.identification_confidence === "low" &&
         retakeCount < 3 &&
-        primaryEngine !== "doubao"
+        primaryEngine !== "vision"
       ) {
         const candidate = [meta.title, meta.scientific_name]
           .map((s) => (s || "").toString().trim())
           .filter(Boolean)
           .join(" ");
-        const second = await doubaoIdentify(dataUrl, priorInline, place, {
+        const second = await secondOpinionIdentify(dataUrl, priorInline, place, {
           candidate,
           plantNetHint,
         });
         if (second) {
+          // 无论结论是否被采纳，这次复核的 token 都已经花掉了 —— 必须计入用量，
+          // 否则被否决的复核会变成一笔查不到的隐形开销。
+          usage = addUsage(usage, second.usage);
           normalizeIdentification(second.meta);
           const resolved = second.meta.identification_confidence !== "low";
           const beforeKey = speciesKey((meta.scientific_name || "").toString());
@@ -3425,14 +3478,14 @@ export const quickIdentifyDraft = createServerFn({ method: "POST" })
           // 决策日志：线上调参用（谁给了什么、最终怎么裁定）。只进服务端日志，不入库。
           console.log(
             `[SecondOpinion] primary=${primaryEngine}(${primaryLabel}) gemini=low(${candidate || "?"}) ` +
-              `doubao=${second.meta.identification_confidence}(${(second.meta.title || "").toString().trim()} / ${(second.meta.scientific_name || "").toString().trim()}) ` +
+              `review=${second.meta.identification_confidence}(${(second.meta.title || "").toString().trim()} / ${(second.meta.scientific_name || "").toString().trim()}) ` +
               `→ ${resolved ? `RESOLVED(${action})，跳过补拍` : "仍疑似 → 照常补拍"}`,
           );
           if (resolved) {
             // 透明留痕：写进 ai_payload._second_opinion（不渲染进卡片，避免污染 150–260 字
             // 导语），配合 ai_usage_logs 里的 provider/model 供管理员复盘与调参。
             secondOpinion = {
-              by: "doubao",
+              by: "second-opinion",
               model: second.model,
               action,
               from: (meta.scientific_name || "").toString().trim(),
@@ -3440,9 +3493,12 @@ export const quickIdentifyDraft = createServerFn({ method: "POST" })
               plantnet: `${primaryEngine}:${primaryLabel}`,
             };
             meta = second.meta;
-            usedProvider = `${usedProvider}+doubao-vision`;
+            usedProvider = `${usedProvider}+review-adopted`;
             usedModel = `${usedModel}+${second.model}`;
-            usage = addUsage(usage, second.usage);
+          } else {
+            // 复核跑了但维持疑似 —— 同样要留痕，否则用量表上这笔开销没有出处。
+            usedProvider = `${usedProvider}+review-declined`;
+            usedModel = `${usedModel}+${second.model}`;
           }
         }
       }
@@ -6923,77 +6979,369 @@ export const clearPlantNetKeyFn = createServerFn({ method: "POST" })
     return { ok: true };
   });
 
-// ─── Admin: 豆包 vision 二次复核配置（stored in site_config）─────────────────
+// ─── Admin: 二次复核模型 vision 二次复核配置（stored in site_config）─────────────────
 // 用的是火山方舟 **ARK API Key**（数据面 Bearer token），不是 IAM 的 AK/SK。
-const SaveDoubaoInput = z.object({
+const SaveSecondOpinionInput = z.object({
   apiKey: z.string().min(1).max(2000),
   model: z.string().min(1).max(200),
   baseUrl: z.string().max(300).optional(),
 });
 
 /** Admin-only: save the Doubao vision config (enables the 疑似 second-opinion site-wide). */
-export const saveDoubaoConfigFn = createServerFn({ method: "POST" })
+export const saveSecondOpinionConfigFn = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .inputValidator((input) => SaveDoubaoInput.parse(input))
+  .inputValidator((input) => SaveSecondOpinionInput.parse(input))
   .handler(async ({ data, context }) => {
     const { supabase, userId } = context;
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     const { data: roles } = await supabase.from("user_roles").select("role").eq("user_id", userId);
     const isAdmin = roles?.some((r) => r.role === "admin") ?? false;
-    if (!isAdmin) throw new Error("仅管理员可配置豆包复核");
+    if (!isAdmin) throw new Error("仅管理员可配置二次复核模型");
     const value = {
       apiKey: (data.apiKey ?? "").replace(/\s+/g, ""),
       model: (data.model ?? "").trim(),
-      baseUrl: (data.baseUrl ?? "").trim().replace(/\/+$/, "") || DOUBAO_DEFAULT_BASE,
+      baseUrl: (data.baseUrl ?? "").trim().replace(/\/+$/, "") || SECOND_OPINION_DEFAULT_BASE,
       updatedAt: new Date().toISOString(),
       updatedBy: userId,
     };
     const { error } = await (supabaseAdmin as any)
       .from("site_config")
-      .upsert({ key: "doubao_vision_config", value }, { onConflict: "key" });
+      .upsert({ key: "second_opinion_config", value }, { onConflict: "key" });
     if (error) throw new Error(`保存失败：${error.message}`);
-    console.log(`[Doubao] Admin ${userId} updated Doubao vision config (model=${value.model})`);
+    console.log(`[SecondOpinion] Admin ${userId} updated Doubao vision config (model=${value.model})`);
     return { ok: true };
   });
 
 /** Admin-only: load the current Doubao config (key masked for display). */
-export const getDoubaoConfigFn = createServerFn({ method: "GET" })
+export const getSecondOpinionConfigFn = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
   .handler(async ({ context }) => {
     const { supabase, userId } = context;
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     const { data: roles } = await supabase.from("user_roles").select("role").eq("user_id", userId);
     const isAdmin = roles?.some((r) => r.role === "admin") ?? false;
-    if (!isAdmin) throw new Error("仅管理员可查看豆包配置");
+    if (!isAdmin) throw new Error("仅管理员可查看二次复核配置");
+    // 与 loadSecondOpinionConfig 保持同样的新旧 key 回退，否则旧配置在跑、面板却显示「未启用」。
     const { data } = await (supabaseAdmin as any)
       .from("site_config")
-      .select("value")
-      .eq("key", "doubao_vision_config")
-      .maybeSingle();
-    if (!data?.value) return null;
-    const cfg = typeof data.value === "string" ? JSON.parse(data.value) : data.value;
+      .select("key, value")
+      .in("key", ["second_opinion_config", "doubao_vision_config"]);
+    const rows: any[] = Array.isArray(data) ? data : [];
+    const picked =
+      rows.find((r) => r.key === "second_opinion_config") ??
+      rows.find((r) => r.key === "doubao_vision_config");
+    if (!picked?.value) return null;
+    const cfg = typeof picked.value === "string" ? JSON.parse(picked.value) : picked.value;
     const key: string = cfg?.apiKey ?? "";
     if (!key) return null;
     return {
       apiKeyMasked: key.length <= 10 ? key : `${key.slice(0, 4)}…${key.slice(-4)}`,
       model: (cfg?.model ?? "") as string,
-      baseUrl: (cfg?.baseUrl ?? DOUBAO_DEFAULT_BASE) as string,
+      baseUrl: (cfg?.baseUrl ?? SECOND_OPINION_DEFAULT_BASE) as string,
       updatedAt: cfg?.updatedAt ?? null,
     };
   });
 
 /** Admin-only: remove the Doubao config (疑似 结果回退为直接进补拍). */
-export const clearDoubaoConfigFn = createServerFn({ method: "POST" })
+export const clearSecondOpinionConfigFn = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .handler(async ({ context }) => {
     const { supabase, userId } = context;
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     const { data: roles } = await supabase.from("user_roles").select("role").eq("user_id", userId);
     const isAdmin = roles?.some((r) => r.role === "admin") ?? false;
-    if (!isAdmin) throw new Error("仅管理员可配置豆包复核");
-    await (supabaseAdmin as any).from("site_config").delete().eq("key", "doubao_vision_config");
-    console.log(`[Doubao] Admin ${userId} cleared Doubao vision config`);
+    if (!isAdmin) throw new Error("仅管理员可配置二次复核模型");
+    // 新旧两个 key 都删 —— 只删新的会让旧的 doubao_vision_config 继续被 load 回退命中，
+    // 表现成「点了停用却还在跑」。
+    await (supabaseAdmin as any)
+      .from("site_config")
+      .delete()
+      .in("key", ["second_opinion_config", "doubao_vision_config"]);
+    console.log(`[SecondOpinion] Admin ${userId} cleared Doubao vision config`);
     return { ok: true };
+  });
+
+// ─── Admin: 拉取二次复核模型可用模型（免去手填模型 ID 填错）──────────────────────────
+const ListVisionModelsInput = z.object({
+  apiKey: z.string().max(2000).optional(),
+  baseUrl: z.string().max(300).optional(),
+});
+
+/** 粗筛可能具备视觉能力的模型，避免对目录里上百个模型全量探测（真正的能力以实际探测为准）。
+ *  覆盖各家命名习惯：二次复核模型 vision/seed、通义 qwen-vl、OpenAI gpt-4o/omni、智谱 glm-4v、
+ *  Claude、Gemini 等。先按黑名单排除生图/视频/3D/向量/语音/翻译这类做不了植物复核的。 */
+function isVisionModelCandidate(id: string): boolean {
+  const s = id.toLowerCase();
+  if (
+    /embedding|rerank|seedream|seedance|seededit|seed3d|hyper3d|hitem3d|t2v|i2v|t2i|flf2v|image-gen|imagen|dall-?e|tts|whisper|audio|speech|asr|translation|pretrain|functioncall/.test(
+      s,
+    )
+  ) {
+    return false;
+  }
+  return (
+    /vision|vl\b|-vl-|multimodal|omni/.test(s) || // 通用/通义/多模态命名
+    /gpt-4o|gpt-4\.1|gpt-5|o[34]-/.test(s) || // OpenAI 多模态
+    /glm-\d+(\.\d+)?v/.test(s) || // 智谱 glm-4v / glm-4.5v
+    /claude-\d|claude-(opus|sonnet|haiku)/.test(s) || // Claude 全系多模态
+    /gemini/.test(s) || // Gemini 全系多模态
+    /seed-\d+-\d+/.test(s) // 二次复核模型 seed 系列原生多模态
+  );
+}
+
+/** Admin-only: 列出该 ARK Key 下的模型目录，并**逐个实测**哪些真能调用。
+ *  必要性：目录里有 ≠ 你的账号已开通 —— 实测过某账号目录 126 个、视觉模型却全部 404。 */
+export const listVisionModelsFn = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input) => ListVisionModelsInput.parse(input))
+  .handler(async ({ data, context }) => {
+    const { supabase, userId } = context;
+    const { data: roles } = await supabase.from("user_roles").select("role").eq("user_id", userId);
+    const isAdmin = roles?.some((r) => r.role === "admin") ?? false;
+    if (!isAdmin) throw new Error("仅管理员可拉取模型列表");
+
+    const saved = await loadSecondOpinionConfig();
+    const apiKey = (data.apiKey || "").replace(/\s+/g, "") || saved?.apiKey || "";
+    const baseUrl =
+      (data.baseUrl || "").trim().replace(/\/+$/, "") || saved?.baseUrl || SECOND_OPINION_DEFAULT_BASE;
+    const empty = { ok: false, total: 0, models: [] as { id: string; callable: boolean; note: string }[] };
+    if (!apiKey) return { ...empty, hint: "请先填入方舟 ARK API Key（或先保存一次配置）。" };
+
+    const H = { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" };
+    let catalog: string[] = [];
+    try {
+      const r = await fetch(`${baseUrl}/models`, { headers: H });
+      if (r.status === 401 || r.status === 403) {
+        return {
+          ...empty,
+          hint: `API Key 无效（HTTP ${r.status}）—— 请确认用的是方舟「API Key」（数据面），不是 IAM 的 Access Key/Secret Key。`,
+        };
+      }
+      if (!r.ok) {
+        return {
+          ...empty,
+          hint: `拉取模型目录失败：HTTP ${r.status} ${(await r.text().catch(() => "")).slice(0, 200)}`,
+        };
+      }
+      const j = await r.json();
+      catalog = (Array.isArray(j?.data) ? j.data : [])
+        .map((m: any) => String(m?.id ?? ""))
+        .filter(Boolean);
+    } catch (e) {
+      return { ...empty, hint: `拉取模型目录异常：${e instanceof Error ? e.message : String(e)}` };
+    }
+
+    const cands = catalog.filter(isVisionModelCandidate).slice(0, 24);
+    // 用**一张真图**探测，而不是纯文本 ping —— 纯文本只能测出模型存不存在，测不出它能不能
+    // 看图。而本功能的全部意义就是「只列出真有图形能力的模型」。
+    const probe = async (id: string) => {
+      try {
+        const r = await fetch(`${baseUrl}/chat/completions`, {
+          method: "POST",
+          headers: H,
+          body: JSON.stringify({
+            model: id,
+            messages: [
+              {
+                role: "user",
+                content: [
+                  { type: "text", text: "什么颜色？一个词。" },
+                  {
+                    type: "image_url",
+                    image_url: { url: `data:image/jpeg;base64,${VISION_PROBE_JPEG_B64}` },
+                  },
+                ],
+              },
+            ],
+            max_tokens: 4,
+          }),
+        });
+        if (r.ok) return { id, callable: true, note: "支持图片 ✓ 实测通过" };
+        const body = (await r.text().catch(() => "")).slice(0, 200);
+        if (r.status === 404) return { id, callable: false, note: "未开通 / 无权限（404）" };
+        if (r.status === 401 || r.status === 403)
+          return { id, callable: false, note: `鉴权失败（${r.status}）` };
+        // 模型存在但拒绝了图片内容 → 多半是纯文本模型，对本任务同样不可用。
+        return {
+          id,
+          callable: false,
+          note: `不支持图片输入（HTTP ${r.status}）${body.slice(0, 80)}`,
+        };
+      } catch (e) {
+        return {
+          id,
+          callable: false,
+          note: `探测异常：${e instanceof Error ? e.message.slice(0, 50) : ""}`,
+        };
+      }
+    };
+    const models: { id: string; callable: boolean; note: string }[] = [];
+    for (let i = 0; i < cands.length; i += 6) {
+      models.push(...(await Promise.all(cands.slice(i, i + 6).map(probe))));
+    }
+    models.sort((a, b) => Number(b.callable) - Number(a.callable) || a.id.localeCompare(b.id));
+
+    const usable = models.filter((m) => m.callable).length;
+    const hint = usable
+      ? `目录共 ${catalog.length} 个模型，实测其中 ${usable} 个**确实能看图**（下方绿色项，点一下即可选用）。`
+      : `目录里有 ${catalog.length} 个模型，探测了 ${cands.length} 个视觉候选，但**没有一个能用**。若清一色 404，说明这个 Key 对应的账号还没开通模型直调权限 —— 火山方舟需到控制台「在线推理」创建**推理接入点**，再把 ep- 开头的 ID 手动填进下面的模型框；其它厂商请确认模型已开通。`;
+    console.log(
+      `[SecondOpinion] admin=${userId} 模型探测 base=${baseUrl} 目录${catalog.length} 候选${cands.length} 可用${usable}`,
+    );
+    return { ok: true, total: catalog.length, models, hint };
+  });
+
+// ─── Admin: 识别引擎连通性自检 ────────────────────────────────────────────────
+// 回答「我配的 key 到底能不能用」。两个引擎都用**站内一张真实植物照片**跑完整链路，
+// 而不是只 ping 一下 key —— 纯文本 ping 会让「key 有效但模型不是多模态」这种最常见的
+// 配置错误蒙混过关（二次复核模型必须是 vision 模型才能复核照片）。
+export const testIdentifyEnginesFn = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .handler(async ({ context }) => {
+    const { supabase, userId } = context;
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data: roles } = await supabase.from("user_roles").select("role").eq("user_id", userId);
+    const isAdmin = roles?.some((r) => r.role === "admin") ?? false;
+    if (!isAdmin) throw new Error("仅管理员可自检识别引擎");
+
+    const plantnet = { ok: false, detail: "" };
+    const review = { ok: false, detail: "" };
+
+    // 取一张站内真实植物照片当测试样本。
+    // 注意字段名：plants 用 `cover_url`，plant_drafts 才是 `photo_url` —— 两张表不一样，
+    // 写错会 400（column does not exist），而且要把真实错误带出来，别再吞成一句笼统提示。
+    let sampleDataUrl = "";
+    let sampleNote = "";
+    let sampleErr = "";
+    const trySample = async (table: string, col: string, label: string) => {
+      if (sampleDataUrl) return;
+      const { data, error } = await (supabaseAdmin as any)
+        .from(table)
+        .select(`title, ${col}`)
+        .not(col, "is", null)
+        .order("created_at", { ascending: false })
+        .limit(40);
+      if (error) {
+        sampleErr += `[${label}] 查询失败：${error.message}；`;
+        return;
+      }
+      const rows: any[] = Array.isArray(data) ? data : [];
+      // 样本图**必须是 JPEG/PNG**：Pl@ntNet 不收 WebP，拿 WebP 当样本只会撞上 415，
+      // 测不到 key 到底有没有效（站内历史图大多是 WebP，这个坑踩过一次）。
+      const hit = rows.find((r) => /\.(jpe?g|png)(\?|$)/i.test(String(r?.[col] ?? "")));
+      if (!hit) {
+        sampleErr += `[${label}] 最近 ${rows.length} 条里没有 JPEG/PNG 图（历史图多为 WebP）；`;
+        return;
+      }
+      const img = await fetchInlineImage(hit[col]);
+      if (!img) {
+        sampleErr += `[${label}] 图片下载失败：${String(hit[col]).slice(0, 80)}；`;
+        return;
+      }
+      sampleDataUrl = `data:${img.mimeType};base64,${img.base64}`;
+      sampleNote = (hit?.title as string) || label;
+    };
+    try {
+      // 先查草稿：识别链路已改为强制 JPEG，最新的识别图必定是 JPEG，命中率最高。
+      await trySample("plant_drafts", "photo_url", "识别草稿");
+      await trySample("plants", "cover_url", "已收录植物");
+    } catch (e) {
+      sampleErr += `异常：${e instanceof Error ? e.message : String(e)}；`;
+    }
+    if (!sampleDataUrl) {
+      const msg = `无法取得 JPEG/PNG 测试样本照片（Pl@ntNet 不收 WebP）—— ${sampleErr || "原因未知"}。请先用相机识别一张照片（新识别图已强制为 JPEG），再回来自检。`;
+      console.warn("[EngineTest] sample photo unavailable:", sampleErr);
+      return {
+        plantnet: { ok: false, detail: msg },
+        review: { ok: false, detail: msg },
+        plantNetQuotaFlagged: await isPlantNetQuotaExhausted(),
+        sample: "",
+      };
+    }
+
+    // ── Pl@ntNet：没有单纯校验 key 的端点，只能发一次真实识别请求。
+    const pkey = await loadPlantNetKey();
+    if (!pkey) {
+      plantnet.detail = "未配置（site_config.plantnet_api_key 与环境变量都为空）";
+    } else {
+      try {
+        const res = await plantNetIdentify(sampleDataUrl, pkey);
+        if (res.quotaExhausted) {
+          await markPlantNetQuotaExhausted();
+          plantnet.detail =
+            "HTTP 429：每日免费额度（500 次/天）已用尽。已记下标记，接下来的识别会自动改由二次复核模型顶一线，额度重置后自动切回。";
+        } else if (res.verdict) {
+          plantnet.ok = true;
+          plantnet.detail = `连通正常 —— 样本判定为 ${res.verdict.scientific_name}（${Math.round((res.verdict.score ?? 0) * 100)}%）`;
+        } else if (res.status === 200) {
+          // key 有效，只是这张样本图认不出来 —— 对「key 能不能用」而言这就是通过。
+          plantnet.ok = true;
+          plantnet.detail = "key 有效（HTTP 200），只是这张样本图没match到物种，不影响正常识别";
+        } else if (res.status === 401 || res.status === 403) {
+          plantnet.detail = `HTTP ${res.status}：key 无效或已停用，请到 my.plantnet.org 重新获取。${res.body.slice(0, 120)}`;
+        } else if (res.status === 0) {
+          plantnet.detail = "请求未能发出（网络异常 / 超时），详见服务端日志";
+        } else {
+          plantnet.detail = `HTTP ${res.status}：${res.body.slice(0, 160) || "无响应体"}`;
+        }
+      } catch (e) {
+        plantnet.detail = `请求异常：${e instanceof Error ? e.message : String(e)}`;
+      }
+    }
+
+    // ── 二次复核模型：跑真实的 vision 定种，一次验证 key + 模型 ID + 多模态能力。
+    const dcfg = await loadSecondOpinionConfig();
+    if (!dcfg) {
+      review.detail = "未配置（site_config.second_opinion_config 与环境变量都为空）";
+    } else {
+      try {
+        const dv = await secondOpinionPrimaryVerdict(sampleDataUrl, []);
+        if (dv) {
+          review.ok = true;
+          review.detail = `连通正常 —— 模型 ${dcfg.model} 对样本判定为 ${dv.label}`;
+        } else {
+          // 看图失败时再发一次**纯文本** ping，用来把「key/模型根本不通」和「模型通但不支持
+          // 视觉」区分开 —— 这两者的修法完全不同，只报「调用失败」等于没说。
+          let probeStatus = -1;
+          let probeBody = "";
+          try {
+            const probe = await fetch(`${dcfg.baseUrl}/chat/completions`, {
+              method: "POST",
+              headers: {
+                Authorization: `Bearer ${dcfg.apiKey}`,
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({
+                model: dcfg.model,
+                messages: [{ role: "user", content: "ping" }],
+                max_tokens: 4,
+              }),
+            });
+            probeStatus = probe.status;
+            probeBody = (await probe.text().catch(() => "")).slice(0, 260);
+          } catch (e) {
+            probeBody = e instanceof Error ? e.message : String(e);
+          }
+          if (probeStatus === 200) {
+            review.detail = `模型 ${dcfg.model} 的纯文本调用正常，但**看图失败** —— 它很可能不是多模态（视觉）模型。请用「拉取可用模型」挑一个实测支持图片的。`;
+          } else {
+            review.detail = `调用失败（模型 ${dcfg.model}）：HTTP ${probeStatus === -1 ? "请求未发出" : probeStatus} ${probeBody}。常见原因：模型 ID 写错、该模型未在当前账号/地区开通（火山方舟此时应改填推理接入点 ep-…）、API Key 无效、或 API Base 填错。可先点「拉取可用模型」看看这个 Key 到底能调什么。`;
+          }
+        }
+      } catch (e) {
+        review.detail = `请求异常：${e instanceof Error ? e.message : String(e)}`;
+      }
+    }
+
+    console.log(
+      `[EngineTest] admin=${userId} plantnet=${plantnet.ok ? "OK" : "FAIL"} review=${review.ok ? "OK" : "FAIL"}`,
+    );
+    return {
+      plantnet,
+      review,
+      plantNetQuotaFlagged: await isPlantNetQuotaExhausted(),
+      sample: sampleNote,
+    };
   });
 
 // ─── Admin: AI Usage Statistics ───────────────────────────────────────────────
