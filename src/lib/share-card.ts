@@ -692,11 +692,8 @@ export async function renderShareCard(data: ShareCardData): Promise<Blob> {
  * apps appear (微信/小红书/抖音/… if installed). The card PNG **and** the detail-page
  * link must both travel, so the receiver gets a clickable link card next to the image.
  *
- * Why the staged attempts: many platforms (iOS Safari, Android Chrome) refuse a
- * `files` + `url` payload — `canShare({files})` says yes, then `share()` either throws
- * or silently drops the url, which is how the link went missing. So we probe the full
- * payload first, and when it's rejected we fold the link into `text` (every target that
- * accepts text auto-links a bare URL) rather than lose it.
+ * 图片优先策略：payload 只带 `files`(+可选 caption 文字)，**从不带 `url` 字段** —— `url` 会让
+ * 微信/小红书把分享判定成「网页分享」并丢掉图片。链接改折进 caption 文字（自动转链）+ 剪贴板。
  *
  * Falls back to a plain download when the platform can't share files at all
  * (most desktop browsers).
@@ -717,18 +714,20 @@ export async function shareOrSaveImage(
   const textWithLink = [opts?.text, link].filter(Boolean).join("\n");
 
   if (nav.share && nav.canShare) {
-    // The link rides in BOTH `url` and the caption text — deliberately duplicated.
+    // 图片优先 —— 关键：payload 里**绝不放 `url` 字段**。
     //
-    // Why: the receiving app decides what it keeps. 微信 / 小红书 / 短信 / 邮箱 routinely take
-    // the image and silently drop `url`, and share() still RESOLVES — so we cannot detect the
-    // loss and cannot fall back after the fact (the old code only demoted the link into the
-    // caption when the platform *rejected* the payload up front, which these apps don't do).
-    // A bare URL inside the caption survives that stripping, and every one of those targets
-    // auto-links it. Cost: targets that honour `url` show the link twice.
-    const attempts: { files?: File[]; title?: string; text?: string; url?: string }[] = [];
-    if (link) attempts.push({ files: [file], title, text: textWithLink, url: link });
-    // Same payload minus `url`, for targets that reject the files+url combination outright.
+    // 之前把链接同时塞进 `url` 和 caption，本意是「谁认哪个都行」；但实测发现 `url` 字段恰恰是
+    // 「有链接没图片」的元凶：微信 / 小红书的分享扩展一看到 `url`，就把这次分享判定成「分享网页」，
+    // 渲染成链接卡片、**直接丢掉 `files`（那张分享卡图）**。而分享卡的全部价值就是那张图（图上本就
+    // 印了 plantspedia.club 邀请），图必须过去。
+    //
+    // 去掉 `url` 后，图片作为 `files` 稳稳传出；链接折进 caption 文字（裸 URL 每个目标都会自动转链）
+    // + 剪贴板兜底。代价：极少数只认 `url` 卡片的目标不再显示富链接卡，但换来图片 100% 送达。
+    const attempts: { files?: File[]; title?: string; text?: string }[] = [];
+    // 1) 图片 + 文案（含链接）—— 大多数目标的主路径。
     attempts.push({ files: [file], title, text: textWithLink || undefined });
+    // 2) 纯图片兜底 —— 个别目标一旦带 text 就拒绝 files+text 组合，退到只发图。
+    attempts.push({ files: [file], title });
 
     for (const payload of attempts) {
       if (!nav.canShare(payload)) continue;

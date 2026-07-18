@@ -18,6 +18,9 @@ import {
   savePlantNetKeyFn,
   getPlantNetKeyFn,
   clearPlantNetKeyFn,
+  saveDoubaoConfigFn,
+  getDoubaoConfigFn,
+  clearDoubaoConfigFn,
 } from "@/lib/identify-plant.functions";
 import { XiaoPModelPanel } from "@/components/xiaop-model-panel";
 import { toast } from "sonner";
@@ -242,6 +245,190 @@ function PlantNetPanel() {
               onClick={() => saveMutation.mutate()}
               disabled={saveMutation.isPending}
               className="flex-1 py-2 text-xs font-bold rounded-lg bg-emerald-500 text-white hover:bg-emerald-600 transition-all cursor-pointer disabled:opacity-60"
+            >
+              {saveMutation.isPending ? "保存中…" : "保存并全站启用"}
+            </button>
+            <button
+              onClick={() => setIsOpen(false)}
+              className="px-4 py-2 text-xs rounded-lg border border-rule text-ink-soft hover:bg-paper-deep transition-all cursor-pointer"
+            >
+              取消
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Admin 豆包二次复核 Panel ──────────────────────────────────────────────────
+// 识别判为「疑似」时，先让豆包视觉模型复核一遍；它有把握就直接出确诊卡、跳过补拍，
+// 它同样没把握才进补拍。用的是火山方舟 ARK API Key（不是 IAM 的 AK/SK）。
+
+const DOUBAO_BASE_PLACEHOLDER = "https://ark.cn-beijing.volces.com/api/v3";
+
+function DoubaoPanel() {
+  const qc = useQueryClient();
+  const [isOpen, setIsOpen] = useState(false);
+  const [apiKey, setApiKey] = useState("");
+  const [model, setModel] = useState("");
+  const [baseUrl, setBaseUrl] = useState("");
+  const [showKey, setShowKey] = useState(false);
+
+  const saveFn = useServerFn(saveDoubaoConfigFn);
+  const getFn = useServerFn(getDoubaoConfigFn);
+  const clearFn = useServerFn(clearDoubaoConfigFn);
+
+  const { data: active, isLoading } = useQuery({
+    queryKey: ["doubao-config"],
+    queryFn: () => getFn({ data: undefined }),
+    retry: false,
+  });
+
+  const saveMutation = useMutation({
+    mutationFn: async () => {
+      if (!apiKey.trim()) throw new Error("请填写方舟 ARK API Key");
+      if (!model.trim()) throw new Error("请填写模型 ID 或推理接入点 ID");
+      await saveFn({
+        data: {
+          apiKey: apiKey.replace(/\s+/g, ""),
+          model: model.trim(),
+          baseUrl: baseUrl.trim() || undefined,
+        },
+      });
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["doubao-config"] });
+      toast.success("✅ 豆包二次复核已启用——疑似结果会先复核再决定是否补拍");
+      setIsOpen(false);
+      setApiKey("");
+    },
+    onError: (e: Error) => toast.error(e.message),
+  });
+
+  const clearMutation = useMutation({
+    mutationFn: () => clearFn({ data: undefined }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["doubao-config"] });
+      toast.success("已停用豆包复核（疑似结果直接进补拍）");
+    },
+    onError: (e: Error) => toast.error(e.message),
+  });
+
+  return (
+    <div className="mb-6 animate-in fade-in slide-in-from-top-2 duration-300">
+      <div className="flex items-center gap-3 mb-2">
+        <span className="text-[11px] font-semibold tracking-widest uppercase text-ink-faint">
+          管理员 · 疑似复核 豆包 Vision
+        </span>
+        <div className="flex-1 h-px bg-rule/50" />
+        {isLoading ? (
+          <span className="text-[11px] text-ink-faint">加载中…</span>
+        ) : active ? (
+          <span className="inline-flex items-center gap-1.5 text-[11px] font-semibold px-2.5 py-1 rounded-full bg-sky-500/10 text-sky-600 border border-sky-500/25">
+            <span className="w-1.5 h-1.5 rounded-full bg-sky-500 animate-pulse" />
+            已启用 · {active.model || active.apiKeyMasked}
+          </span>
+        ) : (
+          <span className="inline-flex items-center gap-1.5 text-[11px] text-ink-faint px-2.5 py-1 rounded-full border border-rule/50">
+            未启用（疑似直接进补拍）
+          </span>
+        )}
+      </div>
+
+      <div className="flex items-center gap-2 flex-wrap">
+        <button
+          onClick={() => setIsOpen((v) => !v)}
+          className="inline-flex items-center gap-2 text-xs font-medium px-3 py-1.5 rounded-lg border border-rule bg-paper hover:bg-ink hover:text-background transition-all cursor-pointer"
+        >
+          <LeafIcon className="w-3.5 h-3.5" />
+          {isOpen ? "收起" : active ? "修改配置" : "配置豆包复核"}
+        </button>
+        {active && (
+          <button
+            onClick={() => clearMutation.mutate()}
+            disabled={clearMutation.isPending}
+            className="inline-flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg border border-rule/60 text-ink-soft hover:border-destructive hover:text-destructive hover:bg-destructive/5 transition-all cursor-pointer disabled:opacity-50"
+          >
+            {clearMutation.isPending ? "停用中…" : "停用"}
+          </button>
+        )}
+      </div>
+
+      {isOpen && (
+        <div className="mt-3 p-4 rounded-2xl border border-sky-500/30 bg-sky-500/5 space-y-4 animate-in fade-in slide-in-from-top-1 duration-200">
+          <div className="flex gap-2 p-2.5 rounded-lg bg-sky-50 border border-sky-200 text-[11px] text-sky-900 leading-relaxed">
+            <span>🔍</span>
+            <span>
+              启用后豆包承担<b>两个角色</b>：①<b>疑似复核</b>——识别判为「疑似」时先让豆包独立复核，
+              它有把握就直接出确诊卡、<b>跳过补拍</b>（可确认也可纠正物种），它同样没把握才引导用户补拍；
+              ②<b>顶替 Pl@ntNet</b>——Pl@ntNet 每日免费额度（500 次）用尽后，自动改由豆包承担一线专业定种，
+              额度次日重置后自动切回。角色 ① 只在疑似时才调用，不拖慢正常识别。全站立即生效，无需重新部署。
+            </span>
+          </div>
+          <div>
+            <label className="block text-xs font-semibold text-ink-soft mb-1.5">
+              方舟 ARK API Key
+            </label>
+            <div className="relative">
+              <input
+                type={showKey ? "text" : "password"}
+                value={apiKey}
+                onChange={(e) => setApiKey(e.target.value)}
+                placeholder="方舟控制台生成的 API Key"
+                className="w-full pr-10 pl-3 py-2 text-xs rounded-lg border border-rule bg-background font-mono focus:outline-none focus:border-sky-400 transition-colors"
+              />
+              <button
+                type="button"
+                onClick={() => setShowKey((v) => !v)}
+                className="absolute right-2 top-1/2 -translate-y-1/2 text-ink-faint hover:text-ink transition-colors cursor-pointer"
+              >
+                {showKey ? (
+                  <EyeOffIcon className="w-3.5 h-3.5" />
+                ) : (
+                  <EyeIcon className="w-3.5 h-3.5" />
+                )}
+              </button>
+            </div>
+            <p className="mt-1 text-[11px] text-ink-faint">
+              用推理（数据面）的 <b>API Key</b>，不是 IAM 的 Access Key/Secret Key。Key 存在服务端数据库。
+            </p>
+          </div>
+          <div>
+            <label className="block text-xs font-semibold text-ink-soft mb-1.5">
+              模型 ID / 推理接入点 ID
+            </label>
+            <input
+              value={model}
+              onChange={(e) => setModel(e.target.value)}
+              placeholder="doubao-1-5-vision-pro-32k-250115 或 ep-2025xxxx-xxxxx"
+              className="w-full px-3 py-2 text-xs rounded-lg border border-rule bg-background font-mono focus:outline-none focus:border-sky-400 transition-colors"
+            />
+            <p className="mt-1 text-[11px] text-ink-faint">
+              必须是<b>多模态（视觉）</b>模型，纯文本模型无法复核照片。注意方舟模型名用<b>连字符</b>
+              （doubao-1-5-…，不是 doubao-1.5-…）。若报 InvalidEndpointOrModel.NotFound，
+              说明该模型未在当前账号/地区开通，改填推理接入点 ID（ep-…）。
+            </p>
+          </div>
+          <div>
+            <label className="block text-xs font-semibold text-ink-soft mb-1.5">
+              API Base（可选）
+            </label>
+            <input
+              value={baseUrl}
+              onChange={(e) => setBaseUrl(e.target.value)}
+              placeholder={DOUBAO_BASE_PLACEHOLDER}
+              className="w-full px-3 py-2 text-xs rounded-lg border border-rule bg-background font-mono focus:outline-none focus:border-sky-400 transition-colors"
+            />
+            <p className="mt-1 text-[11px] text-ink-faint">
+              留空即用 {DOUBAO_BASE_PLACEHOLDER}（OpenAI 兼容接口）。
+            </p>
+          </div>
+          <div className="flex gap-2">
+            <button
+              onClick={() => saveMutation.mutate()}
+              disabled={saveMutation.isPending}
+              className="flex-1 py-2 text-xs font-bold rounded-lg bg-sky-500 text-white hover:bg-sky-600 transition-all cursor-pointer disabled:opacity-60"
             >
               {saveMutation.isPending ? "保存中…" : "保存并全站启用"}
             </button>
@@ -756,6 +943,7 @@ function IdentifyPage() {
 
         {/* Admin-only professional plant-ID engine (Pl@ntNet) */}
         {isAdmin && <PlantNetPanel />}
+        {isAdmin && <DoubaoPanel />}
 
         {/* Admin-only 小P蛙 agent model config */}
         {isAdmin && <XiaoPModelPanel />}

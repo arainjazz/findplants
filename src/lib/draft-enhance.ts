@@ -16,6 +16,12 @@
 const REPLACEABLE_SELECTOR = "img.sec-img";
 
 const VIEWER_STYLE = `<style id="pp-viewer-style">
+/* 防溢出兜底（真机微信/WKWebView 尤其需要）：iframe 内文档的 viewport=device-width，
+   真机上偶尔按设备宽而非 iframe 宽布局，宽图/宽表就横向撑破屏幕。这里强制任何媒体元素
+   不超出容器、并禁掉文档级横向滚动。覆盖新旧所有草稿（drafts.$id 渲染都过 enhance）。 */
+html,body{max-width:100%;overflow-x:hidden;}
+img,video,iframe,table,pre{max-width:100%!important;height:auto;}
+.page-wrap{max-width:100%;overflow-x:hidden;}
 @media (max-width:640px){
   .page-wrap{padding:24px 16px 56px;}
   .masthead{padding:20px 0;margin-bottom:26px;}

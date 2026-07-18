@@ -1,7 +1,101 @@
 # Plantspedia — Working State  (single source of truth)
 
-_Last updated: 2026-07-18 — by Claude (续8：分享卡去名录标签 + 疑似关卡跳补拍 + 不符按钮移到enrich后 + enrich自动提交 + 星号清洗；tsc=0，✅ 已部署 6e9a105c + SQL已跑）_
+_Last updated: 2026-07-18 — by Claude (续9：Pl@ntNet 接回 phase-1 一线 + 豆包 vision 疑似复核 + 管理员配置面板；tsc=0，⚠️ 未部署/未端到端实测）_
 _Read this FIRST and update it LAST, every session._
+
+## ✅ 2026-07-18（续10）— 出卡提速 + 手机端图片溢出 + 分享无图（tsc=0；**已部署 512b1658**）
+**部署记录**：续9（Pl@ntNet 一线 + 豆包复核 + 管理员面板）与续10 **一起上线**，版本
+`512b1658-4fba-49fd-a201-24c66422ecab`（2026-07-18T09:18）。⚠️ 这次 wrangler **连失败 2 次、第 3 次才成功**
+（GFW 掐大文件上传；期间 `curl api.cloudflare.com` 只需 0.6s 且返回 403=可达，证明短请求正常、
+只有 4MB 脚本 PUT 被掐）。照例用 `deployments list` 对时间戳确认前两次真没上。
+**线上实证**：① 分享 chunk 里 payload 已是 `{files,title,text}` + `{files,title}`、**`url` 字段消失** ✅
+② viewer 样式含两条防溢出兜底 ✅。
+1. **✅ 分享到微信/小红书只有链接没有图片 —— 根因找到并修复**
+   （[share-card.ts](src/lib/share-card.ts) `shareOrSaveImage`）：
+   **元凶是 payload 里的 `url` 字段**。微信/小红书的分享扩展一看到 `url` 就把这次分享判定成
+   「分享网页」，渲染链接卡片、**直接丢掉 `files`（分享卡图）**。续6 为保链接特意把链接同时放
+   `url` + caption，恰恰是这个 `url` 把图挤掉了。
+   - **改法**：payload **永不带 `url`**；图片走 `files`，链接折进 caption 文字（裸 URL 各家都会
+     自动转链）+ 剪贴板兜底。attempts 顺序改为 ①图+文案 ②纯图兜底。
+   - **实测**（浏览器 stub navigator.share）：A 全接受→`有files:true / 有url字段:false`、链接在
+     text 里 ✅；B 目标拒 text→退纯图、`有files:true` ✅。**两种场景图片都在**。
+2. **✅ 手机端草稿配图溢出屏幕**（[draft-enhance.ts](src/lib/draft-enhance.ts) VIEWER_STYLE）：
+   模板本身响应式是对的（`.section-with-img` 的 grid 只在 ≥768px 生效），375px 模拟也复现不出 ——
+   真机（微信 X5 / WKWebView）对 `iframe srcDoc` + 内部 `viewport=device-width` 的处理才会按设备宽
+   而非 iframe 宽布局，把宽图撑出屏幕。**在 enhance 注入防御兜底**（`html,body{max-width:100%;
+   overflow-x:hidden}` + `img,video,iframe,table,pre{max-width:100%!important;height:auto}`），
+   **新旧草稿全覆盖**（drafts.$id 渲染都过 enhance）。
+   - **实测**：1600px 宽图放进 320px iframe → 渲染宽 272px、`scrollWidth=320`（=iframe 宽）→ **零横向溢出** ✅。
+3. **✅ phase-1 出卡提速**（[identify-plant.functions.ts](src/lib/identify-plant.functions.ts)）：
+   - **砍掉快速卡用不到的 AI 输出**：`AI_QUICK_SCHEMA` 移除 `summary_en` / `field_notes_zh` /
+     `field_notes_en`（`buildSummaryCardHtml` 只用 title/sci/summary_zh/family/genus/chips，
+     这三个字段**从来没被读过**），required 里也去掉 summary_en，prompt 同步删除对应要求。
+     flash 是顺序生成，输出量砍掉近一半 → 直接缩短 Gemini 那一段。`summary_zh` 仍 required，
+     写库的 `summary_zh || summary_en` 回退链安全。
+   - **地名反查 + 原图上传改为与识别并行**：识别只吃 base64，既不要 photoUrl 也不真需要地名；
+     以前是 `geocode → upload → identify` 三个网络往返**串行**。现在两者并行启动，识别期间在后台跑完。
+     `uploadP` 用 `.then(ok,err)` 就地接住 rejection（否则 await 之前失败会 unhandled rejection 带崩请求）。
+   - **地名只等 4s**（`reverseGeocode` 走 Nominatim，**原本无超时**、偶发挂死会拖住整次识别）：
+     超时就先不带地点提示去识别，**写库前再取完整值补回** → `capture_place` 不会因此丢。
+- **⚠️ 最大的慢因不在我这轮改动里，需你定夺**：续9 把快速路径变成**最多 3 个串行模型调用**
+  —— Pl@ntNet（20s 超时）→ Gemini（45s 超时）→ 疑似时再加豆包复核。而「疑似」很常见 →
+  豆包经常触发。这是续9 为降低错误率有意加的，**质量与速度的直接权衡**，我没擅自改。
+  可选项：① 维持现状（准但慢）②豆包复核改成后台异步、先出卡后更新 ③只在 Pl@ntNet 与 Gemini
+  结论冲突时才触发豆包（而非所有 low）④给 Pl@ntNet 更短超时（20s 太宽）。
+- **验证**：tsc=0 ✅；lint 我的改动**零新增**（identify-plant 的 +4 `any` 全部来自续9 的
+  Pl@ntNet/豆包代码，逐行核对过）。**未提交、未部署** —— 工作区混着续9 的在制品
+  （identify.tsx、STATE.md 也是他们的），部署会一并带上。
+
+## 🚧 2026-07-18（续9）— Pl@ntNet 接回一线 + 豆包 vision 疑似复核（tsc=0；⚠️ 未部署 / 未端到端实测）
+全部改动在 [identify-plant.functions.ts](src/lib/identify-plant.functions.ts) + [identify.tsx](src/routes/identify.tsx)。
+**补拍链路（drafts.$id.tsx / camera-identify.tsx）零改动** —— 它只看 `identification_confidence`，合并后的 meta 会把字段设对。
+
+- **根因发现（用户问"为什么识别错误率高"）**：**Pl@ntNet 此前根本没参与常规识别**。拍照走 phase-1
+  `identifyQuick`（**纯 Gemini**），不进 `callAiIdentify`；phase-2 `enrichDraft` 因物种已 pin，
+  `callAiIdentify` 里的 Stage-0 Pl@ntNet 分支被跳过。即 Pl@ntNet 只在 Gemini 不可用的兜底分支才发请求。
+  用户看到的「疑似/LOW」一直是 **Gemini 的** confidence，不是 Pl@ntNet 的。
+- **1. Pl@ntNet 接回 phase-1 一线**：`quickIdentifyDraft` 里在 `identifyQuick` 前先调
+  `loadPlantNetKey()`+`plantNetIdentify()`，判定作为 `plantNetHint` 注入 `identifyQuick` 的 system
+  prompt（复刻 callAiIdentify `:941` 那套写法）。**Gemini 的置信度因此吸收 Pl@ntNet 信号**（低分/不符 →
+  倾向标疑似），不用再单独维护脆弱的分数阈值门。代价：每次拍照多一次 Pl@ntNet 请求（顺序，约 +1–2s）。
+- **2. 豆包 doubao-1.5-vision-pro 二次复核**：新增 `doubaoIdentify()`（以 `quickIdentify()` 的 OpenAI
+  兼容 vision 调用为模板，火山方舟 `/chat/completions`，`response_format: json_object`，30s 超时，
+  多图=新图+最多4张补拍旧图）。**仅当 `identification_confidence==="low"` 且 `retakeCount<3` 时才调用**。
+  豆包**有把握（!low）→ 整卡采纳**（确认或纠正物种走同一条路径，即用户选的 "let Doubao override"）→
+  直接出确诊卡、跳过补拍；豆包**同样 low → 维持疑似 → 照常补拍**。未配置/失败 → 返回 null，行为与改动前完全一致。
+- **2b. Pl@ntNet 额度用尽 → 豆包顶一线**（用户追加需求）：新增 `doubaoPrimaryVerdict()`（轻量版，
+  只产出 hint 所需的 {学名/科/属/confidence/candidates}，比完整复核快且省 token）。降级链：
+  **Pl@ntNet（500次/天）→ 429/未配key/失败 → 豆包顶一线 → 豆包也不可用 → 纯 Gemini**。
+  `plantNetIdentify` 返回值改为 `{verdict, quotaExhausted}`（**只有 HTTP 429 才算额度耗尽**；
+  401/403 是 key 问题、不该让 Pl@ntNet 被长期跳过）。耗尽状态持久化在
+  `site_config.plantnet_quota_state = {exhaustedAt}`，命中则直接跳过 Pl@ntNet 不再撞 429；
+  **用「1 小时窗口」而非「按 UTC 日期」**——Pl@ntNet 重置时区无明确文档，猜错会整天不恢复。
+  一线已是豆包时**跳过疑似复核**（同一模型看同一张图第二遍不会有新结论，白花一次调用）。
+- **3. 字段集对齐**：本轮另一会话把 `AI_QUICK_SCHEMA` 精简掉了 `summary_en`/`field_notes_*`（提速）。
+  豆包 prompt 已同步只要那批精简字段，**不要**再让它产出 field_notes/英文摘要。
+- **4. Pl@ntNet 参数调优**：`no-reject=true`（把握不足也返候选，避免 404）+ `nb-results` 3→5，
+  candidates 展示 3→4。**project 仍是 `all`** —— 公共库无中国/内蒙 flora，盲切区域库反而漏本地种。
+- **5. 透明留痕**：复核改变结论时写 `ai_payload._second_opinion`（by/model/action=confirm|override/
+  from/to/plantnet），**不渲染进卡片**（避免污染 150–260 字导语）；另有 `[SecondOpinion]` 服务端决策日志
+  + `ai_usage_logs` 的 provider(`gemini-quick+doubao-vision`)/model 供复盘调参。
+- **6. 管理员配置面板**：identify.tsx 新增 `DoubaoPanel`（仿 PlantNetPanel），server fns
+  `saveDoubaoConfigFn/getDoubaoConfigFn/clearDoubaoConfigFn` → `site_config.doubao_vision_config`
+  = `{apiKey, model, baseUrl}`，**全站立即生效、无需部署**；.env 兜底 `DOUBAO_API_KEY/DOUBAO_MODEL/DOUBAO_API_BASE`。
+- **⚠️ 密钥类型（易踩坑）**：推理用**方舟 ARK API Key（数据面 Bearer）**，**不是 IAM 的 AK/SK**（管理面签名用）。
+- **⚠️ 模型 ID 命名（已实测）**：方舟用**连字符**——`doubao-1-5-vision-pro-32k-250115`，不是 `doubao-1.5-…`。
+  本机 arkcli 实测该 ID **控制面可见但当前账号数据面 NotFound**（`InvalidEndpointOrModel.NotFound`）→
+  用户需在自己账号开通该模型，或改填**推理接入点 ID（ep-…）**。arkcli 的 `models list`/`resources list`
+  当前因 **Volc SSO STS 过期**不可用（需 `arkcli auth login volc-sso`，未代为执行）。
+- **验证**：`tsc --noEmit` = 0 ✅；dev server(5199) `/identify` 加载正常、服务端无报错 ✅。
+  **未验证**：豆包端到端（缺可用的 ARK key+模型，且管理面板需 admin 登录）；未部署。
+- **⚠️ 用户反馈「面板里看不到填豆包 key 的地方」→ 三个可能原因**（代码本身没问题：`DoubaoPanel`
+  就在 `PlantNetPanel` 下一行、同一个 `isAdmin` 门，identify.tsx `:944-945`）：
+  ① **改动没部署**（最可能——线上跑的还是旧代码）；② 面板 **admin-gated**，必须以管理员登录；
+  ③ **Vite HMR 卡陈旧模块**——本轮亲历：新增导出后 HMR 报
+  `does not provide an export named 'clearDoubaoConfigFn'` → `identify.tsx` 组件重载失败 → 面板不渲染。
+  `tsc` 通过 + 导出确实存在即可判定是 HMR 陈旧，**重启 dev server + 硬刷新**即可。
+- **⚠️ 本轮有另一会话并行改同一仓库**（`draft-enhance.ts` / `share-card.ts` / 上述 AI_QUICK_SCHEMA 精简
+  均非本会话所为）—— 提交/部署前先 `git diff` 确认要带上哪些改动。
 
 ## ✅ 2026-07-18 部署 + SQL 记录（版本 6e9a105c-59a5-44b9-a0a3-6f66708edfe5）
 - **已上线**：续8 全部 5 项（分享卡去名录标签 / 疑似关卡跳补拍 / 不符按钮移到enrich后 /

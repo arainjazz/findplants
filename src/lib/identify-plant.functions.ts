@@ -718,18 +718,68 @@ async function loadPlantNetKey(): Promise<string> {
   return (process.env.PLANTNET_API_KEY ?? "").replace(/\s+/g, "");
 }
 
-/** Identify a plant photo via Pl@ntNet. Returns the top species + 2 alternates with
- *  confidence scores, or null on any failure (caller continues with LLM-only). */
-async function plantNetIdentify(
-  photoDataUrl: string,
-  apiKey: string,
-): Promise<{
+type PlantNetVerdict = {
   scientific_name: string;
   family: string;
   genus: string;
   score: number;
   candidates: string[];
-} | null> {
+};
+
+// ─── Pl@ntNet 免费额度（500 次/天）耗尽的持久标记 ────────────────────────────
+// Workers 是无状态的（每个 isolate 各自的内存缓存不可靠），所以把「已耗尽」写进
+// site_config。命中标记时直接跳过 Pl@ntNet、改用豆包顶一线，省掉一次必定 429 的往返。
+// 用时间戳 + 1 小时窗口而不是「按 UTC 日期」：Pl@ntNet 的重置时区没有明确文档，
+// 猜错时区会导致整天不恢复；1 小时窗口最多每小时浪费一次 429（不消耗额度），
+// 且额度重置后最迟 1 小时自动恢复。
+const PLANTNET_QUOTA_RETRY_MS = 60 * 60 * 1000;
+
+/** True if Pl@ntNet was marked quota-exhausted within the retry window. */
+async function isPlantNetQuotaExhausted(): Promise<boolean> {
+  try {
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data } = await (supabaseAdmin as any)
+      .from("site_config")
+      .select("value")
+      .eq("key", "plantnet_quota_state")
+      .maybeSingle();
+    const raw = (data as { value?: unknown } | null)?.value;
+    if (!raw) return false;
+    const cfg = typeof raw === "string" ? JSON.parse(raw) : raw;
+    const at = Date.parse(cfg?.exhaustedAt ?? "");
+    if (!Number.isFinite(at)) return false;
+    return Date.now() - at < PLANTNET_QUOTA_RETRY_MS;
+  } catch (e) {
+    console.warn("[Pl@ntNet] quota-state read failed; assuming quota OK:", e);
+    return false;
+  }
+}
+
+/** Record that Pl@ntNet returned 429 so subsequent identifies skip it for a while. */
+async function markPlantNetQuotaExhausted(): Promise<void> {
+  try {
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    await (supabaseAdmin as any).from("site_config").upsert(
+      {
+        key: "plantnet_quota_state",
+        value: { exhaustedAt: new Date().toISOString() },
+      },
+      { onConflict: "key" },
+    );
+    console.warn("[Pl@ntNet] 429 每日额度已用尽 → 标记状态，改由豆包顶一线识别");
+  } catch (e) {
+    console.warn("[Pl@ntNet] quota-state write failed:", e);
+  }
+}
+
+/** Identify a plant photo via Pl@ntNet. `verdict` is the top species + alternates
+ *  (null on any failure → caller continues with the fallback identifier).
+ *  `quotaExhausted` is true only on HTTP 429 — the daily free quota (500/day) ran out,
+ *  which is the signal to hand the first-line job over to Doubao. */
+async function plantNetIdentify(
+  photoDataUrl: string,
+  apiKey: string,
+): Promise<{ verdict: PlantNetVerdict | null; quotaExhausted: boolean }> {
   const m = photoDataUrl.match(/^data:([^;]+);base64,(.+)$/);
   const mime = m?.[1] ?? "image/jpeg";
   const b64 = m?.[2] ?? photoDataUrl;
@@ -740,7 +790,11 @@ async function plantNetIdentify(
   form.append("images", new Blob([new Uint8Array(bytes)], { type: mime }), `plant.${ext}`);
   form.append("organs", "auto");
 
-  const url = `https://my-api.plantnet.org/v2/identify/all?api-key=${encodeURIComponent(apiKey)}&nb-results=3`;
+  // project=all (k-world-flora)：PlantNet 公共库没有专门的中国/内蒙 flora，盲切区域库反而
+  // 可能漏掉本地种；若日后确认有可用亚洲库再切 project。
+  // no-reject=true：对把握不足的图也返回最可能候选（否则可能 404 Species not found），一线
+  // 信号更稳；nb-results=5：多带备选进 hint，帮下游模型排除易混种。
+  const url = `https://my-api.plantnet.org/v2/identify/all?api-key=${encodeURIComponent(apiKey)}&nb-results=5&no-reject=true`;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 20_000);
   let resp: Response;
@@ -751,24 +805,256 @@ async function plantNetIdentify(
   }
   if (!resp.ok) {
     console.warn("[Pl@ntNet] HTTP", resp.status, (await resp.text().catch(() => "")).slice(0, 200));
-    return null;
+    // 429 = 每日免费额度（500 次）用尽。只有这一种状态值得持久标记并交棒给豆包；
+    // 401/403 之类是 key 配置问题，本次失败即可，不该让 Pl@ntNet 被长期跳过。
+    return { verdict: null, quotaExhausted: resp.status === 429 };
   }
   const data = await resp.json();
   const results = Array.isArray(data.results) ? data.results : [];
   const top = results[0];
   const sci = top?.species?.scientificNameWithoutAuthor ?? top?.species?.scientificName ?? "";
-  if (!sci) return null;
+  if (!sci) return { verdict: null, quotaExhausted: false };
   return {
-    scientific_name: sci,
-    family: top.species?.family?.scientificNameWithoutAuthor ?? "",
-    genus: top.species?.genus?.scientificNameWithoutAuthor ?? "",
-    score: typeof top.score === "number" ? top.score : 0,
-    candidates: results.slice(0, 3).map((r: any) => {
-      const n = r.species?.scientificNameWithoutAuthor ?? r.species?.scientificName ?? "?";
-      const s = typeof r.score === "number" ? Math.round(r.score * 100) : 0;
-      return `${n}（${s}%）`;
-    }),
+    quotaExhausted: false,
+    verdict: {
+      scientific_name: sci,
+      family: top.species?.family?.scientificNameWithoutAuthor ?? "",
+      genus: top.species?.genus?.scientificNameWithoutAuthor ?? "",
+      score: typeof top.score === "number" ? top.score : 0,
+      candidates: results.slice(0, 4).map((r: any) => {
+        const n = r.species?.scientificNameWithoutAuthor ?? r.species?.scientificName ?? "?";
+        const s = typeof r.score === "number" ? Math.round(r.score * 100) : 0;
+        return `${n}（${s}%）`;
+      }),
+    },
   };
+}
+
+// ─── 豆包 doubao-1.5-vision-pro 二次复核（火山方舟 Ark，OpenAI 兼容）────────────
+// 只在 phase-1（Pl@ntNet + Gemini）判为「疑似」时才咨询的第二个多模态模型。它返回与
+// identifyQuick 相同的摘要卡字段，所以一个有把握的判定可以整卡替换 phase-1 结果
+// （确认或纠正皆走同一条路径），从而跳过补拍；它若同样没把握，则维持疑似 → 照常补拍。
+// 注意：推理用的是方舟 **ARK API Key**（数据面 Bearer），不是 IAM 的 AK/SK（管理面签名用）。
+type DoubaoConfig = { apiKey: string; model: string; baseUrl: string };
+
+const DOUBAO_DEFAULT_BASE = "https://ark.cn-beijing.volces.com/api/v3";
+
+/** Read the Doubao vision config from site_config (admin-set, no deploy needed); fall back to .env. */
+async function loadDoubaoConfig(): Promise<DoubaoConfig | null> {
+  try {
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data } = await (supabaseAdmin as any)
+      .from("site_config")
+      .select("value")
+      .eq("key", "doubao_vision_config")
+      .maybeSingle();
+    const raw = (data as { value?: unknown } | null)?.value;
+    if (raw) {
+      const cfg = typeof raw === "string" ? JSON.parse(raw) : raw;
+      const apiKey = String(cfg?.apiKey ?? "").replace(/\s+/g, "");
+      const model = String(cfg?.model ?? "").trim();
+      if (apiKey && model) {
+        const baseUrl =
+          String(cfg?.baseUrl ?? DOUBAO_DEFAULT_BASE)
+            .trim()
+            .replace(/\/+$/, "") || DOUBAO_DEFAULT_BASE;
+        return { apiKey, model, baseUrl };
+      }
+    }
+  } catch (e) {
+    console.warn("[Doubao] Failed to load doubao_vision_config from site_config:", e);
+  }
+  const envKey = (process.env.DOUBAO_API_KEY ?? "").replace(/\s+/g, "");
+  const envModel = (process.env.DOUBAO_MODEL ?? "").trim();
+  if (envKey && envModel) {
+    const baseUrl =
+      (process.env.DOUBAO_API_BASE ?? DOUBAO_DEFAULT_BASE).trim().replace(/\/+$/, "") ||
+      DOUBAO_DEFAULT_BASE;
+    return { apiKey: envKey, model: envModel, baseUrl };
+  }
+  return null;
+}
+
+/** Second-opinion identify via Doubao. Returns the SAME quick-card fields as identifyQuick
+ *  (so a confident verdict can replace the phase-1 card wholesale), or null on any failure /
+ *  missing config — in which case the caller keeps the 疑似 result and routes to 补拍. */
+async function doubaoIdentify(
+  photoDataUrl: string,
+  priorPhotos: InlineImage[],
+  hintPlace: string,
+  ctx: { candidate?: string | null; plantNetHint?: string | null },
+): Promise<{ meta: AiMeta; model: string; usage: AiTokenUsage } | null> {
+  const cfg = await loadDoubaoConfig();
+  if (!cfg) return null;
+
+  const prior = priorPhotos.slice(0, 4);
+  const cand = (ctx.candidate || "").trim();
+  const system = `你是资深植物分类学家，正在对一张实地拍摄的植物照片做「二次复核」识别。前序识别（Pl@ntNet 专业引擎 + Gemini）对本图把握不足、判为「疑似」。请你**独立判断**：若你有充分把握，可确认或**纠正**为你认为正确的物种（不必迁就前序判断）；若你同样无法确诊到种，请诚实给 low。
+只返回一个 JSON 对象（不要 markdown、不要多余文字），字段如下。为了尽快出卡，**只输出下列字段，不要生成英文摘要、拍摄记录等额外内容**（与 phase-1 简介摘要卡的字段集保持一致）：
+{"title":"中文物种名","scientific_name":"拉丁学名（尽量精确到种）","common_name_en":"英文俗名","common_names_zh":"中文俗名（逗号分隔，可留空）","family":"科（中文+拉丁）","genus":"属（中文+拉丁）","summary_zh":"150–260 字趣味导语（博物学家口吻，讲与生活相关的趣闻/冷知识，勾起好奇心；不要罗列科属学名形态，也不要复述拍摄地点）","identification_confidence":"high 或 medium 或 low","needs_more_photos_zh":"","needs_more_photos_en":""}
+硬性规则：
+- 置信度必须诚实：诊断特征充分且高度吻合=high；仅能到属=medium；照片不足只能疑似=low。**宁可 low 也不要凭有限照片武断定成错误物种——错误定种比暂不定种更糟。**
+- 为 low（medium 视需要）时：summary_zh 以「疑似」开头，且 needs_more_photos_zh/en 必须写 2–4 条面向**完全不懂植物学的普通人**的大白话拍摄动作，① ② ③ 编号，每条一句话一个动作，讲清「拍哪里+怎么拍」，**严禁专业术语**（脉序/被毛/托叶/花序/苞片…）。**每条都必须是「拍下来能看见」的动作——严禁摸质感/闻气味/尝味道这类非视觉建议**（用户唯一能给你的就是照片）。每条都要瞄准最能把本物种与常见易混种区分开的那个部位。identification_confidence 为 high 时，两个 needs_more_photos_* 一律留空字符串。
+- 拍摄地点真实性（硬性）：仅当下文给出拍摄地点时才可写具体地名；未提供则严禁编造或反推任何地名。
+- 中文用正式植物志措辞；不要在字段里使用 * 等 markdown 强调符。`;
+
+  const content: unknown[] = [
+    {
+      type: "text",
+      text:
+        `请复核识别这${prior.length ? "组" : "张"}植物照片。` +
+        (prior.length
+          ? `第 1 张是最新、最清晰的照片，随后 ${prior.length} 张是同一株植物先前拍摄的，请**综合全部 ${prior.length + 1} 张照片**判定。`
+          : "") +
+        (cand ? `前序倾向判断为「${cand}」，仅供参考、可以推翻。` : "") +
+        (ctx.plantNetHint ? `${ctx.plantNetHint}` : "") +
+        (hintPlace ? `拍摄地点：${hintPlace}。` : "") +
+        `只按上面的 JSON 结构返回。`,
+    },
+    { type: "image_url", image_url: { url: photoDataUrl } },
+    ...prior.map((im) => ({
+      type: "image_url",
+      image_url: { url: `data:${im.mimeType};base64,${im.base64}` },
+    })),
+  ];
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 30_000);
+  try {
+    const resp = await fetch(`${cfg.baseUrl}/chat/completions`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${cfg.apiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: cfg.model,
+        messages: [
+          { role: "system", content: system },
+          { role: "user", content },
+        ],
+        response_format: { type: "json_object" },
+        max_tokens: 3000,
+        temperature: 0,
+      }),
+      signal: controller.signal,
+    });
+    if (!resp.ok) {
+      console.warn("[Doubao] HTTP", resp.status, (await resp.text().catch(() => "")).slice(0, 300));
+      return null;
+    }
+    const data = await resp.json();
+    const text = data.choices?.[0]?.message?.content;
+    if (!text) return null;
+    const meta = JSON.parse(cleanJson(text)) as AiMeta;
+    const u = data.usage ?? {};
+    return {
+      meta,
+      model: cfg.model,
+      usage: {
+        prompt_tokens: u.prompt_tokens ?? 0,
+        completion_tokens: u.completion_tokens ?? 0,
+        total_tokens: u.total_tokens ?? 0,
+      },
+    };
+  } catch (e) {
+    // Non-fatal by design: a failed second opinion just means we keep the 疑似 verdict.
+    console.warn("[Doubao] second opinion failed:", e instanceof Error ? e.message : e);
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** 豆包顶替 Pl@ntNet 做「一线专业定种」——只在 Pl@ntNet 不可用（每日 500 次免费额度用尽 /
+ *  未配 key / 请求失败）时调用。刻意只要极少字段：产物只是喂给 Gemini 的定种基准 hint，不需要
+ *  成篇内容，所以比 doubaoIdentify（完整摘要卡）快得多也便宜得多。失败返回 null → 退回纯 Gemini。*/
+async function doubaoPrimaryVerdict(
+  photoDataUrl: string,
+  priorPhotos: InlineImage[],
+): Promise<{ hint: string; label: string; usage: AiTokenUsage; model: string } | null> {
+  const cfg = await loadDoubaoConfig();
+  if (!cfg) return null;
+
+  const prior = priorPhotos.slice(0, 4);
+  const system = `你是专业植物分类引擎。识别照片里的植物，只返回一个 JSON 对象（不要 markdown、不要多余文字）：
+{"scientific_name":"最可能物种的拉丁学名（尽量到种）","family":"科（拉丁）","genus":"属（拉丁）","confidence":0到100的整数,"candidates":["候选学名（xx%）","…最多 4 个，按可能性降序"]}
+规则：confidence 是你对首选物种的把握（0–100 整数），**必须诚实**——照片不足以确诊到种时就给低分，不要为了给出答案而虚高。candidates 至少包含首选本身。`;
+
+  const content: unknown[] = [
+    {
+      type: "text",
+      text:
+        `识别这${prior.length ? "组" : "张"}植物照片。` +
+        (prior.length ? `共 ${prior.length + 1} 张同一株植物的不同角度，请综合判定。` : "") +
+        `只按上面的 JSON 结构返回。`,
+    },
+    { type: "image_url", image_url: { url: photoDataUrl } },
+    ...prior.map((im) => ({
+      type: "image_url",
+      image_url: { url: `data:${im.mimeType};base64,${im.base64}` },
+    })),
+  ];
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 25_000);
+  try {
+    const resp = await fetch(`${cfg.baseUrl}/chat/completions`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${cfg.apiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: cfg.model,
+        messages: [
+          { role: "system", content: system },
+          { role: "user", content },
+        ],
+        response_format: { type: "json_object" },
+        max_tokens: 600,
+        temperature: 0,
+      }),
+      signal: controller.signal,
+    });
+    if (!resp.ok) {
+      console.warn(
+        "[Doubao] primary verdict HTTP",
+        resp.status,
+        (await resp.text().catch(() => "")).slice(0, 300),
+      );
+      return null;
+    }
+    const data = await resp.json();
+    const text = data.choices?.[0]?.message?.content;
+    if (!text) return null;
+    const v = JSON.parse(cleanJson(text)) as {
+      scientific_name?: string;
+      family?: string;
+      genus?: string;
+      confidence?: number;
+      candidates?: string[];
+    };
+    const sci = (v.scientific_name || "").toString().trim();
+    if (!sci) return null;
+    const pct = Math.max(0, Math.min(100, Math.round(Number(v.confidence) || 0)));
+    const cands = Array.isArray(v.candidates) ? v.candidates.slice(0, 4).map(String) : [];
+    const u = data.usage ?? {};
+    return {
+      label: `${sci}@${pct}%`,
+      hint:
+        `【专业识别判定（豆包视觉 · Pl@ntNet 额度用尽时顶替）】最可能物种：${sci}` +
+        `${v.family ? `（科 ${v.family}${v.genus ? ` / 属 ${v.genus}` : ""}）` : ""}` +
+        `，置信度 ${pct}%。${cands.length ? `备选：${cands.join("、")}。` : ""}` +
+        `请以此判定为基准核对照片；若置信度偏低（低于 30%）或与照片明显不符，` +
+        `请在 summary_zh 开头标注「疑似」并简述分歧依据。`,
+      model: cfg.model,
+      usage: {
+        prompt_tokens: u.prompt_tokens ?? 0,
+        completion_tokens: u.completion_tokens ?? 0,
+        total_tokens: u.total_tokens ?? 0,
+      },
+    };
+  } catch (e) {
+    console.warn("[Doubao] primary verdict failed:", e instanceof Error ? e.message : e);
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /** Token-saving helper: given a species key (normalized scientific name), query the
@@ -931,10 +1217,12 @@ async function callAiIdentify(
   // When the species is already pinned, skip re-identification entirely — it only
   // risks disagreeing with the card the user saw, and wastes a Pl@ntNet call.
   if (plantNetKey && !pinned) {
-    const pn = await plantNetIdentify(photoDataUrl, plantNetKey).catch((e) => {
+    const pnRes = await plantNetIdentify(photoDataUrl, plantNetKey).catch((e) => {
       console.warn("[Pl@ntNet] identify failed; continuing with LLM-only:", e);
-      return null;
+      return { verdict: null, quotaExhausted: false };
     });
+    if (pnRes.quotaExhausted) await markPlantNetQuotaExhausted();
+    const pn = pnRes.verdict;
     if (pn && pn.scientific_name) {
       earlySpeciesName = pn.scientific_name;
       const pct = Math.round((pn.score ?? 0) * 100);
@@ -2195,12 +2483,9 @@ const AI_QUICK_SCHEMA = {
     iucn_status: { type: "string", description: "IUCN 评级，无把握留空" },
     tags: { type: "array", items: { type: "string" } },
     summary_zh: { type: "string", description: "150–260 字趣味导语式摘要" },
-    summary_en: { type: "string", description: "50–90 词" },
-    field_notes_zh: {
-      type: "string",
-      description: "拍摄记录：对本张照片的形态分析 + 定种判断依据",
-    },
-    field_notes_en: { type: "string" },
+    // 刻意不含 summary_en / field_notes_zh / field_notes_en：简介摘要卡（buildSummaryCardHtml）
+    // 完全不用它们，让它们出现在 schema 里只会白白拉长 flash 的顺序生成、拖慢出卡。enrich
+    // 生成完整草稿时会用 full schema 另行产出这些字段。
     identification_confidence: { type: "string", enum: ["high", "medium", "low"] },
     needs_more_photos_zh: {
       type: "string",
@@ -2215,7 +2500,6 @@ const AI_QUICK_SCHEMA = {
     "family",
     "genus",
     "summary_zh",
-    "summary_en",
     "identification_confidence",
   ],
 };
@@ -2232,6 +2516,9 @@ async function identifyQuick(
     /** Prior shots of the SAME plant (earlier 补拍) — sent alongside the new photo so
      *  the model judges from ALL angles together, not just the latest frame. */
     priorPhotos?: InlineImage[];
+    /** Pl@ntNet 的专业定种判定（含置信度/备选），作为定种基准提示注入 system prompt。
+     *  这样 Gemini 的置信度会吸收 Pl@ntNet 信号：低分或明显不符 → 倾向标「疑似」。 */
+    plantNetHint?: string;
   },
 ): Promise<{ meta: AiMeta; model: string; provider: string; usage: AiTokenUsage } | null> {
   // Prefer the admin-configured Gemini model/key so the quick summary card uses the
@@ -2254,10 +2541,11 @@ async function identifyQuick(
   const forceCtx = opts?.forceResult
     ? `\n- 最终裁定（硬性）：这已是第 ${opts?.retakeCount ?? 3} 次补拍，**必须给出最终结论**。即使证据仍不充分，也要输出你认为最可能的物种，并把 identification_confidence 设为 low（表示"疑似"）、summary_zh 以「疑似」开头；needs_more_photos_zh/en **一律留空**，不要再要求补拍。`
     : "";
+  const pnHint = (opts?.plantNetHint || "").trim();
+  const plantNetCtx = pnHint ? `\n- ${pnHint}` : "";
 
-  const system = `你是 Plantspedia 的首席植物学家。请**快速**识别这张实地拍摄的植物照片，并只产出一张"简介摘要卡"所需的少量字段（不要写形态/人文/养护等长篇分区）。${retakeCtx}${forceCtx}
-- summary_zh：150–260 字趣味导语（博物学家口吻，讲与生活相关的趣闻/冷知识，勾起好奇心；不要罗列科属学名形态，也不要复述「本次拍摄于…」）。summary_en：50–90 词意译。
-- field_notes_zh：120–220 字「拍摄记录」，只针对本张照片的可见诊断特征 + 定种依据；field_notes_en：45–85 词。
+  const system = `你是 Plantspedia 的首席植物学家。请**快速**识别这张实地拍摄的植物照片，并只产出一张"简介摘要卡"所需的少量字段（不要写形态/人文/养护等长篇分区）。为了尽快出卡，**只输出下列字段，不要生成英文摘要、拍摄记录等额外内容**。${retakeCtx}${forceCtx}${plantNetCtx}
+- summary_zh：150–260 字趣味导语（博物学家口吻，讲与生活相关的趣闻/冷知识，勾起好奇心；不要罗列科属学名形态，也不要复述「本次拍摄于…」）。
 - identification_confidence + needs_more_photos_zh/en（**硬性**）：诚实给出置信度。**宁可 low 也不要凭有限照片武断定成错误物种——错误定种比暂不定种更糟。** 诊断特征充分且高度吻合=high；仅能到属=medium；照片不足只能疑似=low。为 low（medium 视需要）时必须填 needs_more_photos_*：**读者是完全不懂植物学的普通人**，用大白话写 2–4 条可直接照做的拍摄动作，① ② ③ 编号，每条一句话一个动作，讲清「拍哪里+怎么拍」；**严禁专业术语**（脉序/被毛/托叶/花序/苞片…）。**每条都必须是「拍下来能看见」的动作——严禁非视觉建议**（摸质感/闻气味/尝味道/掐断看汁液/搓叶子闻香…）：用户唯一能给你的就是照片，摸和闻的结果传不过来。**关键：每条都要瞄准最能一锤定音、把该物种与常见易混种区分开的那个部位**——先在心里想清楚"要确认它是不是这个种、还差看哪一处"，再让用户去拍那一处（例如「凑近拍一朵完整的花、正面数清花瓣几片」「把叶子翻过来拍背面看有没有细毛」「拍一下果实的形状和有没有刺」「退后一步拍整棵的株型」），不要给泛泛而无区分力的建议。且 summary_zh 以「疑似……」开头、不得用确诊口吻；high 时 needs_more_photos_* 留空。
 - 拍摄地点真实性（硬性）：仅当上文给出拍摄地点时才可写具体地名；未提供则严禁编造/反推任何地名，一律「拍摄地点未知」。
 - 中文用正式植物志措辞；拉丁学名用 *Genus species* 斜体标记。`;
@@ -2918,18 +3206,22 @@ export const quickIdentifyDraft = createServerFn({ method: "POST" })
       data.logged_in_user_id,
     );
 
-    let place = "";
     const lat = data.lat ?? null;
     const lng = data.lng ?? null;
-    if (lat != null && lng != null) {
-      place = await reverseGeocode(lat, lng);
-      console.log(`[QuickIdentify] Reverse-geocoded to: ${place}`);
-    }
-
     const dataUrl = `data:${data.photo_mime};base64,${data.photo_base64}`;
 
-    // Upload the user photo: it's the summary card's hero AND a re-identify source
-    // later (user can re-run enrich / re-upload from a better-signal spot).
+    // ── 出卡速度：地名反查 + 原图上传 都不该串在识别前面 ────────────────────────
+    // 识别只吃 base64（dataUrl），既不需要 photoUrl 也不真的需要地名。以前这三步是串行的
+    // （geocode → upload → identify），用户就得连等三个网络往返。现在前两步**并行启动**，
+    // 识别期间它们在后台跑完，关键路径只剩识别本身。
+    const geoP: Promise<string> =
+      lat != null && lng != null
+        ? reverseGeocode(lat, lng).catch((e) => {
+            console.warn("[QuickIdentify] reverseGeocode failed:", e);
+            return "";
+          })
+        : Promise.resolve("");
+
     const buffer = Buffer.from(data.photo_base64, "base64");
     const ext = data.photo_mime.includes("png")
       ? "png"
@@ -2937,15 +3229,15 @@ export const quickIdentifyDraft = createServerFn({ method: "POST" })
         ? "webp"
         : "jpg";
     const path = `drafts/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
-    const { error: upErr } = await supabaseAdmin.storage
+    // `.then(ok, err)` 就地接住 rejection —— 这个 promise 要等到识别之后才 await，
+    // 中途若失败又没有 handler，Node 会报 unhandled rejection 把整个请求带崩。
+    const uploadP = supabaseAdmin.storage
       .from("plant-images")
-      .upload(path, buffer, { contentType: data.photo_mime, upsert: false });
-    if (upErr)
-      throw new AiError(
-        "STORAGE_UPLOAD_FAILED",
-        `照片上传失败（STORAGE_UPLOAD_FAILED）：无法把照片存入云端存储。原因：${upErr.message}。请检查网络后重试。`,
+      .upload(path, buffer, { contentType: data.photo_mime, upsert: false })
+      .then(
+        (r) => r as { error: { message?: string } | null },
+        (e) => ({ error: { message: e instanceof Error ? e.message : String(e) } }),
       );
-    const photoUrl = supabaseAdmin.storage.from("plant-images").getPublicUrl(path).data.publicUrl;
 
     let meta: AiMeta;
     let usedModel: string;
@@ -2955,6 +3247,15 @@ export const quickIdentifyDraft = createServerFn({ method: "POST" })
     let enriched: boolean;
     let isInvasive = false;
     let gbifTaxonKey: number | null = null;
+    // 豆包二次复核的留痕（仅当复核真的改变了结论时非 null），写进 ai_payload 供复盘。
+    let secondOpinion: {
+      by: string;
+      model: string;
+      action: string;
+      from: string;
+      to: string;
+      plantnet: string;
+    } | null = null;
 
     const retakeCount = data.retake_count ?? 0;
     const speciesHint =
@@ -2984,7 +3285,12 @@ export const quickIdentifyDraft = createServerFn({ method: "POST" })
         console.warn("[QuickIdentify] prior user_photos load failed (migration pending?):", e);
       }
     }
-    const allPhotos = [photoUrl, ...priorPhotos].filter(Boolean).slice(0, 12);
+    // 地名只是识别的辅助提示，最多等它 4s —— Nominatim 偶发很慢/无响应，不该拖住出卡。
+    // 写库前会再取一次完整结果（那时通常早已 resolve），所以 capture_place 不会因此丢。
+    let place = await Promise.race([
+      geoP,
+      new Promise<string>((r) => setTimeout(() => r(""), 4000)),
+    ]);
 
     // On 补拍, load the earlier shots as inline images so the model can judge from
     // ALL angles at once. Best-effort: a fetch failure just falls back to single-image.
@@ -3000,20 +3306,147 @@ export const quickIdentifyDraft = createServerFn({ method: "POST" })
       }
     }
 
+    // ── Stage 0（phase-1）：专业识别引擎作为一线信号 ────────────────────────────
+    // 先做一次专业定种，判定作为「定种基准」提示喂给 Gemini —— Gemini 的置信度因此吸收了
+    // 这个信号（低分或与照片明显不符 → 倾向标「疑似」→ 触发下方豆包复核），无需再单独维护
+    // 一个脆弱的分数阈值门。此前这条链路只在 callAiIdentify（重路径）里跑，而拍照走的是本
+    // 快路径，等于专业识别一直没参与常规识别 —— 这里把它接回一线。
+    //
+    // 一线引擎降级链：
+    //   Pl@ntNet（免费额度 500 次/天）
+    //     → 额度用尽 / 未配 key / 请求失败 → 豆包视觉顶替
+    //       → 豆包也不可用 → 退回纯 Gemini（旧行为）
+    // 额度耗尽（HTTP 429）会被持久标记进 site_config.plantnet_quota_state，之后的请求直接
+    // 跳过 Pl@ntNet，不用每次都撞一发必定 429 的往返；1 小时后自动重试，额度一重置就切回。
+    let plantNetHint: string | undefined;
+    let primaryLabel = "none";
+    let primaryEngine: "plantnet" | "doubao" | "none" = "none";
+    let doubaoPrimary: { usage: AiTokenUsage; model: string } | null = null;
+    const plantNetKey = await loadPlantNetKey();
+    const quotaKnownExhausted = plantNetKey ? await isPlantNetQuotaExhausted() : false;
+
+    if (plantNetKey && !quotaKnownExhausted) {
+      const pnRes = await plantNetIdentify(dataUrl, plantNetKey).catch((e) => {
+        console.warn("[Pl@ntNet] quick-path identify failed; falling back:", e);
+        return { verdict: null, quotaExhausted: false };
+      });
+      if (pnRes.quotaExhausted) await markPlantNetQuotaExhausted();
+      const pn = pnRes.verdict;
+      if (pn && pn.scientific_name) {
+        const pct = Math.round((pn.score ?? 0) * 100);
+        primaryEngine = "plantnet";
+        primaryLabel = `${pn.scientific_name}@${pct}%`;
+        plantNetHint =
+          `【专业识别引擎 Pl@ntNet 判定】最可能物种：${pn.scientific_name}` +
+          `${pn.family ? `（科 ${pn.family}${pn.genus ? ` / 属 ${pn.genus}` : ""}）` : ""}` +
+          `，置信度 ${pct}%。备选：${pn.candidates.join("、")}。` +
+          `请以此专业判定为基准核对照片；若置信度偏低（低于 30%）或与照片明显不符，` +
+          `请在 summary_zh 开头标注「疑似」并简述分歧依据。`;
+      }
+    }
+
+    // Pl@ntNet 没能给出判定（额度用尽 / 未配 key / 请求失败）→ 豆包顶上一线专业定种。
+    if (!plantNetHint) {
+      const dv = await doubaoPrimaryVerdict(dataUrl, priorInline);
+      if (dv) {
+        primaryEngine = "doubao";
+        primaryLabel = `${dv.label}（豆包顶替）`;
+        plantNetHint = dv.hint;
+        doubaoPrimary = { usage: dv.usage, model: dv.model };
+      }
+    }
+    console.log(
+      `[Phase1] 一线引擎=${primaryEngine}（${primaryLabel}）` +
+        (quotaKnownExhausted ? " · Pl@ntNet 额度已标记用尽，本次跳过" : ""),
+    );
+
     const quick = await identifyQuick(dataUrl, place, {
       speciesHint,
       retakeCount,
       forceResult: retakeCount >= 3, // 补拍满 3 次必须出结论（哪怕疑似）
       priorPhotos: priorInline,
+      plantNetHint,
     });
+
+    // 识别已出结果 —— 到这一步才真正需要 photoUrl（建卡 / 写库）。上传是和地名反查、
+    // Pl@ntNet、识别**并行**跑的，此刻通常早已完成，这个 await 基本不耗时。
+    const { error: upErr } = await uploadP;
+    if (upErr)
+      throw new AiError(
+        "STORAGE_UPLOAD_FAILED",
+        `照片上传失败（STORAGE_UPLOAD_FAILED）：无法把照片存入云端存储。原因：${upErr.message}。请检查网络后重试。`,
+      );
+    const photoUrl = supabaseAdmin.storage.from("plant-images").getPublicUrl(path).data.publicUrl;
+    const allPhotos = [photoUrl, ...priorPhotos].filter(Boolean).slice(0, 12);
+    // 补回完整地名（上面为了不拖慢识别只等了 4s；此刻反查早已结束）。
+    place = (await geoP) || place;
+
     if (quick) {
       meta = quick.meta;
       usedModel = quick.model;
       usedProvider = quick.provider;
       usage = quick.usage;
       enriched = false;
+      // 豆包顶一线时它的 token 也要计入本次识别的用量。
+      if (doubaoPrimary) {
+        usage = addUsage(usage, doubaoPrimary.usage);
+        usedProvider = `${usedProvider}+doubao-primary`;
+        usedModel = `${usedModel}+${doubaoPrimary.model}`;
+      }
       // 统一疑似信号：名称/正文/补拍横幅三者一致（详见 normalizeIdentification）。
       normalizeIdentification(meta);
+
+      // ── 豆包 doubao-1.5-vision-pro 二次复核 ──────────────────────────────────
+      // 仅在 phase-1 判为「疑似」且仍有补拍名额时，才咨询第二个视觉模型：它有把握 → 整卡
+      // 采纳（确认或纠正物种）→ 直接出确诊卡、跳过补拍；它同样没把握 → 维持疑似 → 照常进
+      // 补拍。补拍满 3 次不再复核（那已是强制出终局结论的关卡）。未配置豆包 / 请求失败 →
+      // doubaoIdentify 返回 null → 行为与改动前完全一致。
+      // primaryEngine==="doubao" 时跳过：一线已经是豆包看过这张图了，同一个模型再看一遍
+      // 基本不会得出不同结论，白花一次调用 —— 直接照常进补拍。
+      if (
+        meta.identification_confidence === "low" &&
+        retakeCount < 3 &&
+        primaryEngine !== "doubao"
+      ) {
+        const candidate = [meta.title, meta.scientific_name]
+          .map((s) => (s || "").toString().trim())
+          .filter(Boolean)
+          .join(" ");
+        const second = await doubaoIdentify(dataUrl, priorInline, place, {
+          candidate,
+          plantNetHint,
+        });
+        if (second) {
+          normalizeIdentification(second.meta);
+          const resolved = second.meta.identification_confidence !== "low";
+          const beforeKey = speciesKey((meta.scientific_name || "").toString());
+          const afterKey = speciesKey((second.meta.scientific_name || "").toString());
+          const action = beforeKey && afterKey && beforeKey === afterKey ? "confirm" : "override";
+          // 决策日志：线上调参用（谁给了什么、最终怎么裁定）。只进服务端日志，不入库。
+          console.log(
+            `[SecondOpinion] primary=${primaryEngine}(${primaryLabel}) gemini=low(${candidate || "?"}) ` +
+              `doubao=${second.meta.identification_confidence}(${(second.meta.title || "").toString().trim()} / ${(second.meta.scientific_name || "").toString().trim()}) ` +
+              `→ ${resolved ? `RESOLVED(${action})，跳过补拍` : "仍疑似 → 照常补拍"}`,
+          );
+          if (resolved) {
+            // 透明留痕：写进 ai_payload._second_opinion（不渲染进卡片，避免污染 150–260 字
+            // 导语），配合 ai_usage_logs 里的 provider/model 供管理员复盘与调参。
+            secondOpinion = {
+              by: "doubao",
+              model: second.model,
+              action,
+              from: (meta.scientific_name || "").toString().trim(),
+              to: (second.meta.scientific_name || "").toString().trim(),
+              plantnet: `${primaryEngine}:${primaryLabel}`,
+            };
+            meta = second.meta;
+            usedProvider = `${usedProvider}+doubao-vision`;
+            usedModel = `${usedModel}+${second.model}`;
+            usage = addUsage(usage, second.usage);
+          }
+        }
+      }
+
       // Summary-card HTML with the full gallery of the user's own shots (newest first).
       html = buildSummaryCardHtml({
         photos: allPhotos,
@@ -3039,7 +3472,13 @@ export const quickIdentifyDraft = createServerFn({ method: "POST" })
     }
 
     const safeTitle = (meta.title || meta.scientific_name || "待鉴定植物").toString().slice(0, 200);
-    const aiPayload = JSON.parse(JSON.stringify({ ...meta, _enriched: enriched }));
+    const aiPayload = JSON.parse(
+      JSON.stringify({
+        ...meta,
+        _enriched: enriched,
+        ...(secondOpinion ? { _second_opinion: secondOpinion } : {}),
+      }),
+    );
 
     let draftId: string;
     if (data.merge_draft_id) {
@@ -6481,6 +6920,79 @@ export const clearPlantNetKeyFn = createServerFn({ method: "POST" })
     if (!isAdmin) throw new Error("仅管理员可配置 Pl@ntNet");
     await (supabaseAdmin as any).from("site_config").delete().eq("key", "plantnet_api_key");
     console.log(`[Pl@ntNet] Admin ${userId} cleared Pl@ntNet key`);
+    return { ok: true };
+  });
+
+// ─── Admin: 豆包 vision 二次复核配置（stored in site_config）─────────────────
+// 用的是火山方舟 **ARK API Key**（数据面 Bearer token），不是 IAM 的 AK/SK。
+const SaveDoubaoInput = z.object({
+  apiKey: z.string().min(1).max(2000),
+  model: z.string().min(1).max(200),
+  baseUrl: z.string().max(300).optional(),
+});
+
+/** Admin-only: save the Doubao vision config (enables the 疑似 second-opinion site-wide). */
+export const saveDoubaoConfigFn = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input) => SaveDoubaoInput.parse(input))
+  .handler(async ({ data, context }) => {
+    const { supabase, userId } = context;
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data: roles } = await supabase.from("user_roles").select("role").eq("user_id", userId);
+    const isAdmin = roles?.some((r) => r.role === "admin") ?? false;
+    if (!isAdmin) throw new Error("仅管理员可配置豆包复核");
+    const value = {
+      apiKey: (data.apiKey ?? "").replace(/\s+/g, ""),
+      model: (data.model ?? "").trim(),
+      baseUrl: (data.baseUrl ?? "").trim().replace(/\/+$/, "") || DOUBAO_DEFAULT_BASE,
+      updatedAt: new Date().toISOString(),
+      updatedBy: userId,
+    };
+    const { error } = await (supabaseAdmin as any)
+      .from("site_config")
+      .upsert({ key: "doubao_vision_config", value }, { onConflict: "key" });
+    if (error) throw new Error(`保存失败：${error.message}`);
+    console.log(`[Doubao] Admin ${userId} updated Doubao vision config (model=${value.model})`);
+    return { ok: true };
+  });
+
+/** Admin-only: load the current Doubao config (key masked for display). */
+export const getDoubaoConfigFn = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
+  .handler(async ({ context }) => {
+    const { supabase, userId } = context;
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data: roles } = await supabase.from("user_roles").select("role").eq("user_id", userId);
+    const isAdmin = roles?.some((r) => r.role === "admin") ?? false;
+    if (!isAdmin) throw new Error("仅管理员可查看豆包配置");
+    const { data } = await (supabaseAdmin as any)
+      .from("site_config")
+      .select("value")
+      .eq("key", "doubao_vision_config")
+      .maybeSingle();
+    if (!data?.value) return null;
+    const cfg = typeof data.value === "string" ? JSON.parse(data.value) : data.value;
+    const key: string = cfg?.apiKey ?? "";
+    if (!key) return null;
+    return {
+      apiKeyMasked: key.length <= 10 ? key : `${key.slice(0, 4)}…${key.slice(-4)}`,
+      model: (cfg?.model ?? "") as string,
+      baseUrl: (cfg?.baseUrl ?? DOUBAO_DEFAULT_BASE) as string,
+      updatedAt: cfg?.updatedAt ?? null,
+    };
+  });
+
+/** Admin-only: remove the Doubao config (疑似 结果回退为直接进补拍). */
+export const clearDoubaoConfigFn = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .handler(async ({ context }) => {
+    const { supabase, userId } = context;
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data: roles } = await supabase.from("user_roles").select("role").eq("user_id", userId);
+    const isAdmin = roles?.some((r) => r.role === "admin") ?? false;
+    if (!isAdmin) throw new Error("仅管理员可配置豆包复核");
+    await (supabaseAdmin as any).from("site_config").delete().eq("key", "doubao_vision_config");
+    console.log(`[Doubao] Admin ${userId} cleared Doubao vision config`);
     return { ok: true };
   });
 
