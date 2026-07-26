@@ -151,6 +151,44 @@ export async function fetchAiPlantIds(): Promise<Set<string>> {
   return new Set((data ?? []).map((d) => d.published_plant_id).filter(Boolean) as string[]);
 }
 
+/**
+ * 已发布条目 → 识别地点（plant_id → capture_place）。
+ *
+ * 条目表本身**不存**识别地点：地点只在来源草稿的 `capture_place` 上，采纳后草稿不删除、
+ * `published_plant_id` 指向条目（见 fetchOriginProvenance）。逐条查太贵（标签选择器
+ * 一屏可能列几百个条目），所以这里一次性拉全表建索引。
+ *
+ * 同一条目可能有多条来源草稿（补拍 / 多人识别同一株）——取**最早**那条，与详页页头
+ * 「最早识别人 / 地点 / 时间」的口径保持一致。
+ *
+ * ⚠️ capture_place 是自由文本，粒度从「鄂尔多斯市」到整条街道地址都有（见 CLAUDE.md），
+ * 所以调用方应当做**子串匹配**，不要指望能枚举出干净的地点集合。
+ */
+export async function fetchPlantCapturePlaces(): Promise<Map<string, string>> {
+  const PAGE = 1000;
+  const byPlant = new Map<string, { place: string; at: string }>();
+  for (let from = 0; ; from += PAGE) {
+    const { data, error } = await supabase
+      .from("plant_drafts")
+      .select("published_plant_id,capture_place,created_at")
+      .not("published_plant_id", "is", null)
+      .not("capture_place", "is", null)
+      .order("created_at", { ascending: true })
+      .range(from, from + PAGE - 1);
+    // 这是个纯锦上添花的筛选维度：查不到就当没有地点，别把整个标签管理页拖垮。
+    if (error) break;
+    const rows = (data ?? []) as { published_plant_id: string; capture_place: string; created_at: string }[];
+    for (const r of rows) {
+      const place = (r.capture_place ?? "").trim();
+      if (!place) continue;
+      const prev = byPlant.get(r.published_plant_id);
+      if (!prev || r.created_at < prev.at) byPlant.set(r.published_plant_id, { place, at: r.created_at });
+    }
+    if (rows.length < PAGE) break;
+  }
+  return new Map(Array.from(byPlant, ([id, v]) => [id, v.place]));
+}
+
 export async function fetchDraftById(id: string): Promise<PlantDraft | null> {
   const { data, error } = await supabase
     .from("plant_drafts")

@@ -1,10 +1,12 @@
 import { useRef, useState } from "react";
+import { FileText } from "lucide-react";
 import { useNavigate } from "@tanstack/react-router";
 import { toast } from "sonner";
 import { useAuth } from "@/hooks/use-auth";
 import { supabase } from "@/integrations/supabase/client";
 import { compressImage, extForMime } from "@/lib/image-compress";
-import { BlockEditor } from "@/components/block-editor";
+import { BlockEditor, type BlockEditorHandle } from "@/components/block-editor";
+import { docToImages, isConvertibleDoc } from "@/lib/doc-to-images";
 import { createProject, updateProject, type Project } from "@/lib/projects";
 
 /** Create / edit a 项目驱动调研成果 entry. 时间/地点/主题/发起人 are required — they
@@ -13,6 +15,8 @@ export function ProjectEditor({ initial }: { initial?: Project }) {
   const { user } = useAuth();
   const navigate = useNavigate();
   const coverInputRef = useRef<HTMLInputElement>(null);
+  const docInputRef = useRef<HTMLInputElement>(null);
+  const editorRef = useRef<BlockEditorHandle>(null);
 
   const [title, setTitle] = useState(initial?.title ?? "");
   const [projectDate, setProjectDate] = useState(initial?.project_date ?? "");
@@ -23,13 +27,72 @@ export function ProjectEditor({ initial }: { initial?: Project }) {
   const [coverUrl, setCoverUrl] = useState(initial?.cover_url ?? "");
   const [html, setHtml] = useState(initial?.content_html ?? "");
   const [busy, setBusy] = useState(false);
+  const [docBusy, setDocBusy] = useState(false);
+  const [docProgress, setDocProgress] = useState("");
 
-  const uploadToStorage = async (file: File, prefix: string): Promise<string> => {
-    let toUpload: Blob | File = file;
+  // ── PDF → 图片 ────────────────────────────────────────────────────────────
+  // 源文件**一次都不上传**：转换在浏览器里做完，只有渲染出的图片进 storage。
+  // 服务器上没有那份 PDF，也就没有任何 URL 能指向它 —— 这比前端拦右键靠谱得多
+  // （拦右键 F12 一开就绕过了）。
+  const insertDoc = async (file: File) => {
+    if (!user) return void toast.error("请先登录");
+    setDocBusy(true);
+    setDocProgress("");
     try {
-      toUpload = await compressImage(file);
+      const pages = await docToImages(file, {
+        onProgress: (done, total) => setDocProgress(`渲染中 ${done}/${total}`),
+      });
+      setDocProgress(`上传中 0/${pages.length}`);
+      const urls: string[] = [];
+      for (const [i, p] of pages.entries()) {
+        urls.push(await uploadToStorage(p.file, "project-doc", /* alreadyCompressed */ true));
+        setDocProgress(`上传中 ${i + 1}/${pages.length}`);
+      }
+      editorRef.current?.appendImages(urls);
+      toast.success(`已插入 ${urls.length} 页图片`);
     } catch (err) {
-      console.error("compress failed, using original:", err);
+      toast.error((err as Error).message);
+    } finally {
+      setDocBusy(false);
+      setDocProgress("");
+    }
+  };
+
+  /**
+   * 编辑器自己的上传口。**必须在这里拦 PDF/PPT** —— BlockNote 允许直接把文件拖进
+   * 正文，不拦的话 `uploadToStorage` 会把 PDF 原样传上去（compressImage 对 PDF 抛错，
+   * 而那个 catch 是「压缩失败就传原件」），源文件就这么泄出去了。
+   * 拦下来顺手转掉：第一页交还给 BlockNote 自己那个块，其余页追加到文末。
+   */
+  const handleEditorUpload = async (f: File): Promise<string> => {
+    if (isConvertibleDoc(f)) {
+      const pages = await docToImages(f, {
+        onProgress: (done, total) => setDocProgress(`渲染中 ${done}/${total}`),
+      });
+      const urls: string[] = [];
+      for (const p of pages) urls.push(await uploadToStorage(p.file, "project-doc", true));
+      setDocProgress("");
+      if (urls.length > 1) editorRef.current?.appendImages(urls.slice(1));
+      return urls[0];
+    }
+    if (!f.type.startsWith("image/")) {
+      throw new Error("正文只支持插入图片与 PDF（PDF 会转成图片）。");
+    }
+    return uploadToStorage(f, "project");
+  };
+
+  const uploadToStorage = async (
+    file: File,
+    prefix: string,
+    alreadyCompressed = false,
+  ): Promise<string> => {
+    let toUpload: Blob | File = file;
+    if (!alreadyCompressed) {
+      try {
+        toUpload = await compressImage(file);
+      } catch (err) {
+        console.error("compress failed, using original:", err);
+      }
     }
     const ext = extForMime(toUpload.type, file.name.split(".").pop() || "jpg");
     const path = `${user!.id}/${prefix}/${Date.now()}-${Math.random().toString(36).slice(2, 6)}.${ext}`;
@@ -105,7 +168,7 @@ export function ProjectEditor({ initial }: { initial?: Project }) {
     <div className="max-w-3xl mx-auto">
       {coverUrl ? (
         <div className="relative group mb-6 -mx-6 md:-mx-12">
-          <img src={coverUrl} alt="" className="w-full max-h-[280px] object-cover" />
+          <img src={coverUrl} alt="" className="w-full h-auto block" />
           <div className="absolute top-2 right-2 flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
             <button onClick={() => coverInputRef.current?.click()} className="text-xs bg-background/90 border border-ink/40 px-2 py-1 hover:bg-background">更换</button>
             <button onClick={() => setCoverUrl("")} className="text-xs bg-background/90 border border-ink/40 px-2 py-1 hover:bg-background">移除</button>
@@ -150,10 +213,44 @@ export function ProjectEditor({ initial }: { initial?: Project }) {
         <input value={summary} onChange={(e) => setSummary(e.target.value)} placeholder="用一句话概括这次调研…" className={field} />
       </label>
 
+      {/* 插入文档按钮：从 text-xs 细边框放大到 border-2 + text-sm，并把说明挪到按钮下方
+          单独成行 —— 之前和一长串说明挤在 flex-wrap 同一行里，窄屏上按钮又小又难点中
+          （用户 2026-07-25 反馈「非常难选择到文件这个按钮」）。 */}
+      <div className="mb-2">
+        <button
+          type="button"
+          onClick={() => docInputRef.current?.click()}
+          disabled={docBusy}
+          className="inline-flex items-center gap-2 border-2 border-ink px-4 py-2 text-sm font-semibold transition-colors hover:bg-ink hover:text-background disabled:opacity-50"
+        >
+          <FileText className="h-4 w-4" />
+          {docBusy ? docProgress || "转换中…" : "插入 PDF / 幻灯片（转为图片）"}
+        </button>
+        <p className="mt-1.5 text-xs text-ink-faint">
+          PDF 会逐页转成压缩图片插入正文，源文件不上传 —— 读者右键只能存到图片。
+          幻灯片（PPT / PPTX / Keynote）请先在原软件里「导出为 PDF」，再选它插入。
+        </p>
+      </div>
+      {/* accept 放开到也能选中 PPT/Keynote —— 之前只收 .pdf，用户想插幻灯片时文件被灰掉、
+          根本选不中（正是「很难选择到文件」的一半原因）。选中后 docToImages 会给出
+          「请先导出为 PDF」的明确指引，好过让文件在选择框里直接不可选。 */}
+      <input
+        ref={docInputRef}
+        type="file"
+        accept="application/pdf,.pdf,.ppt,.pptx,.odp,application/vnd.ms-powerpoint,application/vnd.openxmlformats-officedocument.presentationml.presentation,application/vnd.oasis.opendocument.presentation"
+        className="hidden"
+        onChange={(e) => {
+          const f = e.target.files?.[0];
+          if (f) void insertDoc(f);
+          e.target.value = "";
+        }}
+      />
+
       <BlockEditor
+        ref={editorRef}
         initialHTML={initial?.content_html ?? ""}
         onChange={setHtml}
-        uploadFile={(f) => uploadToStorage(f, "project")}
+        uploadFile={handleEditorUpload}
         placeholder="输入 / 唤出命令菜单，像 Notion 一样撰写调研成果…"
       />
 

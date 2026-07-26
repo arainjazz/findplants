@@ -2,6 +2,8 @@ import { createFileRoute, Link, notFound } from "@tanstack/react-router";
 import { useQuery } from "@tanstack/react-query";
 import { SiteHeader, SiteFooter } from "@/components/site-header";
 import { fetchProjectById } from "@/lib/projects";
+import { ShareButton } from "@/components/share-button";
+import { useAuth } from "@/hooks/use-auth";
 
 export const Route = createFileRoute("/projects/$id")({
   component: ProjectDetail,
@@ -9,6 +11,7 @@ export const Route = createFileRoute("/projects/$id")({
 
 function ProjectDetail() {
   const { id } = Route.useParams();
+  const { user } = useAuth();
   const { data: project, isLoading } = useQuery({
     queryKey: ["project", id],
     queryFn: () => fetchProjectById(id),
@@ -24,6 +27,9 @@ function ProjectDetail() {
     );
   if (!project) throw notFound();
 
+  // 自己的项目才显示「编辑」（与博客同一条规则：user.id === author_id）；别人的只有分享。
+  const canEdit = !!user && user.id === project.author_id;
+
   const dateLabel = project.project_date
     ? new Date(project.project_date).toLocaleDateString("zh-CN")
     : "";
@@ -32,10 +38,24 @@ function ProjectDetail() {
     <div className="min-h-screen flex flex-col">
       <SiteHeader />
       <main className="mx-auto max-w-3xl px-6 py-8 flex-1 w-full">
-        <Link to="/projects" className="label hover:text-vermilion">← 项目驱动调研成果</Link>
+        <div className="flex items-center justify-between mb-4">
+          <Link to="/projects" className="label hover:text-vermilion">← 项目驱动调研成果</Link>
+          <div className="flex items-center gap-2">
+            {canEdit && (
+              <Link
+                to="/admin/projects/edit/$id"
+                params={{ id: project.id }}
+                className="text-xs border border-ink/40 px-3 py-1.5 hover:bg-ink hover:text-background transition-colors"
+              >
+                编辑
+              </Link>
+            )}
+            <ShareButton title={project.title} summary={project.summary} />
+          </div>
+        </div>
 
         {project.cover_url && (
-          <img src={project.cover_url} alt="" className="w-full max-h-[420px] object-cover mt-4 mb-8 border border-rule" />
+          <img src={project.cover_url} alt="" className="w-full h-auto block mt-4 mb-8 border border-rule" />
         )}
 
         <h1 className="font-display text-4xl md:text-5xl font-bold leading-tight mt-4 mb-4">{project.title}</h1>

@@ -1,23 +1,29 @@
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { FileText } from "lucide-react";
 import { compressImage, extForMime } from "@/lib/image-compress";
 import { useNavigate } from "@tanstack/react-router";
 import { toast } from "sonner";
 import { useAuth } from "@/hooks/use-auth";
 import { supabase } from "@/integrations/supabase/client";
-import { BlockEditor } from "@/components/block-editor";
+import { BlockEditor, type BlockEditorHandle } from "@/components/block-editor";
+import { docToImages, isConvertibleDoc } from "@/lib/doc-to-images";
 import { createPost, updatePost, firstImageSrc, type BlogPost } from "@/lib/blog";
 
 export function BlogEditor({ initial }: { initial?: BlogPost }) {
   const { user } = useAuth();
   const navigate = useNavigate();
   const coverInputRef = useRef<HTMLInputElement>(null);
+  const docInputRef = useRef<HTMLInputElement>(null);
+  const editorRef = useRef<BlockEditorHandle>(null);
 
   const [title, setTitle] = useState(initial?.title ?? "");
   const [subtitle, setSubtitle] = useState(initial?.subtitle ?? "");
   const [coverUrl, setCoverUrl] = useState(initial?.cover_url ?? "");
   const [html, setHtml] = useState(initial?.content_html ?? "");
   const [busy, setBusy] = useState(false);
+  const [docBusy, setDocBusy] = useState(false);
+  const [docProgress, setDocProgress] = useState("");
 
   // Auto-resize title textarea
   const titleRef = useRef<HTMLTextAreaElement>(null);
@@ -95,6 +101,71 @@ export function BlogEditor({ initial }: { initial?: BlogPost }) {
     } catch {
       /* logging is best-effort */
     }
+  };
+
+  /** 把一张已压缩好的图片传进 storage，回公开 URL。 */
+  const putImage = async (f: File, prefix: string): Promise<string> => {
+    const ext = extForMime(f.type, f.name.split(".").pop() || "jpg");
+    const path = `${user!.id}/${prefix}/${Date.now()}-${Math.random().toString(36).slice(2, 6)}.${ext}`;
+    const { error } = await supabase.storage
+      .from("plant-images")
+      .upload(path, f, { upsert: false, contentType: f.type });
+    if (error) throw error;
+    return supabase.storage.from("plant-images").getPublicUrl(path).data.publicUrl;
+  };
+
+  // ── PDF → 图片 ────────────────────────────────────────────────────────────
+  // 源文件**一次都不上传**：转换在浏览器里做完，只有渲染出的图片进 storage。
+  // 服务器上没有那份 PDF，也就没有任何 URL 能指向它。
+  const insertDoc = async (file: File) => {
+    if (!user) return void toast.error("请先登录");
+    setDocBusy(true);
+    setDocProgress("");
+    try {
+      const pages = await docToImages(file, {
+        onProgress: (done, total) => setDocProgress(`渲染中 ${done}/${total}`),
+      });
+      const urls: string[] = [];
+      for (const [i, p] of pages.entries()) {
+        urls.push(await putImage(p.file, "blog-doc"));
+        setDocProgress(`上传中 ${i + 1}/${pages.length}`);
+      }
+      editorRef.current?.appendImages(urls);
+      toast.success(`已插入 ${urls.length} 页图片`);
+    } catch (err) {
+      toast.error((err as Error).message);
+    } finally {
+      setDocBusy(false);
+      setDocProgress("");
+    }
+  };
+
+  /**
+   * 编辑器自己的上传口。**必须在这里拦 PDF/PPT** —— BlockNote 允许直接把文件拖进
+   * 正文，不拦的话下面那段「压缩失败就传原件」会把 PDF 原样传上去，源文件就泄了。
+   */
+  const handleEditorUpload = async (file: File): Promise<string> => {
+    if (isConvertibleDoc(file)) {
+      const pages = await docToImages(file, {
+        onProgress: (done, total) => setDocProgress(`渲染中 ${done}/${total}`),
+      });
+      const urls: string[] = [];
+      for (const p of pages) urls.push(await putImage(p.file, "blog-doc"));
+      setDocProgress("");
+      if (urls.length > 1) editorRef.current?.appendImages(urls.slice(1));
+      return urls[0];
+    }
+    if (!file.type.startsWith("image/")) {
+      throw new Error("正文只支持插入图片与 PDF（PDF 会转成图片）。");
+    }
+    let f: Blob | File = file;
+    try {
+      f = await compressImage(file);
+    } catch {
+      /* use original on compress failure */
+    }
+    const named = f instanceof File ? f : new File([f], file.name, { type: f.type });
+    return putImage(named, "blog");
   };
 
   const save = async (publish: boolean) => {
@@ -206,24 +277,42 @@ export function BlogEditor({ initial }: { initial?: BlogPost }) {
         />
       </div>
 
+      {/* 插入文档按钮：放大 + 说明挪到下方单独成行，别再挤在 flex-wrap 里难点中
+          （用户 2026-07-25 反馈「非常难选择到文件这个按钮」）。 */}
+      <div className="mb-2">
+        <button
+          type="button"
+          onClick={() => docInputRef.current?.click()}
+          disabled={docBusy}
+          className="inline-flex items-center gap-2 border-2 border-ink px-4 py-2 text-sm font-semibold transition-colors hover:bg-ink hover:text-background disabled:opacity-50"
+        >
+          <FileText className="h-4 w-4" />
+          {docBusy ? docProgress || "转换中…" : "插入 PDF / 幻灯片（转为图片）"}
+        </button>
+        <p className="mt-1.5 text-xs text-ink-faint">
+          PDF 会逐页转成压缩图片插入正文，源文件不上传 —— 读者右键只能存到图片。
+          幻灯片（PPT / PPTX / Keynote）请先在原软件里「导出为 PDF」，再选它插入。
+        </p>
+      </div>
+      {/* accept 放开到也能选中 PPT/Keynote —— 之前只收 .pdf，用户想插幻灯片时文件被灰掉、
+          根本选不中。选中后 docToImages 会给出「请先导出为 PDF」的明确指引。 */}
+      <input
+        ref={docInputRef}
+        type="file"
+        accept="application/pdf,.pdf,.ppt,.pptx,.odp,application/vnd.ms-powerpoint,application/vnd.openxmlformats-officedocument.presentationml.presentation,application/vnd.oasis.opendocument.presentation"
+        className="hidden"
+        onChange={(e) => {
+          const f = e.target.files?.[0];
+          if (f) void insertDoc(f);
+          e.target.value = "";
+        }}
+      />
+
       <BlockEditor
+        ref={editorRef}
         initialHTML={initial?.content_html ?? ""}
         onChange={setHtml}
-        uploadFile={async (file) => {
-          let f: Blob | File = file;
-          try {
-            f = await compressImage(file);
-          } catch {
-            /* use original on compress failure */
-          }
-          const ext = extForMime(f.type, file.name.split(".").pop() || "jpg");
-          const path = `${user!.id}/blog/${Date.now()}-${Math.random().toString(36).slice(2, 6)}.${ext}`;
-          const { error } = await supabase.storage
-            .from("plant-images")
-            .upload(path, f, { upsert: false, contentType: f.type });
-          if (error) throw error;
-          return supabase.storage.from("plant-images").getPublicUrl(path).data.publicUrl;
-        }}
+        uploadFile={handleEditorUpload}
         placeholder="输入 / 唤出命令菜单，像 Notion 一样写作…"
       />
 

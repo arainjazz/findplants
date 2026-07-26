@@ -3,6 +3,8 @@ import { compressImage, extForMime } from "@/lib/image-compress";
 import { useNavigate } from "@tanstack/react-router";
 import { useServerFn } from "@tanstack/react-start";
 import { extractPlantMetaFn, savePlantFn, uploadAssetFn, checkSkillDuplicateFn } from "@/lib/identify-plant.functions";
+import { checkNameFn } from "@/lib/name-authority.functions";
+import type { NameVerdict } from "@/lib/name-authority";
 import { useQueryClient } from "@tanstack/react-query";
 import {
   FolderOpen,
@@ -27,6 +29,7 @@ import {
   detachPlantFromTag,
   type TagWithCount,
 } from "@/lib/tags";
+import { TagPicker } from "@/components/tag-picker";
 
 type Props = { initial?: Plant | null };
 
@@ -38,6 +41,7 @@ export function PlantEditor({ initial }: Props) {
   const savePlant = useServerFn(savePlantFn);
   const uploadAsset = useServerFn(uploadAssetFn);
   const checkSkillDup = useServerFn(checkSkillDuplicateFn);
+  const checkName = useServerFn(checkNameFn);
   const htmlInputRef = useRef<HTMLInputElement>(null);
   const htmlFolderInputRef = useRef<HTMLInputElement>(null);
   const hydratedDraftRef = useRef(false);
@@ -72,6 +76,11 @@ export function PlantEditor({ initial }: Props) {
   const [allTags, setAllTags] = useState<TagWithCount[]>([]);
   const [selectedTagIds, setSelectedTagIds] = useState<Set<string>>(new Set());
   const [originalTagIds, setOriginalTagIds] = useState<Set<string>>(new Set());
+  // 保存前的正名核对（只提示、不静默改写 —— 见 runNameCheck 注释）。
+  const [nameChecking, setNameChecking] = useState(false);
+  const [nameVerdict, setNameVerdict] = useState<NameVerdict | null>(null);
+  const [nameDialogOpen, setNameDialogOpen] = useState(false);
+
   const [showCoverSearch, setShowCoverSearch] = useState(false);
   const [pageImages, setPageImages] = useState<string[]>([]);
   const [showPagePicker, setShowPagePicker] = useState(false);
@@ -82,9 +91,20 @@ export function PlantEditor({ initial }: Props) {
   const [mergeBusy, setMergeBusy] = useState(false);
   const [bodyText, setBodyText] = useState("");
 
+  // 名字 → id 的**同步**索引。TagPicker 对外说的是标签**名**（草稿的 tags 是 text[]），
+  // 而这里存的是 id（保存时要算 tagIdsToAdd / tagIdsToRemove）。就地新建标签时，
+  // TagPicker 会「先刷新列表、紧接着 onChange 带上新名字」——两件事在同一个 tick 里，
+  // 走 useState 的 allTags 还没重渲染，onChange 里会查不到新标签的 id。ref 是同步写的，
+  // 所以用它做映射，setAllTags 只管渲染。
+  const tagIdByName = useRef(new Map<string, string>());
+  const syncTagIndex = (list: TagWithCount[]) => {
+    tagIdByName.current = new Map(list.map((t) => [t.name, t.id]));
+    setAllTags(list);
+  };
+
   // Load all tags + current plant's tags
   useEffect(() => {
-    fetchAllTags().then(setAllTags).catch(() => {});
+    fetchAllTags().then(syncTagIndex).catch(() => {});
     if (initial?.id) {
       fetchTagsForPlant(initial.id).then((ts) => {
         const ids = new Set(ts.map((t) => t.id));
@@ -93,6 +113,9 @@ export function PlantEditor({ initial }: Props) {
       }).catch(() => {});
     }
   }, [initial?.id]);
+
+  /** 选中的标签**名字** —— TagPicker 对外说名字，这里存 id（保存时要算增删差集）。 */
+  const selectedTagNames = allTags.filter((t) => selectedTagIds.has(t.id)).map((t) => t.name);
 
   // Load all <img> srcs from html doc whenever htmlUrl changes (for page picker)
   useEffect(() => {
@@ -629,9 +652,63 @@ export function PlantEditor({ initial }: Props) {
     await extractMetaFromUrl(htmlUrl, "已识别并填充，请检查后点「保存修改」提交");
   };
 
-  const onSave = async () => {
+  /**
+   * 保存前对一次名录。
+   *
+   * **刻意只提示、不静默改写** —— 这条链路上的名字是人写的，不是模型生成的。
+   * AI 草稿那两条链路可以自动对齐（模型本来就没有署名权），但把编辑亲手敲进去的
+   * 名字在他不知情的时候换掉，是另一回事：名录也会有他知道而我们不知道的例外。
+   * 所以这里弹一个「名录说 X，你写的是 Y」，改不改他定。
+   */
+  const runNameCheck = async (): Promise<boolean> => {
+    if (!scientificName.trim() && !title.trim()) return true;
+    setNameChecking(true);
+    try {
+      const v = await checkName({
+        data: {
+          title: title.trim() || null,
+          scientificName: scientificName.trim() || null,
+          family: family.trim() || null,
+          genus: genus.trim() || null,
+          commonNamesZh: commonNamesZh.trim() || null,
+        },
+      });
+      setNameVerdict(v);
+      // 与名录一致，或名录里查无此名（境外种等）→ 不打扰，直接放行。
+      if (v.status === "accepted" || v.status === "unmatched") return true;
+      setNameDialogOpen(true);
+      return false; // 等用户在弹窗里定夺
+    } catch {
+      return true; // 核对服务挂了绝不能挡住保存
+    } finally {
+      setNameChecking(false);
+    }
+  };
+
+  /** 采纳名录正名：把字段改掉，原名并进俗名（不丢信息）。 */
+  const adoptChecklistName = () => {
+    const v = nameVerdict;
+    if (!v) return;
+    const extra: string[] = [];
+    if (v.acceptedZh && title.trim() && title.trim() !== v.acceptedZh) extra.push(title.trim());
+    for (const a of v.aliases) extra.push(a.name);
+    if (v.acceptedZh) setTitle(v.acceptedZh);
+    if (v.acceptedLa) setScientificName(v.acceptedLa);
+    if (v.familyZh && v.familyLa) setFamily(`${v.familyZh} ${v.familyLa}`);
+    if (v.genusZh && v.genusLa) setGenus(`${v.genusZh} ${v.genusLa}`);
+    if (extra.length) {
+      const cur = commonNamesZh.split(/[,，、;；]/).map((x) => x.trim()).filter(Boolean);
+      for (const e of extra) if (e && !cur.includes(e)) cur.push(e);
+      setCommonNamesZh(cur.join(", "));
+    }
+    setNameDialogOpen(false);
+    toast.success("已采用名录正名，原名已并入中文俗名");
+  };
+
+  const onSave = async (opts?: { skipNameCheck?: boolean }) => {
     if (!user) return;
     if (!title.trim()) return toast.error("请填写标题");
+    if (!opts?.skipNameCheck && !(await runNameCheck())) return;
     const finalSlug = slug.trim() || slugify(title);
     if (contentType === "html" && !htmlUrl) return toast.error("请上传 HTML 文件");
 
@@ -808,7 +885,11 @@ export function PlantEditor({ initial }: Props) {
             placeholder="如：在北美、欧洲构成入侵；无则填「无记录」"
           />
         </Field>
-        <Field label="标签（逗号分隔）">
+        {/* ⚠️ 这一栏和下面的「主题标签 #tag」是**两套东西**，以前都叫「标签」，
+            所以谁也说不清 AI 自动填进来的那串词到底干什么用。
+            这里是 plants.tags（text[]）—— 只进全站搜索的匹配范围 + 详页/草稿页/分享卡
+            顶部那排卡签，**不会**把条目挂进任何专题页。挂专题页要用下面的主题标签。 */}
+        <Field label="特征词（逗号分隔 · 供搜索与卡签，不建专题）">
           <input
             value={tags}
             onChange={(e) => setTags(e.target.value)}
@@ -1008,44 +1089,9 @@ export function PlantEditor({ initial }: Props) {
                   {extracting ? "AI 识别中…" : "AI 识别并自动填充字段"}
                 </button>
                 <p className="text-xs text-ink-faint">
-                  将自动填入：学名、Slug、科属（科+属）、物种入侵、标签、摘要。已手动改过的 Slug 不会被覆盖。
+                  将自动填入：学名、Slug、科属（科+属）、物种入侵、<b>特征词</b>、摘要。已手动改过的
+                  Slug 不会被覆盖。自动填的是<b>特征词</b>（进搜索与卡签）；要挂专题页请用下面的「主题标签 #tag」。
                 </p>
-                {/* Tag dropdown — multi-select existing tags */}
-                <div className="border border-rule p-3 mt-3 bg-paper-deep/20">
-                  <p className="label text-[11px] mb-2">选择 Tag（多选，可挂到已创建的标签下）</p>
-                  {allTags.length === 0 ? (
-                    <p className="text-xs text-ink-faint">暂无已创建的 Tag，可前往管理页创建。</p>
-                  ) : (
-                    <div className="flex flex-wrap gap-1.5">
-                      {allTags.map((t) => {
-                        const on = selectedTagIds.has(t.id);
-                        return (
-                          <button
-                            key={t.id}
-                            type="button"
-                            onClick={() => {
-                              setSelectedTagIds((prev) => {
-                                const next = new Set(prev);
-                                if (next.has(t.id)) next.delete(t.id);
-                                else next.add(t.id);
-                                return next;
-                              });
-                            }}
-                            className={`text-xs px-2 py-1 border ${
-                              on
-                                ? "bg-ink text-background border-ink"
-                                : "border-rule hover:border-ink"
-                            }`}
-                            title={t.description ?? ""}
-                          >
-                            #{t.name}
-                            <span className="ml-1 opacity-60">({t.plant_count})</span>
-                          </button>
-                        );
-                      })}
-                    </div>
-                  )}
-                </div>
               </>
             )}
             <p className="text-xs text-ink-faint">
@@ -1081,6 +1127,37 @@ export function PlantEditor({ initial }: Props) {
             )}
           </div>
         )}
+
+        {/* ── 项目标签 #tag ─────────────────────────────────────────────────
+            这块原先埋在 `{htmlUrl && …}` 里面 —— 只有传了 HTML 文件才出现，
+            富文本模式和「还没上传」时整个不见，用户报的「+标签#tag 按键消失了」
+            就是这个。挪到 fieldset 末尾，**两种内容类型都常驻**。
+            另补回就地新建标签的按钮：以前要新建得跳去管理页，回来编辑内容全丢。 */}
+        <div className="border border-rule p-3 mt-4 bg-paper-deep/20">
+          <p className="label text-[11px] mb-2">主题标签 #tag（决定这条详页出现在哪些专题页）</p>
+          {/* 原先是把全部标签平铺成一墙 chip 让人扫。标签一多（现在已经在长）那面墙
+              会把「保存」按钮顶到屏幕外，而且和草稿页简介卡上那个「手动添加 #tag 标签」
+              明明是同一件事，长得却完全不同 —— 用户会以为是两套功能。
+              统一换成同一个 TagPicker：黑底白字按钮 + 可搜索下拉，两处一模一样。
+              这里只挂**已创建的标签**；编辑可以就地新建（allowCreate）。 */}
+          <TagPicker
+            allowCreate
+            value={selectedTagNames}
+            onTagsLoaded={syncTagIndex}
+            onChange={(names) => {
+              const ids = new Set<string>();
+              for (const n of names) {
+                const id = tagIdByName.current.get(n);
+                if (id) ids.add(id);
+              }
+              setSelectedTagIds(ids);
+            }}
+          />
+          <p className="mt-2 text-xs text-ink-faint leading-relaxed">
+            挂上后这条会出现在 <b>/tags/该标签</b> 专题页与首页「主题标签」里。
+            和上面那栏「特征词」不是一回事 —— 特征词只进搜索和卡签，不建专题。
+          </p>
+        </div>
       </fieldset>
 
       <label className="flex items-center gap-2 text-sm">
@@ -1095,12 +1172,77 @@ export function PlantEditor({ initial }: Props) {
       <div className="flex gap-3 pt-4 border-t border-rule">
         <button
           type="button"
-          onClick={onSave}
-          disabled={saving}
+          onClick={() => void onSave()}
+          disabled={saving || nameChecking}
           className="bg-ink text-background px-6 py-2 hover:bg-vermilion transition-colors disabled:opacity-60"
         >
-          {saving ? "保存中…" : initial ? "保存修改" : "创建条目"}
+          {nameChecking ? "核对名录中…" : saving ? "保存中…" : initial ? "保存修改" : "创建条目"}
         </button>
+
+        {/* 名录核对结论。**只提示不静默改写** —— 这里的名字是编辑亲手敲的，
+            名录也会有他知道而我们不知道的例外，改不改由他定。 */}
+        {nameDialogOpen && nameVerdict && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-ink/40 p-4">
+            <div className="max-h-[85dvh] w-full max-w-lg overflow-y-auto rounded-lg border border-rule bg-background p-5 shadow-xl">
+              <p className="label text-vermilion">核对《中国植物物种名录 2026》</p>
+              <h3 className="mt-1 font-display text-xl font-bold">
+                {nameVerdict.status === "ambiguous" ? "名录里对不上唯一一条" : "与名录正名不一致"}
+              </h3>
+              <p className="mt-2 text-sm leading-relaxed text-ink-soft">{nameVerdict.note}</p>
+
+              {nameVerdict.status !== "ambiguous" && (
+                <div className="mt-4 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1.5 text-sm">
+                  <span className="text-ink-faint">你写的</span>
+                  <span>
+                    {title.trim() || "—"} <i className="text-ink-faint">{scientificName.trim()}</i>
+                  </span>
+                  <span className="text-ink-faint">名录正名</span>
+                  <span className="font-medium text-vermilion">
+                    {nameVerdict.acceptedZh ?? "—"}{" "}
+                    <i className="font-normal">{nameVerdict.acceptedLa ?? ""}</i>
+                  </span>
+                  {nameVerdict.familyZh && (
+                    <>
+                      <span className="text-ink-faint">名录科</span>
+                      <span>
+                        {nameVerdict.familyZh} {nameVerdict.familyLa}
+                      </span>
+                    </>
+                  )}
+                </div>
+              )}
+
+              <div className="mt-5 flex flex-wrap justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => setNameDialogOpen(false)}
+                  className="border border-rule px-4 py-2 text-sm hover:border-ink"
+                >
+                  返回修改
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setNameDialogOpen(false);
+                    void onSave({ skipNameCheck: true });
+                  }}
+                  className="border border-ink px-4 py-2 text-sm hover:bg-ink hover:text-background"
+                >
+                  保持我写的，直接保存
+                </button>
+                {nameVerdict.status !== "ambiguous" && nameVerdict.acceptedLa && (
+                  <button
+                    type="button"
+                    onClick={adoptChecklistName}
+                    className="bg-vermilion px-4 py-2 text-sm text-background hover:bg-vermilion/85"
+                  >
+                    采用名录正名
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
         <button
           type="button"
           onClick={() => navigate({ to: "/admin" })}

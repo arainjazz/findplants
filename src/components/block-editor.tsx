@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from "react";
 import { zh } from "@blocknote/core/locales";
 import { useCreateBlockNote } from "@blocknote/react";
 import { BlockNoteView } from "@blocknote/mantine";
@@ -20,25 +20,55 @@ export type BlockEditorProps = {
  * with the same markup the blog/plant pages already use. Client-only — BlockNote
  * touches the DOM, so we mount it after hydration to stay SSR-safe.
  */
-export function BlockEditor(props: BlockEditorProps) {
-  const [mounted, setMounted] = useState(false);
-  useEffect(() => setMounted(true), []);
-  if (!mounted) {
-    return (
-      <div className="min-h-[320px] border border-rule rounded-lg bg-paper-deep/20 flex items-center justify-center text-sm text-ink-faint">
-        编辑器载入中…
-      </div>
-    );
-  }
-  return <BlockEditorInner {...props} />;
-}
+/** 命令式接口。给「插入 PDF」这种一次要塞进 N 个块的操作用 —— `uploadFile`
+ *  只能返回一个 URL，装不下一份 PDF 转出来的几十页。 */
+export type BlockEditorHandle = {
+  /** 在文档末尾追加一批图片块。 */
+  appendImages: (urls: string[]) => void;
+};
 
-function BlockEditorInner({ initialHTML, onChange, uploadFile, placeholder }: BlockEditorProps) {
+export const BlockEditor = forwardRef<BlockEditorHandle, BlockEditorProps>(
+  function BlockEditor(props, ref) {
+    const [mounted, setMounted] = useState(false);
+    useEffect(() => setMounted(true), []);
+    if (!mounted) {
+      return (
+        <div className="min-h-[320px] border border-rule rounded-lg bg-paper-deep/20 flex items-center justify-center text-sm text-ink-faint">
+          编辑器载入中…
+        </div>
+      );
+    }
+    return <BlockEditorInner {...props} handleRef={ref} />;
+  },
+);
+
+function BlockEditorInner({
+  initialHTML,
+  onChange,
+  uploadFile,
+  placeholder,
+  handleRef,
+}: BlockEditorProps & { handleRef?: React.Ref<BlockEditorHandle> }) {
   const editor = useCreateBlockNote({
     dictionary: zh,
     uploadFile,
   });
   const loaded = useRef(false);
+
+  useImperativeHandle(
+    handleRef,
+    () => ({
+      appendImages: (urls: string[]) => {
+        if (!urls.length) return;
+        const doc = editor.document;
+        const last = doc[doc.length - 1];
+        const blocks = urls.map((url) => ({ type: "image" as const, props: { url } }));
+        if (last) editor.insertBlocks(blocks, last, "after");
+        else editor.replaceBlocks(doc, blocks);
+      },
+    }),
+    [editor],
+  );
 
   // Load the initial HTML into the editor exactly once.
   useEffect(() => {

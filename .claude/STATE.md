@@ -1,7 +1,295 @@
 # Plantspedia — Working State  (single source of truth)
 
-_Last updated: 2026-07-18 — by Claude (续10：引擎自检 + 用量可观测性修复 + 分享卡纯图 + 放弃补拍；tsc=0，✅ 已部署 211770f2）_
+_Last updated: 2026-07-26 — by Claude（本轮草稿页五修：① 换了配图仍显示「暂无该物种的…公开
+照片」→ 新增 stripStaleMissingNotes，三条换图路径 + 视图 + 保存 + 收录发布全清；② 银叶草稿的
+简介卡不再顶「疑似」、不再压补拍框（showTentativeOnCard）；③ 正文下新增编辑专属绿框
+「草稿内容符合我的观察」=采纳+收录；④ 小P蛙讨论范围新增「快速识别简介卡」并能真改那几个字段；
+⑤ 编辑可手改简介卡（DraftCardEditor）。tsc/build/lint=0，**未部署**，编辑态 UI 未能本地实测
+（需编辑登录）。详见文件最下方本轮小节。）_
+_上一轮：2026-07-25（续二）— by Claude（本轮又三修：人文图槽加 plant/插画兜底（不加生境）；
+草稿三档判据改用 ai_payload._enriched（快速不再被错标银叶）；分享卡 og:* 改成「植物照片+
+Plantspedia草木志·名称+该植物简介」（plants.$slug 显式写全 og:*、drafts.$id 新增 loader/head）。
+上一轮：植物人文→Section I、配图框对齐拍摄记录、align:start 消空挡、PDF 插入按钮放大+放开 PPT。
+全部 tsc/build=0、已实测，**未部署**。详见文件最下方两节。）_
 _Read this FIRST and update it LAST, every session._
+
+## 🚨 部署真相（以 Cloudflare 为准，不以本文件的小节标签为准）
+
+**线上版本 = `adf3316b-687d-4f0d-9aea-d6b2929a206b`，2026-07-25 15:11 CST 部署。**
+（`./node_modules/.bin/wrangler deployments list | tail -30` 查得；07-25 那天还有一次
+`b9755785` 12:15 CST，两次都没记进本文件。）
+
+**判据规则 —— 别再照抄小节标题里的「NOT deployed」：**
+`wrangler deploy` 打包的是**整个工作树**（含未提交改动），所以某一轮是否上线**只看时间**：
+凡是文件改动时间**早于最后一次部署**的，无论当时小节里写了什么，都**已经在线上**。
+这就是为什么 07-20～07-25 那一长串标着「NOT deployed」的小节其实全都生效了。
+
+**查「现在到底什么没上线」的标准动作**（两条命令，别靠读小节）：
+```
+./node_modules/.bin/wrangler deployments list | tail -30      # 取最后一次部署时间
+find src supabase *.ts *.jsonc -newermt "<那个时间>" -type f   # 晚于它的就是未上线的
+```
+
+**截至 2026-07-26 17:57，未上线 = 13 个源文件、3 轮改动**：
+① 卡签配色分名录 + 项目页（conservation.ts / registry-chips.tsx / share-card.ts / projects.$id.tsx）
+② 识别假失败自愈 + 闲聊消毒（tentative.ts / model-chatter.ts / explain-error.ts / camera-identify.tsx）
+③ 草稿页五修（draft-enhance.ts / html-doc-editor.tsx / draft-card-fields.ts /
+   identify-plant.functions.ts / drafts.$id.tsx）—— 详见文末小节。
+
+**✅ 两份迁移已于 2026-07-26 由用户在 Supabase 控制台执行**（均 Success, no rows returned）：
+- `20260720120000_species_dossiers.sql` —— 表建好了。**注意这一刻起线上行为就变了**：
+  线上代码早就在调 `loadDossier` 读 / `upsertDossier` 写，之前因表不存在一直静默失败；
+  现在物种级复用真正生效（同物种第二次识别照搬通用正文、只重写拍摄记录，2 秒出卡）。
+- `20260721120000_projects_fix_has_role.sql` —— projects 四条 RLS 策略已改用 `private.has_role`，
+  「添加新项目内容报错 permission denied for function has_role」应已消失（待用户复看）。
+两份都可重复执行（if not exists / drop policy if exists），已生效、与部署无关。
+
+**git**：最后一次提交是 07-18（e7a61b4）。之后 8 天的改动全部未提交 —— 没有检查点。
+
+## 🆕 2026-07-21（续16）两个线上报错的定位与修复
+- **① 「添加新项目内容报错：permission denied for function has_role」——已修（待控制台执行）。**
+  根因：`20260704120000_projects.sql` 的四条 RLS 策略调用 `public.has_role`，而
+  `authenticated` 早在 `20260513124950`（第 98 行）就被 REVOKE 掉了对 `public.has_role`
+  的 EXECUTE —— 整套改造把角色判断迁到了 `private.has_role`（`20260513133147` 授权给
+  authenticated/anon）。作者用对了 `private.is_approved_editor`，却把 has_role 误写成 public。
+  - 修复：新增 [20260721120000_projects_fix_has_role.sql](supabase/migrations/20260721120000_projects_fix_has_role.sql)
+    把四条策略全部重建为 `private.has_role`；并同步修正了原始 projects 迁移文件。
+  - **⏳ 待办：去 Supabase 控制台 SQL Editor 执行那份新迁移**（托管库、本地无 CLI）。
+    纯策略重建，无 schema 变更、不用改 types.ts。
+- **②✅ 真因已定死（07-21 wrangler tail 实测）＝Cloudflare 单次调用「子请求(对外 fetch)数」超限。**
+  日志铁证:`[job-queue] 已入队` + 消费者接住 → **队列完全正常**(之前所有关于「没部署/26s
+  waitUntil/换模型」的判断全部作废)。任务在消费者里跑了约 78s,联网调研→Kimi 生成正文→抓 12 张
+  缩略图(PhotoOrgans)→PhotoSlots→QualityGate **全过**,最后 `DRAFT_UPDATE_FAILED … 原因：
+  Too many subrequests by single Worker invocation` —— **正文生成好了,写回库那步的 fetch 被平台拒**。
+  更坑:连 failJob 写「失败状态」也要 fetch、同样被拒(`[jobs] patch skipped … not found`)→
+  失败状态没记下 → 前端退回「连续两分钟没心跳」兜底文案。**所以「没心跳」是假象,真错误是子请求超限。**
+  - **免费版上限 50 子请求/次调用;付费版 1000。** 本次估算逼近 50 才崩 → 基本确定**免费版**。
+  - 子请求大户(累积撑爆 50):心跳(每 15s readJob+upsert=2)≈10、阶段更新(每次 read+write)≈10、
+    联网调研 429 轮换≈4、配图 fetchSpeciesPhotos+classifyPhotoOrgans 抓 12 缩略图≈16、dossier≈2、
+    写库+日志+扣叶≈5。**心跳/阶段机制本身就吃掉约 40% 预算。**
+  - **✅ 用户选「免费改代码压到 50 以下」。已做 4 项(tsc=0，未部署)：**
+    ① **[background-jobs.ts](src/lib/background-jobs.ts) 新增 `bindJobUpdates(job)`**：把心跳/阶段/
+       收尾全绑定到内存副本、每次只 **blind upsert 不先 read** —— 每次更新从 2 子请求降到 1，
+       整趟省约 10。删掉旧的 patchJob/setJobPhase/finishJob/failJob/touchJob/startJobHeartbeat
+       （原来只有 runQueuedJob 用）。[identify-plant.functions.ts](src/lib/identify-plant.functions.ts)
+       的 runQueuedJob 改用 `bindJobUpdates`。
+    ② enrich 配图候选 **12→8**（classifyPhotoOrgans 少抓 4 张缩略图，且更易全数成功让分类生效）。
+    ③ **upsertDossier 挪到写库之后**（写库先拿配额；dossier fire-and-forget 失败无害）。
+    ④ 修正 [poll-job.ts](src/lib/poll-job.ts) 误导文案：删掉「换更快的模型」，改说触及平台单次
+       请求上限、与模型快慢无关。**blind-write 后 failJob 能写进真实错误了**，「没心跳」会少见。
+  - **预算估算**：故障那趟 ~50 → 现约 36–42/50，缓冲 ~8–14，**典型情况够用但非零脆弱**。
+    若部署后仍撞顶：下一步走「先存正文再best-effort补配图」的分段改造，或升级 Workers 付费版。
+  - **✅ 07-21 真正的解法：用户开通 Workers Paid（$5/mo），子请求上限 50→1000。**
+    （中间买错过一次：Page Rules $5/mo 与 Workers 无关，已提示退订。）
+    上限是**运行时按账号套餐判定**，不需改代码。→ **原计划的「分段改造」不必做了**，上面那 4 项
+    优化作为纯收益保留（更快更省）。⏳ 待用户复测生成草稿 + 金叶创建。
+
+- **④ 复核之谜已定案（用户问：疑似时不是该先自动复核吗？为何用量表第一次只有 plantnet+gemini-quick）**
+  - **闸门没有 bug**（一度怀疑判据不一致，查证后推翻）：`isTentative` 认「confidence=low」和
+    「summary_zh 以疑似开头」两种，而闸门只认前者 —— 但 `normalizeIdentification` 在闸门**之前**
+    就把后者回填成 `confidence="low"`，所以两种疑似都会触发复核。
+  - **真凶**：`secondOpinionIdentify` 在 **HTTP 非 200（含 429 限流）/ 空响应 / 30s 超时** 时
+    **静默返回 null**，只写一行 console.warn。日志实证当时 Gemini 正 429 RESOURCE_EXHAUSTED。
+    → 复核「跑了但没跑成」→ 无 `+review-*` 后缀 → 用户被直接推去补拍；等补拍时（1 分多钟后）
+    配额窗口重置 → 复核成功 → 才出现 `+review-adopted`。
+  - **✅ 已修（透明化）**：新增 `_identify_trace` 全链路痕迹，**每次识别都记**，含复核没跑时的原因。
+
+- **⑤ ② 简介卡「识别过程 · 综合可信度%」——已实现（tsc=0，未部署未实测）**
+  - [identify-plant.functions.ts](src/lib/identify-plant.functions.ts)：`IdentifyTrace` 类型 +
+    `computeIdentifyConfidence()` + `identifyTraceHtml()`，渲染进 `buildSummaryCardHtml`。
+  - **可信度%刻意不让模型自评**（三档映射百分比是假精度）：只用 ① Pl@ntNet 的 score（链路上
+    唯一非自评的客观数字）② 最终置信档（high90/medium70/low45）。同种取均值、复核确认 +5；
+    异种只认档位 −5；无 PlantNet 分则只认档位。**卡上同时写出依据**，不做黑盒数字。
+  - 位置正确：只进 `html_content`（草稿页简介卡）；`share-card.ts` 不读 html_content → 分享卡不受影响。
+- **⑥ ③ 三按钮机制 —— 已实现（tsc=0，线上流程未实测）**
+  - 用户拍板的两个口径：**份数为主 + 用户数括注**（「已有 5 份 · 3 位用户」）；
+    **只算已生成正文的银叶草稿**。
+  - **关键判据 = `ai_payload._enriched === true`**（不是 html_content！快速识别也会把简介卡写进
+    html_content，`_enriched` 快速草稿显式为 false —— draft-card.tsx 的 tier 判据其实不准，
+    但那是既有问题，本次没动）。
+  - 新增 [species-existing.functions.ts](src/lib/species-existing.functions.ts)：服务端
+    （service role，跨用户统计不受 RLS 限制）按属名前缀粗筛 + `speciesKey` 精确比对，
+    返回 {草稿份数, 不重复用户数, 最新草稿id, 金叶详页}。查失败静默返回空，绝不挡生成流程。
+  - [drafts.$id.tsx](src/routes/drafts.$id.tsx)：`closeCard` 的**非疑似**分支触发
+    （条件 `cardAutoOpened && !draftTentative && notEnriched`，与补拍关卡同一套「只认自动弹出
+    的那张卡」判据），弹三按钮面板。第三个按钮始终保留 —— 推荐归推荐，不剥夺「我就是要自己生成」；
+    未登录时该按钮改为走 onLoginToEarn。
+- **⏳ 待用户线上实测**：①生成进一步介绍草稿（Workers Paid 后）②金叶创建 ③识别过程卡片
+  ④三按钮面板。
+- **⑦ 07-21 晚线上实测暴露一批 bug —— 已修 4 类（tsc=0，待部署）**
+  - **根因（一因四果）**：`quickIdentifyDraft` 的 `else` 兜底分支会**自动跑完整流水线**
+    `buildDraftContent` 并标 `enriched=true`。用户用自建模型（qwen3.5-omni-flash）时
+    `identifyQuick`（Gemini 专用）返回 null，补救链路 `callAiIdentify(...,"card")` 也失败
+    → 掉进 else，一次性造成：①没点「生成进一步介绍草稿」草稿却已整篇生成 ②简介卡上没有
+    识别过程/可信度（该分支不走 buildSummaryCardHtml）③配图是重复的用户原图（走 section
+    photos 抓不到）。**注意：代码注释显示这个 bug 之前修过一次，补救链路本身也会失败。**
+  - **✅ 改法**：else 分支**永不再自动跑完整流水线**，改用 Pl@ntNet 判定兜底出**摘要卡**
+    （`enriched=false`，生成正文永远由用户按按钮决定）；连 Pl@ntNet 也没有 → 如实抛
+    `IDENTIFY_FAILED`，而不是造一张空卡。
+  - **✅ 「待鉴定植物」双保险**：① else 分支用 Pl@ntNet 学名命名；② 快路径下模型 title 与
+    scientific_name 双空时，用 Pl@ntNet 学名回填并强制 low（→ 显示「疑似 X」）。
+  - **✅ iframe 无限增长空白（金叶按钮几乎点不到）**：[draft-enhance.ts](src/lib/draft-enhance.ts)
+    原来量 `documentElement.scrollHeight` —— 该值**不小于视口高**，而视口高就是父层按上次上报
+    设的 iframe 高，叠加 body margin 后每轮自我放大，ResizeObserver 持续触发 → 无限变高。
+    改为只量 body 内容盒 + 外边距（与视口无关、收敛），并加「变化 >1px 才上报」阈值。
+    ※ 用户报的「完整草稿已生成却不知道去哪看」很可能是同一个 bug 的表象（正文被空白顶没了）。
+  - **✅ 金叶完成改弹窗**：原来只有 12 秒会消失的 toast + 角落「查看」，等几分钟回来正好错过。
+    改成必须显式关闭的弹窗，「立即查看」整页跳 `/plants/$slug`（落在页面开头）/「稍后查看」。
+- **⑧ 07-21 第二轮实测：三个问题全部定位并修复（Version 55d22d69 已上线）**
+  - **⒜ 可信度一直不显示 —— 我上一轮放错了地方。** 草稿页对快速草稿走
+    `notEnriched ? null : <iframe>`（drafts.$id.tsx），**`html_content` 根本不上屏**，
+    所以写进 `buildSummaryCardHtml` 的痕迹永远看不到。真正的简介摘要卡是 React 组件。
+    → 算法抽成纯模块 [identify-trace.ts](src/lib/identify-trace.ts)（服务端 + 客户端共用，
+    避免两边各算一个数），在 React 卡片里渲染；老草稿无痕迹字段时用最小痕迹兜底，
+    保证**无论疑似非疑似都有百分比**。
+  - **⒝ 空白无限增长 + 页面自己滑动 —— 根因是 `plant-html-template.ts:110` 的
+    `body{min-height:100vh}`。** iframe 内 100vh = 父层刚按上报值设的高 → body 至少这么高
+    → 加 margin 报回去 → 每轮 **+16px**（正是 body 默认上下 margin），ResizeObserver 持续
+    触发。**上一轮我只改了测量方式，没拆掉这个根源，所以没修好。**
+    → 在 iframe 注入 CSS 中和：`html,body{height:auto!important;min-height:0!important}`
+    + `body{margin:0!important}`（只影响 iframe 预览，不影响已发布详页）。
+    **✅ 已用复现实验证明**：未修版 416→432→448→464→480 持续增长；修复版一次收敛到 400。
+  - **⒞ 「草稿内容和我的观察不符」按钮缺失 —— 代码自相矛盾。** 按钮条件含
+    `!submittedForReview`，而 `runEnrichCore` 写库时就置 `submitted_for_review: true`
+    （identify-plant.functions.ts:4688）→ 生成完成的同一刻按钮被自己藏掉，**正常流程下永远
+    看不到**。→ 去掉该条件（已进审核队列反而更该让用户纠正错误定种）。
+- **⑨ 07-21 第三轮：进度面板 + 照片查重（tsc=0，已 build，🚧 deploy 连续 2 次 fetch failed 未上线）**
+  - 新增 [job-progress.tsx](src/components/job-progress.tsx)：常驻进度面板（阶段文案 + 进度条 +
+    **已用时秒表**）。银叶/金叶两条链路共用。`awaitJob` 本来就在回调 (phase, progress)，
+    以前只喂给 toast —— toast 会自动消失又挤在角落，几分钟长任务里用户不知道它还在不在跑。
+    面板**刻意放在可信度卡之后**，不放各自按钮旁边：按钮所在分支会随 notEnriched/余额/编辑态
+    消失，进度跟着藏起来就白做了。
+  - 银叶成功文案改为「完整草稿已生成，自动进入待审序列」（runEnrichCore 确实置了
+    submitted_for_review=true，之前不说用户不知道还要不要再点提交）。
+  - **照片查重**：`findDraftByPhotoHash`（species-existing.functions.ts）+ camera-identify 弹
+    「是，去看已有的简介摘要卡 / 否，再识别一次」。指纹 = **原始文件字节** SHA-256（压缩前算，
+    压缩是有损再编码不保证跨次一致）。**存在 `ai_payload._photo_sha256`，刻意不加列 ——
+    hosted Supabase 加列要人工去 dashboard 跑迁移。** 补拍路径跳过查重（本来就是同一株）。
+  - 草稿页新增**常驻**「站内已有该物种的内容」区（银叶草稿/金叶详页跳转），与关分享卡时弹的
+    面板同源，区别是不打断操作 —— 满足「跳过去后简介卡下面能看到并跳转」。
+- **⑩ 批量识别：用户反提议做 MCP，让外部 agent 接管。已答的三项口径**：疑似照收但单独标出、
+  完整链路且保留复核、仅管理员/编辑且不消耗叶片。**关键矛盾待定**：MCP 若只是触发站内现有
+  管线，限流照旧（同一个 Gemini key，且只有 1 个）；若让外部 agent 自带视觉模型，则绕开限流
+  但失去 PlantNet 客观分与二次复核 —— 与「完整链路」的选择冲突。下轮需就此拍板。
+- **⑪ 07-22 第四轮：可信度算法 + 编辑器图片 + Key 体检（Version ae49e876 已上线，Consumer 也注册成功）**
+  - **可信度算法修了一个真实缺陷**（用户实测 `Begonia chitoensis 7%` 却被当分歧扣 5 分）：
+    新增 `PN_MEANINGFUL_PCT=30` 阈值 —— 低于它视为「Pl@ntNet 自己都没把握」，**不计入**
+    （既不算印证也不算反证）；达到阈值的分歧，**惩罚随其置信度线性放大**（刚过阈值几乎不扣，
+    近 100% 扣满 30）。旧版一律扣 5，把「7% 的瞎猜」和「95% 的强烈反证」等同对待。
+    UI 同步写明「一线模型只给档位、不给百分比」——避免用户以为漏显示了分数。
+  - **澄清「两个引擎」的说法**：代码里**没有**两个引擎。**引擎只有 Pl@ntNet 一个**（唯一给
+    客观分数的）；其余都是**视觉模型**（一线识别 / 二次复核），排成降级序列。控制台里
+    「两个…视觉自检通过」指的是**两个候选模型**都能看图，不是两个引擎。
+  - **编辑器图片固定比例**（上一轮只修了预览态）：编辑器 iframe 用原始 `docText`，没有预览态
+    注入的 VIEWER_STYLE，所以图上的硬编码 height 没人压得住。→ 在已有的
+    `lov-editor-runtime-style` 里加 `img{height:auto!important;max-width:100%!important}`，
+    并在 `onSave` 的 docClone 上**用 querySelector 剔除**（getElementById 在克隆文档上不保证
+    可靠；漏删一次这段 CSS 就被永久写进正文）。**已实测验证**：注入后硬编码 height=120 被压成
+    auto；clone→剔除→序列化结果不含任何编辑器 CSS。
+    另外 `replaceActiveSrc` 换图时一并摘掉 `.img-slot` 的 `broken`/`no-organ` 类
+    （`.img-slot.broken` 带 aspect-ratio:4/3，不摘则新图被困在 4:3 里）。
+  - **每个 Key 的独立体检**：新增 [key-health.functions.ts](src/lib/key-health.functions.ts)。
+    Pl@ntNet 面板（identify.tsx）加「检测连通性与剩余额度」，走 `GET /v2/status`（**不消耗
+    识别配额**），并回显本站自己记的耗尽标记 —— 以前 500 次/天完全是黑盒，只有撞 429 才知道。
+    模型控制台每项加「连通体检」，走 `GET /models`（不产生 token 费用），与「视觉自检」
+    分工明确：前者测 key 通不通/是否限流，后者测模型能不能看图。
+    **刻意不显示 LLM 余额数字**：各厂商没有统一的余额接口，宁可如实说「无法显示」也不编造。
+- **⑫ 07-22 第五轮（Version aaa3348a 已上线）**
+  - **Gemini「连通体检」按钮是灰的** —— 根因：`ModelSlot.baseUrl` 对 **gemini/anthropic 用官方
+    地址时就是 `""`**（model-queue.ts:33 明写），而我把 baseUrl 也列为必填 → 一律禁用。
+    → 按钮只要求 apiKey；体检函数按 provider 分派端点：gemini 走
+    `generativelanguage.googleapis.com/v1beta/models?key=`（**query 带 key，非 Bearer**），
+    anthropic 走 `x-api-key` + `anthropic-version` 头，其余走 OpenAI 兼容 `GET /models`。
+    响应数组字段 `data`（OpenAI/Anthropic）与 `models`（Gemini）都认。
+  - **「自检两个引擎」→「自检三条链路」**：以前只报 Pl@ntNet / 复核模型两个孤立的点，
+    **出卡模型那一环根本没测**，两个 ✅ 也答不出「拍一张照到底能不能出卡」。
+    现在测三条端到端链路：①PlantNet 可信→出卡AI ②PlantNet 存疑→一线识别顶替→出卡AI
+    ③一线仍疑似→二次复核。出卡AI（consoleId="card"）**逐项测序列每一条**（只测第一项
+    等于没测出冗余还在不在）。
+  - **MCP 规划已写入 [.claude/MCP-PLAN.md](.claude/MCP-PLAN.md)**（设计稿，未实现）。核心思路：
+    **agent 只能提交「证据」不能提交「结论」** —— 只收 `plantnet.score` + `model_verdict.confidence`
+    三档，**不收 agent 自报的百分比、不收 agent 写的 HTML**；可信度由服务端调同一个
+    `computeIdentifyConfidence()` 算，格式由 `buildSummaryCardHtml()` 渲染。这样多个 agent 接入
+    也不会出现格式/标准漂移。已如实标注方案 B 的固有局限：**本站无法验证 agent 是否真调了
+    Pl@ntNet**（可伪造 score），缓解靠 `_identify_trace.source="mcp"` 溯源 + 整批回滚。
+    `plant_drafts` 已有 `tags: string[]`，批量打标签可在草稿层直接做，**无需新迁移**。
+- **⑬ 07-22 第六轮：MCP 最小闭环已实现并部署（Version b2f312b8）**
+  - 用户已定：**只给 owner 用**（不对其他编辑开放 → 不做多租户/OAuth）、接受 Pl@ntNet
+    伪造风险、**标签只能从已有里选**、先做最小闭环（2 工具、无批次表）。
+  - **架构**：本机 stdio MCP → HTTPS → `/api/mcp/*` → 站内同一条建卡流水线。
+    **刻意不复用 server fn**：TanStack 的 `/_serverFn/<hash>` 是内部实现、hash 随构建变化，
+    外部进程没法稳定调用。端点在 [server.ts](src/server.ts) 里**先于**渲染管线拦截，
+    不匹配则返回 null 照常走（已实测首页不受影响）。
+  - **只收证据不收结论**（[mcp-api.ts](src/lib/mcp-api.ts)）：只接受 `plantnet.score` +
+    `confidence` 三档；**拒收** agent 自报百分比与自写 HTML。可信度由
+    `computeIdentifyConfidence()` 算、卡片由 `buildSummaryCardHtml()` 渲染 —— 与站内识别同一段代码。
+    另强制要求**显式提供 `plantnet` 字段**（可为 null 但必须写），逼 agent 真去调专业引擎。
+  - `ingestMcpIdentification()` 在 identify-plant.functions.ts，复用
+    `normalizeIdentification` / `lookupRegistryChips` / `draftTitleFor`，落库 `_enriched:false`
+    （要正文仍需用户点按钮）、`_identify_trace.source="mcp"` 可溯源。
+  - 标签白名单校验 + 照片 SHA-256 查重（与站内同口径）都在端点里做。
+  - **⚠️ 踩过的坑**：`ai_usage_logs` **没有 `note` 列**（我一开始猜的），真实字段是
+    `draft_id/draft_title/task_type/capture_*`。写错会静默失败（外包了 try/catch）。
+  - **实测通过**：无 token→401、有 token 但服务端未配置→401 且提示具体原因、GET→405、
+    首页仍 200。业务逻辑待用户执行 SQL 配 token 后实测。
+  - 文件：[mcp/plantspedia-mcp.mjs](mcp/plantspedia-mcp.mjs)、[mcp/README.md](mcp/README.md)
+    （含已生成的 token 与安装 SQL）。
+- **⑭ 07-22：「草稿内容和我的观察不符」按钮之谜 —— 定案（Version 0b60bd73 已上线）**
+  - **不是被条件藏掉**（07-21 我以为是 `!submittedForReview`，那个确实是 bug 也确实修了，
+    但修完用户仍说没有）。真因是**位置**：按钮渲染在**正文 iframe 之前**，而它自己的提示语写着
+    「读**下面**的完整草稿时…点**上面**这个按钮」——正文很长，用户读完早已在几屏之外，
+    叠加当时「页面自己滑动」的 bug，等于不存在。
+  - **已移到正文 iframe 之后、金叶入口之前**，提示语改为「读完**上面**的完整草稿…」。
+    DOM 顺序现为：正文(1312) → 观察不符按钮(1346) → 金叶入口(1374)。
+  - 教训：UI 元素「渲染了」不等于「看得见」。条件对了之后还要看它在滚动流里的位置。
+- **⏳ 仍未做（用户已提出）**：
+  ⒝ 金叶生成过程想要更显眼的实时阶段提示（目前阶段文案只走 toast）；
+  ⒞ 金叶「成功但用量表无记录」是否真成功 —— 需用户下次复现时抓 `wrangler tail` 才能定论。
+- **🚧 BLOCKER（07-21 18:04）：③ 已 build 成功但 deploy 连续 2 次 `fetch failed`，按止损原则停手。**
+  - **线上现状**：`Version 13170e23`（含 ①②④⑤ = 子请求优化 + 识别过程痕迹/可信度卡）**已上线**；
+    **③ 三按钮机制代码已写完、tsc=0、dist 已构建，但未上线**。
+  - **恢复动作**：网络好转时直接 `./node_modules/.bin/wrangler deploy`（**不必重新 build**，
+    dist/ 就是含 ③ 的产物）。deploy 后务必确认输出里有 `Consumer for plant-jobs` 那行 ——
+    07-21 就发生过只注册上 Producer、consumer 触发器被掐掉的情况。
+- **(以下为定位前的过时判断，保留备查)**
+  队列系统（job-queue/model-queue/worker-ctx/server.ts 的 queue handler/wrangler 队列配置）
+  **代码全部写好且 wiring 正确**（逐一核过 enqueueJob→退回 keepAlive 的降级）。
+  - **队列基建已就绪**：`wrangler queues list` 显示 `plant-jobs`（1 producer + 1 consumer）
+    与 `plant-jobs-dlq` 均已于 07-20T08:33 创建；**不需要再建**。
+  - **⚠️ 修正续16 早先的判断**：`wrangler deployments list` 显示 07-20 有多次部署，最后一次
+    **07-20T22:31**，晚于队列创建，且 plant-jobs 已绑定 consumer → **带队列的 worker 很可能
+    已经上线**，并非「完全没部署」。所以「生成失败」不一定是队列没上，可能是队列路径的运行时
+    问题（enqueue 在运行时拿不到绑定而退回 26s waitUntil、或模型本身报错/超 15min）。
+  - **「模型视觉自检通过」是干扰项**：自检只发 1KB 探针图测「能不能看图」，测不出长文生成能否
+    在时限内跑完。
+  - **下一步**：用户自行 `npm run build && ./node_modules/.bin/wrangler deploy`（部署当前工作树，
+    含最新队列代码 + 本次海报修复）。**若部署后仍报「连续两分钟没有心跳」，就不是部署问题**——
+    去 Cloudflare → Observability（wrangler.jsonc 已开日志留存）查那次失败任务的日志：
+    看 `[job-queue] 已入队` 有没有出现（没出现＝退回了 waitUntil）、consumer 有没有跑 runQueuedJob。
+- **③ projects 封面海报缩略图改为按原图比例自适应——已修并线上前验证。**
+  竖版海报（1023×1537）以前被 `aspect-[16/10]`+`object-cover` 裁成横条。三处全改为
+  `w-full h-auto`：卡片 [projects.index.tsx](src/routes/projects.index.tsx) ✅ dev 实测渲染
+  412×619（比例 0.666 与原图一致、整张完整）、详情页 [projects.$id.tsx](src/routes/projects.$id.tsx) ✅、
+  编辑器预览 [project-editor.tsx](src/components/project-editor.tsx)。tsc=0。**随用户下次 deploy 上线。**
+
+## 🆕 2026-07-19（续13）「识别复核出卡AI三重奏」栏 + 网络报错人话化（tsc=0，**未部署**）
+- **新增 [explain-error.ts](src/lib/explain-error.ts)**：把 `Load failed`（Safari/iOS）/
+  `Failed to fetch`（Chrome）这类**浏览器原生网络错误**翻译成「原因 + 下一步」。这两条是同一个
+  `TypeError`：fetch 在网络层就失败、**根本没拿到 HTTP 响应**，所以服务端那套「原因+怎么办」
+  文案压根没机会产生 —— 用户屏幕上只剩一句废话。翻译时结合**耗时**（秒断=断网/切网，久等后断=
+  超时/后台挂起）与**上传体积**给出排序后的可能原因。已接入 camera-identify 识别失败分支
+  （带 elapsedMs / sizeBytes）与 identify.tsx 的 6 处 onError。
+- **UI 重排（用户要求）**：新增 `IdentifyTrioSection`「识别复核出卡AI三重奏」折叠，
+  **排在「配置 AI 模型」内容第一位**，含 Pl@ntNet → 疑似复核模型 → AI 模型控制台，
+  **引擎自检抽成独立组件 `EngineSelfTestPanel` 放在该栏最后**（它跨越两块配置，
+  挂在复核模型面板里名不副实）。草稿生成 / 小P蛙留在三重奏之外。
+- **验证**：tsc=0 ✅；dev(5203) 临时放开 admin gate 实测渲染顺序与文案正确、无 console 报错，
+  **gate 已改回 `isAdmin &&`** ✅。
+- **⏳ 待用户回答（Kimi 变慢的定位）**：快速出卡链路
+  [identify-plant.functions.ts:2761](src/lib/identify-plant.functions.ts:2761) **只挑
+  `provider === "gemini"` 的序列项**，Kimi 排第 1 位理论上不参与出卡。所以变慢只可能是
+  ① AI 控制台序列里**已经没有 Gemini 项** → quick 返回 null → 掉进完整管线用 Kimi 跑重 prompt；
+  或 ② 别处配了推理模型。已确认复核模型是 qwen3-vl-flash（正常，不是 Kimi）。
 
 ## ✅ 2026-07-18（续14）二次复核模型改造为**厂商无关** + 模型选择器（已部署 69b5b919）
 用户要求「不要局限于豆包，我要能自由配置任何模型；填 key + url，然后拉取模型（只展示有图形能力的）」，
@@ -2826,3 +3114,2071 @@ Implement one slice → `tsc --noEmit` → preview → update this file.
     reset). → The AU exit node's upstream can't hold the sustained upload. **Next
     lever: switch VPN exit node to HK/JP/US-West (better Cloudflare routing) and
     rerun `wrangler deploy`.** Code/build/auth all fine; purely the upload path.
+
+## 2026-07-19 — 自定义接口 Base URL 粘贴完整 URL 导致「拉取可用模型」404
+- **症状：** 管理台加 Kimi/Moonshot 作 Gemini 备用模型时，Base URL 填
+  `https://api.moonshot.cn/v1/chat/completions`，点「拉取可用模型」报
+  `HTTP 404 url.not_found … "url":"/v1/chat/completions/models"`。
+- **根因：** 代码统一自己拼路径（调用拼 `/chat/completions`、列模型拼 `/models`），
+  base 里已含路由就被二次拼接。以前只 strip 尾部斜杠，没 strip 路由段。
+- **修复：** 新增 `src/lib/ai-base-url.ts → normalizeBaseUrl()`，剥掉尾部
+  `/chat/completions | /completions | /responses | /messages`；替换全部 11 处
+  server 端 base 规范化 + 前端 3 个文件（面板/identify/用户设置）的保存、拉取、
+  预览行；帮助文案改为「粘完整 URL 也行，会自动裁掉」并把 Kimi 列入兼容示例。
+- **验证：** `tsc --noEmit` 干净；normalizer 各输入形态单测通过；dev 起在 5203，
+  /identify 渲染正常无 console 报错。管理台面板需管理员登录，未做端到端点击。
+- **未部署** —— 需 `npm run build && wrangler deploy`（老规矩：挂梯子）。
+- **部署完成 2026-07-19：** `wrangler deploy` 一次成功，Version ID
+  `fe2f1154-e0f5-42c5-a795-25794cb26efd`，触发 plantspedia.club / www 双域名。
+  线上 /identify 正常渲染、无 console 报错（浏览器验证；shell 里 curl 与
+  `wrangler deployments list` 因本机代理/网络返回 000/fetch failed，与部署无关）。
+- **Kimi 备用模型选型结论：** Moonshot 2026-07-16 发布 **kimi-k3**（2.8T MoE，
+  原生视觉 + 1M 上下文），带图识别可用；kimi-k2.6 / k2.7-code 也支持图片。
+  旧的 moonshot-v1-* 纯文本版不能看图。Base URL 填 `https://api.moonshot.cn/v1`
+  （现也可直接粘完整 URL）。
+
+## 2026-07-19（续）— key 池跨厂商混用导致 401（比 404 更深的一层）
+- **症状：** Base URL 修好后改报 `HTTP 401 Invalid Authentication`。
+- **根因：** 管理台的 API Key 列表是**全厂商共用的一个池**，逗号 join 后存下。
+  用户池里顺序是 `AQ.…(Gemini) , AQ.…(Gemini) , sk-…(Moonshot)`。
+  1) `listProviderModelsFn` 只取 `split(",")[0]` → 拿 Gemini key 去问 Moonshot → 401。
+  2) 更严重：正式调用处 `Bearer ${apiKey}` **直接把整串 join 后的池当成一个 token
+     发出去**（identify 主链路 L1618、quickIdentify L656、openaiCompatChat L5152）
+     → 即使存下来，识别也必 401。UI 却写着「自定义接口也支持轮换」。
+- **修复：** 新增 `src/lib/ai-key-pool.ts`（`splitKeyPool` / `keyRejected` /
+  `bearerFetchRotating`）；401/403/429 自动换下一个 key，其他状态码原样返回不吃掉
+  调用方自己的重试。接入拉模型、identify 主链路、quickIdentify、openaiCompatChat
+  （后者额外记住命中的 key 供无图重试复用）。错误信息里 key 一律打码。
+- **验证：** `tsc --noEmit` 干净；起本地假 OpenAI 服务跑 5 条断言全过（含用户真实
+  的「两个 Gemini key 排在 Moonshot key 前面」这一顺序 → 第 3 个 key 命中、
+  join 串从未被当成单 token 发出、全坏池如实报 401）。
+- **已部署：** Version ID `42c1c35f-14ae-4f04-bcd1-a039ad55a082`，线上无 console 报错。
+- **待用户确认：** 管理台点「拉取可用模型」应能列出 kimi-k3；管理员登录态我这边没有。
+
+## 2026-07-19（进行中）— 重新设计 key 池 → 「优先调用序列」
+**用户要求：** 三个控制台（AI 模型 / 疑似复核 / 小P蛙）统一改成：一个「配置后台AI模型」
+按钮 → 展开后第一行「优先调用序列1」+ 完整配置（服务商 / **单个** API Key / Base URL /
+模型 / 拉取可用模型），保存按钮旁「添加排队序列2」（递增），点序列号可下拉调顺序、
+调完按 1~n 重排。分享卡三按钮同行三色。
+**为什么：** 旧机制一个控制台只有一个 provider + 一池逗号 key，跨厂商必 401
+（小P蛙排队模型同样中招），且表达不了「Gemini 用完换 Kimi」。
+**新数据模型：** `src/lib/model-queue.ts` —— 每个序列项是一套**完整自洽**配置
+`{provider, apiKey(单个), baseUrl, model}`，`sequence[0]` 即序列 1。
+`readModelQueue()` 认三种历史形态，旧的逗号 key 池**按 key 自动展开成多个序列项**
+（provider/model/baseUrl 原样复制）→ 线上数据零手工迁移。site_config 是 JSON 列，
+**不需要 DB migration**。`shouldFailOver()`：401/403/404/429/5xx/网络错误 顺位下一个；
+400 不顺位（换家也一样挂，且会埋掉真错误）。
+**进度：**
+- [x] 分享卡三按钮同行三色（drafts.$id.tsx；「关闭」= 原「放弃补拍」，删掉下划线链接）
+- [x] `src/lib/model-queue.ts` + 20 条断言全过（含用户线上真实的三 key 混池形态）
+- [ ] 队列执行器（按序调用 + 顺位降级）
+- [ ] 通用 server fn（get/save/clear，按 console id 映射 site_config key）
+- [ ] 共用 UI 组件 `<ModelQueueConsole>` + 接到三个控制台
+- [ ] 运行时四个消费点接入（identify 主链路 / quickIdentify / openaiCompatChat / 二次复核）
+- [ ] 部署
+**进度（续）：**
+- [x] 队列执行器 `runModelQueue` + `httpStatusOf`（在 identify-plant.functions.ts 内，
+      靠 model-queue.ts 的 shouldFailOver/slotLabel/maskKey）。9 条降级断言全过。
+- [x] 通用 server fn：`getModelQueueFn` / `saveModelQueueFn` / `clearModelQueueFn`
+      （按 consoleId 映射 site_config key，assertAdmin 守卫，context 是 {supabase,userId}）
+- [x] 共用 UI `src/components/model-queue-console.tsx`，三个控制台全部接入：
+      AdminModelPanel（identify.tsx，447 行 → 17 行）、XiaoPModelPanel（整文件重写）、
+      SecondOpinionPanel（只换配置表单，保留启用状态/引擎自检）
+- [x] 三个 loader 全部走 readModelQueue（新旧形态通吃，9 条兼容断言全过）
+- [x] identify 主链路降级：`callAiIdentify` 拆成 `callAiIdentifyWithConfig(slot,…)`
+      + 外层按序列跑；序列为空时传 null 走 .env 兜底（与改造前一致）
+- [ ] 二次复核链路仍只用序列 1（loadSecondOpinionConfig 取 sequence[0]），未接降级
+- [ ] 部署
+**踩坑记录：** 想把执行器挪进 model-queue.ts 时，python 切片的 end 锚点选错，
+一刀切掉了 25k 字符（quickIdentify/plantNet 等全没了）。靠切前存的 /tmp/execblock.txt
+原位插回救活。教训：大文件切块务必先验证 start/end 区间长度再落盘。
+- **修一个自己刚引入的 bug（已部署 `c330e677-5a11-4c41-8315-c9beeba2770b`）：**
+  `getSecondOpinionConfigFn` 直读 `cfg.apiKey`，新界面存的是 sequence 形态 → 保存后
+  状态条显示「未启用（疑似直接进补拍）」但模型其实在跑。改走 readModelQueue，
+  并多回一个 `sequenceCount`（面板可显示「1 主 + N 备」）。
+  同类问题的 `getAiConfigFn` / `getXiaoPConfigFn` 已无 UI 调用（面板改成薄封装），
+  identify.tsx 里三个死导入已删；这两个 fn 本身留着未清理。
+
+## 2026-07-19（续2）— 「队列没真正激活」：两处绕开队列的链路
+**用户报错：** 识别报 `AI 文案生成失败（HTTP 429 · RESOURCE_EXHAUSTED）` Gemini 日额度用尽，
+没有降级到 Kimi。
+**根因（两个，叠加）：**
+1. `identifyQuick`（phase-1 快速出卡，Gemini 专用）调的是 `loadAiConfig()` = **只取序列 1**，
+   整段没被 runModelQueue 包住；且它的 catch 里 `if (e instanceof AiError) throw e` 会把
+   429 直接抛给用户。那句注释的理由是「重链路会撞同一堵墙」—— 在旧的单厂商世界成立，
+   现在重链路能降级到 Kimi，所以这个 rethrow 变成了「在降级发生前先掐死流程」。
+2. `callAiIdentifyWithConfig` 里的 two-stage 分支：provider=custom 时用 custom 做快速定种、
+   然后 `dbConfig = null` 把**重活改道回 .env Gemini**。于是即使降级到 Kimi，草稿生成
+   还是回到那个已耗尽的 Gemini → 队列等于白降。
+**修法：**
+1. identifyQuick 改为对**序列里所有 Gemini 项**跑 runModelQueue；全挂时若序列中还有
+   非 Gemini 替补（`hasNonGeminiBackup`）则返回 null 交给重链路降级，没有替补才抛原错误。
+2. `callAiIdentifyWithConfig` 加 `allowGeminiReroute` 参数，只有 `index === 0`（序列 1）
+   才允许改道回 env Gemini；轮到替补时用替补自己的模型干重活。
+**已部署：** `884d447a-717e-4c1f-b2ed-b15c507603db`。lint exit 0，tsc 干净，build 通过，
+prettier 已格式化。
+**仍未接队列：** `extractPlantMetaFn`（admin 从 HTML 抽植物 meta 的工具，非识别链路）
+仍用 loadAiConfig()+env key 混池；二次复核运行时仍只用序列 1。
+**未验证：** 真实的 429 降级需要线上跑一次识别才能确认（我无管理员登录态/无法触发）。
+
+## 2026-07-19（续3）— 用户端小P蛙配置 + 二次复核运行时接队列
+**已部署：** `7491943a-a820-4366-b4d4-8bae7628f53e`
+1. **`<ModelQueueConsole>` 改成存储无关**：新增 `storage?: {load,save,clear}` 适配器，
+   与 `consoleId`（存 site_config）二选一。另加 `clearLabel/defaultOpen/onSaved`。
+2. **用户端小P蛙**（`xiaop-user-settings.tsx`，每人自带 key，存 localStorage）
+   原本还是老机制：一个厂商 + 一池逗号 key。这不只是外观问题 —— `xiaoPChat` 把
+   override 当**单个** slot，逗号池会被整串当一个 token 发出去 = 必 401。
+   现改为共用 ModelQueueConsole + 本地存储适配器。整个文件 330 行 → 60 行。
+   预设模型也顺手更新（claude-3-5-sonnet-20241022 → claude-sonnet-5 等）。
+3. **`xiaop-user-model.ts`** 改存序列，`readModelQueue` 迁移旧 v1 单配置/逗号池；
+   `userModelArg()` 同时带扁平字段（兼容）和 `sequence`（新）。13 条断言全过。
+4. **服务端 `UserModelInput`** 新增可选 `sequence`；`toOverride` → `toOverrideSlots`
+   回 ModelSlot[]；`xiaoPChat.opts.override` → `overrideSequence`（整条都用，能自己降级）。
+   `resolveXiaoPGemini` 改为从序列里挑第一个 Gemini 项（grounding 仅 Gemini 支持）。
+5. **二次复核运行时接队列**：新增 `withSecondOpinionSlots()` —— 两个消费点本来就是
+   「失败返回 null」的优雅风格，所以降级 = 挨个试到有结果为止，不会因序列 1 挂了就哑掉。
+**测试：** 5 套共 51 条断言全过（queue 20 / compat 9 / failover 9 / usermodel 13 / pool）。
+tsc 干净、lint exit 0、build 通过、prettier 已格式化。
+**仍未接队列：** 只剩 `extractPlantMetaFn`（admin 从 HTML 抽 meta 的工具，非识别链路）。
+**未验证：** 小P蛙面板需 `canEdit`（编辑登录）、管理台需 admin —— 两处 UI 我都进不去，
+渲染与点击均未实测。
+
+## 2026-07-19（续4）— 队列已生效；Kimi K3 拒收 temperature
+**已部署：** `ec2cad3f-61e2-4e45-bec4-e5abf3e8b541`
+**好消息：** 降级链路确认工作 —— 用户报错显示 序列1 Gemini 429 → **确实顺位到了**
+序列2 Kimi。前面几轮的修复有效。
+**新问题：** Kimi K3 回 `HTTP 400 invalid temperature: only 1 is allowed for this model`。
+各家对可调参数的支持差异很大，不支持时一律 400 而非忽略（OpenAI o 系列同理）。
+**修法（厂商无关）：** `ai-key-pool.ts` 新增 `postOpenAICompat()` —— 400 时从**错误文本里
+认出**是我们发过的哪个可调参数（temperature/top_p/max_tokens/response_format/
+frequency_penalty/presence_penalty）被拒，删掉它重试**一次**；与参数无关的 400 原样返回，
+不掩盖真错误。比维护「哪家支持哪些参数」的表更耐用（新模型不用改代码）。
+接入 4 处：identify 主链路、quickIdentify、二次复核 ×2（signal 超时控制经
+`opts.signal` 保留）。9 条断言（含用户报错原文）全过。
+**另修：** runModelQueue 的失败信息以前说「N 个序列都没能出结果」，但遇 400 会提前停，
+说成 N 个会让人去查根本没试过的配置。改为「已依次尝试 X / N 个序列（末项的错误无法靠
+换模型解决，已停止顺位）」。
+**`extractPlantMetaFn` 已接队列：** 改用序列里**所有** Gemini 项组池 + .env 兜底
+（原来只取序列 1，额度一满整个工具不可用）。至此**所有** AI 调用点都走队列了。
+（二次复核运行时在「续3」已接，本轮用户是引用了我更早的旧描述。）
+**测试：** 5 套 60 条断言全过；tsc/build/prettier 干净。
+
+## 2026-07-19（续5）— 草稿页深色模式移除
+**已部署：** `89a4cf0e-5206-42ec-9b6f-404d32378c46`
+**问题：** 用户开系统深色模式时草稿/植物页变黑，与站点整体米白纸色不协调。
+**根因：** 站点主体（React app）**完全不做**深色模式，只有 `src/lib/plant-html-template.ts`
+里有 3 处 `@media(prefers-color-scheme:dark)`（:root 变量覆盖 + 入侵卡 + 保护卡），
+于是只有这一块跟着系统变黑 → 不协调。非本次改动引入，是既有行为。
+**修法：** 删掉那 3 块，模板恒为浅色，与站点一致。
+**已验证（少见地能真验一次）：** 浏览器 colorScheme=dark 下访问线上植物页，
+`matchMedia('(prefers-color-scheme: dark)').matches === true` 但 body 背景仍是
+`oklch(0.948 0.018 90)`（米白）、文字 `oklch(0.2…)`（深色），截图确认视觉正常。
+
+## 2026-07-19（续6）— 524 网关超时 + Gemini 换 key 无效
+**已部署：** `1a52dc26-0ecf-4109-9373-db00cc0089b2`
+**用户现象：** 换了 3 个新 key 后，识别正常，但生成完整草稿仍三个序列全挂：
+序列1/3 Gemini 依旧 429；序列2 Kimi 回 **HTTP 524**。
+**问题 A — Gemini 换 key 没用（重要）：** 免费额度按 **Google Cloud 项目**计，不是按 key。
+同项目下新建 key 共用同一个已耗尽的配额。而我们的错误提示当时写着「或在管理后台更换
+API key」—— **是这句错误建议让用户白换了一轮 key**。已改写：明确说明换 key 无效，
+给出四条真正有效的做法（等重置 / 换不同项目的 key / 开通付费 / 把非 Gemini 排到序列 1）。
+**问题 B — 524：** Cloudflare 的「上游超时」。整份草稿要生成几十秒~几分钟，Kimi K3 这类
+推理模型每次都同样慢 → 已有的 3 次 5xx 重试全部同样超时，重试解决不了。
+**修法：流式。** `ai-key-pool.ts` 新增 `postOpenAICompatStream()`：开 `stream:true`，
+token 边生成边回，网关一直看得到字节就不判超时；再把 SSE 增量拼回**与普通响应同形**的
+Response（`choices[0].message.content` + `usage`），上层 `resp.json()` 无需改动。
+处理了跨 chunk 半行、`[DONE]`、心跳行；中转忽略 stream 回普通 JSON 时返回 **599**，
+调用方据此退回非流式。接入点：重活链路遇 524/504/408 时自动改流式重试，失败则回原路。
+6 条断言全过（含跨 chunk 分片、非 SSE 回退、524 透传）。
+**测试合计：** 6 套 66 条断言全过。tsc/build/prettier 干净。
+**未验证：** 真实 Kimi 长生成是否确实不再 524 —— 需线上跑一次完整草稿生成才知道。
+
+## 2026-07-19（续7）— 草稿模型独立控制台 + 配置总开关 + 用量统计重做
+**已部署：** `08c85b67-d705-4db9-83ca-3dcac1f58622`
+1. **第 4 个控制台 `enrich`**（site_config key `enrich_model_config`）：专管
+   「进一步生成草稿」。`callAiIdentify` 新增 `queueKind: "ai"|"enrich"` 参数，
+   enrichDraft 传 "enrich"。`loadEnrichQueue()` **留空时自动回退到 ai 序列** ——
+   新控制台不配也不会坏。
+2. **`AdminModelHub`**：识别页原本平铺 5 块管理员面板（要滚过一屏才能拍照），
+   现在全收进一个「配置 AI 模型」按钮，默认收起。
+3. **用量统计重做**：以前聚合只 select `total_tokens`，看不出钱花在哪。现在取回
+   prompt/completion/task_type/created_at，新增：输入vs输出构成、按环节拆分
+   （识别/草稿生成/复核/小P蛙）、近 24h / 7d / 30d 三个时间窗、单次均耗。
+   UI 用 `UsageOverview` + 双色占比条重画。
+4. **余额查询 `getQueueBalancesFn`**：**只有 Moonshot 有公开余额接口**
+   （`GET {base}/users/me/balance`，已核实官方文档），实现之。Gemini 免费额度按项目计、
+   OpenAI/Anthropic 均无公开接口 → 一律标 `unsupported` 并说明去哪看，
+   **绝不用估算值冒充余额**。控制台收起态显示余额行 + 「刷新余额」。
+**测试：** 6 套 66 条断言全过；tsc/build/prettier 干净。
+**未验证：** 四个控制台、总开关、用量面板、余额显示全都在 admin 门后，我无登录态，
+**UI 一次都没实测过**。余额接口只按官方文档实现，未用真 key 打过。
+
+## 2026-07-19（续8）— Kimi 排序列1 却报 Gemini 401
+**已部署：** `f2edc6ea-147c-4a38-9ea7-981a6dd220d0`（改道修复）+
+`f7b3bb90-436c-4f03-b4af-ddf08fdc8cb7`（草稿卡分级）
+**症状：** 用户把 Kimi 放序列 1 后，报错却是「序列 1 · custom kimi-k2.6：Gemini API key 无效」。
+**根因：** 就是「续2」里我加的 `allowGeminiReroute = (index === 0)`。那个判断默认序列 1
+一定是 Gemini；用户把 Kimi 放第一后，custom + index 0 → 触发 two-stage 改道
+→ `dbConfig = null` → 重活交给 .env 的 GEMINI_API_KEY（已被用户轮换失效）→ Gemini 401。
+错误信息与所配模型完全对不上，正是这条线索定位到的。
+**修法：整段删除改道。** 旧设计假设 custom 只是弱视觉中转；在「优先调用序列」下
+每项都是管理员明确指定的完整配置，不该被偷偷换成别的模型。连带删掉失去所有赋值的
+`stageUsage`（`stageModel` 仍被 Pl@ntNet 分支使用，保留）。
+**草稿卡三档标识：** `draftTier()` 从字段推断 —— published_plant_id → 金叶详页；
+html_content 非空 → 银叶草稿；否则 → 快速简介。带 title 悬浮说明。
+⚠️ 注意 published_plant_id 在「审核通过收录」时也会写，所以第三档准确含义是
+「已存在正式收录页」，不单指金叶生成；标签用词已按此拿捏，未夸大。
+**下一步（用户已确认方案）：** enrichDraft 超时改「后台任务 + 前端轮询」。
+诊断：3 次联网调研 + 一次长文生成 > Cloudflare 边缘 100s 响应上限 → failed to fetch，
+重试无用。方案：server fn 立刻返回任务 ID，用 waitUntil 在后台跑，前端每几秒轮询进度
+（可显示「正在调研…正在撰稿…」）。**尚未开始。**
+
+## 2026-07-19（续9）— 超时的真正原因 + 金叶同样有雷（交接重点）
+**为什么 enrich 现在超时、以前不超时：**
+以前 provider=custom 时会 `dbConfig = null` 把重活改道给 .env 的 **Gemini Flash**，
+所以**无论管理员怎么配，写草稿的永远是 Flash**（十几秒，远低于上限）。「续8」删掉改道后
+草稿生成才真正落到所配模型上；用户配的是 Kimi K3/K2.6（推理模型，慢一个量级）
+→ 一次联网调研 + 一整份中英双语长文 > Cloudflare 边缘 **100 秒**响应上限 → failed to fetch。
+**超时是修好 bug 后暴露出来的，不是退步。** 同理解释了之前的 524。
+**更正一处早先的错误说法：** enrichDraft 只跑 **1 次** `xiaopGroundedSearch`；
+跑 3 次的是 `createGoldDetailPageFn`（金叶）。早前我说 enrich 跑 3 次是张冠李戴。
+**各链路用哪套序列（已核实）：**
+- 识别一线 / 快速出卡 → `ai` 序列（`ai_model_config`）
+- 进一步生成草稿 enrichDraft → `enrich` 序列（`enrich_model_config`，留空回退 ai）
+- 疑似复核 → `second_opinion`；小P蛙对话/改写 → `xiaop`
+- **金叶详页 `createGoldDetailPageFn` → 走 `xiaop` 序列**（经 xiaopTextCall /
+  xiaopGroundedSearch），且用户自带模型优先。代码里 `goldProvider="gemini"` 只是初始值。
+**金叶也有同样的雷：** drafts.$id.tsx 里金叶只是前端 `void` 掉 Promise + 常驻 toast，
+**请求仍是同一个前台 HTTP 请求**（提示语「请勿关闭或刷新标签页」即证据）。它跑 3 次调研 +
+多次长文，比 enrich 更重。目前没炸只因为 xiaop 序列多半还是 Gemini Flash；
+一旦小P蛙也换 Kimi，金叶会以同样方式挂掉。**改造必须两条路一起做。**
+
+## 2026-07-19（续10）— 长任务改「后台执行 + 前端轮询」（进行中）
+**目标：** enrichDraft / createGoldDetailPageFn 超过 Cloudflare 边缘 100s 响应上限。
+改为：server fn 立刻返回任务 ID → keepAlive(ctx.waitUntil) 在响应后继续跑 →
+前端每 3s 轮询阶段文案 → 完成取结果。关标签页也不丢任务。
+**零迁移：** 任务存 `site_config`（key `job:<uuid>`，value jsonb），沿用
+plantnet_quota_state 的既有玩法，service-role 读写绕过 RLS。**不需要用户执行 SQL。**
+**已完成（未部署，等用户复核）：**
+- `src/lib/worker-ctx.ts`（新）—— AsyncLocalStorage 传递 ExecutionContext + `keepAlive()`
+  （= ctx.waitUntil，让活儿撑过响应）。拿不到 ctx 时优雅退化成 fire-and-forget。
+- `src/server.ts` —— fetch 入口包一层 `runWithExecutionCtx(ctx, …)`。**这是关键：**
+  ctx 只有 worker 入口拿得到，server fn 里没有；不能用模块级全局（同 isolate 并发请求
+  会拿到别人已结束的 ctx）。
+- `src/lib/background-jobs.ts`（新）—— 任务 store。**存 `site_config`，key `job:<uuid>`，
+  零迁移**（沿用 plantnet_quota_state 的既有玩法，service-role 读写绕 RLS）。
+  createJob/readJob/setJobPhase/finishJob/failJob/pruneExpiredJobs/isJobStale。
+  patchJob 故意「写失败只记日志不抛」—— 进度写不进去不该搞挂已跑了两分钟的生成。
+- `src/lib/poll-job.ts`（新）—— 前端轮询（3s 一次，20min 兜底上限），**从不 reject**，
+  失败走返回值。另含 rememberJob/recallJob/forgetJob（localStorage 存 jobId）。
+- `identify-plant.functions.ts` —— `enrichDraft` 拆成 `enrichPreflight`（快校验，前台同步跑，
+  用户点下去立刻知道能不能干）+ `runEnrichCore`（重活，后台）；新增 server fn
+  `startEnrichDraftFn` / `startGoldDetailPageFn`（立刻返回 jobId）/ `pollJobFn`。
+  `createGoldDetailPageFn` 同构拆成 `goldPreflight` + `runGoldCore`。
+  **旧的 `enrichDraft` / `createGoldDetailPageFn` 导出已删除**（只有 drafts.$id.tsx 用过）。
+- `src/routes/drafts.$id.tsx` —— 两条链路都改轮询，toast 显示阶段文案（「正在联网调研 2/3…」
+  「正在撰稿 1/3…」）。**挂载时自动接回未完成任务**（读 localStorage）→ 刷新/关标签页
+  /换设备都不丢。「请勿关闭或刷新标签页」那句提示已删，改成「可关闭或刷新本页」。
+**阶段文案：** enrich = 读原图 5% → 联网调研 20% → 撰稿 45% → 保存 88%；
+gold = 名录取证 5% → 配图 12% → 调研 1/3·2/3·3/3 (20/28/36%) → 撰稿 1/3·2/3·3/3
+(45/58/70%) → 渲染上传 82% → 写档案 90%。
+**不需要用户执行任何 SQL。**
+**测试：** 7 套 81 条断言全过（原 6 套 66 条 + 新 jobs.test.ts 15 条：卡死判定边界、
+ALS 传递与隔离、无 ctx / waitUntil 抛错 / rejected promise 三种兜底）。
+tsc 干净、build 通过、新文件 eslint 0 error、prettier 已格式化。
+**未验证（重要，别当成已验证）：**
+- 草稿页需登录，**整条 UI 一次都没实测**：按钮、toast 阶段文案、断线续跑都没在浏览器里跑过。
+- **`ctx.waitUntil` 在 TanStack Start + @cloudflare/vite-plugin 下是否真能拿到 ctx，
+  只在测试里用假 ctx 验过，没在真实 Workers 运行时验过。** 万一 ctx 是 undefined，
+  会退化成 fire-and-forget —— 任务大概率仍被 isolate 回收掐死，表现为轮询到 stale。
+  **部署后第一件事就是跑一次完整 enrich，看是否走完全程。**
+- site_config 里的 job 行清理逻辑（pruneExpiredJobs）没有真跑过。
+
+## 2026-07-19（续10）— 后台任务改造（subagent 产出，已复核并部署）
+**已部署：** `4af1d127-efeb-4c72-903e-53b53ec24603`
+**方案：** server fn 立刻回 jobId → `ctx.waitUntil` 让重活活过响应 → 前端 3s 轮询。
+ctx 只在 worker fetch 入口拿得到，用 AsyncLocalStorage 往下传（不能用模块级全局：
+同 isolate 并发会串 ctx）。新文件：`worker-ctx.ts` / `background-jobs.ts` / `poll-job.ts`。
+两条链路各拆成 `xxxPreflight`（前台快校验）+ `runXxxCore`（后台重活），
+新增 `startEnrichDraftFn` / `startGoldDetailPageFn` / `pollJobFn`，
+**删除旧导出 `enrichDraft` / `createGoldDetailPageFn`**。
+**零 DB 迁移**：任务存 `site_config`（key `job:<uuid>`），沿用 plantnet_quota_state 的玩法，
+建任务时顺手 prune 6 小时前的行。
+**我复核时发现并修掉的部署阻断（重要）：**
+subagent 说「tsc 干净 + build 通过」属实，但**构建通过 ≠ 能启动**。
+`src/server.ts` 静态 import worker-ctx 后，Vite 把它整个**命名空间对象**并进入口 chunk
+并重新导出 → 产物末尾 `export { server as default, renderErrorPage as r, workerCtx as w }`。
+Cloudflare 校验 worker 每个导出，命名空间对象原型链止于 null 而非 Object →
+部署被拒 **10021 `Exported value's prototype chain does not end in Object`**。
+改成在 fetch 内**动态 import** worker-ctx，它就留在自己的 chunk 里，入口只剩合法导出。
+**教训：worker 入口文件避免静态 import 会被其它 chunk 共享的模块。**
+**测试：** 8 套 81 条断言全过（新增 jobs.test.ts 15 条）。注意 pool.test.ts 不打印汇总行，
+用 grep "N passed" 会误判成 FAIL，实际 5 条全 PASS。
+**仍未验证（关键）：** `ctx.waitUntil` 在真实 Workers 运行时是否真拿得到 ctx —— 
+只用假 ctx 在测试里验过。已确认 wrangler main = dist/server/server.js 且 ctx 是标准
+fetch 第三参，理论成立。**若 ctx 为 undefined 会静默退化成 fire-and-forget，
+任务很可能被 isolate 回收掐死，表现为轮询到 stale「生成似乎已中断」。**
+下一步：登录后跑一次完整「进一步生成草稿」，这是唯一的真验证。
+
+## 2026-07-19（续11）— 三个症状的诊断（用户要求只诊断、不修）
+### 症状 A：首页「近期更新 / 全部条目」出现英文标题 + 裂图条目 → **07-13 遗留，与今天无关**
+证据（用 wrangler.jsonc 里的 publishable key 直接查线上 REST）：
+- `Crystal Anthurium` / `Early Violet` / `Three-cornered Leek` 等行：
+  `created_at = 2026-07-13T03:12`、`title` 是英文俗名、`scientific_name = ""`、
+  `cover_url` 指向 `plant-images/drafts/...jpg` 但该 URL **HTTP 400**（图已不存在）。
+- 与已知的 [[orphan-cleanup-image-loss]]（07-13 orphan 清理误删 draft 照片）完全吻合。
+- **今天 plants 表零新增**（最新一条 07-17）→ 后台任务没有制造垃圾条目。
+修复方向：这些行需要人工补 title/scientific_name，封面图不可恢复（需重新上传或置空走占位）。
+### 症状 B：Log 里大量「新建条目 · ai_identify（条目已删除）· 前后为空」→ **设计如此，非 bug**
+`src/lib/edits.ts:239` 把**每一条 plant_drafts 合成成一条虚拟「新建条目」**并硬编码
+source=`ai_identify`。所以：「前后为空」是因为它是合成记录、本就没有 diff；
+「条目已删除」= 那条草稿已被删/驳回。时间戳精确对得上今天的草稿
+（DB 里 01:01:38Z / 00:18:00Z ＝ 用户看到的 09:01:38 / 08:18:00 CST）。
+用户反复测试识别 → 每次建一条 draft → Log 就多一行。**要改的是这个 Log 的噪音策略**
+（如过滤已删除的、或不把 draft 当「新建条目」），不是去查什么幽灵写入。
+### 症状 C：进一步生成草稿「生成似乎已中断」→ **未能从外部确认**
+`site_config` 对 anon 全表返回 `[]`（RLS 挡住），拿不到 `job:<uuid>` 行，
+**无法判断 waitUntil 是否生效**。这正是「续10」标注的那个未验证地基。
+下一个窗口应先做：`npx wrangler tail --format pretty` 然后触发一次生成，看日志里
+① 有没有 `[worker-ctx] AsyncLocalStorage unavailable` 或 `waitUntil threw`
+② 阶段是否推进过（setJobPhase）③ 是否在响应返回后就静默停止。
+若 ctx 确实拿不到 → 改用 Durable Object 或 Cloudflare Queues，waitUntil 这条路走不通。
+### 附带发现（待确认，可能是我引入的小瑕疵）
+草稿卡三档标识用 `html_content 非空` 判定「银叶草稿」，但**一次性提交路径
+（submitPlantDraft → buildDraftContent）也会写 html_content**，今天两条 pending 草稿
+都已有 html。若如此，「快速简介」这一档几乎永远不会出现，判据需要换（例如另存标记位）。
+
+## ✅ 2026-07-19（续12）— 「生成似乎已中断」真因找到并修复 + 首页两个症状清零
+
+### 一、waitUntil 是清白的（续10/续11 一直没验的那块地基，现在验了）
+写了个最小 worker（ALS + 动态 import + waitUntil，compat_date/nodejs_compat 与本项目
+一致），用 `wrangler dev` 跑在**真 workerd** 上：`hasCtx:true`、`mode:"waitUntil"`，
+且响应返回后 12 秒的后台 tick **全部跑完**。
+→ **ctx.waitUntil 完全可用，不是根因。续11 里「若拿不到 ctx 就改 Durable Object /
+Queues」的预案作废，别再往那个方向查。**
+
+### 二、真因：存活判定误杀（不是任务死了，是前端把活人判死了）
+`isJobStale` 靠 `updatedAt` 判存活，而 `updatedAt` **只在 setJobPhase 时才动**。
+enrich 全程只有 4 次 onPhase，其中 `identify-plant.functions.ts:4050`「正在撰写完整
+草稿正文」到 4090「正在保存草稿」之间是**一整个 `await buildDraftContent()`**。
+换推理模型（Kimi K3 这类）后这一步跑 5 分钟以上是常态 → 超过 `JOB_STALE_MS = 5min`
+→ 前端弹「生成似乎已中断」，**而后台任务其实还在正常跑、多半最后也跑完了**。
+金叶链路同构（调研 1/3→2/3、撰稿 1/3→2/3 之间都是单个长 await）。
+
+**修法：把「存活」和「阶段推进」彻底解耦。**
+- `background-jobs.ts`：新增 `touchJob()`（只推 updatedAt，进终态即返回 false 停表）
+  + `startJobHeartbeat(id)` 返回 `stop()`（自重排 setTimeout，不用 setInterval，
+  避免写库慢时叠加并发写）。`JOB_HEARTBEAT_MS = 15s`；
+  `JOB_STALE_MS` 5min **→ 2min**（有心跳后可以卡更紧，真死时报得更快）。
+- 两条 keepAlive 里都 `startJobHeartbeat` → finally `stop()`。
+  **终态写入前必须先停表**：否则晚到的心跳可能夹进 finishJob 的读-改-写中间把结果盖掉
+  （touchJob 里也加了 `status !== "running"` 的二道闸）。
+- `drafts.$id.tsx`：`forgetJob` 原来在判断结果**之前**就调 —— 客户端一放弃 jobId 就没了，
+  「刷新接回」这张网恰好在最需要时失效。改成只在 `out.ok || out.reported` 时才 forget。
+- enrich 的 loading toast 漏了 `duration: Infinity`（金叶有），长阶段里 toast 会自己消失，
+  看起来就像「卡住了」。补上。
+- poll-job.ts 两条放弃文案改写：超时那条改成引导「刷新本页会自动接回，别急着重试」。
+
+**仍未实测：** 草稿页要登录，整条 UI 还是没在浏览器里跑过。心跳逻辑本身是纯函数级改动，
+但「真机上一次完整 enrich 走完全程」依然是唯一的终极验证。部署后请跑一次。
+
+### 三、首页英文标题 + 裂图 → 已彻底修好，线上已验证
+续11 的诊断对了一半：确实是 07-13 [[orphan-cleanup-image-loss]] 的遗留，但**正确的
+中文名和学名一直都在**——躺在各自 html 页面的 `<title>` 里
+（`<title>晶状花烛 Anthurium crystallinum Linden & André — Plantspedia</title>`），
+只有 `<h1>` 是英文俗名。当初那次批量导入取了 `<h1>` 当 title，学名则整个丢了。
+
+用 `scratch/repair_english_title_rows.mjs`（dry-run 默认，`--apply` 才写；凭证从 .env
+和 publish.py 现读，不新增副本；写前把原行 + 原 HTML 备份到
+`scratch/_english_title_repair_backup/`）修了 5 条：
+title→中文名、scientific_name→学名、原英文名存进 common_name_en（不丢信息）、
+cover_url→null（原图不可恢复，走占位图；用户明确选了不引用 iNaturalist 图）。
+正文 `<h1>` 也一并改成中文。
+**⚠️ storage 坑：** `plant-html` 桶**不允许覆盖已有对象**（PUT 和 POST+x-upsert 都被
+RLS 挡：`new row violates row-level security policy`），只放行「在自己 uid 目录下新建」。
+app 里的 `persistPlantHtml` 就是这么干的 —— 传新文件 + 改 `html_url` 指过去。
+脚本照办。**以后要改 Storage 里的 HTML，别想着覆盖，一律新建 + 重指。**
+
+**线上验证（浏览器实跑 + REST 复查）：** 首页 broken image **0 张**、
+英文标题 **0 个**，5 条全显示中文名 + PlantPattern 占位图，正文 `<h1>` 也已是中文。
+
+**⚠️ 后续（同一会话内）：这 5 条已被用户手动从管理后台删除，plants 表 236 → 231 行。**
+所以上面的数据修复现在是**历史记录，不是当前状态** —— 别再去查这 5 个 slug，它们不存在了。
+（当时我发现行消失后排查过：我的脚本只有 PATCH/POST 没有 DELETE、wrangler.jsonc 无 cron、
+`src/` 里唯一删除路径是 admin.index.tsx:114 的手动按钮；用户确认是自己删的。
+顺带发现一个盲点：**直接走 REST 的批量改动不会进 plant_edits 审计日志**，
+所以「修改记录」里查不到，排查时别指望它。）
+原行 + 原 HTML 的备份仍在 `scratch/_english_title_repair_backup/`（要还原还能用，但已无必要）。
+
+**真正长期有价值的是下面第四节的 SafeImg 改动** —— 它防的是「以后任何封面失效」，
+跟这 5 条在不在没关系。
+
+### 四、代码改动（首页 SafeImg）—— 需要部署才生效
+`routes/index.tsx` 有 3 处裸 `<img>`（hero、全部条目网格、PlantCard），封面 4xx 时直接
+裂图；同页别处早就用 SafeImg 了，`plants.index` / `search` 也是，首页是漏网的。
+三处统一换成 SafeImg + PlantPattern 兜底。这是**防将来**：再有封面失效也只会显示占位图。
+（顺带把 index.tsx 的 lint 报错从 51 降到 48 —— 长单行被拆开了。）
+
+**未做（有意收窄范围）：** `editors.$id.tsx` / `profile.tsx` / `projects.$id.tsx`
+还有 8 处裸 `<img>` 绑 cover_url/photo_url，同样会裂图。不在本次范围内。
+
+### 五、✅ 已部署 —— Version ID `9e7ae599-8d68-4ae2-9a6a-7200915dccb2`
+本次上线内容：① 后台任务心跳（本节核心修复）② 首页 3 处 SafeImg
+③ **另一会话做的 identify.tsx「识别复核出卡AI三重奏」折叠栏**（用户点名要一起上）。
+部署前查过产物入口导出只有 `default` + `r`，没有命名空间对象 —— 续10 那个 10021
+「Exported value's prototype chain does not end in Object」的坑没有复现。
+线上验证：`/` 与 `/identify` 均 200，首页 broken image 0 张、英文标题 0 个。
+
+### 六、下一步
+1. **登录后跑一次完整「进一步生成草稿」** —— 心跳修复的唯一真验证，还没做。
+   要看的是：慢模型跑到第 5 分钟以上时，还会不会弹「生成似乎已中断」（不该弹了）。
+2. 续11 记的两个附带问题仍未处理：edits.ts:239 把每条草稿合成成虚拟「新建条目」造成
+   Log 噪音；草稿卡「银叶」判据用 html_content 非空，但一次性提交路径也写 html_content。
+3. 已挂了一个后台任务 chip：editors/profile/projects 还有 8 处裸 `<img>` 绑
+   cover_url/photo_url，同样会裂图（本次有意没动，收窄范围）。
+
+## ✅ 2026-07-19（续13）— 出卡AI 控制台拆分 + 两个识别 bug（已部署，见文末版本号）
+
+### 一、「出卡AI」独立成控制台，「AI 模型控制台」移出三重奏并降级为兜底
+用户要求：三重奏折叠栏里不要放「管理员 · AI 模型控制台」，改放一个专门的「出卡AI」；
+控制台移到折叠栏**外面下方**，只负责其它特定功能之外的杂项。
+
+新增 console `card` → site_config key `card_model_config`，标签「出卡AI」。
+`loadCardQueue()` **留空时回退 `loadAiQueue()`**（同 enrich 的兜底套路）——
+所以上线那一刻出卡行为完全不变，零迁移、不需要先去填配置。
+两条出卡链路都切过去了：`callAiIdentify`（queueKind 默认值 `"ai"` → `"card"`）
+和快速出卡的 Gemini 专用链路。
+
+**追踪结论 —— 拆分后「AI 模型控制台」到底还管什么**（当时逐个调用点查的）：
+`loadAiQueue()` 原本有 4 个消费者，①`callAiIdentify` ②快速出卡 都归了「出卡AI」，剩下：
+- **③ `extractPlantMetaFn`：批量导入条目时从 HTML 提取元数据**（管理后台「批量添加条目」
+  的识别按钮）。Gemini 专用，把序列里所有 Gemini key 当轮换池用。**这是它唯一的实功能。**
+- **④ 兜底**：「出卡AI」「草稿生成模型」留空时回退到它。
+所以标题改成「管理员 · AI 模型控制台（兜底）」，面板说明里写明这两件事
++ 「建议始终配一套可用的通用 Gemini 序列、别清空」。
+
+改动文件：identify-plant.functions.ts（CONSOLE_CONFIG_KEYS/LABELS、ConsoleIdSchema、
+loadCardQueue、两条链路）、routes/identify.tsx（CardModelPanel 新增、AdminModelPanel
+移出折叠栏并改文案）、components/model-queue-console.tsx（ConsoleId 类型同步）。
+
+### 二、bug：没点「进一步生成草稿」却自动生成了 —— **换非 Gemini 模型后必现**
+根因在 quickIdentifyDraft：`identifyQuick` 是 **Gemini 专用**链路，序列里没有 Gemini 项
+就返回 null（用户改配 custom 模型后正是如此）→ 掉进 `else` 跑完整 `buildDraftContent`
+→ `enriched = true`。于是草稿在用户没点按钮时就被完整生成，既莫名其妙又白烧长文的钱。
+**修法：** `identifyQuick` 返回 null 时，改用「出卡AI」序列本身再识别一次
+（`callAiIdentify(..., "card")`），**仍然只出摘要卡、enriched 保持 false**。
+完整流水线降为最后兜底（前者抛错时才走）。
+
+**顺带补的硬保证：** `forceResult`（补拍满 3 次必须出结论）是靠 identifyQuick 的 prompt
+实现的，非 Gemini 兜底链路没有那段 prompt，模型也可能不听 → 用户会被困在补拍循环里。
+现在在代码层直接兜：`retakeCount >= 3` 就清空 needs_more_photos_*，补拍关卡必然放行。
+
+### 三、bug：疑似植物名称全变成「待鉴定植物」
+两个原因叠加：
+1. 草稿 `title` 那行 `(meta.title || meta.scientific_name || "待鉴定植物")`
+   **从来没加过「疑似」前缀**；
+2. prompt 在不同链路上的约定**互相矛盾**（`:1588` 要求「title 给最可能物种、只在 summary
+   标疑似」，`:802` 却要求「title 前面加疑似」），模型不确定时干脆不给 title → 落兜底。
+
+**修法：** 新建 `src/lib/tentative.ts`（纯函数、可独立测试），三个导出：
+`isTentative()`（疑似的**唯一**判据：confidence=low **或** summary_zh 以疑似开头 ——
+模型两种表达都用）、`stripTentativePrefix()`、`draftTitleFor()`（先剥后加，
+拼出「疑似X」；连学名都没有才退回「待鉴定植物」）。
+`normalizeIdentification` / 草稿标题 / 摘要卡 tentative 三处**共用同一判据**，不会再分叉。
+已确认全站没有第二处加「疑似」前缀会导致「疑似疑似X」：
+drafts.$id.tsx:814 和 buildSummaryCardHtml 都是先剥后加。
+
+**测试：** `scratch/tentative.test.mjs` 15 条断言全过，**直接跑 src/lib/tentative.ts 本体**
+（`node --experimental-strip-types scratch/tentative.test.mjs`），不是跑副本。
+覆盖：疑似X 拼接、只有学名、啥都没有、高置信不加前缀、不重复加前缀（含括号形式）、
+summary 表达疑似时标题跟着标、summary 中间出现「疑似」不误判。
+
+### 四、验证边界（重要，别当成已验证）
+- 识别链路要**模型调用 + 登录**才跑得起来，`tsc=0` + `build` 通过 + 上面 15 条纯函数测试
+  是本次能拿到的全部证据。**两个 bug 的真实修复效果需要实拍一次才算数。**
+- 管理员面板同理，「出卡AI」面板长什么样、排版对不对，需要登录看。
+
+## 🔴 2026-07-20（续14）— 实测：生产环境 waitUntil **约 26 秒就被掐**，长任务方案必须重做
+
+### 结论（已用生产探针实测，不是推断）
+部署了一次性探针 `/__wu-probe`（`src/lib/waituntil-probe.ts`，走的正是 enrich 用的
+keepAlive/ALS 链路），它只做一件事：每 5 秒往 site_config 写一个时间戳面包屑，共 3 分钟。
+
+```
+hasCtx: true    hasWaitUntil: true
+面包屑(秒): [5, 10, 15, 21, 26]   ← 然后再无输出，此后 200 秒一动不动
+```
+
+**ctx.waitUntil 拿得到，但 Cloudflare 在约 26 秒时终止后台任务。**
+探针里没有模型调用、没有任何可能抛错的东西 —— 它就是 sleep + 写库，所以
+「任务抛错了只是 failJob 没写进去」这个替代解释被**彻底排除**。
+
+与 07-19 两次 enrich 实况完全吻合：两次都在**第 21 秒**停摆、都停在「撰写正文」
+（progress 45）、status 始终 running、对应时段 ai_usage_logs 一条都没有。
+
+### ⚠️ 纠正续12 的错误结论
+续12 写着「waitUntil 机制在真 workerd 里完全成立」——**那个结论是错的**。
+当时用 `wrangler dev --local`（miniflare）验了 12 秒的后台任务能跑完就下了定论。
+**miniflare 不执行生产环境的 waitUntil 限制**，本地能跑完 ≠ 线上能跑完。
+教训：涉及平台运行时限制的验证，本地模拟器不作数，必须在生产实测。
+
+### 这意味着什么
+**任何单次超过约 26 秒的模型调用都不可能在 waitUntil 里跑完。**
+Kimi K3 撰稿一次远不止 26 秒 → 换模型、换 key、调心跳阈值都救不了。
+心跳机制本身是对的（它把过去的 5 分钟误杀换成了准确的死亡报告），它只是报信的。
+
+顺带一提：**改造成后台任务前，enrich 跑在前台请求里反而有 100 秒预算**（边缘响应上限），
+比 waitUntil 的 26 秒还多。所以对于 26–100 秒之间的任务，续10 的后台化改造是退步。
+真正需要解决的是 >100 秒的情况。
+
+### 下一步（未决，等用户定方向）
+候选：Cloudflare Workflows（专为可持久多步长任务设计）/ Durable Object + alarm /
+Queues（消费者有 15 分钟，但要 Workers Paid）。
+**动手前必须先查 Cloudflare 官方文档确认各自的真实时限，别凭记忆做架构决策**
+（仓库里有 `cloudflare` 和 `agents-sdk` 两个 skill，它们倾向从官方文档检索）。
+
+### 🧹 欠账：探针必须删掉
+`src/lib/waituntil-probe.ts` + `src/server.ts` 里 `/__wu-probe` 的路由分支，
+**量完就该删**，下次部署时一并清掉。已部署版本 `356d5143`。
+
+### 同批部署的另一项：429 文案修复（已上线）
+`isDailyQuota` 只匹配 `/PerDay/`，而 Google 的 **token 配额** quotaId 同样含 PerDay
+（形如 `...InputTokensPerModelPerDay`）→ token 打满被一律报成「每日免费**请求**额度用尽」，
+管理员去用量后台看请求数才个位数，完全对不上（用户 07-19 就是这么被误导的）。
+新增 `quotaDimension()` 按 quotaId 判断是 **token 数 / 请求数**、**每日 / 每分钟**，
+文案照实说，并把 Google 原始 `quotaId` 附在错误里。
+
+### 同批的配置改动（DB，已生效，不需部署）
+`card_model_config`（出卡AI）原本只有 gemini-3-flash-preview 一项、**没有备胎**，
+Gemini 一 429 出卡就整个失败。用 `scratch/add_card_fallback.mjs` 把 ai_model_config 里
+已跑通的 `custom / deepseek-v4-flash` 原样复制为序列 2，回读校验通过。
+原值备份在 `scratch/_card_model_config.backup.*.json`。
+
+## 2026-07-20（续15）— 官方限制查证 + 模型实测 + 定方案 Queues
+
+### 官方坐实：waitUntil 就是 30 秒
+> `waitUntil() can extend execution for up to 30 seconds after the response is sent or the client disconnects.`
+> —— https://developers.cloudflare.com/workers/platform/limits/
+实测 26 秒与之吻合。**续10 的 waitUntil 后台化方向从一开始就不成立**，不是配置问题。
+
+各方案挂钟上限（均已查官方文档）：
+| 载体 | 挂钟 | CPU | 免费版 |
+|---|---|---|---|
+| waitUntil | **30s** | 随请求 | — |
+| HTTP 请求（客户端连着） | 不限 | 同上 | — |
+| Queues consumer | **15 分钟** | 30s（可配 5min） | 文档未要求付费 |
+| DO alarm | **15 分钟** | 同上 | 仅 SQLite 版 |
+| Workflows 单步 | **不限**（等网络 I/O 时） | 同上 | 100 并发/1024 步 |
+免费版 CPU 仅 10ms、子请求仅 50 —— 本项目识别要 base64 整图、金叶要打十几次外部请求，
+**几乎可以确定账号是 Workers Paid**（`wrangler whoami` 不显示套餐，需 Dashboard 确认）。
+
+### ⚠️ 严重：我加的出卡备胎是纯文本模型，会让 AI 凭空编造
+`deepseek-v4-flash` 带图调用**返回 HTTP 200 但 prompt_tokens 只有 26**（图片零 token），
+模型自述「您没有提供图片」。也就是说 Gemini 一 429 顶到它，出卡会**编一个物种出来，还不报错**。
+已改成 `qwen3.5-omni-flash`（实测 image_tokens=1249，确实读图）。
+**`ai_model_config` 序列 3 也是 deepseek-v4-flash，同样看不见图，仍待处理。**
+教训：给视觉链路配备胎必须**带图实测**，只测纯文本会漏掉这类静默失败。
+
+### 阿里云端点上实测可用的视觉模型（用站上真实照片测）
+qwen3.5-omni-flash 1362ms / qwen3.5-omni-plus 1387ms / qwen3-omni-flash 1639ms /
+qwen-vl-max 2132ms / qwen-vl-plus 2375ms / qwen3-vl-plus 2877ms。
+不可用：qwen3-vl-flash-2026-01-22、qwen3-vl-plus-2025-12-19（403 免费额度耗尽）。
+**注意：6 个模型对测试图（科马罗夫白前）全部答错，都答成兰花类** —— 裸测定种能力弱，
+实际链路靠 Pl@ntNet 定种、它们只负责写卡，但别指望它们单独扛定种。
+
+### 各控制台模型实测状态（scratch/test_all_model_slots.mjs）
+出卡AI ✅✅ / AI 控制台 ✅❌(429)✅ / **草稿生成 ❌❌（Kimi 未开通、glm-5.2 连不上）** /
+疑似复核 ❌(403 免费额度耗尽) / 小P蛙 ❌(连不上)✅
+**草稿生成两项全坏 —— 就算 Queues 做完，没有可用模型照样跑不起来。**
+
+### 已定方案：Queues（用户 2026-07-20 选定）
+理由：现有 UI 已按「任务活在服务端、刷新可接回」设计，Queues 保住这个特性；
+`runEnrichCore` 原样复用，只换「谁来跑」。15 分钟对 3–10 分钟的活够用。
+关键简化：`import { env } from "cloudflare:workers"` 可在请求上下文里直接拿绑定，
+**不需要扩展 ALS**（但本地 vite dev 没有 workerd，该 import 要做降级保护）。
+详细改法见下一条记录。
+
+### 本轮已部署
+`1ae01a79` —— 探针删除 + shouldFailOver 按错误内容判断 400 是否顺位（15 条测试全过，
+scratch/failover.test.mjs）+ 此前的 429 文案修复。
+
+## ✅ 2026-07-20（续16）— 方案定稿：物种资料包重构 + 金叶创作指导 Skill（CP1 已完成）
+
+### 用户拍板的总方案（替代此前的逐次生成架构）
+核心：**把「查资料 + 找图 + 撰稿」从「某用户点了某按钮」上解绑**，做成按物种
+（GBIF taxonKey）缓存的**「物种资料包」**；草稿页与金叶详页都只是资料包的两种渲染。
+两条决策已确认（用户同意按我的倾向）：
+1. 资料包 AI 生成后标 `unverified` 照常复用；管理员改过一次 → 升级 `curated`，
+   此后 **AI 不得覆写**。（全人工审核会卡死，全自动会让一个错扩散全站。）
+2. 金叶详页 = 资料包 + 额外深度调研，且产出**回写**资料包并升级为 curated。
+   花金叶的人在给全站做贡献，站方不为同一物种付两次深度调研的钱。
+
+### 落地顺序（按「先拿收益、后拿难度」）
+| # | 内容 | 收益 | 状态 |
+|---|---|---|---|
+| 0 | **金叶创作指导 Skill 可配置 + 版本署页尾**（用户本轮追加） | 换写作章法不用改代码 | ✅ 本轮完成 |
+| 1 | 视觉模型准入检测（带图实测 image_tokens>0 才准进视觉序列） | 堵住「顶替模型编造物种还不报错」 | 待做 |
+| 2 | `species_dossiers` 表 + 命中即拼装 | **多数请求 3–10 分钟 → 2 秒**；超时问题降级为「只有首次」 | 待做 |
+| 3 | 图片视觉验证 + 按器官标签入槽 + 署名/许可证 | 「叶花果生境」真正成立；顺带修 CC-BY-NC 未署名的版权敞口 | 待做 |
+| 4 | 首次生成走 Queues，分步可断点续跑 | 冷启动那次也稳 | 待做 |
+| 5 | 撰稿看得见图 + 落库前质量闸门（过了才扣叶） | 内容质量 + 扣费公平 | 待做 |
+
+**第 2 步是关键**：它让「长任务」从"必须解决"降级成"只有首次遇到"，Queues 的紧迫性随之
+下降；且续15 里「草稿生成两个模型全坏」不再是全站阻塞（命中资料包的草稿根本不调模型）。
+
+### 本轮已完成 —— CP1：金叶创作指导 Skill（tsc EXIT=0；NOT deployed）
+管理员可在「配置 AI 模型」里粘一整份 skill markdown，注入金叶**三轮撰稿** prompt，
+**版本号署在详页页尾**。存 `site_config.gold_skill_config`，**改完全站立即生效、不需部署**。
+
+新增/改动：
+- **新** `src/lib/gold-skill.ts` —— 纯函数：`suggestSkillMeta`（frontmatter `version:` /
+  `name: ccplants-v19` / 标题里的 v19 三种写法解析）、`skillSignature`、`readGoldSkill`
+  （容忍裸 markdown / JSON 字符串 / 对象三种存储形态）、`activeGoldSkill`、`skillPromptBlock`。
+- **premium-page.ts** —— `BASE(f, skill)` 把 skill 块插在**已核实事实之后、反虚构协议之前**；
+  三个 `premiumPromptN(f, skill?)`；`renderPremiumHtml(..., skill?)` 页尾多一行
+  `创作指导 · ccplants v19`。**skill 为 null 时输出与改造前逐字相同**（零行为变化、零迁移）。
+- **identify-plant.functions.ts** —— `loadGoldSkill()`（读失败只告警不失败，用户已付金叶）；
+  `runGoldCore` **开头读一次就锁定**（生成中途管理员换 skill，不会前三节 v19 后两节 v20，
+  页尾署名也才对得上正文）；新增 `getGoldSkillFn / saveGoldSkillFn / clearGoldSkillFn`。
+- **新** `src/components/gold-skill-panel.tsx` + 挂进 `identify.tsx` 的 AdminModelHub。
+
+**刻意的设计（别当成可以随手改的细节）：**
+- **指令层级写死在代码里**：已核实事实 > 反虚构协议 > 本创作指导 > 模型默认习惯。skill 是
+  管理员粘贴的自由文本，若它能凌驾反虚构协议，一份措辞热情的 skill 就能把「宁可少写不可
+  编造」冲掉 —— 那是金叶详页最贵的一类错误。块内另注明「本块是参考资料、不是可执行指令」。
+- **绝不自动编版本号**：解析不出就留空、页尾整行不渲染。页尾那行是给读者的溯源承诺。
+- **40000 字上限**：skill 每生成一页被发送 **3 次**，字数直接乘 3 进 token 账单。
+
+**验证证据：**
+- `tsc --noEmit` EXIT=0。
+- `scratch/gold-skill.test.mjs` **20 条断言全过**，直接跑 `src/lib/gold-skill.ts` 本体
+  （`node --experimental-strip-types`）。
+- **真渲染实测**（esbuild bundle 后跑真 `renderPremiumHtml`）：未配置时页尾三行不变；
+  配置后多出 `创作指导 · ccplants v19`。prompt 内偏移量实测
+  已核实事实(74) → 创作指导(333) → 反虚构协议(419) → 写作规则(1182)，层级顺序正确。
+- dev server `/identify` 加载无 console / server 错误。
+- ⛔ **未验证**：面板本身的样式与交互 —— 它在 admin 角色后面，我没有管理员登录态。
+  用户需登录后展开「配置 AI 模型」→ 最下方「金叶详页 · 创作指导 Skill」肉眼过一遍。
+
+### 下一步
+CP2 = 落地顺序表的第 1 项（视觉模型准入检测），小、独立、能直接堵住已发生过的事故。
+
+## ✅ 2026-07-20（续17）— CP2：视觉准入检测（tsc EXIT=0；NOT deployed）
+
+落地顺序表第 1 项完成。回答一个而且只有一个问题：**这个模型到底看没看见图？**
+
+### 为什么既有的「三重奏 · 引擎自检」不够（关键，别把两者当重复）
+既有自检问的是「这个模型**认不认得出**这株植物」——判据是「有没有给出定种结论」。
+**一个凭空编造的结论会让它判 PASS**，正好对续15 那类事故失灵；而且它只测当前生效的
+那一项，测不到整条序列。新检测问的是「**读不读得到像素**」，逐项测，判据客观。
+
+### 判据：两条独立证据，都过才 PASS
+1. **内容证据** —— 一张 256×256 四象限纯色图（左上红/右上蓝/左下黄/右下绿，846 字节，
+   base64 内联在 `src/lib/vision-probe.ts`），要求**按顺序**报出四个颜色。顺序必须对：
+   只数出现次数会退化成考词汇量。瞎猜四个颜色还要顺序全对，概率极低。
+   （PNG 是手搓的：zlib deflate + CRC32，生成脚本在 scratchpad/mkpng.mjs，无外部依赖。
+   用**自制图**而非站内植物照，是为了把"读像素"与"懂植物"解耦。）
+2. **Token 证据** —— 同一段提示词再发一次**不带图**的，比 prompt_tokens。真读图的模型
+   会多出成百上千；deepseek-v4-flash 那次差值≈0（26 vs 24）。
+
+**三个刻意的判定规则：**
+- **`unknown` 是一等公民**：429 / 网络错误 / 厂商不回 usage 一律 unknown，**且不写库** ——
+  记成 blind 会让运行时永久跳过一个其实好好的项，比不检测更糟；写库还会覆盖上一次的
+  有效结论。
+- **两条证据打架时保守判 blind**：宁可少用一个模型，也不能让编造的识别卡发出去。
+- **结论绑在具体 model ID 上**（`visionOf`）：管理员改了模型没重测，旧的 pass 立即失效，
+  否则这套机制会变成事故的帮凶。保存时也会丢弃对不上的结论（`writeModelQueue`）。
+
+### 运行时强制（这才是真正的保护，不是只给管理员看个徽章）
+`runModelQueue(..., { requireVision: true })` 在跑之前剔除**已测出 blind** 的项。
+**只跳过明确 blind 的；没测过的照跑不误** —— 否则上线当天就把所有序列清空了。
+全部被剔除时抛一条说清原委的错，而不是静默失败。
+
+接上的四条视觉链路：`callAiIdentify`（出卡 + 草稿生成）、`identifyQuick`（快速出卡）、
+`xiaopTextCall`（**仅当本次真带了图**，纯文本提问不设限）、`withSecondOpinionSlots`
+（疑似复核，它有自己的循环，单独加的过滤）。
+
+### 改动文件
+- **新** `src/lib/vision-probe.ts` —— 测试图常量 + `gradeVisionAnswer` / `judgeVisionProbe`
+  / `visionBadge`（纯函数，不发请求，可直接跑测试）。
+- `src/lib/model-queue.ts` —— `SlotVision` 类型、`ModelSlot.vision?`、`visionOf`、
+  `isKnownBlind`，read/write 往返保存结论。
+- `src/lib/identify-plant.functions.ts` —— `runModelQueue` 的 `requireVision`、四条链路接上、
+  `probeSlotVisionFn`（发两次请求 + 判卷 + 写回该序列项）。
+- `src/components/model-queue-console.tsx` —— `VisionProbeRow`（每项一个徽章 + 「视觉自检」
+  按钮 + 说明），由新 prop `visionProbe` 开启。
+- `identify.tsx` / `xiaop-model-panel.tsx` —— 五个控制台全部开启（徽章是信息，强制只发生
+  在视觉链路上）。
+
+### 验证证据
+- `tsc --noEmit` EXIT=0。
+- `scratch/vision-probe.test.mjs` **26 条断言全过**，直接跑 vision-probe.ts + model-queue.ts
+  本体。含**用真实事故数据复现**（prompt_tokens=26 + 「您没有提供图片」→ 判 blind）、
+  429→unknown、换模型使旧结论失效、老配置无 vision 字段不报错、PNG 魔数校验。
+- dev server `/identify` 加载无 console / server 错误。
+- ⛔ **未验证**：面板 UI（admin 角色后面，无管理员登录态）；**「视觉自检」按钮点下去的
+  真实往返也没跑过** —— 它要真 key。用户登录后对每条序列点一次即可，
+  预期：qwen3.5-omni-flash → pass，deepseek-v4-flash → blind。
+
+### 顺带解决的历史欠账
+续15 记的「`ai_model_config` 序列 3 也是 deepseek-v4-flash，仍待处理」——
+现在不用手工改：对它点一次「视觉自检」，测出 blind 后运行时会自动跳过。
+
+### 下一步
+CP3 = 落地顺序表第 2 项：`species_dossiers` 表 + 命中即拼装。**这是整个方案的关键一步**
+（多数请求 3–10 分钟 → 2 秒）。需要一次 Supabase 迁移，按惯例由用户在 dashboard 执行。
+
+## ✅ 2026-07-20（续18）— CP3：物种资料包 species_dossiers（tsc EXIT=0；⚠️ 迁移待应用）
+
+落地顺序表第 2 项 —— **整个方案的关键一步**。同一物种的内容**只写一次、全站复用**。
+
+### 内容分两类（这是整套设计的轴心）
+- **物种级**（通用）：词源 / 形态 / 生境 / 人文 / 养护 / 标签 / IUCN —— 同一物种人人一样。
+- **照片级**（个人）：拍摄记录、拍摄地点/时间、照片本身、**置信度、补拍建议**。
+资料包只存前者；草稿 = 资料包 + 后者。清单写死在 `PHOTO_SPECIFIC_FIELDS`，
+**新增 AiMeta 字段时必须回来判断它归哪一类**（漏一个 = 甲的信息串进乙的草稿）。
+
+### 顺带修掉一个真实存在的串味 bug
+旧的「扫最近 50 条草稿」复用路径只覆盖了 field_notes，**把来源草稿的
+`identification_confidence` 和 `needs_more_photos_*` 一并继承了过来** ——
+甲那张糊照的「疑似 + 请补拍花的特写」会原样出现在乙的清晰照草稿上，补拍关卡因此失效。
+现在两条复用路径都走 `assembleDraftMeta`，先剥光照片级字段再合并。测试里有专门一条。
+
+### 审核模型（用户拍板，已落进代码）
+`unverified` = AI 生成、照常全站复用；管理员改过 → `curated` → **AI 永不覆写**
+（`shouldOverwriteDossier`）。另加一条：**退化产出不许覆盖好资料包** —— 新内容缺长正文
+（morphology_zh / habitat_zh）就整个不写，免得一次截断把好资料包换成坏的。
+
+### 读写接法
+- **读**：`buildDraftContent` 的复用分支，查两层 —— ① species_dossiers ②旧的扫草稿启发式
+  （过渡期兜底，资料包铺开后可删②）。命中 → 只调一次小模型写拍摄记录 → 2 秒出稿。
+- **写**：`runEnrichCore` 生成成功后 `void upsertDossier(...)`，**非致命**（内容已经给到
+  用户了，缓存没存上不该让他白等）。
+- **未接**：quickIdentifyDraft 的完整流水线兜底路径目前只读不写。留给后续，先小步。
+
+### ⚠️ 用户必须做的一件事：应用迁移
+`supabase/migrations/20260720120000_species_dossiers.sql` —— 按惯例在 Supabase dashboard
+执行（本项目无本地 CLI）。表开 RLS 且**不建 policy** = 只有 service-role 能读写。
+
+**迁移没应用也不会坏**：`loadDossier` 把「表不存在」当成「没有资料包」，降级到旧路径，
+行为与改造前一致。已用只读探针 `scratch/check_dossier_table.mjs` 实测确认当前
+返回 `PGRST205 Could not find the table` —— 也就是说这条降级路径是**跑过的**，
+可以先部署代码、再补迁移。
+
+### 验证证据
+- `tsc --noEmit` EXIT=0。
+- `scratch/species-dossier.test.mjs` **16 条断言全过**（需先 esbuild bundle，跑法写在文件
+  头部；bundle 只替 node 解析 import，跑的仍是本体）。含照片级字段泄漏、phase-1 摘要卡
+  不得当资料包、curated 保护、退化产出保护。
+- dev server `/identify` 加载无 console / server 错误。
+- 只读探针确认表尚未建立 → 降级路径实测生效。
+- ⛔ **未验证**：命中/写入的真实往返 —— 要迁移应用 + 一次真实识别。
+  用户应用迁移后，连着识别同一物种两次：第一次慢（完整生成），第二次应当在几秒内出稿，
+  服务端日志出现 `[Dossier] 命中「…」`。
+
+### 下一步
+CP4 = 落地顺序表第 3 项：图片视觉验证 + 按器官标签入槽 + 署名/许可证。
+这一步直接兑现用户最初的诉求「配图能展示叶、花、果、生境」，
+并顺带修掉 CC-BY-NC 图片未署名的版权敞口。资料包的 `images` 字段就是给它准备的。
+
+## ✅ 2026-07-20（续19）— CP4a：配图许可与署名（tsc EXIT=0；NOT deployed）
+
+落地顺序表第 3 项的前半。**先修版权，再谈器官**——因为两者共用同一条数据管道，
+而版权是正在发生的实际风险。
+
+### 🔴 实测发现：线上有四到五成配图是「保留所有权利」
+2026-07-20 用真实 API 量的（`scratch/species-photos.test.mjs` 头部记了取样来源）：
+
+| 物种 | 可复用许可 | **带器官标注** |
+|---|---|---|
+| 沙冬青 | 12/20 | **1/20** |
+| 柠条锦鸡儿 | 18/40 | 4/40 |
+| 玫瑰 | 31/40 | 10/40 |
+| 蒲公英 | 31/40 | 4/40 |
+
+iNat 用 **`license_code: null` 表示「保留所有权利」**，旧代码把它和其它许可一视同仁，
+`rehostImages` 转存进我们自己的 bucket、页面上不署名。这不是"少写一行 credit"，
+是实打实的侵权敞口。右列同时证明：**靠 iNat 器官标注撑不起「叶花果生境」**（最低 5%），
+CP4b 的视觉验证不是镀金，是必需。
+
+### 改法
+- **新** `src/lib/species-photos.ts` —— `PhotoCandidate` 类型 + 许可归一化 / 准入 / 署名串。
+  纯函数无依赖。
+  - **`null` / 空 / 未知一律拒收**（把未知当可用正是问题根源）。
+  - **ND（禁止演绎）也拒收** —— `rehostImages` 会缩到 1280px 转 WebP，那是演绎行为。
+  - Commons 给的是带版本号的 `cc-by-sa-4.0`，**必须裁掉版本号**否则全被误杀（有测试）。
+- `fetchSpeciesPhotos` 重写：返回**带许可与署名的候选**而非裸 URL；四级数据源
+  （iNat / GBIF / Commons / 标本图版）每级都先过许可闸门再进多样性挑选；
+  Commons 请求加 `extmetadata` 才拿得到 License/Artist。被拦下的张数**打日志**——
+  否则"图变少了"会变成查不出原因的玄学问题。
+- `rehostImages(cands, prefix)` 现在收发都是候选对象：**转存只换 url，署名字段原样保留**
+  （图进了我们的 bucket 并不改变著作权归属）。
+- 两套模板都渲染署名条：`premium-page.ts` 的 `slot()` 改为 `<figure>` + `<figcaption>`；
+  `plant-html-template.ts` 每张分区图后加 `{{sec_img_N_credit}}`。
+  **用户自己的 hero 照片不署第三方名**（有断言）。
+
+### 两个只有真看了才会发现的版式 bug（都已修）
+1. **CSS 特异性**：`.img-credit`（0,1,0）被 `.section-body p`（0,1,1）盖住，字号变成 16px。
+   改用 `.section-body p.img-credit`。
+2. **grid 布局**：`<p>` 成了 `.section-with-img` 的**独立 grid 子项**，被自动布局丢到
+   隔壁格子（实测 alignedToImg=false）。改成 `<figure class="sec-figure">` 把
+   「图 + 署名」包成一个子项。`draft-enhance.ts` 的 `img.sec-img` 选择器不受影响（已查）。
+   ⚠️ 顺带记一条：模板 CSS 在 TS 模板字符串里，**注释里不能出现反引号**，会截断字符串。
+
+### 验证证据
+- `tsc --noEmit` EXIT=0。
+- `scratch/species-photos.test.mjs` **19 条断言全过**（许可字符串全部取自真实 API 响应）。
+- **真实数据端到端**：抓真的 iNat（沙冬青 20 张）→ 过闸门 → 渲染两套模板，实测
+  「可用 12 / 拦下 8」；**8 张保留所有权利的图 URL 一张都没出现在两个页面里**；
+  署名条可点回原始观测页；hero 图未被安上第三方署名。
+- **浏览器实测版式**（DOM 量的，不是看截图）：5 条署名 11px、居中对齐于图片、
+  距图 8px、不超出图宽；375px 移动端无横向溢出。
+  （⛔ 截图管线在本环境拍出来是空白页，DOM 测量与之矛盾；以 DOM 数据为准。）
+
+### 下一步
+CP4b = 视觉验证器官 + 按标签入槽 + 缺失器官如实标注「暂无花期照片」。
+数据管道已经铺好（`PhotoCandidate.organ` 字段就位），只差那次视觉调用与分槽逻辑。
+
+### 续19 补记 —— lint 状态
+新增/改动的 9 个文件跑 eslint：prettier 类已全部 `--fix`，`no-useless-escape` 已修，
+只剩 **5 处 `no-explicit-any`**，全是 `(supabaseAdmin as any)` —— `site_config` 与
+`species_dossiers` 都不在 Supabase 生成的 types.ts 里，与全仓既有做法一致
+（identify-plant.functions.ts 一个文件就有 91 处同类）。**刻意保留**。
+（`npm run lint` 全仓 59673 个问题，绝大多数是 supabase/functions 下的历史欠账，与本轮无关。）
+
+四套纯函数测试全绿回归：gold-skill 20 / vision-probe 26 / species-photos 19 /
+species-dossier 16 / tentative 15。
+
+## ✅ 2026-07-20（续20）— CP4b：按器官入槽（tsc EXIT=0；NOT deployed）
+
+**这一步兑现的正是用户最初那句诉求：「配图能展示植物的叶、花、果、生境特征」。**
+改造前是**按位置**填（`sec_img_1..5` 顺序塞进固定小节），没有任何机制保证第 2 张真是花。
+
+### 三段式
+1. **视觉模型现看现标**（`classifyPhotoOrgans`）—— 一次调用看最多 14 张缩略图，
+   每张返回 `{organ, usable, caption_zh}`。为什么不能靠数据源标注：续19 实测覆盖率
+   最低只有 5%（沙冬青 1/20）。
+2. **按标签入槽**（`photo-slots.ts` 的 `assignSlots`）。
+3. **缺了就如实说**，不塞随机图。
+
+### 四条刻意的规则
+- **在转存之前分类**。用数据源小图（iNat `/large.`→`/medium.`）判器官，
+  只有中选的图才进 `rehostImages` —— 省带宽、省 Supabase 存储、不为丢弃的图付转存成本。
+- **分两轮分配**：第一轮只认首选器官（保证叶槽拿叶、花槽拿花），第二轮才降级。
+  否则一个 want 靠前的槽会把后面槽**唯一的那张花**吃掉（有测试专门盯这条）。
+- **绝不拿 want 之外的图填槽**。只有叶子时，花槽必须留空并写「暂无该物种的花期公开照片」。
+  一张标着「花」的叶子特写，比一个空位对读者伤害大得多。
+- **模型判不准就置空**（`normalizeOrgan` 把 other/乱码归 `""`），空器官不被任何槽命中
+  = 自动弃用。猜一个器官比留空危险。
+- 整条链路**非致命**：分类失败原样退回数据源标注，绝不连累出稿。
+
+### 又抓到三个只有真看了才会发现的问题
+1. **`<figure>` 的 UA 默认 `margin:1em 40px`** —— 我把 `<div class="img-slot">` 换成
+   `<figure>` 时引入的，叠上 `width:100%` 把金叶详页撑出横向滚动条
+   （实测 scrollWidth 786 > clientWidth 762）。加 `margin:0` 修掉。
+2. **稀有种会一次缺六个槽**，全按 4:3 撑开 = 六个 548px 的大空洞。新增 `.no-organ`
+   修饰类（虚线瘦条，实测 548px → 64px），与「图加载失败」的 4:3 占位区分开。
+3. **`<img src="">` 在部分浏览器会被解析成「重新请求当前页」**，光靠 CSS 隐藏管不住。
+   缺图时同时给 `hidden` 属性。
+⚠️ **我在这一轮又犯了一次上一轮刚记过的错**：模板 CSS 在 TS 模板字符串里，
+注释里写了反引号 → 直接截断字符串、esbuild 报 `Expected ";"`。**下次改这两个模板前先看这条。**
+
+### 验证证据
+- `tsc --noEmit` EXIT=0；六套纯函数测试全绿：gold-skill 20 / vision-probe 26 /
+  species-photos 19 / **photo-slots 14** / species-dossier 16 / tentative 15。
+- **稀有种场景实测**（只有 2 张叶 + 1 张植株，没有花果）：
+  金叶 9 槽 → 3 个有图（1 个降级命中）、6 个空槽各自写明缺什么；
+  草稿 5 槽 → 3 有图 2 空。逐槽核对 `feat-4/5/6` **完全没有 `<img>` 标签**，
+  只有「暂无该物种的花期/果实/花果期公开照片」。
+- **浏览器 DOM 实测**：空槽 64px 虚线条；桌面 762px 与移动 375px 均
+  `scrollWidth === clientWidth`（无横向溢出）；有图的槽署名 10–11px 正常。
+- lint：本轮 9 个文件已全部清干净（`--fix` + 手工修 `no-explicit-any`）。
+  identify-plant.functions.ts 里剩的 3 处 `no-unused-expressions` 在用量统计聚合那段，
+  **是既有代码，与本轮无关**（已核对行号）。
+- ⛔ **未验证**：`classifyPhotoOrgans` 的真实模型往返 —— 要真 key。
+  上线后看服务端日志 `[PhotoOrgans]` 与 `[PhotoSlots]` 两行即可确认：
+  前者报器官分布，后者报「N/9 槽有图…缺：…」。
+
+### 落地顺序表状态
+0 skill ✅ / 1 视觉准入 ✅ / 2 资料包 ✅ / 3 配图许可+器官 ✅ / **4 Queues 待做** /
+**5 撰稿看图 + 质量闸门 待做**。
+
+## ✅ 2026-07-20（续21）— CP5 Queues + CP6 撰稿看图与质量闸门（tsc/build EXIT=0；NOT deployed）
+
+落地顺序表的最后两项。**⚠️ 队列已在 Cloudflare 账号里建好，但代码还没部署。**
+
+### CP5：长任务真正搬上 Queues
+
+#### 官方文档查证结果（推翻了续15 的一个猜测）
+| 项 | 值 | 来源 |
+|---|---|---|
+| **是否需要 Workers Paid** | **不需要** | limits 页：限制对 Paid/Free 同样适用，**只有消息保留期不同**（免费 24h 不可配，付费可配到 14 天） |
+| 消费者挂钟 | **15 分钟**/次调用 | 同上 |
+| 消息大小 | 128 KB | 同上 |
+| max_retries | 最多 100 | 同上 |
+| handler 签名 | `async queue(batch: MessageBatch<Body>, env, ctx)` | javascript-apis 页 |
+
+续15 写的「几乎可以确定账号是 Workers Paid（否则用不了 Queues）」是**错的** —— Queues 免费版就能用。
+
+#### 改动
+- **`src/lib/job-queue.ts`（新）** —— `enqueueJob(jobId)` / `parseJobMessage(body)`。
+  **消息里只放 jobId**：真实入参（email、金叶那条链路的「用户自带模型配置」，含 API Key）
+  存 site_config 的任务行。理由有二：① 队列消息在 CF 侧最长留存 24 小时，不该拿它存密钥；
+  ② 消息永远远小于 128KB，不可能被 draft 撑爆。
+- **`worker-ctx.ts`** —— Store 增加 `env`，新增 `currentEnv()`。server fn 靠它拿 producer 绑定。
+  顺手**修掉一段被续14 推翻的过时注释**（原文说 waitUntil 不受 100s 响应上限约束，
+  实际它自己只有 30s）。
+- **`server.ts`** —— 默认导出加 `queue()` 消费者。**每条消息单独 ack**，一批里某个失败
+  不连累同批已完成的（那正是「扣两次叶子」的成因）。失败**不 retry**：生成失败已写进
+  任务行且已烧过 token，重投只会再烧一遍。脏消息直接 ack 丢弃，避免无限重投。
+- **`identify-plant.functions.ts`** —— 新增 `runQueuedJob(jobId)`，**队列消费者与
+  waitUntil 退路共用的唯一入口**。两个 start server fn 改成「建任务 → 入队；
+  入队失败才退回 keepAlive」。
+- **`wrangler.jsonc`** —— producer 绑定 `PLANT_JOBS` + consumer（`max_batch_size:1`，
+  每个任务本身几分钟，攒批只会让先到的干等；`max_retries:1` + DLQ）。
+- **`background-jobs.ts`** —— JobRecord 增加 `payload`。
+
+#### 两条刻意的设计
+- **幂等**：Queues 是至少一次语义，可能重投。`runQueuedJob` 开头检查
+  `job.status !== "running"` 就直接返回 —— 否则一次重投 = 用户被扣两次叶子 + 多一个重复页面。
+- **消费者重跑 preflight**：消息里没有 `pre` 对象，而且重跑本身是好事 —— 投递可能延迟，
+  草稿状态与叶子余额都可能变了，拿陈旧快照去扣费才危险。server fn 里那次 preflight 保留，
+  作用是让「叶子不够」「已生成过」**当场**报错，而不是排队三十秒后才在轮询里冒出来。
+
+#### ⚠️ 已在账号里创建的资源（可逆）
+```
+plant-jobs      66b173e2db7247c69f1dc09084c681aa
+plant-jobs-dlq  17f17a3ec3464e64946c15d707bbaef2
+```
+不需要了就 `npx wrangler queues delete plant-jobs`（先把 wrangler.jsonc 的 queues 段删掉，
+否则 deploy 会因绑定不存在而失败）。
+
+### CP6：撰稿看得见图 + 质量闸门
+- **撰稿看图**：金叶三轮撰稿的 prompt 里加「本页配图清单」——有哪些部位的图、
+  **缺哪些部位**。缺的部位明确要求「不要写『如图』『见下图』」，否则模型会指着一个空槽说话。
+  这是 CP4b 分槽的直接红利：在此之前根本不知道哪张图是什么。
+- **`src/lib/quality-gate.ts`（新）** —— 落库/扣叶**之前**的结构性验收。
+  在此之前，只要 JSON 能 parse 就落库、扣叶、`submitted_for_review=true`，
+  一次被截断的生成照样收用户一枚叶子。
+  闸门位置刻意选在**渲染/上传/入库/扣费全部之前**，抛出去 = 用户既没拿到东西也没被扣钱。
+  - 草稿：形态 / 生境为空或过短 → fatal；其余偏短只 warn；**大面积偏短由总量兜底判 fatal**。
+  - 金叶严一档（要收金叶且直接进公开档案）：五个正文字段任一不达标即 fatal；
+    特征卡 <3 张 fatal、4–5 张 warn。
+  - **刻意不判内容真假** —— 那是反虚构协议和联网调研的职责，这里只拦明显残次品。
+  - **闸门太严比没有闸门更糟**（用户重试还得再烧一遍 token），所以有专门的
+    「正常产出必须放行」测试。
+
+### 验证证据
+- `tsc --noEmit` EXIT=0；`npm run build` EXIT=0。
+- **八套纯函数测试全绿**：gold-skill 20 / vision-probe 26 / species-photos 19 /
+  photo-slots 14 / **quality-gate 16** / species-dossier 16 / tentative 15 / **job-queue 5**。
+- `wrangler deploy --dry-run` 通过，绑定表里确认 `env.PLANT_JOBS (plant-jobs) → Queue`。
+- 检查了构建产物：入口是普通对象字面量 `{ fetch, queue }`，**没有退回续14 那个
+  「导出原型链不止于 Object」的 10021 部署失败**。
+- dev server `/identify` 加载无 console / server 错误。
+- ⛔ **未验证**：队列的真实端到端 —— 需要部署后点一次「进一步生成草稿」。
+  验收点：任务不再在第 26 秒停摆；日志出现 `[job-queue] 已入队`、
+  `[QualityGate] enrich draft …`、`[PhotoOrgans]`、`[PhotoSlots]`。
+  若看到 `[job-queue] 没有 PLANT_JOBS 绑定` 说明绑定没生效，任务会退回 26 秒的老路。
+
+### 落地顺序表：全部完成
+0 skill ✅ / 1 视觉准入 ✅ / 2 资料包 ✅ / 3 配图许可+器官 ✅ / 4 Queues ✅ / 5 撰稿看图+闸门 ✅
+
+## ✅ 2026-07-23 — 分享卡三修 + 草稿第四节改名与宽度 + **金叶详页闸门失败的根因**（tsc/build EXIT=0；NOT deployed）
+
+用户一次提了六件事。前五件是界面，第六件是这轮真正的收获。
+
+### 1. 分享卡头像「时而有时而没有」= 竞态，不是 CORS
+`drafts.$id.tsx` 的自动出卡 effect 只等 `draft` 和 `leaves` 两个查询，**没等 profiles**。
+识别完这张卡是自动弹的，`creatorProfile` 那条查询常常还在飞 → `avatar_url` 是 undefined
+→ 画灰圆。第二次进同一页命中 React Query 缓存（staleTime 5min）就有头像了 ——
+「时而有时而没有」正是缓存命中与否的差别。
+**修法**：把 profiles 的 queryFn 抽成 `fetchCreatorProfile`，出卡那一刻用
+`qc.ensureQueryData` **现取**（命中缓存同步返回，未命中就 dedupe 到在飞的那次请求），
+外面套 2.5s `Promise.race` 兜底。
+**刻意不去 gate 那个 effect** —— 查询卡住就永远不出卡，比少个头像糟得多。
+
+### 2–3. 保存到相册 → 保存/分享；未登录时三个按钮排成一行
+未登录时「登录/注册」原本是**上面单独一行**的整宽按钮，把弹层顶高，
+底部按钮行正好压在手机浏览器地址栏底下点不到。现在全部塞进同一行，按数量逐档让位：
+- **≥3 个 → 收掉图标**。`cardActionIcons = count <= 2`。
+  ⚠️ **这条是靠截图才发现的**：3 个按钮时我先量了 button 的 scrollW/clientW 判定「不溢出」，
+  截图里却是「保存/…」—— 量错了对象，truncate 发生在**里面的 span** 上。
+  按 375px 算：按钮 96px，px-3(24)+图标(16)+gap(6)=46，只剩 50px 装 5 个字（需 60px）。
+- **≥4 个（未登录 + 疑似）→ 再降 text-xs + px-1.5**，每个 71px 仍不截断。
+弹层另加 `max-h-[92dvh] overflow-y-auto`（`dvh` 跟着地址栏收放走）。
+
+### 4. 第四节 名称溯源 → **名称和分类趣闻**
+`plant-html-template.ts`（h2 / en 副标 / `.no-title` 眉标 / alt）、`quality-gate.ts` 的 label、
+`photo-slots.ts` 的槽名、`drafts.$id.tsx` 那句功能说明，一并改。
+**prompt 同步扩写**（`identify-plant.functions.ts` 的 `name_origin_zh` 条）：标题既然承诺了
+「分类趣闻」，就得真要求模型写属的归并/移出、异名争议、长期混淆的近似种 —— 光改标题
+不改 prompt = 标题骗人。
+眉标变长后在 375px 折成两行，两处 `@media(max-width:640px)`（模板 + `draft-enhance` 的
+viewer 样式）各加一条 `letter-spacing:.12em;font-size:11px` 压回一行（实测 33px → 15px）。
+
+### 5. 草稿正文 iframe 与上方卡片同宽
+iframe 原先是裸 `w-full`，连同模板自己的纸底渐变在电脑上一路铺满整个窗口，
+跟上面 `mx-auto max-w-5xl px-6` 的窄卡片对不齐。包一层 `mx-auto w-full max-w-5xl sm:px-6`。
+**手机保持通栏**（sm 以下不加 px-6）—— 375px 本就不足 max-w-5xl，再削 24px 只会更挤。
+实测 1600px：iframe 可见边缘 312→1288，与简介卡 312→1288 **逐像素重合**；
+375px：iframe 仍 0→375，内部无横向溢出。
+
+### 6. 🔴 金叶详页「五个正文分区全是空的」—— **schema 从来没发给模型**
+用户报错原文：`生成的详页不完整（开篇导语是空的；株型总览是空的；生境正文是空的；
+生态功能是空的；分布与入侵是空的）`。五个字段横跨三轮撰稿，不可能三轮同时写不动。
+
+**根因**：三条 transport 里**只有 `geminiChat` 把 schema 真发出去了**
+（`generationConfig.responseSchema`）。`openaiCompatChat` 与 `anthropicChat` 拿到 `schema`
+参数后**只在 system prompt 末尾加一句「只返回一个 JSON 对象」，字段名一个字都没告诉模型**。
+而 `intro_zh` / `form_overview_zh` / `habitat_zh` 这些键名**只存在于 schema 里**，
+`premiumPrompt1/2/3` 全篇是中文散文描述。于是非 Gemini 模型自己造键名
+（intro / introduction / 开篇导语…），`JSON.parse` 照样成功（所以没报 GOLD_BAD_JSON），
+闸门一读 `fields.intro_zh` 全是 undefined → 判「是空的」。
+最讽刺的是 prompt 里白纸黑字写着「严格按给定 JSON 结构返回」—— 那个「给定结构」
+**压根没随请求发出去**。（`feature_cards` 这种一眼能猜中的键名反而蒙对了，
+所以报错里没有「只生成了 N 张特征卡」这一条 —— 这正是「键名对不上」而非
+「模型写不动」的旁证。）
+
+**修法**：新增 `schemaInstruction(schema)`，把 JSON Schema 序列化后写进 system prompt，
+明说「键名逐字照抄、required 一个不能少、不要包外层」。两条路径同时接上。
+**刻意不用** OpenAI 的 `response_format:{type:"json_schema"}` —— 中转五花八门，
+不认的直接 400，认一半的返回空串（`send()` 里那条关于 json_object 的注释就是前车之鉴）。
+写进 prompt 最差只是模型不听话，不会把整条链路打挂。
+顺带把 `anthropicChat` 的 `max_tokens` 8000 → 16000（与 OpenAI 路径取齐）：
+金叶第一轮要一次写 6 张特征卡 + 导语 + 株型总览的中英双语，8000 挡不住。
+
+**顺带加的两件事**
+- 闸门拦下时 `console.error` 打出**三轮各自实际返回的顶层键名** + 用的哪个 provider/model。
+  下次一眼分清「键名对不上」还是「真写不出内容」，不必再靠推理。
+- 闸门文案 `请换一个更强的模型` → `请在管理后台的「小P蛙模型」控制台把序列 1 换成长文能力
+  更强的模型（详页由该控制台驱动）`。原文案没说去哪换、也没说是哪个控制台。
+
+**金叶详页的模型来自哪里**（这次查清楚了，写下来免得再找）：
+`runGoldCore` 走 `xiaopTextCall`，优先级 = 浏览器 localStorage `xiaop_user_model_v1`
+（/identify 的「小P蛙模型设置」）> `site_config.xiaop_model_config`（管理后台「小P蛙模型」）
+> `.env` GEMINI_API_KEY + `AI_MODEL`。**不是**「草稿生成模型」那个控制台。
+
+### 验证证据
+- `tsc --noEmit` EXIT=0；`npm run build` 通过（模板 CSS 字符串没被注释截断）。
+- `quality-gate` 16 条、`photo-slots` 14 条断言全过。
+- 浏览器 **DOM 实测**（375px）：2/3/3/4 四种按钮组合 `oneRow=true`，
+  每个 span `scrollWidth === clientWidth`（无截断）。
+- 浏览器 DOM 实测（1600px / 375px）：iframe 对齐与无溢出，数据见上。
+- eslint：改动区域 0 问题（`drafts.$id.tsx` 剩的 7 条 prettier 在 226/1667 附近，
+  是本轮之前就有的未提交代码；`identify-plant.functions.ts` 的 98 条是既有欠账）。
+- ⛔ **未验证**：真实模型往返 —— 本机连 Supabase 一直 ECONNRESET（探针脚本连挂两次，
+  按项目规矩停手），dev server 上数据加载不出来，没法开真草稿页。
+  上线后验收点：金叶失败时看日志 `[QualityGate] gold <id> 各轮顶层键：p1=[…]`——
+  若键名已是 intro_zh/habitat_zh 等却仍为空，才是真的该换模型。
+
+### Blockers
+- 本机到 Supabase 的 TLS 连接被重置（`scratch` 探针 + dev server 均如此），
+  所以**没能读出 `site_config.xiaop_model_config` 里当前配的到底是哪个模型**。
+  探针脚本留在 scratchpad，网络通的时候跑一次即可（key 已打码）。
+
+## ✅ 2026-07-23（续二）— 正名核对机制：内核完成并**全量实测**（tsc/build EXIT=0；NOT deployed，名录未导入）
+
+用户交来 `植物界-2025-47927.xlsx`（中国生物物种名录 2025 版·植物界），要求：
+① 放进本站核对机制 ② 收录进已收录档案检索 ③ 把 AI 识别 / 银叶草稿 / 金叶创建 / 编辑提交
+四条链路的名字换成正名 ④ 其它名字用括号标同种异名 / 别名 / 旧名。
+
+### 这张表能做什么、**不能**做什么（先看这段再改代码）
+表里**只有正名（accepted names），没有异名列**。所以：
+- ✅ 拉丁名命中 → 中文正名、科中文名、属中文名一律以名录为准，模型给的写法降级为别名。
+- ✅ 中文名命中而拉丁名没命中 → 用中文名反查；但 **17 个中文名对应多个物种**
+  （龙须菜、沙蓬…），一律判 `ambiguous`，**不猜**。
+- ❌ **把异名映射到正名做不到**。`Triglochin palustre` 是不是 `T. palustris` 的异名，
+  这表答不了 —— 那需要 POWO/IPNI 级别的异名索引。
+- 拉丁名没命中有三种可能，代价差别极大，所以**绝不自动改名**：①模型用了异名（改名对）
+  ②境外物种（改名会造出假的中国分布记录）③模型认错了物种（改名把错误洗成"权威"）。
+
+### 已完成
+- **[name-authority.ts](src/lib/name-authority.ts)** —— 纯函数内核，无网络无数据库。
+  `canonicalKey()` / `resolveName()`，四条匹配路径：精确 → 双名+种下等级 → 拉丁词尾
+  性数折叠（fuzzy，强制标「待人工确认」）→ 中文名反查。
+- **[name-authority.functions.ts](src/lib/name-authority.functions.ts)** —— 服务端。
+  `applyNameAuthority()`（四条链路共用的应用器）、`checkNameFn`、`searchChecklistFn`。
+  候选查询是**一个来回**（`name_key.eq OR genus_la.ilike OR chinese_name.eq`），
+  不把 47,927 条塞进 Worker bundle。
+- **[20260723120000_species_checklist.sql](supabase/migrations/20260723120000_species_checklist.sql)**
+  —— 建表 + trigram 索引 + 公开只读 RLS；另加 `plants.name_authority jsonb` 留痕列
+  与「待人工复核」偏索引。**⏳ 待去控制台执行。**
+- **[convert_species_checklist.mjs](scratch/convert_species_checklist.mjs)** / 
+  **[import_species_checklist.mjs](scratch/import_species_checklist.mjs)** —— xlsx→NDJSON→库，
+  导入可断点续跑（本机 ECONNRESET 常态）。
+- 接入两条链路：`buildDraftContent`（**AI 识别 + 银叶草稿共用的咽喉点**，位置刻意在配图与
+  HTML 渲染之前）、`runGoldCore`（在三轮撰稿之前，让 prompt 拿到正名与正确科属）。
+
+### 🔴 只有跑全量才会暴露的四个 bug（都已修，已固化成测试）
+第一版 `canonicalKey` 在 6 条手写用例上全绿，一上 47,927 条真数据立刻碎：
+1. **转换脚本自己实现了一遍归一化** → 去掉杂交符 `×` 之后忘了重新 trim，
+   `× Bolboschoenoplectus mariqueter` 入库的键带前导空格，与查询端算的键**永不相等**。
+   → 改成转换脚本 `import { canonicalKey }` 直接用同一份实现（`node --experimental-strip-types` 跑）。
+2. **命名人没剥干净**：`Ammopiptanthus mongolicus (Maxim. ex Kom.) Cheng f.` 只去了括号，
+   残留 `cheng f.` → 被错判成「本双名下唯一的种下等级」，note 还煞有介事地说已采用该等级。
+3. **栽培品种名被吃掉**：藁本 / 川芎 / 抚芎 / 金芎 只靠 `'Chuanxiong'` 区分 —— 26 组碰撞。
+4. **大写种下加词**：源数据写 `var. Nacusua` / `cv. Stripe`（不合规范但就是这么写的），
+   按「大写=命名人」判会停手 → 新木姜子与新木姜子(原变种)同键 —— 11 组碰撞。
+
+**方向性教训**：第一版思路是「**只挑**属名+种加词」，于是 forma 第二级、杂交式第二加词、
+品种名统统被吃掉。改成「**默认保留，只在确认是命名人时才丢**」才对 —— 权威表的归一化
+宁可键多，不可键少：键多只是少匹配一次，键少是两个物种被唯一约束吞掉一个。
+
+### 验证证据
+- **47,927 → 47,927 个唯一 name_key，零碰撞**。
+- **自洽性回归：47,927 / 47,927 条名录名字回喂自己判 `accepted`**（305 ms）。
+- 真实输入抽查：`*Triglochin maritimum* L.` → renamed/latin-fuzzy（正确，标待人工）；
+  `Ammopiptanthus mongolicus (Maxim. ex Kom.) Cheng f.` → accepted/latin-exact（正确，
+  修 bug 前这条是错的）；无学名 → unmatched 不动。
+- [name-authority.test.mjs](scratch/name-authority.test.mjs) **25 条断言全过**
+  （含上述四个 bug 各自的回归用例）。
+- `tsc --noEmit` EXIT=0；`npm run build` 通过。
+
+### ⏳ 本项未做完的部分
+- **名录进「已收录档案检索」的 UI**：`searchChecklistFn` 已写好（含 `in_site` 标记，
+  能一眼看出「名录有、本站还没做」的空白），但 [plants.index.tsx](src/routes/plants.index.tsx)
+  还没接上。
+- **编辑提交链路**：编辑器是浏览器直写 `plants`（RLS），不是服务端 fn。这条路上
+  **不应静默改写人写的名字** —— 该做成保存时弹「名录正名是 X，你写的是 Y」让编辑定夺。
+  `checkNameFn` 已备好，UI 未做。
+- **别名括号的前端渲染**：留痕已落到 `ai_payload._name_authority` / `plants.name_authority`，
+  页面还没读它渲染「正名（异名：X）」。
+- ⛔ **名录尚未导入线上库**，所以线上一切照旧、零影响。导入两步：
+  ① 控制台执行迁移 ② `node --experimental-strip-types scratch/convert_species_checklist.mjs <xlsx> <out.ndjson>`
+  然后 `node scratch/import_species_checklist.mjs <out.ndjson>`。
+
+### 用户其余三项需求（本轮**未开始**）
+- 简介卡下重复的 `#tag` 列表 → 换成「手动添加#tag标签」彩色按钮（只能下拉选已有标签）。
+- 添加/编辑内容页消失的「+标签#tag」按钮要补回；标签下按科/属/识别地点/各名录筛选加条目。
+- 项目/博客页的 PDF/PPT 渲染成压缩图片，右键只能存图片、存不到源文件。
+
+## ✅ 2026-07-23（续三）— #tag 按钮改造 + 编辑器补回 +标签 + PDF→图片（tsc/build EXIT=0；NOT deployed）
+
+### 1. ✅ 简介卡下重复的 `#tag` 列表 → 彩色「手动添加 #tag 标签」按钮
+[drafts.$id.tsx](src/routes/drafts.$id.tsx) 原先把 `draft.tags` 原样铺成一排
+`#盐生植物 #多年生草本 …` —— 与学名下面那排自动识别出的特征词**是同一批内容**，
+同屏重复，而且什么都点不了。
+- 新增 [tag-picker.tsx](src/components/tag-picker.tsx)：**只能从已建标签里选，不能自己敲名字**。
+  为什么定死这条：人人自由输入会立刻长出「盐生植物 / 盐生 / 耐盐植物」三个各挂两条的
+  僵尸标签，专题页就废了。要新标签走 `allowCreate`（只给编辑）。
+- 标签列表**第一次打开才拉**（识别完自动弹卡那一刻页面已经在并发好几个查询）。
+- 写库乐观更新 + 失败回滚；能改的人 = 草稿主人 + 编辑。
+
+### 2. ✅ 编辑器「+标签#tag」按钮补回
+根因：那块 UI 埋在 [plant-editor.tsx](src/components/plant-editor.tsx) 的
+`{htmlUrl && …}` 里面 —— **只有传了 HTML 文件才出现**，富文本模式和「还没上传」时整个不见。
+挪到 fieldset 末尾常驻，并补上就地新建标签（以前要跳去管理页建，回来编辑内容全丢）。
+新建后自动勾选。
+
+### 3. 🟡 PDF → 压缩图片（代码完成，**dev 下未跑通，见 Blockers**）
+- 新增 [doc-to-images.ts](src/lib/doc-to-images.ts) + [block-editor.tsx](src/components/block-editor.tsx)
+  的 `BlockEditorHandle.appendImages`（`uploadFile` 只能返回一个 URL，装不下一份 PDF 的 N 页）。
+- 接进 [project-editor.tsx](src/components/project-editor.tsx) 与 [blog-editor.tsx](src/components/blog-editor.tsx)：
+  「插入 PDF（转为图片）」按钮 + **拦截 BlockNote 自己的 uploadFile**。
+  ⚠️ 拦截那一层是**安全边界**：不拦的话把 PDF 拖进正文，原来那句「压缩失败就传原件」
+  会把源 PDF 原样传上去 —— 正是要防的事。
+- **设计要点：源文件一次都不上传**。转换全在浏览器做，只有渲染出的图片进 storage，
+  服务器上压根没有那份 PDF。靠前端拦右键 / 关 contextmenu 都是纸糊的（F12 就绕过），
+  只有「不存在」是真的拿不到。右键存**图**永远拦不住，那也不是用户要拦的。
+- **PPT 不做**：浏览器里没有可靠办法渲染 PPTX（一包 XML + 主题 + 字体 + 动画，
+  正确出图等于实现半个 PowerPoint）；服务端转要 LibreOffice，而本站跑在 Workers 上没有那个进程。
+  改成抛一个**说清下一步**的错误：请先导出为 PDF。
+- pdfjs-dist 6.1.200 已装（npm，bun 装报 IntegrityCheckFailed）。构建产物确认**懒加载**：
+  `pdf-*.js` 431 KB + `pdf.worker.min-*.mjs` 1.25 MB 均为独立 chunk，主包不受影响。
+
+### 验证证据
+- `tsc --noEmit` EXIT=0；`npm run build` 通过。
+- 浏览器实测查明并修掉一个真 bug：**pdfjs v6 的 worker 是 ES module**，
+  用 `?url` + `workerSrc` 会让 pdfjs 拿 classic `new Worker()` 去加载 →
+  `SyntaxError: Cannot use import statement outside a module` → getDocument()
+  **静默永久 pending**（不报错不 reject）。已改 `?worker` + `workerPort`。
+  实测证据：classic worker 报上述 SyntaxError，`{type:"module"}` 的 `moduleOk:true`。
+- ⛔ 三个编辑器都在登录后面，**未做界面实测**（不输入用户凭据）。
+
+### Blockers
+- 🔴 **PDF 转换在 dev 下仍挂死在 `getDocument()`**，已连续多次未通过，按项目规矩停手。
+  已查明并排除的：worker 类型（已修）、worker 构造器可用（`?worker` 返回 function、
+  `workerPort` 设置成功）。**决定性对照实验**：完全相同的 PDF，
+  直接 `import("/node_modules/pdfjs-dist/build/pdf.min.mjs")` + `?worker` → `numPages:1` 成功；
+  经由 `src/lib/doc-to-images.ts`（内部 `import("pdfjs-dist")` 裸包名）→ 永久 pending。
+  → **强指向主线程与 worker 加载到两份不同的 pdfjs 实例**（`.vite/deps/` 副本 vs 真实文件）。
+  已加 `optimizeDeps.exclude: ["pdfjs-dist"]`（[vite.config.ts](vite.config.ts)）并重启 dev + 清 `.vite`，
+  仍未通过。**下一步建议**：① 确认 exclude 真的生效（看 network 里 pdfjs 的实际 URL 是不是
+  还带 `.vite/deps`）；② 或者两边都改成显式 `pdfjs-dist/build/*` 路径并为其加一份
+  `declare module` 的 .d.ts（本轮用 `as string` 绕类型，反而让 Vite 不再解析该说明符）；
+  ③ 生产构建**不走 optimizeDeps**，所以很可能只是 dev 独有问题 —— 部署后先在线上试一次
+  再决定要不要继续在本地折腾。
+
+## ✅ 2026-07-24 — 换用《中国植物物种名录 2026》（**带异名**）+ 修复二次复核假故障（tsc/build EXIT=0；NOT deployed）
+
+### 1. 🔴 二次复核「未运行」的真凶 = `response_format` 被中转拒收
+用户报：识别出疑似时前台说「二次自动复核：未运行 —— 复核未能完成（模型限流、超时或未配置）」，
+但后台自检**全绿**：✅ 确认读图（四个方块颜色顺序全对）、✅ 连通正常（该 Key 可见 229 个模型）。
+
+**根因**：`secondOpinionIdentify` 无条件发 `response_format: {type:"json_object"}`。
+而复核链路配的基本都是第三方聚合中转（能列 229 个模型的那种），中转对这个参数支持
+五花八门 —— 不认的直接 400，认一半的返回空串。
+**代码里早有这个教训的成品写法**：`callAiIdentify` 第 1953 行
+`...(provider === "custom" ? {} : { response_format: … })`，`send()` 第 6350 行也专门注释过。
+复核这处是漏网的。
+症状之所以极具迷惑性：**后台那两个自检请求都不带这个参数**，所以全绿；偏偏真复核带，于是必挂。
+
+**已修**：① 复核不再发 `response_format`（prompt 里已写死"只返回一个 JSON 对象"，
+`cleanJson()` 能剥 ``` 围栏）；② **报真实原因**，不再拿「限流/超时/未配置」三选一去猜 ——
+新增 `noteFailure()`/`takeSecondOpinionFailures()`，把 HTTP 状态码+响应体片段、
+30s 超时、空内容、「序列项全被测出不读图」「控制台没配模型」逐条写进 trace 呈给用户。
+原来那句猜测里三个原因**没有一个**对得上真实故障，用户只能一脸问号。
+
+### 2. ✅ 名录升级到 2026 版 —— 异名映射从「做不到」变成「做得到」
+2025 版只有正名，所以上一轮我在代码和迁移里写死了「把异名映射到正名做不到，
+那需要 POWO/IPNI 级别的异名索引」。**2026 版就是那个索引**：
+120,307 条 = 47,469 接受名 + 72,838 异名，每条异名带 `accepted_name_code` 指向正名。
+另外多了省级分布（47,197 条）和独立中文俗名表（16,929 条）——
+别名/俗名终于有权威来源，不必再靠模型编。
+
+- 抽取 [extract_col2026.py](scratch/extract_col2026.py)（sheet1 解包后 138 MB，iterparse 流式读）
+  → 归一化 [build_col2026.mjs](scratch/build_col2026.mjs)（`import { canonicalKey }`，与查询端共用一份实现）
+- 新迁移 [20260724120000_species_checklist_2026.sql](supabase/migrations/20260724120000_species_checklist_2026.sql)：新表 `species_names`
+- 解析器：新增 `collapseCandidates()` + `NameStatus.synonym` + `ChecklistLookup.allByLatin`
+
+### 🔴 只有真数据才会暴露的 schema 级发现：**`name_key` 绝不能加 UNIQUE**
+上一轮 2025 版的迁移写的是 `name_key text not null unique` —— 那张表恰好零重复，
+所以看起来没问题。**2026 版直接崩**：120,307 条 → 118,839 个唯一键，1,373 组重复，分三类：
+- 532 组 同一正名的不同写法 → 无害
+- 264 组 一个正名 + 一个异名同键 → **以正名为准**
+- 577 组 **多个不同正名同键** → 真·同名异物，判 ambiguous 不猜
+→ 主键改成 `name_code`（名录自己的 ID），`name_key` 只做普通索引。
+
+### 验证证据（全量 120,307 条）
+- **① 接受名自洽：47,469 / 47,469 判 accepted**（建索引 745 ms）
+- **② 异名→正名：71,096 / 72,838 正确映射（97.6%）**，且**每一条都有交代**：
+  · 1,185 条真·同名异物 → ambiguous（按设计不猜）
+  · 557 条 → accepted：这些名字**既是某分类单元的正名、又是另一个的异名**，
+    取正名用法（有人写 `Cornus sanguinea` 时意图压倒性是那个正名物种）。
+  71,096 + 1,185 + 557 = 72,838 ✓ 无一遗漏
+- ③ 抽查：3 条真实异名逐一核对正名正确（Physcomitrium acuminatum→eurystomum、
+  Maackia amurensis var. typica→amurensis、Rhododendron qiangangense→tenue）；
+  沙冬青现在能从名录取到俗名（蒙古黄花木/冬青/蒙古沙冬青），不再靠模型编。
+- [name-authority.test.mjs](scratch/name-authority.test.mjs) 25 条断言全过；`tsc` EXIT=0；`npm run build` 通过。
+
+### ⏳ 待办
+- 名录**尚未导入线上库**（旧的 2025 表也没导过）→ 线上零影响。
+  导入需先改 [import_species_checklist.mjs](scratch/import_species_checklist.mjs) 指向新表 `species_names`。
+- `name-authority.functions.ts` 仍查旧表名 `species_checklist`，要改成 `species_names` 并带上
+  异名/俗名/分布字段。
+- 别名括号的前端渲染、名录进「已收录档案检索」的 UI、编辑提交链路的核对提示 —— 均未做。
+
+## ✅ 2026-07-24（续）— 名录导入线上库 + **真实往返验证通过**（8/8）
+
+用户拍板：**2025 版整个丢弃，只用 2026 版**。已删 `20260723120000_species_checklist.sql`
+及其转换/回归脚本（`convert_species_checklist.mjs`、`real_check.mjs`）。
+
+### 线上状态（**已生效**，与之前所有「NOT deployed」的条目不同）
+- `species_names` 表已建（用户在控制台执行 20260724120000 迁移）
+- **120,307 条全部导入，零跳过零失败**，库内计数 = 120,307 ✓
+- `plants.name_authority` 留痕列已就位
+
+### 打通的这条路
+- [import_col2026.mjs](scratch/import_col2026.mjs)（原 import_species_checklist.mjs）——
+  去重键 `name_key` → **`name_code`**。这不是形式改动：12 万条里 1,373 组同键，
+  拿 name_key 去重会直接吞掉不同物种。
+- [name-authority.functions.ts](src/lib/name-authority.functions.ts) 改查 `species_names`，
+  并新增**一次必要的补查**：命中异名时正名常常不在第一批候选里 ——
+  **实测 34,962 条异名（占 48%）的正名在不同属**（属被拆并正是产生异名的主因），
+  按属捞根本捞不到。没这次补查，一半的异名查询会退回「标注不改名」。
+- 检索改成异名感知：搜到异名换成正名再去重（用户拿旧书上的名字来搜，正是最该接住的情形）。
+- [types.ts](src/integrations/supabase/types.ts) 手工补 `species_names`（托管库无本地 CLI）。
+
+### 验证证据（**打到线上库**，不是内存索引）
+[roundtrip_col2026.mjs](scratch/roundtrip_col2026.mjs) —— 走与服务端逐字同构的查询：
+```
+✅ 命中正名 + 命名人混在学名里   沙冬青（别名：蒙古黄花木；冬青；蒙古沙冬青）  2 候选 · 5354ms(冷)
+✅ 模型用了别的中文名 → 换正名   圆果水麦冬 → 海韭菜                        2 候选 · 715ms
+✅ 拉丁词尾性数错配 → fuzzy      Triglochin maritimum L. → maritima         2 候选 · 658ms
+✅ 异名→正名（跨属）             Dracocephalum stewartianum → Nepeta stewartiana 多花荆芥  123 候选 · 1107ms
+✅ 异名→正名（跨属+种下等级）     Parthenocissus henryana var. glaucescens → Yua thomsonii var. glaucescens  36 候选
+✅ 异名→正名（属被拆分）          Racomitrium fasciculare var. orientale → Dilutineuron fasciculare 丛枝藓  82 候选
+✅ 不在名录 → unmatched 一字不改  Adansonia notarealis                       1 候选 · 597ms
+✅ 只有中文名 → 补上学名科属      沙冬青                                     1 候选 · 475ms
+→ 8/8 通过
+```
+- 顺带验了 PostgREST 的类型往返：`common_names` text[] 回来是**真数组**，
+  `is_accepted` 是真布尔，`distribution_zh` 正常。
+- 单元测试 25 条全过；`tsc --noEmit` EXIT=0；`npm run build` 通过。
+- 修掉一处漏网的旧书名（unmatched 的 note 还写着「中国生物物种名录 2025」）。
+  新文案顺带说明：**名录已含 7.2 万条异名，所以「只是用了旧名」基本可排除** ——
+  走到 unmatched 多半是境外物种或识别有误。
+
+### ⏳ 下一步（前端，均未做）
+- 别名括号的页面渲染（留痕已落 `ai_payload._name_authority` / `plants.name_authority`）
+- 名录进「已收录档案检索」的 UI（`searchChecklistFn` 已就绪，plants.index.tsx 未接）
+- 编辑提交链路的核对提示（编辑器是浏览器直写，不该静默改人写的名字）
+- ⚠️ 代码改了但**站点尚未部署** —— 线上仍跑旧代码，还不会用这张表。
+
+## ✅ 2026-07-24（续二）— 前端三块 + **已部署上线**（Version 41569210）
+
+### 1. 别名括号的页面渲染
+新增 [name-authority-badge.tsx](src/components/name-authority-badge.tsx)：`readNameStamp()` +
+`<NameAuthorityNote>`。接到两处：[drafts.$id.tsx](src/routes/drafts.$id.tsx)（读
+`ai_payload._name_authority`，放在学名下方）、[plants.$slug.tsx](src/routes/plants.$slug.tsx)
+（读 `plants.name_authority`，放在正文 iframe **之前** —— 正文是上传的整页 HTML，
+插不进去，而「这名字被自动改过」必须在读正文之前就看到）。
+**只读不算**：核对是服务端在内容生成那一刻做完的，页面重算既拿不到名录也会每次渲染打库。
+四种状态各自配色/图标；**renamed / synonym 一定显示 `was` 原值** ——
+不显示原文等于把一次自动改写藏起来，fuzzy 那条路是会错的，藏起来就没人能发现。
+
+### 2. 名录进「已收录档案检索」
+新增 [checklist-results.tsx](src/components/checklist-results.tsx)，接在
+[plants.index.tsx](src/routes/plants.index.tsx) 本站结果**之后**（先站内、后名录）。
+两层意义：① 搜旧名也能中（服务端把异名折算到正名再去重）②`in_site` 标出
+「名录有、本站还没做」的空白 —— 那正是把国家名录接进检索页的全部意义：**它是选题清单**。
+未收录的排在前面。查询 ≥2 字才触发（单字命中几千条，既慢又没用）。
+
+### 3. 编辑提交链路的核对提示
+[plant-editor.tsx](src/components/plant-editor.tsx) 保存前跑 `checkNameFn`，
+不一致时弹窗给三个选择：返回修改 / 保持我写的直接保存 / 采用名录正名。
+**刻意只提示、不静默改写** —— 这条链路上的名字是编辑亲手敲的，不是模型生成的。
+AI 那两条链路可以自动对齐（模型本没有署名权），但把人写的名字在他不知情时换掉是另一回事：
+名录也会有他知道而我们不知道的例外。采纳正名时原名并入中文俗名，不丢信息。
+核对服务挂掉一律放行，绝不挡保存。
+
+### 验证证据（**线上实测**，非本地）
+- 部署：`wrangler deploy` Version ID `41569210-b95b-4155-9efb-d7bf60446622`，
+  触发器 plantspedia.club / www 均已更新。
+  ⚠️ 第一次部署报 `Completion token has already been consumed [code: 100312]`——
+  资产上传的重试把 token 用掉了，**重跑一次即成功**，不是代码问题。
+- **https://plantspedia.club/plants?q=Dracocephalum+stewartianum**（一个异名，
+  且正名跨属跨科）→ 返回「多花荆芥 Nepeta stewartiana 唇形科 · 四川、云南、西藏 · 待收录」。
+  这条走完了全链路：浏览器 → searchChecklistFn → Supabase 两次查询（trigram + 正名补查）
+  → 异名折算 → 去重 → 渲染。
+- 本地实测 `?q=沙冬青` → 名录命中 2 个：小沙冬青（待收录）/ 沙冬青（本站已收录），
+  分布「新疆」「内蒙古、宁夏、甘肃」正常。控制台零报错。
+- 顺带暴露一个**真实的站内命名不一致**：本站条目叫「蒙古沙冬青」，名录正名是「沙冬青」。
+  这正是这套机制要解决的问题，现在检索页上一眼可见。
+- `tsc --noEmit` EXIT=0；`npm run build` 通过；单元测试 25 条全过；往返验证 8/8。
+
+### 现在线上是什么状态
+名录 120,307 条已在库、代码已部署 → **正名核对对新产生的内容已经生效**：
+AI 识别 / 银叶草稿（buildDraftContent）、金叶详页（runGoldCore）、编辑提交（弹窗）。
+**存量内容不会被回溯改名**（没写回填脚本，也不该在没人看的情况下批量改历史条目）。
+
+## ✅ 2026-07-24（续三）— PDF 渲染真凶查明 + 注册入口拆分 + 标签统一（tsc/build EXIT=0；~~NOT deployed~~ → **实际已随 07-25 15:11 的 adf3316b 上线**（见文首「部署真相」））
+
+### 1. 🎉 PDF→图片：**Blocker 解除**，但真凶不是之前记的那个
+上一轮把它记成「dev 下 getDocument() 挂死，疑似主线程与 worker 加载了两份 pdfjs 实例」。
+本轮用一份手写的最小 PDF（public 下临时放一份，测完删）在浏览器里做了**无需登录**的
+实测，结论是：**那个判断是错的**。
+
+- `getDocument()` **根本没挂**。改成显式深路径 `import("pdfjs-dist/build/pdf.min.mjs")`
+  （与 worker 的 `pdf.worker.min.mjs?worker` 同一份构建产物，见
+  [src/pdfjs-dist.d.ts](src/pdfjs-dist.d.ts)）后，network 里两边都走
+  `/node_modules/pdfjs-dist/build/*`、没有 `.vite/deps` 副本，`getDocument` **124 ms**
+  返回 `numPages:2`。裸包名之所以可疑，是它按 `main` 解析到**未压缩的 pdf.mjs**，
+  与压缩版 worker 不是同一份产物。
+- **真正卡死的是 `page.render()`**，原因是**后台标签页里 `requestAnimationFrame` 不触发**。
+  pdfjs 的 InternalRenderTask 默认一帧画一块（源码 `useRequestAnimationFrame: !intentPrint`）,
+  于是 render().promise **既不 resolve 也不 reject**——无异常、无日志、无网络请求，
+  和「getDocument 挂死」的表象一模一样。上一轮之所以误判，是因为它俩长得完全一样。
+- **四组对照实验**（同一份 PDF，`document.visibilityState === "hidden"`）：
+
+  | 写法 | 结果 | `_useRequestAnimationFrame` |
+  |---|---|---|
+  | 默认 | ❌ 8s 超时未完成 | true |
+  | 设 `task.onContinue = c => c()` | ❌ 8s 超时未完成 | true |
+  | **`intent: "print"`** | ✅ **3 ms** | false |
+  | 手改私有 `_useRequestAnimationFrame` | ✅ 2 ms | false |
+
+  `onContinue` **没用** —— 它交回来的「继续」函数内部仍走 `_scheduleNext()` → rAF。
+  已采用 `intent: "print"`：这是唯一能翻掉那个 flag 的**公开 API**，语义上也正是
+  「这一页打印出来长什么样」。
+- 顺手修掉一个真 bug：**文件名与 MIME 不一致**。原来写死
+  `blob.type === "image/webp" ? "webp" : "jpg"`，而 `compressImage` 对 <200 KB 的图
+  **原样返回不转码** → PNG 内容被命名成 `page-001.jpg`。改用站内既有的 `extForMime()`。
+
+**实测证据**（浏览器，隐藏标签页，`npm run dev`）：
+```
+2 页 300×200 PDF  → 2195 ms · page-001.png/page-002.png · 名实相符 ✓
+1 页 A4 PDF       → 1297 ms · page-001.webp · image/webp · 282 KB（走到了压缩路径）✓
+PPT 拦截          → 抛「请先导出为 PDF」的说明性错误 ✓
+```
+A4 那页的成图已截图核对：45 行文字全部清晰、Helvetica 正常（未内嵌标准字体不影响）。
+
+- **PPT 仍然不做**，理由不变（浏览器渲染不了 PPTX；服务端要 LibreOffice，Workers 上没有）。
+- ⛔ 三个编辑器（project / blog / plant）仍**未做界面实测**——都在登录后面，不输入用户凭据。
+  转换本身已验证；剩下没验的只有「按钮点下去→插进正文」那一段接线。
+
+### 2. ✅ 登录页拆出「去注册」，不再逼所有人写编辑申请
+[login.tsx](src/routes/login.tsx) 原先唯一的注册入口挂在「申请成为编辑」上 ——
+只想评论 / 提交识别草稿的访客也得写一份 ≥20 字的简述、还要等审核。
+- [signup.tsx](src/routes/signup.tsx) 一个路由两种意图，靠 `?mode=` 分：
+  `mode=register` 普通注册（无简述）/ `mode=editor` 编辑申请（现状）。
+  **默认 editor**，因为站头和邮件里的 `/signup` 旧链接不带 mode，语义不能悄悄改。
+- **零数据库改动**：`handle_new_user()` 是看 `raw_user_meta_data->>'editor_application_bio'`
+  有没有值才建 editor_applications 行的，普通注册压根不发这个字段。
+- 登录失败且 `Invalid login credentials` 时额外弹一句提示。措辞是**两问**
+  （「还没注册过？还是密码记错了？」）—— Supabase 出于账号枚举防护，
+  邮箱不存在和密码错回的是同一句，服务端不肯说是哪种，不能断言用户不存在。
+- 已实测：`/login` 两个按钮并排；`/signup?mode=register` 无简述框；`/signup` 仍是编辑申请。
+
+### 3. ✅ 「手动添加 #tag 标签」黑底白字，两处统一
+- [tag-picker.tsx](src/components/tag-picker.tsx) 按钮 `bg-vermilion` → **`bg-ink text-background`**。
+- [plant-editor.tsx](src/components/plant-editor.tsx) 的「项目标签 #tag」原先是把全部标签
+  平铺成一墙 chip，与草稿页简介卡那个按钮**明明是同一件事却长得完全不同**。
+  换成同一个 TagPicker（`allowCreate`，编辑可就地新建）。
+  新增 `onTagsLoaded` 回调 + `tagIdByName` **ref**：TagPicker 对外说标签**名**，
+  plant-editor 存的是 **id**（保存要算增删差集）；就地新建时「刷新列表」和
+  「onChange 带上新名字」在同一个 tick，走 useState 会查不到新 id，ref 是同步写的。
+- **顺带把两套标签的界面命名分开**（这是用户问「这些标签到底有什么用」的根因）：
+  `plants.tags` / `plant_drafts.tags`（text[]，AI 自动填）栏位标题改成
+  **「特征词（逗号分隔 · 供搜索与卡签，不建专题）」**；`tags` 表 + `plant_tags` 关联
+  那一套改称 **「主题标签 #tag（决定这条详页出现在哪些专题页）」**。
+  以前两者都叫「标签」，谁也说不清区别。
+
+### 4. ✅ 标签管理页「+ 从已收录的条目中选择」加三个筛选
+[admin.tags.tsx](src/routes/_authenticated/admin.tags.tsx) 检索框右边：
+- **入侵 GRIIS 名单** —— 复用 `buildConservationMatcher` + `GRIIS_DEGREES`，与 /plants 的
+  GRIIS 筛选**同一套 matcher、同一份 registry 数据**，两边结果必然一致。
+  下拉只列库里真有的等级，另加「仅 GRIIS 名单内（任意等级）」。
+- **创建日期** —— `plants.created_at` 起止两端**含当天**（比的是 ISO 前 10 位，
+  直接拿整串比会把当天全排除）。
+- **识别地点** —— 条目表没有这个字段。新增
+  [`fetchPlantCapturePlaces()`](src/lib/drafts.ts)：`plant_drafts.published_plant_id`
+  → `capture_place`，分页拉全表、同条目取**最早**那条草稿（与详页页头口径一致）。
+  因为 capture_place 粒度极不统一（「鄂尔多斯市」到整条街道地址），做成
+  **子串匹配 + datalist 提示**，不是硬枚举下拉；另给一个「（无识别地点 / 非识别来源）」哨兵值。
+- 两张附表都 `enabled: pickerOpen` —— 只在选择器真展开时才拉。
+- 工具条显示「匹配 n / 总数 · 已选 m」和「清除筛选」。
+
+### 验证证据
+- `tsc --noEmit` EXIT=0；`npm run build` EXIT=0。
+- pdfjs 仍是**独立懒加载 chunk**（`pdf.min-*.js` 428 KB + `pdf.worker.min-*.js` 1.19 MB），
+  主包不受影响。
+- 浏览器实测：PDF 转换（见上表）、`/login`、`/signup` 两种 mode。
+- ⛔ 标签相关的三处 UI（admin.tags / plant-editor / 草稿页简介卡）**只过了 tsc+build，
+  未做界面实测** —— 全在登录后面。
+
+### 下一步
+- 部署（本轮所有改动均**未上线**）。
+- 三个编辑器插 PDF 的按钮接线做一次界面实测。
+- 站头那两个「申请成为编辑」是否也要拆出「注册」（本轮只改了登录页，用户只提了登录页）。
+
+## ✅ 2026-07-24 — 2026 名录回填：两条人工判定已上线 + 批量回填器（已部署 Version 524c1309）
+
+### 部署踩的坑（两次报错**原因不同**，别混为一谈）
+- 第一次 `token already consumed` = 连接断在**重试之间**（上传已消费掉 token 又重发）。
+- 第二次 `fetch failed` = 连接**根本没建起来**。日志铁证：第一个 GET 200 成功、第二个
+  查 secrets 的 GET 就挂 —— **连小请求都断**，所以不是「5MB 包太大被掐」，是链路抖动。
+- ✅ **解法 = 自动重试循环**（`/tmp/deploy_retry.sh`，失败等 10s 重来，最多 20 次）。
+  实测第 1 发就中。curl 探 api.cloudflare.com 返回 400 即代表**网络通**（裸请求本就该 400）。
+
+### 两条歧义条目已人工定夺并改完（含正文）
+- **蝎尾菊 → 猬菊** `Olgaea lomonossowii`（种加词少写一个 s，同一株植物）
+- **多枝岩黄芪 → 羊柴** `Corethrodendron fruticosum`（属被拆分后的新组合）
+  - 🔑 **歧义是被命名人解开的**：名录里 `Hedysarum fruticosum` 有两条异名 ——
+    `auct. non Pall.`→蒙古羊柴、`Pall.`→羊柴(原变种)。站内条目学名正是 `Pall.`，唯一确定。
+    机器当初判不了，只因它没拿命名人比对。**命名人是消歧的关键信息，别当噪音丢掉。**
+- 脚本 [rename_entries_2026.mjs](scratch/rename_entries_2026.mjs)，dry-run→apply，已实测回读验证。
+
+### 🔴 正文批量替换的四类改坏（全是真数据跑出来的，手写用例一个都想不到）
+写在 [backfill_stock_2026.mjs](scratch/backfill_stock_2026.mjs) 里，**改这类脚本前先读这段**：
+1. **调换被自己后面的规则撤销**：先把「A又名B」翻成「B又名A」，紧接着的通用替换
+   A→B 又把它改回去。→ 翻面后的旧名要用**哨兵包起来**，全部替换跑完再还原。
+   ⚠️ 哨兵**不能含旧名**（第一版用 `§§蝎尾菊§§`，通用替换照样伸进去改），
+   也不能用 `KO`/`KN` 这种正文里可能出现的字母（会被错还原成物种名）。
+2. **子串碰撞**：慈姑 ⊂ 野慈姑 → 正文里本就正确的「野慈姑」被改成「野野慈姑」。
+   → 旧名是新名子串时，先把已有的新名保护起来。
+3. **镜像写法**：我只处理了「新名（旧名）」，真数据里大量是「旧名（新名）」
+   （狭叶柴胡（红柴胡））和「新名，又名旧名」（拉拉藤，又名猪殃殃）。两个方向都要覆盖。
+4. **🔴 近似种对比自指**（最阴险，没叠字没括号，前三类检测器全抓不到）：
+   原文在拿旧名和新名当**两个不同分类单元**比较 ——「部分分类处理将猪殃殃视为拉拉藤的亚种」
+   改完变成「将拉拉藤视为拉拉藤的亚种」。辽东栎→蒙古栎、中间荸荠→沼泽荸荠、慈姑→野慈姑
+   都是这种。**这种页面不能机器改，整页跳过交人工。**
+   - 检测器的松紧要分开：`视为/归入/混淆/近缘` 等强连接词可以隔一段话；
+     `与/和` 太常见（"形态与生境"里就有），必须要求两名**紧挨着**，否则误报。
+
+### 另外两条方法论（本轮吃了亏）
+- **检测器必须比对替换前后**，只报**新增**的问题。正文里本来就有的叠字（实测「锦葵锦葵」
+  写在 alt 属性里）不是这次改出来的，拿它拦下一次正当回填毫无道理。
+- **探针脚本的 catch 不许静默返回 []** —— 「没数据」和「没连上」会分不清。本轮就因此
+  误报过「该正名没有异名」和「按学名查不到」，还据此给了错误解释（真因是列名写错
+  `accepted_name`，实际是 `accepted_code`，400 被吞了）。
+
+### 回填盘子
+| 类别 | 条数 | 处理 |
+|---|---:|---|
+| 🔴 异名→正名 + 🟠 名称/科名不一致 + ➕人工定夺 4 条 | **69** | 自动改（含正文） |
+| ⏭️ 近似种对比自指，机器不能改 | **5** | 整页跳过，待人工/AI 重写正文 |
+| ⏸️ 柽柳 | 1 | **用户尚未定夺**，明确不动 |
+| ✅ 与名录一致 | 154 | 不动 |
+
+### ⏳ 待办
+- 上面 69 条的 `--apply`（dry-run 已干净）。
+- 5 页近似种对比的正文重写（建议走金叶重生成，而不是手改）。
+- 柽柳的人工定夺。
+- **用户报的新 bug 未查**：识别出疑似时提示「二次自动复核：未运行（模型限流/超时/未配置）」，
+  但后台自检显示读图 ✅、连通 ✅、可见 229 个模型。→ 复核那条链路的失败原因文案与
+  真实状态对不上，要查 `secondOpinionIdentify` 的静默 null 分支。
+- 前端三块（#tag 按钮改造、+标签#tag 补回并支持按科属/地点/各名录筛选、
+  项目/博客 PDF/PPT 转图片防下载）—— **本轮未开始**。
+
+## ✅ 2026-07-24（续）— 存量回填已 APPLY + 复核 bug 已修（待部署复核修复）
+
+### 回填结果（已写入线上库）
+- **69 条**存量条目按 2026 名录改完（字段 + Storage 正文），+ 猬菊/羊柴 2 条 = 库里 71 条 2026 留痕。
+- **5 页**近似种对比自指整页跳过（猪殃殃/辽东栎/中间荸荠/慈姑/茶条枫）—— 待金叶重生成正文。
+- **柽柳** 待用户定夺（正名 Tamarix chinensis，但名录分布不含内蒙古）。
+- 重试循环踩到「apply 跨两次」：第一遍改 38 条断网，第二遍重跑，已改的判 accepted 跳过，
+  补完剩 31 条 → 合计 69。**幂等，重跑安全**（这正是 dry-run/apply 都从名录现判、不靠外部状态的好处）。
+- 实测受保护片段生效：热亚海芋页「海芋属」保留 3 处、0 处误改；碱韭页「多根葱」归零。
+
+### 🔴 复核「未运行」的真凶（用户报的 bug，已修，**待部署**）
+用户看到「二次自动复核：未运行（模型限流/超时/未配置）」，但后台自检显示 ✅ 读图 ✅ 连通 229 模型。
+- **两个问题叠加**：
+  ① **配置**：二次复核控制台只配了 `qwen3.8-max-preview`，它 07-24 视觉自检被判 `blind`。
+     用户看到的 ✅ 是**另一个控制台**（xiaop_model_config 的 kimi，07-23 pass）的；
+     「可见 229 模型」只证明 Key 连得通，**不代表该模型读图**。
+  ② **代码 bug**（[identify-plant.functions.ts](src/lib/identify-plant.functions.ts) `withSecondOpinionSlots`）：
+     blind 过滤被兜底架空 —— 剔除 blind 项后 `seeing` 为空，就回退 `loadSecondOpinionConfig()`，
+     而它读的正是**同一控制台的 sequence[0]**（刚被剔除的瞎模型），照样打一遍、必然失败，
+     且因 slots 非空，「全部不读图」的说明不会报出 → 用户只看到语焉不详的「复核未能完成」。
+  - **修**：配了序列但全 blind → 直接 `[]`（不再兜底回同一个瞎模型），并报明是哪个模型、去哪换。
+- ⏳ **待部署**：这个修复 + 上一轮的 schema-instruction 修复都在 dist 里没上线。
+- ⏳ **用户侧**：去二次复核控制台换一个能读图的视觉模型，点「视觉自检」验证。
+
+### 前端三块 —— 刚开始摸排
+- 简介卡重复 `#tag` **不在** buildSummaryCardHtml（那里只有 registryChipsHtml，是要保留的）。
+  真正的 `#盐生植物…` 在 [drafts.$id.tsx](src/routes/drafts.$id.tsx) 约 1100 行（`draft.tags` 平铺）。
+- 待做：①简介卡 #tag → 彩色「手动添加#tag标签」下拉按钮（只选已有标签）
+  ②编辑页补回「+标签#tag」按钮 + 按科属/地点/各名录筛选加条目
+  ③项目/博客 PDF/PPT 转压缩图片、右键只能存图。
+
+## ✅ 2026-07-24（续四）— 二次复核超时真凶 + 手动 tag 置顶绿框 + 十星打分（tsc/build EXIT=0；~~NOT deployed~~ → **实际已随 07-25 15:11 的 adf3316b 上线**（见文首「部署真相」））
+
+用户线上实测报告：`二次自动复核：未运行 —— qwen3.7-plus 超过 30 秒未返回`，
+「换了好几个模型，而且自检三条链路通过了，但仍然是二次复核没有运行」。
+
+### 1. 🔴 复核超时 —— 症结是「自检根本测不出真复核要多久」
+**这和 07-24 上午那个 `response_format` 的坑是同一类错误**：拿一个**不具代表性的探针**
+去证明真实链路可用。
+- 视觉自检发的是 **846 字节四色小图 + 只要四个词的回答**（约 2 秒）；
+- 真复核发的是**整张实拍照片 + 最多 4 张补拍照 + 要一段 150–260 字导语**；
+- 而复核链路配的多半是**推理模型**（qwen3 / glm / deepseek 的 thinking 版），
+  默认先写一大段思维链才作答 —— 40 秒以上是常态。
+
+自检回答的是「key 能用吗、模型看得见图吗」，**从来不回答「它够不够快」**。全绿是真的，
+复核超时也是真的，两者不矛盾 —— 但界面上只写了「超过 30 秒未返回」，读起来像自相矛盾。
+
+**五处改动**（[identify-plant.functions.ts](src/lib/identify-plant.functions.ts)、
+[ai-key-pool.ts](src/lib/ai-key-pool.ts)、[vision-probe.ts](src/lib/vision-probe.ts)）：
+1. **关思考，厂商无关**。新增 `THINKING_OFF` = `{enable_thinking:false,
+   reasoning_effort:"low", thinking:{type:"disabled"}}`（Qwen / OpenAI / GLM 三种写法一起发）。
+   同时把这三个键加进 `TUNABLE_PARAMS` —— 于是既有的「**从 400 报错里认出是哪个参数惹的祸、
+   摘掉重试**」机制自动罩住它们，不用维护「哪家支持哪个参数」的表。复核与顶替定种两条路都加。
+2. **改流式**。复核从 `postOpenAICompat` 换成 `postOpenAICompatStream`。中转在上游没吐完
+   之前一个字节都不回，整段生成时间全砸在「等第一个字节」上；开流后 token 边生成边回。
+   中转不支持流式会回 599（该函数既有约定），**退回非流式再打一次**，不白判失败。
+3. **总预算取代每项 30 秒**。原来每项固定 30 秒 × N 项 —— 配 3 项最坏 90 秒，而 phase-1 是
+   **前台 HTTP 请求**，Cloudflare 边缘 100 秒就掐，等于把整次识别一起赔进去。
+   现在 `SECOND_OPINION_TOTAL_BUDGET_MS = 45s` 跨全部序列项共享，单项封顶 28s，
+   剩余不足 8s 就不再起新的一项，并**如实告诉用户还剩几项没试**。
+4. **缩输入缩输出**。补拍照 4 张 → 2 张（图片是最重的输入，第 3、4 张对结论的边际贡献
+   远不抵它对超时的贡献）；`max_tokens` 3000 → 1200（这张卡最长字段就是 260 字导语；
+   这个上限同时是**思维链的天花板**，调小 = 给「想太久」封顶）。
+5. **报真话**。超时文案改成点破自检局限的一整段：写明实际等了多少秒、说明自检为什么
+   测不出这个、并给出可执行的下一步（换非推理 / turbo / non-thinking 版本，慢的排后面）。
+   另外 `probeSlotVisionFn` 现在**量自检本身的耗时**并写进检测说明
+   （新增 `speedNote()`）：≥12 秒直接判「真复核几乎必然超时」，≥5 秒警告偏慢，
+   即使很快也明说「快不等于复核不会超时」。
+
+⛔ **没验的部分**：改动全在服务端识别链路上，需要真实 API key + 登录才跑得起来，
+**本地没有实测**。只过了 tsc / build。上线后请看服务端日志里的
+`[SecondOpinion] … 复核完成，耗时 N ms`（新加的）来确认。
+
+### 2. ✅ 手动挂的 #tag 排第一 + 绿框
+- [conservation.ts](src/lib/conservation.ts) 新增 chip 类型 **`tag_manual`**，与 `tag` 分开：
+  `tag` = AI 自动填的**特征词**（只进搜索和卡签）；`tag_manual` = 人在「手动添加 #tag 标签」
+  里挑的、**`tags` 表里真实存在**的主题标签（决定进哪个专题页）。
+  两者都躺在同一个 `tags` text[] 里，光看数组分不出来 —— 靠**名字在不在 tags 表里**判定。
+- **排在全部 chip 最前**（在重点保护、CITES 之前）。理由：这排卡签里其余各项都是
+  「按学名自动匹配名录」的机器判断，只有它是一次明确的**人的判断**。
+- **绿框**：网页 `border-2 border-leaf-deep bg-leaf-deep/10` + 半粗字；
+  分享卡（canvas）同色 + 描边 `lineWidth` 2→4（卡上没有 hover 和链接，只剩颜色和线宽能表达）。
+- **slug 从库里带走，不用 slugifyTag 现算** —— slug 是建标签那一刻存进库的，规则日后一改
+  现算就全 404。`RegistryChip.slug` 由 `useRegistryChips` 从 `tags` 表填。
+- 🔴 顺带修掉一个**真实存在但一直没人碰到的断链**：原来 tag chip 的链接写
+  `params={{ slug: c.label }}` —— 拿**标签名**当 slug。中文标签的 slug 是
+  `slugifyTag()` 编码过的十六进制串，两者根本不相等，点进去必然 404。
+  现在 `tag_manual` 用库里的真 slug；`tag`（特征词）维持原状（那条路本来就只对纯 ASCII 有效）。
+- 🔴 还修掉一个**数据来源不一致**：主题标签在草稿和已发布条目上**存的地方不一样** ——
+  草稿写 `plant_drafts.tags`，而编辑器写的是 **`plant_tags` 关联表**（`plants.tags` 里只有特征词）。
+  `useRegistryChips` 新增 `plantId` 参数：给了才会把关联表里挂的主题标签算进来，
+  [plants.$slug.tsx](src/routes/plants.$slug.tsx) 已传。不改的话，编辑在详页编辑器里挂的标签
+  **一个都不会出现在卡签里**。
+- [drafts.$id.tsx](src/routes/drafts.$id.tsx)：把 `tagDraftLocal` 乐观状态**提到
+  `useRegistryChips` 之前**，卡签读 `draftTags` 而不是 `draft.tags` —— 否则刚挂上的标签
+  要等一次 refetch 才出现在卡签里，用户点完看不到反应会以为没存上。
+
+### 3. ✅ 十星置信度打分
+- [identify-trace.ts](src/lib/identify-trace.ts) 新增纯函数 `confidenceStars(pct)` →
+  1–10（`CONFIDENCE_STARS_TOTAL = 10`，每颗 10%）。
+  用 **ceil 不用 round**：`computeIdentifyConfidence` 下限是 5%，四舍五入会得到 0 颗星，
+  而「0 颗星」看起来等于「没识别出来」，与「识别出来了但把握很低」不是一回事。
+  满星只可能来自 100%，而该函数永不返回 100 —— 满星是刻意留白的。
+- **草稿页**：新增 [confidence-stars.tsx](src/components/confidence-stars.tsx)，
+  渲染在「识别过程 · 综合可信度 x%」正下方。星形用**内联 SVG** 画，不用 ★ 字符 ——
+  那个字符各系统字体的字面大小/基线差得远，十颗排一行会歪。空心星也画出轮廓，
+  不然用户数不出满分是多少。
+- **分享卡**：`ShareCardData.confidencePct` → 照片**右上角**一枚半透明深色圆角徽标，
+  内容「置信度：x 颗星」+ 十颗星（`drawStar` 手算五角星路径，同样为了跨端一致）。
+  画在照片**上面**是刻意的：分享卡多半被截图转发，看到的人只扫一眼图，
+  把握程度必须和照片同框，否则一张「疑似」卡会被当成确诊结果传出去。
+  已发布详页的分享卡不传这个字段 → 整枚徽标不画。
+
+### 验证证据
+- `tsc --noEmit` EXIT=0；`npm run build` EXIT=0。
+- 浏览器实测（无需登录，直接 import 模块跑）：
+  - 星级取整：`0%→0★ 5%→1★ 10%→1★ 45%→5★ 50%→5★ 51%→6★ 90%→9★ 99%→10★`
+  - chip 排序：`tag_manual:北方湿地(beifang-shidi)` → `protected:国家二级保护` →
+    `griis:入侵物种` → `catalog:鄂尔多斯` → `tag:盐生植物` → `tag:多年生草本` ✓
+    （手动的排第一并带上了库里的真 slug，AI 特征词沉到最后）
+  - 真渲染了一张 1080×1920 分享卡并截图核对：徽标稳稳压在照片右上角，
+    5 颗琥珀实心 + 5 颗白描边空心，深色底衬在浅色照片上清晰可读。
+- ⛔ **复核链路本身没有实测**（需真实 key + 登录）；标签相关的三处 UI 也仍未做界面实测。
+
+### 下一步
+- 部署（07-24 续三、续四两批改动均**未上线**）。
+- 上线后看 `[SecondOpinion]` 日志确认复核是否真的跑完了，以及耗时多少。
+
+## ✅ 2026-07-25 — 二次复核超时真凶 + 手动标签置顶绿框 + 10星打分（tsc/build EXIT=0；已浏览器实测；~~NOT deployed~~ → **实际已随 07-25 15:11 的 adf3316b 上线**（见文首「部署真相」））
+
+用户报（线上）：识别「Pentanema britannica」综合可信度 45%，二次复核显示
+「未运行 —— qwen3.7-plus 超过 30 秒未返回」，且换了几个模型、自检三条链路全过，
+复核照样不运行。另提三项新需求：手动加的 tag 要排第一 + 绿框；置信度除百分比外加 10 星打分。
+
+### 1. 🔴 二次复核超时 —— 根因是「推理模型 + 非流式 + 每项 30s」三者叠加
+不是 bug，是**配置注定超时**。qwen3.7-plus / glm-thinking 这类推理模型默认先写一大段
+思维链再作答，加上复核发的是整张实拍照 + 要 150–260 字导语，40 秒起步。而 phase-1 是
+前台 HTTP 请求，Cloudflare 边缘 100 秒就掐 —— 每项 30s × 多个序列项直接把整次识别赔进去。
+- **总预算跨序列项**：`SECOND_OPINION_TOTAL_BUDGET_MS=45s`，见底就停、不再起注定超时的新项，
+  如实报「预算已用完，还剩 N 项未试」。（原来是每项固定 30s，最坏 90s。）
+- **改流式** `postOpenAICompatStream`：复核多走第三方聚合中转，中转**上游没吐完前一个字节都不回**，
+  整段时间全砸在等首字节 —— 这正是「换几个模型都不行」的直接原因。流式后 token 边生成边回，
+  同样的模型常能在预算内跑完。中转不支持流式会回 599 → 自动退回非流式重试一次。
+- **厂商无关地关思考**：新增 [ai-key-pool.ts](src/lib/ai-key-pool.ts) 的 `THINKING_OFF`
+  （`enable_thinking:false` / `reasoning_effort:"low"` / `thinking:{type:"disabled"}` 三写法一起发），
+  并把这三个键加进 `TUNABLE_PARAMS` —— 不认的那个被 400 拒收时，既有的「从报错里认出参数、
+  去掉重试」机制会自动摘掉。既不用维护「哪家支持哪个」的表，也不会多发一个键把请求打死。
+- **缩输入**：补拍照 4→2 张（图是最重的输入）；`max_tokens` 3000→1200（给推理模型思维链封顶）。
+- **报真实原因**：超时信息带**实测耗时**，并点破「后台自检全绿 ≠ 真复核能跑完」——
+  自检发 846 字节小图 + 只要四个词的回答（约 2 秒），真复核是整张实拍照 + 一段导语，
+  两者根本不是一个量级。**这就是用户最费解那一点的答案**。视觉自检结果里也追加了本次自检
+  耗时（[vision-probe.ts](src/lib/vision-probe.ts) `speedNote`）：连自检都慢的模型跑复核必超预算。
+- ⚠️ **改完复核更可能"跑完"，但不保证一定"确诊"**——它照样可能诚实地维持疑似。用户如果
+  仍看到「未运行」，控制台该换的是**非推理的视觉模型**（或该模型的 non-thinking / turbo 版），
+  失败信息现在会明说这一点。
+
+### 2. ✅ 手动加的主题标签：排第一 + 绿框
+- [conservation.ts](src/lib/conservation.ts) 新增 chip 种类 `tag_manual`，与 `tag` 分开：
+  `tag` = `plants.tags` 里 AI 填的**特征词**；`tag_manual` = 名字命中 `tags` 表的**主题标签**
+  （人在「手动添加 #tag 标签」里挑的）。`registryChips` 把 `tag_manual` **排在全部 chip 最前**
+  （它是这排里唯一一次「人的判断」，其余全是按学名自动匹配名录的机器判断）。
+  slug 从库里带过来、不现算（现算规则一改老链接全 404）。
+- 区分两者靠新增的 `knownTags`（名字→slug 映射）。[use-registry-chips.ts](src/lib/use-registry-chips.ts)
+  拉 `tags` 表 + `plant_tags` 关联表传进去。**草稿**的主题标签在 `plant_drafts.tags`（与特征词
+  同数组，靠是否命中 tags 表分开）；**已发布条目**在 `plant_tags` 关联表，所以详情页额外传
+  `plantId`，否则手动挂的标签一个都不显示。
+- 绿框：[registry-chips.tsx](src/components/registry-chips.tsx) `tag_manual` =
+  `border-2 border-leaf-deep bg-leaf-deep/10 text-leaf-deep font-semibold`
+  （粗全实边框，与 protected 的 `border-leaf-deep/50` 细半透明边区分开）；
+  分享卡 [share-card.ts](src/lib/share-card.ts) `chipColors` 里 `bold:true` → 描边 4px。
+  永远可点进专题页（slug 是库里真值）。
+
+### 3. ✅ 10 星置信度打分
+- [identify-trace.ts](src/lib/identify-trace.ts) 新增纯函数 `confidenceStars(pct)=0..10`
+  （`ceil(pct/10)`，保证任何有效结果≥1 星；满星只可能来自 100%，而算法上限 99% → 刻意留白）。
+- 草稿页：「识别过程 · 综合可信度 x%」下面渲染
+  [confidence-stars.tsx](src/components/confidence-stars.tsx)（10 颗 SVG 星，黄实/灰空 + 「置信度：x 颗星」）。
+- 分享卡：照片**右上角**画「置信度：x 颗星」+ 10 星徽标（半透明深底衬托，浅色天空也看得见）。
+  手画五角星路径，不用 `★` 字符（各系统字面大小/基线差太多，十颗排一行会歪）。两处共用
+  `confidenceStars()` 取整，同一次识别页面与卡上星数必然一致。
+  ⚠️ 卡签**不传**给识别分享卡（替用户断言物种身份），但置信度星**必传** —— 它标的恰恰是
+  「这结论有多不确定」，越疑似越该带上。
+
+### 验证证据（浏览器实测，无需登录）
+- `confidenceStars`：0→0 / 5→1 / 11→2 / 19→2 / 45→**5** / 99→10 / 100→10。
+  用户报的那次（gemini low=45、Pl@ntNet 19% 不计入）→ 45% → **5 星**。
+- `registryChips` 排序：主题标签「北方湿地」(tag_manual, 带 slug) **第一**，
+  然后 protected/cites/griis/catalog，AI 特征词「盐生植物」(tag) **最后**。
+- **真渲染一张分享卡**并截图核对：照片右上角「置信度：5 颗星」5 金 5 空；chip 行
+  北方湿地(粗绿框)→国家二级保护(细绿)→CITES 附录II(紫)→盐生植物(灰)。
+- `tsc --noEmit` EXIT=0；`npm run build` EXIT=0；vision-probe 单测 26 条全过。
+- ⛔ 二次复核的超时修复**只能靠线上真识别验证**（要模型调用 + 登录 + 真照片），本地无法实测；
+  代码路径已 tsc/build 通过，逻辑见上。
+
+### 下一步
+- 部署（本轮全部未上线）。
+- 上线后用一次真识别验证二次复核能在预算内跑完；若仍超时，按失败信息在控制台换非推理视觉模型。
+
+## ✅ 2026-07-25（续）— 草稿页三修 + PDF 插入真凶查明（tsc/build EXIT=0；已浏览器实测；~~NOT deployed~~ → **实际已随 07-25 15:11 的 adf3316b 上线**（见文首「部署真相」））
+
+用户报四件：①植物人文没放在 section i ②配图宽度没和拍摄记录配图框对齐 ③进一步介绍草稿页
+「莫名其妙的空挡」还在 ④项目/博客页 PDF/PPTX 转图片的显示还是 bug。**先问清了两处意图**：
+①用户要「植物人文换位置」→ 追问后拍板**放最前成 Section I**；④用户描述具体现象＝
+「插入文件按钮非常难选择到 + 选了 pdf/ppt 后预览里没展示」。
+
+### 1. ✅ 植物人文 → Section I（[plant-html-template.ts](src/lib/plant-html-template.ts)）
+新顺序：**I 植物人文 · II 形态特征 · III 生境与分布 · IV 名称和分类趣闻 · V 生长条件**。
+- 🔑 **只改罗马数字与 DOM 先后，`sec_img_N`↔内容的绑定保持不变**（人文=sec_img_4、
+  形态=sec_img_2、生境=sec_img_3）—— 这是 [photo-slots.ts](src/lib/photo-slots.ts) `DRAFT_SLOTS`
+  的口径，动了它「花/果配到人文栏、叶配到形态栏」的器官分配就全乱。
+- draft-enhance 的「点击替换」按 DOM 序（querySelectorAll）读写 slot 下标，viewer 与
+  replaceImageInDraftHtml 两边同序，reorder 后仍一致，不破。
+- ⚠️ **副作用（已告知用户，未改）**：人文槽只收 flower/fruit/specimen，公开图最少，
+  所以 Section I 现在**经常是空槽**（「暂无花果公开照片」）。用户此次只选了「换位置」，
+  没选「给人文栏兜底配图」，故未动 photo-slots 的诚实空槽设计。若要让首栏别老空，
+  下一步可给人文槽加 plant/habitat 兜底（仍保留「真没有才空」）。
+
+### 2. ✅ 配图框对齐拍摄记录（同文件 CSS）
+`.sec-img` 的裱边从薄的 `0 0 0 3px/4px`（且无投影）改成与 hero `.img-slot` **完全同一套**：
+`0 0 0 5px paper, 0 0 0 6px rule-soft, 0 14px 30px -12px rgba(30,16,8,.26)`。
+`.sec-figure` 宽 280→320。浏览器实测 `getComputedStyle(...).boxShadow` 两者**逐字节相等**。
+
+### 3. ✅ 「莫名其妙的空挡」＝ `.section-with-img{align-items:center}`
+center 把配图/「暂无」虚线框吊在正文垂直中央，正文一长，图上下各裂一片空白。
+改 **`align-items:start`**（顶对齐），图跟正文首行齐平，短的一侧只在下方留白＝正常。
+渲染实测：5 个分区高度归一（有图区 249px），无浮空缝隙。
+
+### 4. 🎯 PDF/PPTX 显示：**建了临时路由 `/pdftest` 全链路实测——PDF 管线本身没 bug**
+- 用 reportlab 造了张 3 页真 PDF，在**真 Vite/BlockNote 环境**里跑
+  `docToImages → appendImages → onChange 序列化 → .prose-project 显示`：
+  **3 页全部渲染成 image/png(93–98KB)、序列化 HTML 有 3 个 `<img>`、编辑器与显示 div 都
+  正常出图（893×1263，complete=true），控制台零报错。** 测完已删路由与测试 PDF。
+- 先前怀疑的两条都被实测推翻：① BlockNote `onChange` **确实**会在程序化 `insertBlocks`
+  上触发（源码：绑在 tiptap `update` 事件，`onChange(e,t=!0)` 默认不过滤）→ 图会进 HTML；
+  ② `.prose-project` 能正常渲染 BlockNote 全量 HTML 的 `.bn-visual-media` 图。
+- **真因＝用户根本没能把图插进去**：ⓐ「插入文件按钮非常难选择到」——按钮原来是
+  `text-xs` 细边框、和一长串说明挤在 `flex-wrap` 同一行，窄屏难点中；ⓑ `accept` 只收 `.pdf`，
+  用户想插 PPT 时文件在选择框里被灰掉、**根本选不中**（＝「很难选择到文件」的另一半），
+  而 PPT 本就该走「先导出 PDF」，却连选中拿到那句提示的机会都没有。
+- **✅ 改法**（[project-editor.tsx](src/components/project-editor.tsx) +
+  [blog-editor.tsx](src/components/blog-editor.tsx)）：按钮放大成 `border-2 + text-sm + font-semibold`、
+  说明挪到按钮**下方单独成行**；`accept` 放开到 pdf+ppt+pptx+odp，选中 PPT 后
+  `docToImages` 给出「请先导出为 PDF」的明确 toast。
+- ⚠️ **诚实边界**：我只能证明 happy path 通。若用户手上**某个具体 PDF** 仍不显示，
+  那是文件级问题（加密/扫描件/异常字体），需要用户把那份 PDF 发来复现——非本轮能覆盖。
+
+### 验证证据
+- `tsc --noEmit` EXIT=0；`npm run build` EXIT=0；pdfjs 仍是独立懒加载 chunk（428KB+1.19MB），
+  主包不受影响；`dist/` 里无 pdftest 残留。
+- 草稿模板：浏览器实测顺序 = I 植物人文…V 生长条件；框 boxShadow 与 hero 逐字节相等；
+  align=start、分区高度归一。
+- PDF：`/pdftest` 端到端实测（见上），三处计数 imgcount=3 / displayImgs=3 / editorImgs=3。
+
+### 下一步
+- 部署（本轮四项改动**均未上线**）。
+- 上线后请用户复测：①草稿页植物人文在最前、配图框与拍摄记录同款、无空挡；
+  ②项目/博客编辑器「插入 PDF/幻灯片」按钮好点了、PDF 能逐页出图。
+- 若某具体 PDF 仍不显示 → 要用户提供该文件。
+- （可选）给人文图槽加 plant/habitat 兜底，避免 Section I 常空。
+
+## ✅ 2026-07-25（续二）— 人文配图兜底 + 草稿三档区分 + 分享卡 og:*（tsc/build EXIT=0；已实测；~~NOT deployed~~ → **实际已随 07-25 15:11 的 adf3316b 上线**（见文首「部署真相」））
+
+用户三项新需求：①植物人文配图用**植株/插画**兜底、**生境图不在此兜底**；②待审草稿列表把
+**银叶草稿 / 金叶skill / 快速识别简介**三档区分开；③点分享链接不要固定「Plantspedia·全民植物志 /
+由社区共同编纂…」，要**植物照片做缩略图 + 标题「Plantspedia草木志·植物名」+ 简介用该植物 summary**。
+
+### 1. ✅ 人文图槽兜底（[photo-slots.ts](src/lib/photo-slots.ts)）
+`DRAFT_SLOTS` 植物人文 `want`：`["flower","fruit","specimen"]` → **`["flower","fruit","specimen","plant"]`**。
+- 加 `plant`（植株）、保留 `specimen`（插画/标本），**刻意不加 habitat** —— 生境图有自己的
+  「生境与分布」栏，挪来人文既跑题、又会把那栏抽空（用户明确要求）。missingNote 改「暂无该物种的公开配图」。
+- assignSlots 两轮制保证不抢：人文 want[0]=flower，round-1 不碰 plant；只有 round-2 且还有富余
+  plant 时才兜底，名称/生长两个 want[0]=plant 的槽照旧优先。`scratch/photo-slots.test.mjs` **14 条全过**。
+
+### 2. ✅ 草稿三档判据修正（[draft-card.tsx](src/components/draft-card.tsx) `draftTier`）
+老 bug：银叶判据是「html_content 非空」，可**快速识别也会把简介摘要卡写进 html_content**，
+于是所有快速草稿被错标成「银叶草稿」，三档在列表里根本分不开（STATE 2026-07-21 早记过这坑）。
+- 改判据：银叶 = **`ai_payload._enriched === true`**；金叶 = `published_plant_id` 非空；其余 = 快速识别简介。
+  老草稿无 `_enriched` 字段时，才回落到「html_content > 4000 字符 ≈ 整页正文」的长度启发式。
+- 标签统一成用户用词：**银叶草稿 / 金叶详页 / 快速识别简介**。逻辑替身测试 **6/6 过**
+  （quick/silver/gold/老银叶/老快速/无payload 全部判对）。
+- ⚠️ **数据事实（已告知用户）**：金叶 skill 是**一键直接落库到 `plants`**（source=gold_oneclick，
+  status 立即 published），**不进待审 `plant_drafts` 队列**。所以「待审草稿列表」里实际只会出现
+  银叶+快速两档；金叶那档只在已收录视图/未来若把金叶改走审核时才出现。若用户要金叶也过审，
+  是另一处流程改动，本轮没做。
+
+### 3. ✅ 分享卡 og:*（[plants.$slug.tsx](src/routes/plants.$slug.tsx) + [drafts.$id.tsx](src/routes/drafts.$id.tsx)）
+根因：plants.$slug 的 `head()` 只写了 `title`/`description`/`og:image`，**没写 `og:title`/`og:description`**，
+于是这两个**继承 [__root.tsx](src/routes/__root.tsx) 的站点默认**（"Plantspedia·全民植物志 / 由社区共同编纂…"）——
+微信/Twitter 抓的正是 og:*，所以分享出去永远是那句固定文案。
+- plants.$slug `head()` 重写：显式写全 `og:title`/`og:description`/`og:image`/`twitter:*`；
+  **标题=`Plantspedia草木志·{中文名}`**、描述=该植物 `summary`（截 180）、缩略图=`cover_url`。
+- drafts.$id **原来根本没有 loader/head**（分享草稿链接=站点默认）。新增 `loader`（匿名 client 走 SSR，
+  `try/catch` 读不到就回 null、不阻塞）+ 同款 `head()`（缩略图用草稿 `photo_url`）；loader 结果顺手
+  当 useQuery 的 `initialData`，省一次首屏抓取。plant_drafts RLS 是 `GRANT SELECT TO anon` +
+  `FOR SELECT USING(true)`，匿名 SSR 读得到 → 草稿分享卡同样生效。
+- **SSR 实测**（`curl` 原始 HTML）：`/plants/pentanema-britannica…`（旋覆花）→
+  `<title>` 与 `og:title` = `Plantspedia草木志·旋覆花`、`og:description` = 旋覆花真实 summary、
+  `og:image` = 该条目 Supabase 照片绝对 URL、`twitter:card=summary_large_image`。
+  草稿路由用不存在 id 实测 HTTP 200、优雅回落默认标题、不 500。
+
+### 验证证据
+- `tsc --noEmit` EXIT=0；`npm run build` EXIT=0。
+- photo-slots 单测 14/14；draftTier 逻辑替身 6/6；plants.$slug og:* SSR 原始 HTML 实测通过。
+
+### 下一步
+- 部署（续、续二两批共 7 处改动**均未上线**）。
+- 上线后复测微信/Twitter 分享一条已收录条目 → 应显示植物照片 + 「Plantspedia草木志·名称」+ 简介。
+- 若要金叶 skill 产物也进「待审」队列并在列表里显示金叶档，需单独改金叶落库流程（本轮未做）。
+
+## 🔧 2026-07-26 — 卡签配色分名录 + 底部只留手动标签 + 项目页分享/编辑 + 补拍多图（四项全完成）
+
+用户四项需求**全部完成**：`tsc --noEmit` EXIT=0，四项都在 dev（:5203，连生产 Supabase）
+实测过。**均未部署。**
+
+### 1. ✅ 卡签一名录一色系（4 个渲染孪生体必须同改）
+用户要求：手动标签加粗描边（保留）但底色要与其它区分；GRIIS 入侵=橙、国家保护名录=粉、
+内蒙古/地区保护名录=黄、CITES=紫（原样）、GTS=蓝、自动特征词=无底色（原样）。
+- [conservation.ts](src/lib/conservation.ts)：`RegistryChipKind` 把 `protected` **拆成**
+  `protected_national` / `protected_regional`；`registryChips()` 按 `list.province === "国家"` 分派。
+  province 为空按地区处理（国家名录一定带「国家」，缺省更可能是地方名录漏填）。
+- 三处渲染端同步：[registry-chips.tsx](src/components/registry-chips.tsx) TONE（网页 CSS）、
+  [share-card.ts](src/lib/share-card.ts) `chipColors()` + PALETTES 加 protNat/protReg/gtsBlue/griisOrange
+  （light+dark 各一套）、[identify-plant.functions.ts](src/lib/identify-plant.functions.ts)
+  `registryChipsHtml()` TONE（服务端简介卡，旧 `protected` 键保留兜底）。
+- ⚠️ 坑：这四处是**同一排卡签的四个实现**，漏一个就会出现「网页粉、分享卡绿」的不一致。
+- **手动标签「一标签一绿」**（用户原话：不同的绿色系对应不同的手动添加标签）：
+  conservation.ts 加 `manualTagTone(name)`（djb2 哈希 % 4）+ `RegistryChip.tone`，
+  `registryChips()` 建 tag_manual chip 时算好带出去。三个渲染端各存同一组色号：
+  墨绿 #2d6a4f / 青绿 #17726b / 苔绿 #5b7c2a / 松绿 #3f8f5a（分享卡深色主题另有提亮版）。
+  纯哈希 → 三处不查库也永远同色；撞色无害（绿号只做视觉区分，身份靠 slug+文字）。
+  ⚠️ registry-chips.tsx 的类名**必须写成完整静态字符串**，拼接的 `bg-[${x}]` Tailwind 扫不到。
+- 实测（dev + 生产数据）：肉苁蓉 → 国家二级=粉 / 内蒙古省级=黄 / CITES 附录II=紫 三色分明；
+  红豆草黄芪 → `圣水草原的植被` 苔绿 2px 描边 + 12% 底色 + 600 字重，其余 8 个特征词
+  1px 边、`rgba(0,0,0,0)` 无底色。
+
+### 2. ✅ 底部 #tag 只留手动添加的标签（[drafts.$id.tsx](src/routes/drafts.$id.tsx)）
+`draft.tags` 里混着 AI 特征词与手动主题标签，底部 TagPicker 原先把**两拨都**铺成可删的 #标签。
+- 加 `manualDraftTags` / `autoDraftTags`（按名字在不在 `tags` 表里切分，复用 `["all-tags"]` 缓存
+  —— useRegistryChips 已在拉，不额外发请求）；TagPicker 只吃 manual 那拨。
+- `saveManualDraftTags()` 写库时把 autoDraftTags **原样并回去**，特征词一个都不能丢
+  （它们还要喂顶部卡签行和搜索）。顶部卡签行行为不变（两拨都显示，特征词无底色）。
+
+### 3. ✅ 项目页分享/编辑按钮（[projects.$id.tsx](src/routes/projects.$id.tsx)）
+镜像博客页：`canEdit = user.id === project.author_id` → 自己的项目显示「编辑」（→
+`/admin/projects/edit/$id`）+ ShareButton；别人的只有 ShareButton。
+
+### 3 实测：匿名访客看别人的项目 → 只有「分享」，无「编辑」。（登录态那一支没验，无凭据。）
+
+### 4. ✅ 补拍最多 3 张同时识别
+**关键发现：识别管线本来就支持多图** —— `priorInline: InlineImage[]` 一路喂给 Pl@ntNet 后的
+一线模型与二次复核模型（`secondOpinionIdentify` 刻意 `slice(0,2)` prior + 当前 1 张 = 3 张上限，
+注释写明「每多一张都同时推高上传耗时与首字延迟」）。用户要的「一次 3 张」正好落在这个既有
+上限内，**不必改模型侧**，只需让补拍能一次带 2 张额外新图进来。三处上限必须同为 3：
+`MAX_RETAKE_PHOTOS`（客户端）、`SubmitInput.extra_photos.max(2)`、模型侧 slice(0,2)。
+
+服务端 [identify-plant.functions.ts](src/lib/identify-plant.functions.ts)：
+- `SubmitInput` 加 `extra_photos`（≤2 张 `{base64,mime}`）。
+- 额外照与主图**并行上传**，但**失败不致命**：主图传不上=没封面必须报错，角度照传失败只是
+  少一个视角（模型吃的是内存字节、根本不经过存储）→ 只有传成功的 URL 才进 `allPhotos`，
+  免得草稿相册里出现裂图。
+- 额外照转 InlineImage **插在 priorInline 最前面**：下游一律 slice 取前几张，这一轮刚拍的
+  比几轮前的旧照更该被看见。
+- `plantNetIdentify()` 加第三参 `extraDataUrls`：Pl@ntNet 官方支持一次多图综合打分，是它自家
+  的提准手段。⚠️ `images` 与 `organs` 必须**成对**追加，少一个 organs 整个请求 400。
+
+客户端 [camera-identify.tsx](src/components/camera-identify.tsx)：
+- **删掉补拍的自动提交**（原来一选完就识别）——一次能带 3 张时自动提交会把用户锁死在第 1 张。
+  现在停在预览页，由「AI识别」一次性提交。
+- 补拍时相册 input 开 `multiple`：一次选 3 张 = 主图 + 2 张角度照，不用点三轮。
+- 预览下方新增角度照面板：主图 + 可删角度照缩略图、「再拍一张 / 从相册加一张」（到 3 张后
+  自动隐藏）、张数计数。`addExtraFromCamera/Album` **不重置也不重新请求定位**（坐标属于这一
+  株植物，主图那次已取好，再走一遍只会把好不容易拿到的坐标清空）。
+- 角度照 blob: URL 在卸载时 revoke —— 识别成功是 SPA 跳转、document 不销毁，不显式回收
+  每补拍一轮泄漏几 MB。
+
+**实测**（dev :5203，用 canvas 造图注入 file input）：
+- 相册一次选 3 张 → 「本次将同时识别 3 张照片」、2 个可删缩略图、加号按钮消失；选第 4 张被
+  上限挡下并提示；× 删除后计数回退、按钮复现。
+- 拦截 fetch 抓到真实请求体：`extra_photos` = 1 项 `{base64: 6584 chars, mime: image/jpeg}`，
+  同时带 `retake_count:1` / `species_hint_title:绶草` / `species_hint_sci:Spiranthes sinensis`
+  （**故意拦下没真发**，不烧一次识别额度）。
+
+### ⚠️ 排查笔记：自动化浏览器里 toast 永不消失 ≠ bug
+测试时看到「正在优化图片…」等 loading toast 一直堆着，一度以为是 `toast.dismiss` 失效。
+实测：`document.hidden === true`、`hasFocus === false`（Browser pane 的页面跑在隐藏态），
+连 `duration:800` 的普通 toast 也不消失 —— 是浏览器对隐藏页的定时器节流，不是应用问题。
+**别为这个"修" sonner。** 另：`querySelectorAll('[data-sonner-toast]').remove()` 会把 React
+管的节点抽走，下次渲染直接 `insertBefore` 崩页——要藏就注入 CSS，别删节点。
+
+### 下一步
+- 部署（本轮四项 + 上面两批共 11 处改动**全部未上线**）。
+- 上线后建议实测一次真补拍（一次传 3 张）：看 Pl@ntNet 是否接受多图（不接受会 400，
+  链路会静默退回单图 hint —— 日志里搜 `[Pl@ntNet] HTTP 400`）。
+
+## ✅ 2026-07-26 — 识别两个真 bug：假失败（Load failed 但后台已成功）+ 模型闲聊污染字段
+（tsc/build EXIT=0；81 条单测全过；识别页浏览器实测无回归；**NOT deployed**）
+
+用户报两件：①识别中切出浏览器再回来必显示「识别失败（网络未连通）…等待了约 101 秒」，
+**但重点一次就弹「这张照片已经识别过」——后台其实早就成功了，报错是假的**；
+②疑似状态下补拍，出现「疑似长刚毛草（疑似）。地点：…。状态：已完成识别与撰写。返回：JSON
+格式数据。…祝您生活愉快！再见！。注：以上内容为模拟回复…。再见！。祝好！」这类模型元话语 + 复读。
+
+⚠️ **协作提示**：排查期间发现**另一个会话正在并发编辑** `camera-identify.tsx`(09:48) /
+`identify-plant.functions.ts`(09:56) / `STATE.md`(10:02)（它在加「一次识别最多 3 张照片」
+`MAX_RETAKE_PHOTOS`/`extra_photos`）。已暂停并请用户关掉那个会话后才动这两个文件，
+**未覆盖它的改动**（本轮改动是在它 1143/9587 行的版本之上做的）。
+
+### 根因（都已用代码坐实）
+1. **假失败**：`quickIdentifyDraft` 是**同步 server fn**，Pl@ntNet + 二次复核 + 出卡 + 写库
+   全挂在一个 HTTP 请求上（**不走**现成的后台队列，那套只服务 enrich/gold）。识别是个
+   **有副作用的写操作**：撞上 Cloudflare 边缘 ~100 秒上限时连接被掐，但服务端照样跑完并
+   `insert` 了草稿（`_photo_sha256` 也在同一条 insert 里）。而客户端 catch 里**一行确认代码都没有**，
+   直接把「响应没回来」判成「事情没做成」。
+2. **闲聊污染**：污染的字段是 **`title` 不是 summary**（那段脏文本与 `draftTitleFor` 的输出
+   逐字吻合：`疑似` + `长刚毛草（疑似）。地点…`）。两处缺陷叠加：
+   - `TENTATIVE_RE` 是 `^` 锚定的**只剥前缀**，模型把「（疑似）」写在名字**后面**时剥不掉，
+     前面再加一个就成了「疑似X（疑似）」；
+   - 原来的 `.slice(0, 200)` 让 137 字的整段闲聊大摇大摆走过去落进 DB。
+   - ⚠️ **`cleanJson` 不是本次根因** —— 闲聊在 JSON **内部**，parse 是成功的。
+     （它在非 Gemini 链路上是另一个隐患，本轮没动。）
+   - 嫌疑源头：`secondOpinionIdentify` 是 phase-1 里唯一**不发 `response_format`** 的调用
+     （:1377 注释写明是刻意的，怕第三方中转 400），叠加 `temperature: 0` 贪心解码 ——
+     正是复读循环的标准配方。但出卡链路虽有 `responseSchema`，**照样能把闲聊塞进 string 字段**，
+     所以代码层面**分不出是哪个模型**，要看线上日志。
+
+### 1. ✅ 疑似标记 + 物种名闸门（[tentative.ts](src/lib/tentative.ts)）
+- `TENTATIVE_SUFFIX_RE` + `stripTentativeMarks()`：剥名字**两端**的疑似标记（可重复）。
+  ⚠️ 只能用于**名称字段** —— 正文「目前只能算疑似」结尾那个是正常表达，剥了会把话说反，
+  所以 summary 一律仍走 `stripTentativePrefix`。
+- `sanitizeSpeciesName()`：**一个物种名里不可能有句末标点** → 在第一个 `。！？；：` 处截断，
+  60 字封顶。这比「猜像不像闲聊」的启发式可靠 —— 它不猜模型想说什么，只认「名字不长这样」。
+- `META_NOISE` 词表（要求**完全等于**）：截断后只剩「状态」「祝好」这类词判为无效名、返回 `""`，
+  好让 `draftTitleFor` 的 `||` 真正退回 `scientific_name`。没这步会在库里留下一个叫「状态」的植物。
+- `isTentative` 认第三种表达（标在名字上）。
+- ⚠️ **有意的行为变更**（改了一条既有测试的期望）：模型写 `confidence=high` 却把名字写成
+  「疑似X」时，现在**倒向存疑**（旧行为是剥掉疑似、信 high）。依据是 `normalizeIdentification`
+  早已确立的「任一处露出疑似 → 全部疑似」+ 项目反复强调的「错误定种比暂不定种更糟」。
+  代价：补拍更容易被激活（保守方向）。**已告知用户，可一行改回。**
+
+### 2. ✅ 字段级闲聊消毒（新增 [model-chatter.ts](src/lib/model-chatter.ts)）
+- `stripModelChatter()`：① 元话语标记处截断 ② 复读检测（同一 ≤40 字句子出现 ≥3 次 →
+  从第 2 次处切）。词表**刻意极短且都足够刺眼**（「以上内容为模拟回复」这种），
+  「结果 / 说明 / 状态」等日常词**故意不收** —— 「结果表明该种耐旱」是完全正常的句子。
+  误伤一段正常导语比漏掉一次闲聊更糟（前者天天发生）。
+- 接进 `normalizeIdentification`（唯一规范化入口，出卡+复核两条链路都过它），
+  **必须在疑似前缀逻辑之前**跑，否则「疑似」会被加在闲聊前面。
+- 非疑似分支补了兜底文案，避免消毒后留一张白卡。
+
+### 3. ✅ 断线自愈（[camera-identify.tsx](src/components/camera-identify.tsx) + [explain-error.ts](src/lib/explain-error.ts)）
+- catch 里：网络层失败且有照片指纹 → 浮层改「正在确认结果」→ 按 **0/3/8/15 秒退避回查
+  `findDraftByPhotoHash` 4 次**（约 26 秒）→ 命中就当成功走完。
+  **为什么要退避重查**：连接被掐那一刻服务端多半还在收尾，只查一次会扑空 = 把成功误判成失败。
+- 抽出 `goToDraft()` 给正常路径和自愈路径共用，免得自愈少做一步（如忘了清 React Query 缓存）。
+- **补拍现在也算 hash**（原来 `if (retakeCtx) return void runIdentify(null)` 直接传 null，
+  自愈在补拍路径上是死的 —— 而补拍恰恰最容易断）。
+- `explain-error.ts`：导出 `NETWORK_MSG` / `isNetworkError()` 供复用（不复制正则）；
+  文案从**断言「失败」**改成「未收到结果」；新增 `serverStateChecked` 三态 ——
+  已查证没有→「可以放心重试」；没查证→「先别急着重试，去『我的草稿』看一眼」。
+  这条排在所有网络原因**之前**（它决定用户下一步该不该重试，比「为什么断的」更要紧）。
+- 错误横幅标题三档：`识别失败` / `识别未完成（已确认库里没有结果）` / `未收到结果（可能已完成）`。
+
+### 验证证据
+- `tsc --noEmit` EXIT=0；`npm run build` EXIT=0。
+- 单测 **81 条全过**：`scratch/tentative.test.mjs` 36（含用户报的整段原文直接喂进去）、
+  `scratch/model-chatter.test.mjs` 21、`scratch/explain-error.test.mjs` 17、
+  `scratch/recover-decision.test.mjs` 7（catch 分支判定表替身，防三元写反）。
+- 浏览器实测 `/identify` 正常渲染、控制台零错误（无回归）。
+- ⛔ **自愈主路径本地无法实测** —— 要真手机 + 真照片 + 真模型调用才能造出「服务端写了库但
+  客户端没收到」。只能上线后验。
+
+### 下一步
+- 部署（本轮 3 处 + 之前 11 处改动**全部未上线**）。
+- 上线后复测：①切后台造一次断线 → 应显示「正在确认结果」而不是「识别失败」，
+  且能自动跳到草稿；②观察是否还出现闲聊污染的 title。
+- **已知未修（本轮刻意不做，避免一次上太多）**：补拍合并时 `ai_payload` 是**整体替换**，
+  重建时不读旧值 → 原草稿第一次识别的 `_photo_sha256` **会被抹掉**，一株植物只要补拍过一次，
+  首图查重就永久失效。建议改存 `_photo_sha256_all` 数组 + 查询用 `.or()` 同时匹配两处。
+  （注：本轮让补拍也传 hash 后，合并草稿至少会保住**最新那张**的指纹，比原来只多不少。）
+- **可选的更划算方案（修 6′）**：把**二次复核**踢进后台队列。它独占 45 秒预算，是撞 100 秒
+  上限的主要来源。让 phase-1 拿到「疑似」就先出卡返回，复核完成后回写草稿、由草稿页轮询刷新。
+  比「把整个 phase-1 搬上队列」（要拆 600 行 handler、照片不能进 payload）划算得多。
+
+---
+
+## 🆕 2026-07-26 草稿页五修（简介卡 / 空槽说明 / 编辑采纳按钮 / 小P蛙范围）
+
+用户一条反馈里的五件事，全部落地。tsc=0、build=0、lint=0，**未部署**。
+
+### 1. ✅ 换上配图后仍显示「暂无该物种的…公开照片」（本轮真 bug）
+- **根因**：缺器官照片时模板给该槽位留 `<img class="sec-img" data-missing-organ hidden src="">`
+  + 一行 `<p class="img-missing">暂无该物种的植株公开照片</p>`。而 **`hidden` 在这里是无效的** ——
+  `.sec-img{display:block}` 是作者样式，压得住 UA 的 `[hidden]{display:none}`；真正让空槽不显示的是
+  `img.sec-img[src=""]{display:none}`。编辑器右键换图时是通过 `figure` 找到那个隐藏 img 的
+  （html-doc-editor 的 onCtx 会 `closest("figure")?.querySelector("img")`），**只改了 src**，
+  于是图立刻显示、说明还在 → 图旁边写着「没有图」。
+- **修**：[draft-enhance.ts](src/lib/draft-enhance.ts) 新增
+  - `stripStaleMissingNotes(html)`：纯字符串（服务端 Workers 没有 DOM 也能用），逐个 `<figure>`
+    看「img 有非空 src」→ 摘掉 `p.img-missing` 与 `hidden/data-missing-organ`。
+  - `clearMissingOrganMarkers(img)`：DOM 版，换图那一刻用。
+  接入 5 处：`replaceImageInDraftHtml`（点击替换）、html-doc-editor 的 `replaceActiveSrc`（右键换图）、
+  `enhanceDraftHtmlForViewing`（**视图兜底：库里已经存坏的老草稿现在就不显示了**）、
+  drafts.$id 的 `handleHtmlSaved`（保存即写干净）、`approvePlantDraft` 发布前（否则会带到正式条目页）。
+- 验证：`scratch`/scratchpad 里 5 条用例全过（含真实模板 markup、src 带 `$1` 的替换陷阱、
+  空槽必须保留说明、混合页只清有图的那个）。
+
+### 2. ✅ 银叶草稿的简介卡去掉「疑似」+ 去掉补拍框
+- 新增 `showTentativeOnCard = draftTentative && notEnriched`：卡上的「疑似」前缀与那个琥珀色
+  补拍框**只在快速识别简介那一档**出现。理由：银叶草稿是用户花银叶让 AI 通读资料写出的成篇内容，
+  读完一整篇笃定的科普再抬头看见「其实我不确定这是什么」，是自己拆自己的台；纠错的正确时机是
+  正文下面那个「草稿内容和我的观察不符」。
+- 标题两条分支都先 `stripTentativeMarks(draft.title)` —— 库里存的 title **本身**常带「疑似」
+  （`draftTitleFor` 写的），不剥就白改。
+- **`draftTentative` 本身没动**：分享卡、铜叶计数、补拍关卡仍按真实置信度走。
+
+### 3. ✅ 正文下新增编辑专属绿框「草稿内容符合我的观察」
+- 位置：紧跟「草稿内容和我的观察不符」（同一 section，读完正文之后才看得见的位置）。
+- 仅 `isEditor` 可见；点击 = `onAdoptApprove()`（采纳标记 → 识别人该枚铜叶 ×2 → 审核通过并收录），
+  与顶部「采纳识别」同一条服务端路径。已收录时换成「已采纳并收录为条目」的静态绿章。
+
+### 4. ✅ 小P蛙「讨论范围」纳入简介卡，且真能改它
+- `pageSections` 第一项恒为 `DRAFT_CARD_SCOPE`（"快速识别简介卡"）。以前的范围列表只扫
+  html_content 里的小标题，而**简介卡不在 html_content 里**（是 plant_drafts 的列），
+  所以「卡上学名/摘要写错了」这类最常见的问题以前根本没法交给小P蛙。
+- 新增 [draft-card-fields.ts](src/lib/draft-card-fields.ts)（零依赖，客户端/服务端共用）：
+  scope 常量 + 7 个字段（title / scientific_name / common_names_zh / common_name_en /
+  family / genus / summary）+ 标签 / 快照文本 / 逐字段 diff。
+- `askDraftAgentFn`：**始终**附一份卡面快照；scope=简介卡时喂用户自己拍的照片（卡上显示的就是它们）。
+- `applyDraftAgentEditFn`：scope=简介卡走**另一条路** —— 结构化 JSON 出 7 个字段、只接受字符串值、
+  漏字段用原值补齐、名称过 `sanitizeSpeciesName` 形状闸门、写 `plant_drafts` 列并返回 `{card:{changes}}`
+  （**不返回 html**）。客户端据此只补一条修改记录 + 刷新，不走 saveDraftHtml。
+- 修改记录不带 before/after 快照 → `EditLogSection.canRevert` 自然不给「撤销」按钮
+  （撤销是按 before_html 还原 html_content 的，对字段改动会张冠李戴）。
+
+### 5. ✅ 编辑可手改简介卡（DraftCardEditor）
+- 卡右上角「编辑简介卡内容」（`canEditCard = 编辑 or 管理员`，与标签同权），展开 7 个字段的表单，
+  直接 `supabase.from("plant_drafts").update()` + 记一条修改记录。
+- 提示语点明「中文名里若还留着『疑似』，直接删掉即可」——这是把 #2 的显示层处理变成**永久**修正的地方。
+
+### ⚠️ 已知遗留（本轮刻意不做）
+- **快速识别简介的 html_content 副本不同步**：卡的 7 个字段是列，而 `notEnriched` 草稿的
+  html_content 里另存了一份 `buildSummaryCardHtml` 生成的卡 HTML。改字段不会改它；如果编辑
+  **不生成银叶正文就直接收录**一份快速草稿，发布出去的正文仍是旧文字（plants 行的
+  title/summary 取的是列，所以只有正文这一处旧）。重生成需要 chips/trace/photos 全套重跑，
+  且会抹掉编辑手改过的卡 HTML —— 风险大于收益，故留给用户决定。
+- **`!anyMarked` 导致所有配图都画红虚线**：viewer script 里 `isDefault = 有 data-default-img ||
+  文档里没有任何 data-default-img`。老草稿/全部换过图的草稿会满页红虚线 +「可点击替换」提示。
+  本轮未动（不是用户所报问题，且它是老草稿的兜底）。
+
+### 验证证据
+- `tsc --noEmit` EXIT=0；`npm run build` EXIT=0；`npm run lint` EXIT=0。
+- `stripStaleMissingNotes` 5 条用例全过（scratch/missing-notes.test.ts）。
+- 浏览器：dev 起在 5203，`/drafts/<不存在的 id>` 正常渲染「草稿不存在或已被删除」、控制台零错误
+  （证明新模块图在浏览器里解析正常）。
+- ⛔ **编辑态 UI 本地未能实测**：绿框按钮 / 简介卡编辑器 / 小P蛙简介卡改写都要**编辑账号登录**
+  （站内已无 mock 登录），且草稿列表对匿名用户不可见。请登录后在真草稿页上复看这四处。
+
+### 下一步
+- 用编辑账号在一份银叶草稿上复看：① 配图下不再有「暂无…照片」；② 卡上无「疑似」、无补拍框；
+  ③ 正文下有绿框按钮、点了进已收录；④ 小P蛙范围里有「快速识别简介卡」，让它改学名/摘要后卡上真变。
+- 之后部署（本轮 + 之前多轮改动仍**未上线**）。

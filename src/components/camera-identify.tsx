@@ -3,7 +3,9 @@ import { useServerFn } from "@tanstack/react-start";
 import { useNavigate } from "@tanstack/react-router";
 import { useQueryClient } from "@tanstack/react-query";
 import { quickIdentifyDraft } from "@/lib/identify-plant.functions";
+import { findDraftByPhotoHash } from "@/lib/species-existing.functions";
 import { keepVisualAdvice } from "@/lib/retake-advice";
+import { explainError, isNetworkError } from "@/lib/explain-error";
 import { useAuth } from "@/hooks/use-auth";
 import { toast } from "sonner";
 
@@ -29,6 +31,11 @@ export type RetakeContext = {
   mergeDraftId?: string;
   pick?: boolean;
 };
+
+/** 补拍一次最多带几张照片。3 = 主图 + 2 张额外角度照，和服务端 `extra_photos` 的 max(2)、
+ *  以及模型侧一直以来的「prior.slice(0,2) + 当前 1 张」上限是同一个数——三处必须一致，
+ *  改这里就要同时改 SubmitInput.extra_photos 的 .max()。 */
+const MAX_RETAKE_PHOTOS = 3;
 
 // Ordinal label for the retake counter. 3 is the last allowed retake (server forces
 // a final result at count ≥ 3), so it reads「最后一次补拍」.
@@ -58,9 +65,21 @@ export function CameraIdentify({ retake: retakeCtx = null }: { retake?: RetakeCo
   // Last identify failure, kept on screen (a toast vanishes before the user can read
   // the cause). Server errors already carry「原因 + 怎么办」in their message.
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  // 断线自愈期间盖在加载浮层上的说明。非空 = 请求已经断了，正在回查服务端有没有其实做成。
+  // 这段时间**绝不能**显示「识别失败」——那正是要修的误报。
+  const [recoverNote, setRecoverNote] = useState<string | null>(null);
+  // 错误横幅的标题该怎么写。断言「失败」的门槛很高：只有服务端明确拒绝，或回查确认过
+  // 库里确实没有，才算真失败；连接断了又没查证过，只能说「状态未知」。
+  const [errorKind, setErrorKind] = useState<"failed" | "no-result" | "unknown">("failed");
   const cameraInputRef = useRef<HTMLInputElement | null>(null);
   const albumInputRef = useRef<HTMLInputElement | null>(null);
   const capturedBlobRef = useRef<Blob | null>(null);
+  // 补拍专用：同一株植物的**额外角度照**（最多 2 张），和主图在同一次请求里一起识别。
+  // 只在补拍模式下收集——首次识别时用户还没被告知该拍哪儿，多要照片只是白加负担。
+  const [extraShots, setExtraShots] = useState<{ blob: Blob; url: string }[]>([]);
+  // 下一次文件选择是要「加一张额外角度照」还是「换掉主图」。原生 input 的 change 事件里
+  // 分不出是哪个按钮打开的，所以在点击时先记下来。
+  const addingExtraRef = useRef(false);
   // Mirror of `coords` for reads inside async callbacks (avoids stale closures)
   // — ingestImage must not wipe coords already obtained at shutter-tap time.
   const coordsRef = useRef<{ lat: number; lng: number } | null>(null);
@@ -71,6 +90,11 @@ export function CameraIdentify({ retake: retakeCtx = null }: { retake?: RetakeCo
   const navigate = useNavigate();
   const qc = useQueryClient();
   const submit = useServerFn(quickIdentifyDraft);
+  const findDuplicate = useServerFn(findDraftByPhotoHash);
+  // 非空 = 这张照片以前识别过，弹「去看看 / 再识别一次」确认框。
+  const [dupHit, setDupHit] = useState<{ draftId: string; title: string | null; hash: string } | null>(
+    null,
+  );
   // The user's ORIGINAL (uncompressed) file — kept so "保存原图到相册" saves the good
   // copy. A web-camera capture is NOT auto-saved to the iPhone album, so this button
   // is the user's escape hatch to keep the shot (re-identify later from good signal).
@@ -85,6 +109,19 @@ export function CameraIdentify({ retake: retakeCtx = null }: { retake?: RetakeCo
       if (previewUrl) URL.revokeObjectURL(previewUrl);
     };
   }, [previewUrl]);
+
+  // 角度照的 blob: URL 在离开本组件时回收。识别成功后是 SPA 路由跳走、document 不销毁，
+  // 浏览器不会自动释放这些 URL —— 不显式 revoke 就等于每补拍一轮泄漏几 MB。
+  const extraShotsRef = useRef<{ blob: Blob; url: string }[]>([]);
+  useEffect(() => {
+    extraShotsRef.current = extraShots;
+  }, [extraShots]);
+  useEffect(
+    () => () => {
+      extraShotsRef.current.forEach((s) => URL.revokeObjectURL(s.url));
+    },
+    [],
+  );
 
   // Progressive loader steps animation
   useEffect(() => {
@@ -222,16 +259,9 @@ export function CameraIdentify({ retake: retakeCtx = null }: { retake?: RetakeCo
   // 由用户点，是这里唯一的进入方式。（RetakeContext.pick 因此不再影响行为，保留只为兼容
   // 已发出去的 /identify?pick=1 链接。）
 
-  // Retake mode: once a shot is captured, go straight into identification (no manual
-  // "AI识别" tap). Reset on each retake so every re-shot auto-identifies.
-  const autoSubmitRef = useRef(false);
-  useEffect(() => {
-    if (retakeMode && phase === "captured" && !autoSubmitRef.current && capturedBlobRef.current) {
-      autoSubmitRef.current = true;
-      void onSubmit();
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [phase, retakeMode]);
+  // 补拍**不再**一选完就自动识别：现在一次最多能带 3 张，自动提交会把用户锁死在第 1 张，
+  // 根本没机会补上另外两个角度（这正是补拍最需要的东西）。改成选完停在预览页，由用户按
+  // 「AI识别」决定什么时候连同已加的角度照一起发。
 
   // Shared pipeline: compress the image, generate a preview, and move to the "captured"
   // review state. Geolocation strategy depends on the source:
@@ -306,10 +336,59 @@ export function CameraIdentify({ retake: retakeCtx = null }: { retake?: RetakeCo
     toast.dismiss(toastId);
   };
 
+  /** 额外角度照：只压缩 + 存进内存，**不碰定位**。位置属于「这一株植物」，主图那次已经定好了，
+   *  再让每张角度照去改一遍 coords，只会把好不容易拿到的坐标覆盖成空。 */
+  const ingestExtras = async (files: File[]) => {
+    const room = MAX_RETAKE_PHOTOS - 1 - extraShots.length;
+    if (room <= 0) {
+      toast.info(`一次最多识别 ${MAX_RETAKE_PHOTOS} 张照片`);
+      return;
+    }
+    const picked = files.filter((f) => f.type.startsWith("image/")).slice(0, room);
+    if (!picked.length) {
+      toast.error("请选择图片文件");
+      return;
+    }
+    const toastId = toast.loading("正在优化图片...");
+    const { compressImage } = await import("@/lib/image-compress");
+    const added: { blob: Blob; url: string }[] = [];
+    for (const f of picked) {
+      let blob: Blob = f;
+      try {
+        // 同样强制 JPEG：这几张会一起发给 Pl@ntNet，而它只收 JPEG/PNG。
+        blob = await compressImage(f, 1200, 1200, 0.75, "image/jpeg");
+      } catch {
+        /* 压缩失败就用原文件，识别照常 */
+      }
+      added.push({ blob, url: URL.createObjectURL(blob) });
+    }
+    setExtraShots((prev) => [...prev, ...added].slice(0, MAX_RETAKE_PHOTOS - 1));
+    toast.dismiss(toastId);
+    if (files.length > picked.length)
+      toast.info(`已加入 ${picked.length} 张，一次最多识别 ${MAX_RETAKE_PHOTOS} 张`);
+  };
+
+  const removeExtra = (idx: number) => {
+    setExtraShots((prev) => {
+      const target = prev[idx];
+      if (target) URL.revokeObjectURL(target.url);
+      return prev.filter((_, i) => i !== idx);
+    });
+  };
+
   const onUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    void ingestImage(file, { tryExif: true });
+    const files = Array.from(e.target.files ?? []);
+    if (!files.length) return;
+    const asExtra = addingExtraRef.current;
+    addingExtraRef.current = false;
+    if (asExtra) {
+      void ingestExtras(files);
+      return;
+    }
+    void ingestImage(files[0], { tryExif: true });
+    // 补拍时相册允许一次多选：第 1 张当主图，其余的直接补成额外角度照——用户手里本来就有
+    // 好几个角度时，这样一次就选完了，不必「选一张 → 加一张 → 再加一张」点三轮。
+    if (retakeMode && files.length > 1) void ingestExtras(files.slice(1));
   };
 
   // Open the phone's NATIVE camera app (full focus/zoom/flash, real-framing viewfinder)
@@ -336,6 +415,23 @@ export function CameraIdentify({ retake: retakeCtx = null }: { retake?: RetakeCo
     albumInputRef.current?.click();
   };
 
+  // 加一张额外角度照。和 openCamera/openAlbum 的关键差别：**不重置也不重新请求定位** ——
+  // 坐标属于这一株植物，主图那一次已经取好了。
+  const addExtraFromCamera = () => {
+    addingExtraRef.current = true;
+    if (cameraInputRef.current) {
+      cameraInputRef.current.value = "";
+      cameraInputRef.current.click();
+    }
+  };
+  const addExtraFromAlbum = () => {
+    addingExtraRef.current = true;
+    if (albumInputRef.current) {
+      albumInputRef.current.value = "";
+      albumInputRef.current.click();
+    }
+  };
+
   const retake = () => {
     if (previewUrl) URL.revokeObjectURL(previewUrl);
     setPreviewUrl(null);
@@ -347,7 +443,12 @@ export function CameraIdentify({ retake: retakeCtx = null }: { retake?: RetakeCo
     setGeoRequested(false);
     setGeoStatus("idle");
     setPhase("idle");
-    autoSubmitRef.current = false; // allow the next retake shot to auto-identify
+    // 主图都撤了，额外角度照留着没有意义（它们只在有主图的那次请求里一起发出去）。
+    setExtraShots((prev) => {
+      prev.forEach((s) => URL.revokeObjectURL(s.url));
+      return [];
+    });
+    addingExtraRef.current = false;
     // Reset inputs
     if (cameraInputRef.current) cameraInputRef.current.value = "";
     if (albumInputRef.current) albumInputRef.current.value = "";
@@ -386,7 +487,44 @@ export function CameraIdentify({ retake: retakeCtx = null }: { retake?: RetakeCo
     }
   };
 
+  /** 原始文件字节的 SHA-256（十六进制）。压缩前算 —— 压缩是有损再编码，不保证跨次比特一致，
+   *  而同一个文件重新选一次，原始字节必然一模一样。 */
+  const hashOriginalFile = async (): Promise<string | null> => {
+    try {
+      const f = originalFileRef.current;
+      if (!f || !crypto?.subtle) return null;
+      const buf = await f.arrayBuffer();
+      const digest = await crypto.subtle.digest("SHA-256", buf);
+      return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+    } catch {
+      return null; // 查重是锦上添花，算不出来就当没有
+    }
+  };
+
+  /** 点「识别」的入口：先查这张照片是不是识别过。补拍不查 —— 补拍本来就是同一株植物再拍，
+   *  而且要合并回原草稿，弹「已识别过」纯属添乱。 */
   const onSubmit = async () => {
+    if (!capturedBlobRef.current) return;
+    // 补拍**照样算 hash**，只是跳过「已识别过」弹窗（补拍本来就是同一株再拍，弹窗纯属添乱）。
+    // 以前这里直接传 null，导致断线自愈在补拍路径上完全失效 —— 而补拍恰恰是最容易断的一环
+    // （照片更多、还要多带上历轮照片一起送模型）。
+    if (retakeCtx) return void runIdentify(await hashOriginalFile());
+    const hash = await hashOriginalFile();
+    if (hash) {
+      try {
+        const hit = await findDuplicate({ data: { hash } });
+        if (hit) {
+          setDupHit({ ...hit, hash });
+          return; // 交给弹窗决定：跳过去看，还是再识别一次
+        }
+      } catch {
+        /* 查重失败不挡识别 */
+      }
+    }
+    void runIdentify(hash);
+  };
+
+  const runIdentify = async (photoSha256: string | null) => {
     const blob = capturedBlobRef.current;
     if (!blob) return;
 
@@ -407,12 +545,23 @@ export function CameraIdentify({ retake: retakeCtx = null }: { retake?: RetakeCo
 
     setPhase("submitting");
     setErrorMsg(null);
+    // 失败时用来判断「秒断（断网/切网）」还是「久等后断（超时/后台挂起）」——
+    // 光看 `Load failed` 这串字是分不出来的。
+    const startedAt = Date.now();
     try {
       const base64 = await blobToBase64(blob);
+      // 额外角度照与主图同一次请求发出，服务端把它们一起喂给 Pl@ntNet 和视觉模型。
+      const extras = await Promise.all(
+        extraShots.slice(0, MAX_RETAKE_PHOTOS - 1).map(async (s) => ({
+          base64: await blobToBase64(s.blob),
+          mime: s.blob.type || "image/jpeg",
+        })),
+      );
       const res = await submit({
         data: {
           photo_base64: base64,
           photo_mime: blob.type || "image/jpeg",
+          ...(extras.length ? { extra_photos: extras } : {}),
           lat: finalCoords?.lat ?? null,
           lng: finalCoords?.lng ?? null,
           logged_in_user_id: user?.id, // 传递登录用户 ID
@@ -420,36 +569,133 @@ export function CameraIdentify({ retake: retakeCtx = null }: { retake?: RetakeCo
           species_hint_title: retakeCtx?.title,
           species_hint_sci: retakeCtx?.sci,
           merge_draft_id: retakeCtx?.mergeDraftId,
+          photo_sha256: photoSha256 ?? undefined,
         },
       });
       toast.success("已生成简介摘要卡，正在跳转…");
-      const newId = (res as { draftId: string }).draftId;
-
-      // 补拍合并回同一份草稿时，/drafts/$id 会命中 React Query 缓存（staleTime=5min、
-      // 不 refetchOnWindowFocus）→ 页面渲染的是**补拍前**的旧草稿：retake_count 还是 0、
-      // ai_payload 还是上一轮的「疑似」。分享卡是 draft 一到就自动生成的，于是「本轮铜叶 +N」
-      // 按 N=1 画出去、关卡后的补拍横幅也倒回「第一次补拍」。必须先把缓存丢掉，让页面拿新数据。
-      // leaves 同理：本轮铜叶刚变，叶章统计不能用旧值。
-      qc.removeQueries({ queryKey: ["draft", newId] });
-      if (user?.id) qc.removeQueries({ queryKey: ["leaves", user.id] });
-
-      // Signal the draft page to auto-open the share card as the first screen.
-      try {
-        sessionStorage.setItem("plantspedia:justIdentified", newId);
-      } catch {
-        /* private mode / storage disabled — the card still opens via the button */
-      }
-      navigate({ to: "/drafts/$id", params: { id: newId } });
+      goToDraft((res as { draftId: string }).draftId);
     } catch (e) {
+      // ── 断线自愈 ────────────────────────────────────────────────────────────
+      // 识别是个**有副作用的写操作**：服务端跑完就把草稿写进库了。而网络层失败只说明
+      // 「响应没回来」，完全不说明「事情没做成」—— 线上真实案例是等到 101 秒（Cloudflare
+      // 边缘响应上限）连接被掐，前端报「识别失败」，用户重点一次却立刻弹「这张照片已经
+      // 识别过」：后台早就成功了。所以报错之前，先拿照片指纹回查一次。
+      let checked: boolean | undefined;
+      if (isNetworkError(e) && photoSha256) {
+        setRecoverNote("连接断了，正在确认识别是否已经完成…");
+        const hitId = await findDraftAfterDisconnect(photoSha256);
+        if (hitId) {
+          toast.success("识别其实已经完成了，正在跳转…");
+          goToDraft(hitId);
+          return; // ← 不报错：这次是成功的
+        }
+        checked = true; // 回查过、确实没有 → 让文案告诉用户可以放心重试
+      } else if (isNetworkError(e)) {
+        checked = false; // 没指纹可查（算 hash 失败）→ 文案要提醒用户先去草稿列表看看
+      }
+      setRecoverNote(null);
       setPhase("captured");
-      const msg = e instanceof Error && e.message ? e.message : "识别失败（UNKNOWN）：发生了未知错误，请重试。";
+      setErrorKind(checked === true ? "no-result" : checked === false ? "unknown" : "failed");
+      const msg = explainError(e, {
+        elapsedMs: Date.now() - startedAt,
+        sizeBytes: blob.size,
+        action: "识别",
+        serverStateChecked: checked,
+      });
       setErrorMsg(msg);
       toast.error(msg, { duration: 12000 });
     }
   };
 
+  /** 成功收尾：清缓存 → 标记「刚识别完」→ 跳转。正常路径与断线自愈路径共用，
+   *  免得自愈少做一步（比如忘了清缓存）而出现「跳过去还是旧草稿」这种二次 bug。 */
+  const goToDraft = (draftId: string) => {
+    // 补拍合并回同一份草稿时，/drafts/$id 会命中 React Query 缓存（staleTime=5min、
+    // 不 refetchOnWindowFocus）→ 页面渲染的是**补拍前**的旧草稿：retake_count 还是 0、
+    // ai_payload 还是上一轮的「疑似」。分享卡是 draft 一到就自动生成的，于是「本轮铜叶 +N」
+    // 按 N=1 画出去、关卡后的补拍横幅也倒回「第一次补拍」。必须先把缓存丢掉，让页面拿新数据。
+    // leaves 同理：本轮铜叶刚变，叶章统计不能用旧值。
+    qc.removeQueries({ queryKey: ["draft", draftId] });
+    if (user?.id) qc.removeQueries({ queryKey: ["leaves", user.id] });
+
+    // Signal the draft page to auto-open the share card as the first screen.
+    try {
+      sessionStorage.setItem("plantspedia:justIdentified", draftId);
+    } catch {
+      /* private mode / storage disabled — the card still opens via the button */
+    }
+    navigate({ to: "/drafts/$id", params: { id: draftId } });
+  };
+
+  /**
+   * 连接断了之后，回查服务端到底有没有把这次识别写成草稿。
+   *
+   * 为什么要**退避重查几次**而不是查一次就下结论：连接被掐的那一刻，服务端多半还在
+   * 收尾（写库、补 retake_count/user_photos 那几个 best-effort 更新）。立刻查很可能扑空，
+   * 而它两三秒后就写进去了 —— 只查一次等于把「其实成功了」误判成失败，正是要修的那个 bug。
+   *
+   * 总共约 26 秒。真失败的用户要多等这段时间才看到错误文案，换回的是不必白烧一整轮模型。
+   */
+  const findDraftAfterDisconnect = async (hash: string): Promise<string | null> => {
+    const waits = [0, 3000, 8000, 15000];
+    for (const w of waits) {
+      if (w) await new Promise((r) => setTimeout(r, w));
+      try {
+        const hit = await findDuplicate({ data: { hash } });
+        if (hit) return hit.draftId;
+      } catch {
+        /* 回查本身也可能因为同一个弱网失败 —— 继续下一轮，别就此判死 */
+      }
+    }
+    return null;
+  };
+
   return (
     <div className="max-w-md mx-auto w-full bg-paper-deep/35 border border-rule/70 p-4 md:p-5 rounded-3xl shadow-lg mb-12 select-none animate-in fade-in slide-in-from-bottom-4 duration-500">
+
+      {/* 「这张照片已经识别过」——省掉一次完全重复的识别（也省一次模型调用）。
+          刻意做成必须选一个的弹窗而不是 toast：默认行为选错了代价不对称——误跳走只是多点一下，
+          误重复识别则是白等一轮 + 库里多一条重复草稿。 */}
+      {dupHit && (
+        <div
+          className="fixed inset-0 z-[90] bg-black/70 flex items-center justify-center p-4"
+          onClick={() => setDupHit(null)}
+        >
+          <div
+            className="bg-background border border-ink shadow-xl w-full max-w-sm p-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <p className="label text-leaf-deep mb-1">这张照片已经识别过</p>
+            <p className="text-[12px] text-ink-faint mb-4 leading-relaxed">
+              你之前用同一张照片识别过
+              {dupHit.title ? <strong className="text-ink">「{dupHit.title}」</strong> : "一次"}。
+              可以直接去看那份简介摘要卡，不必再等一轮识别。
+            </p>
+            <div className="flex flex-col gap-2">
+              <button
+                onClick={() => {
+                  const to = dupHit.draftId;
+                  setDupHit(null);
+                  navigate({ to: "/drafts/$id", params: { id: to } });
+                }}
+                className="w-full border border-leaf-deep/60 text-leaf-deep px-4 py-2.5 text-sm font-semibold hover:bg-leaf-deep hover:text-background transition-colors cursor-pointer rounded-sm"
+              >
+                是，去看已有的简介摘要卡
+              </button>
+              <button
+                onClick={() => {
+                  const h = dupHit.hash;
+                  setDupHit(null);
+                  void runIdentify(h);
+                }}
+                className="w-full border border-rule text-ink-soft px-4 py-2.5 text-sm hover:border-ink hover:text-ink transition-colors cursor-pointer rounded-sm"
+              >
+                否，再识别一次
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Safety notice — always visible above the viewfinder. AI identifications are
           not a food/medicinal-use authority; keep this prominent and bold. */}
@@ -471,7 +717,10 @@ export function CameraIdentify({ retake: retakeCtx = null }: { retake?: RetakeCo
             </div>
           )}
           <p className="text-[11px] text-ink-faint leading-relaxed">
-            请对准<strong>同一株植物</strong>按上面建议补拍更清晰的照片，<strong>尽量不要同时拍到多种植物</strong>，选好照片后会自动重新识别。
+            请对准<strong>同一株植物</strong>按上面建议补拍更清晰的照片，
+            <strong>尽量不要同时拍到多种植物</strong>。本次
+            <strong>最多可拍 / 上传 {MAX_RETAKE_PHOTOS} 张不同角度</strong>
+            一起识别（整株 / 叶 / 花果各一张最理想），选好第一张后可继续添加，点「AI识别」一并提交。
             {(retakeCtx?.count ?? 0) >= 3 && "本次为第 3 次补拍，将直接给出最终结论。"}
           </p>
           {/* 补拍的**唯一**两个入口：现拍 or 用相册里已有的照片。两条路都走同一个 onSubmit，
@@ -556,10 +805,19 @@ export function CameraIdentify({ retake: retakeCtx = null }: { retake?: RetakeCo
                     <div className="w-10 h-10 rounded-full border-[3px] border-rule/20 border-t-vermilion animate-spin" />
                   </div>
                   <div className="space-y-1 w-full">
-                    <p className="text-xs font-bold text-vermilion tracking-widest uppercase">AI 深度分析中</p>
-                    <p className="text-xs text-ink-soft font-medium min-h-[36px] flex items-center justify-center px-2">
-                      {LOADING_STEPS[stepIndex]}
+                    {/* 连接断了但正在回查时，换一套文案 —— 这时候再滚「AI 深度分析中」是撒谎，
+                        而直接报「识别失败」又往往是误报（服务端多半已经写完库了）。 */}
+                    <p className="text-xs font-bold text-vermilion tracking-widest uppercase">
+                      {recoverNote ? "正在确认结果" : "AI 深度分析中"}
                     </p>
+                    <p className="text-xs text-ink-soft font-medium min-h-[36px] flex items-center justify-center px-2">
+                      {recoverNote ?? LOADING_STEPS[stepIndex]}
+                    </p>
+                    {recoverNote && (
+                      <p className="text-[10px] text-ink-faint leading-relaxed px-1 pt-0.5">
+                        请稍候，先别重新识别 —— 后台可能已经跑完了
+                      </p>
+                    )}
                   </div>
                 </div>
               </div>
@@ -568,6 +826,73 @@ export function CameraIdentify({ retake: retakeCtx = null }: { retake?: RetakeCo
         )}
       </div>
       </div>
+
+      {/* 补拍多角度：主图选好后，最多再加 2 张同一株植物的其它角度，同一次请求一起识别。
+          多角度是提准最实在的一招——Pl@ntNet 官方就按多图综合打分，视觉模型也一次看全。
+          只在补拍模式出现：首次识别时用户还不知道该拍哪里，先要照片只是徒增负担。 */}
+      {retakeMode && phase !== "idle" && (
+        <div className="mt-3 rounded-2xl border border-leaf/35 bg-leaf/5 px-3 py-2.5 space-y-2">
+          <p className="text-[11px] font-semibold text-leaf-deep leading-snug">
+            本次将同时识别 <span className="tabular-nums">{extraShots.length + 1}</span> 张照片
+            {extraShots.length + 1 < MAX_RETAKE_PHOTOS && (
+              <span className="font-normal text-ink-faint">
+                （还可再加 {MAX_RETAKE_PHOTOS - 1 - extraShots.length} 张，多角度更容易定到种）
+              </span>
+            )}
+          </p>
+
+          {/* 缩略图条：第一张是主图（不可删——删了就没得识别了），后面是可删的角度照 */}
+          <div className="flex items-center gap-2 flex-wrap">
+            {previewUrl && (
+              <div className="relative w-14 h-14 rounded-lg overflow-hidden border border-leaf/40 shrink-0">
+                <img src={previewUrl} alt="主图" className="w-full h-full object-cover" />
+                <span className="absolute bottom-0 inset-x-0 bg-ink/70 text-background text-[9px] text-center leading-[13px]">
+                  主图
+                </span>
+              </div>
+            )}
+            {extraShots.map((s, i) => (
+              <div
+                key={s.url}
+                className="relative w-14 h-14 rounded-lg overflow-hidden border border-rule shrink-0"
+              >
+                <img src={s.url} alt={`角度照 ${i + 1}`} className="w-full h-full object-cover" />
+                <button
+                  onClick={() => removeExtra(i)}
+                  disabled={phase === "submitting"}
+                  title="移除这张"
+                  className="absolute top-0 right-0 w-5 h-5 bg-ink/75 text-background text-[13px] leading-[20px] text-center hover:bg-destructive transition-colors cursor-pointer disabled:opacity-50"
+                >
+                  ×
+                </button>
+              </div>
+            ))}
+          </div>
+
+          {extraShots.length + 1 < MAX_RETAKE_PHOTOS && phase !== "submitting" && (
+            <div className="flex gap-2">
+              <button
+                onClick={addExtraFromCamera}
+                className="flex-1 inline-flex items-center justify-center gap-1 border border-leaf/50 text-leaf-deep px-2 py-1.5 text-[11px] font-semibold rounded-full hover:bg-leaf-deep hover:text-background transition-colors cursor-pointer"
+              >
+                <CameraIcon className="w-3.5 h-3.5" />
+                再拍一张
+              </button>
+              <button
+                onClick={addExtraFromAlbum}
+                className="flex-1 inline-flex items-center justify-center gap-1 border border-leaf/50 text-leaf-deep px-2 py-1.5 text-[11px] font-semibold rounded-full hover:bg-leaf-deep hover:text-background transition-colors cursor-pointer"
+              >
+                <GalleryIcon className="w-3.5 h-3.5" />
+                从相册加一张
+              </button>
+            </div>
+          )}
+          <p className="text-[10px] text-ink-faint leading-relaxed">
+            请都拍<strong>同一株植物</strong>的不同部位（如整株 / 叶 / 花或果），不要混入别的植物。
+            拍好后点下方「AI识别」一起提交。
+          </p>
+        </div>
+      )}
 
       {/* Idle: let the user grant location BEFORE opening the camera. Tapping here is
           a real user gesture, which is the only reliable way to make Chrome iOS show
@@ -612,9 +937,14 @@ export function CameraIdentify({ retake: retakeCtx = null }: { retake?: RetakeCo
             <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
               <circle cx="12" cy="12" r="10" /><path d="M12 8v4" /><path d="M12 16h.01" />
             </svg>
-            识别失败
+            {errorKind === "failed"
+              ? "识别失败"
+              : errorKind === "no-result"
+                ? "识别未完成（已确认库里没有结果）"
+                : "未收到结果（可能已完成）"}
           </p>
-          <p className="mt-1 text-xs text-ink-soft leading-relaxed">{errorMsg}</p>
+          {/* whitespace-pre-line：网络类报错是「原因 ①②③」多行文案，不换行会挤成一团 */}
+          <p className="mt-1 text-xs text-ink-soft leading-relaxed whitespace-pre-line">{errorMsg}</p>
           <button
             onClick={() => setErrorMsg(null)}
             className="mt-1.5 text-[11px] text-ink-faint hover:text-vermilion underline underline-offset-2 cursor-pointer"
@@ -769,10 +1099,12 @@ export function CameraIdentify({ retake: retakeCtx = null }: { retake?: RetakeCo
         className="hidden"
         onChange={onUpload}
       />
+      {/* 补拍时相册可一次多选（主图 + 最多 2 张角度照）；首次识别仍是单选——那时只收一张。 */}
       <input
         type="file"
         ref={albumInputRef}
         accept="image/*"
+        multiple={retakeMode}
         className="hidden"
         onChange={onUpload}
       />

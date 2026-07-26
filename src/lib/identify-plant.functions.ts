@@ -13,9 +13,90 @@ import {
   type PremiumFields,
   type VerifiedFacts,
 } from "./premium-page";
+import {
+  readGoldSkill,
+  activeGoldSkill,
+  suggestSkillMeta,
+  skillSignature,
+  GOLD_SKILL_MAX_CHARS,
+  type GoldSkill,
+} from "./gold-skill";
+import {
+  loadDossier,
+  upsertDossier,
+  bumpDossierHit,
+  isDossierUsable,
+  assembleDraftMeta,
+  toDossierBody,
+} from "./species-dossier";
+import {
+  filterLicensed,
+  creditLine,
+  stripHtml,
+  type PhotoCandidate,
+  type Organ,
+} from "./species-photos";
+import {
+  assignSlots,
+  describeAssignment,
+  normalizeOrgan,
+  DRAFT_SLOTS,
+  GOLD_SLOTS,
+} from "./photo-slots";
+import { checkDraftQuality, checkGoldQuality, describeIssues } from "./quality-gate";
 import { lookupChinaInvasive } from "./china-invasive-list";
 import { keepVisualAdvice, DEFAULT_VISUAL_ADVICE } from "./retake-advice";
 import { stripMetaMarkdown, markdownEmphasisToHtml } from "./strip-markdown";
+import {
+  TENTATIVE_RE,
+  stripTentativePrefix,
+  isTentative,
+  draftTitleFor,
+  sanitizeSpeciesName,
+} from "./tentative";
+import { stripStaleMissingNotes } from "./draft-enhance";
+import {
+  DRAFT_CARD_SCOPE,
+  DRAFT_CARD_FIELD_KEYS,
+  DRAFT_CARD_FIELD_LABELS,
+  diffDraftCard,
+  draftCardToText,
+  pickDraftCardFields,
+} from "./draft-card-fields";
+import { stripModelChatter } from "./model-chatter";
+import {
+  type IdentifyTrace,
+  computeIdentifyConfidence,
+  confZh,
+} from "./identify-trace";
+import { normalizeBaseUrl } from "./ai-base-url";
+import {
+  bearerFetchRotating,
+  keyRejected,
+  splitKeyPool,
+  postOpenAICompat,
+  postOpenAICompatStream,
+  THINKING_OFF,
+} from "./ai-key-pool";
+import {
+  readModelQueue,
+  writeModelQueue,
+  shouldFailOver,
+  slotLabel,
+  isKnownBlind,
+  type ModelSlot,
+  type ModelQueue,
+  type SlotVision,
+} from "./model-queue";
+import {
+  VISION_PROBE_PNG_B64,
+  VISION_PROBE_MIME,
+  VISION_PROBE_PROMPT,
+  VISION_PROBE_TEXT_ONLY_PROMPT,
+  gradeVisionAnswer,
+  judgeVisionProbe,
+  speedNote,
+} from "./vision-probe";
 import { slugify, speciesKey, visibleBodyText, textShingles, jaccardSimilarity } from "./plants";
 
 const AI_MODEL = "google/gemini-2.5-pro";
@@ -181,6 +262,21 @@ function parseGeminiError(body: string): {
 /** A daily-quota 429 will NOT recover today, so retrying is pure latency. */
 const isDailyQuota = (quotaId: string) => /PerDay/i.test(quotaId);
 
+/**
+ * 把 Google 的 quotaId 翻成人话。
+ *
+ * **为什么必须区分**：429 不只是「请求数」超了 —— Gemini 免费额度同时卡
+ * **请求数**和 **token 数**，两者各自又分每分钟 / 每日。以前这里一律写成
+ * 「每日免费请求额度已用尽」，于是 token 配额打满时（quotaId 形如
+ * `...InputTokensPerModelPerDay`，同样含 PerDay）也报「请求额度用尽」，
+ * 管理员去用量后台一看请求数才个位数，完全对不上，白白怀疑是 key 坏了。
+ */
+function quotaDimension(quotaId: string): { unit: string; window: string } {
+  const unit = /Token/i.test(quotaId) ? "token 数" : /Request/i.test(quotaId) ? "请求数" : "用量";
+  const window = /PerDay/i.test(quotaId) ? "每日" : /PerMinute/i.test(quotaId) ? "每分钟" : "";
+  return { unit, window };
+}
+
 /** Map a Gemini HTTP failure onto an actionable Chinese message. */
 function describeGeminiError(httpStatus: number, body: string, model: string): AiError {
   const { status, message, quotaId, retryDelaySec } = parseGeminiError(body);
@@ -191,16 +287,28 @@ function describeGeminiError(httpStatus: number, body: string, model: string): A
 
   if (httpStatus === 429) {
     if (isDailyQuota(quotaId)) {
+      const { unit, window } = quotaDimension(quotaId);
       return new AiError(
         code,
-        `${head}：Gemini 的「每日免费请求额度」已用尽。今天无法再生成，请等待配额重置（太平洋时间次日 0 点），` +
-          `或在管理后台更换 API key / 升级为付费配额。${detail}`,
+        `${head}：Gemini 的「${window}免费${unit}额度」已用尽。今天无法再生成。` +
+          `⚠️ 超的是**${unit}**，不一定是请求数 —— 免费额度同时卡「请求数」和「token 数」。` +
+          `用量后台看到请求数很少却报这个错，基本都是 **token 数**打满了：识别要传图、` +
+          `生成长文要吐几十万 token，请求数还是个位数时 token 配额就可能见底。` +
+          `另外 **preview 版模型**（名字带 -preview）的免费额度比正式版低得多。` +
+          `⚠️ 免费额度按 **Google Cloud 项目** 计，同一项目下新建 API key ` +
+          `共用同一个已耗尽的额度，换 key 不会恢复。真正有效的做法是：① 等配额重置` +
+          `（太平洋时间次日 0 点）；② 换一个**不同 Google Cloud 项目**签发的 key；` +
+          `③ 给项目开通结算、升级为付费配额；④ 在管理后台把**非 Gemini 的模型**` +
+          `（如 Kimi / DeepSeek）排到「优先调用序列 2」当备胎，序列 1 挂了会自动顺位。` +
+          `${quotaId ? ` 配额项：${quotaId}。` : ""}${detail}`,
       );
     }
+    const { unit, window } = quotaDimension(quotaId);
     return new AiError(
       code,
-      `${head}：短时间内请求过多，超出 Gemini 的「每分钟请求数」限制。请${retryDelaySec ? ` ${retryDelaySec} 秒` : "稍"}后重试；` +
-        `若频繁出现，说明免费额度偏低，建议升级配额或更换模型。${detail}`,
+      `${head}：超出 Gemini 的「${window || "每分钟"}${unit}」限制。请${retryDelaySec ? ` ${retryDelaySec} 秒` : "稍"}后重试；` +
+        `若频繁出现，说明免费额度偏低，建议升级配额或在管理后台加一个非 Gemini 的备胎序列。` +
+        `${quotaId ? ` 配额项：${quotaId}。` : ""}${detail}`,
     );
   }
   if (httpStatus === 503)
@@ -591,6 +699,95 @@ type AiProviderConfig = {
   baseUrl?: string; // for openai-compatible, anthropic or custom endpoints
 };
 
+// ─── 优先调用序列：读写（三个控制台共用一套）──────────────────────────────────
+// 每个控制台在 site_config 里占一个 key，存的都是同一个 ModelQueue 形态。
+// 读的时候 readModelQueue() 会把历史形态（单配置 / 逗号 key 池）自动折算成序列，
+// 所以线上老数据不需要任何手工迁移。
+
+const CONSOLE_CONFIG_KEYS = {
+  ai: "ai_model_config",
+  // 「出卡AI」—— 三重奏的第三块：拍照后写出简介摘要卡 / 分享卡的那个模型。
+  // 以前它没有自己的控制台，直接借用 ai_model_config，于是「一线出卡」和「其它杂项」
+  // 被迫共用一套配置，调其中一个必然影响另一个。现在拆出来单独配。
+  card: "card_model_config",
+  // 「进一步生成草稿」（enrichDraft 的重活）单独一套 —— 它和一线识别的诉求不同：
+  // 识别要快、要便宜；写整份科普草稿要长文能力、能容忍慢。分开配才不用互相将就。
+  enrich: "enrich_model_config",
+  second_opinion: "second_opinion_config",
+  xiaop: "xiaop_model_config",
+} as const;
+type ConsoleId = keyof typeof CONSOLE_CONFIG_KEYS;
+
+const CONSOLE_LABELS: Record<ConsoleId, string> = {
+  ai: "AI 模型",
+  card: "出卡AI",
+  enrich: "草稿生成模型",
+  second_opinion: "疑似复核模型",
+  xiaop: "小P蛙模型",
+};
+
+async function loadModelQueue(consoleId: ConsoleId): Promise<ModelQueue> {
+  try {
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data } = await (supabaseAdmin as any)
+      .from("site_config")
+      .select("value")
+      .eq("key", CONSOLE_CONFIG_KEYS[consoleId])
+      .maybeSingle();
+    const raw = (data as { value?: unknown } | null)?.value;
+    if (!raw) return { sequence: [] };
+    return readModelQueue(typeof raw === "string" ? JSON.parse(raw) : raw);
+  } catch (e) {
+    console.warn(`[${consoleId} queue] load failed:`, e);
+    return { sequence: [] };
+  }
+}
+
+const loadXiaoPQueue = () => loadModelQueue("xiaop");
+const loadAiQueue = () => loadModelQueue("ai");
+/**
+ * 「出卡AI」的序列 —— 三重奏第三块，负责拍照后写出简介摘要卡 / 分享卡。
+ *
+ * **没单独配时回退到 AI 模型控制台**，与 loadEnrichQueue 同款兜底。这条回退是刻意的：
+ * 新控制台上线时 card_model_config 必然是空的，靠它才能做到「部署即生效、行为不变」，
+ * 管理员想把出卡单独调开再去配即可。
+ */
+async function loadCardQueue(): Promise<ModelQueue> {
+  const own = await loadModelQueue("card");
+  return own.sequence.length ? own : await loadAiQueue();
+}
+/**
+ * 「进一步生成草稿」的序列。**没单独配时回退到「AI 模型控制台」** —— 这样新加的控制台
+ * 留空也不会让草稿生成失灵，管理员想分开调再去配。
+ */
+async function loadEnrichQueue(): Promise<ModelQueue> {
+  const own = await loadModelQueue("enrich");
+  return own.sequence.length ? own : await loadAiQueue();
+}
+const loadSecondOpinionQueue = () => loadModelQueue("second_opinion");
+
+/** 「金叶详页创作指导 Skill」在 site_config 里的 key。 */
+const GOLD_SKILL_CONFIG_KEY = "gold_skill_config";
+
+/**
+ * 读取管理员粘贴的金叶创作指导。没配 / 读失败 → null → 撰稿走 premium-page.ts 的内置底版，
+ * 与本功能上线前逐字相同。**读失败绝不能让金叶生成整体失败**（用户已经付了金叶）。
+ */
+async function loadGoldSkill(): Promise<GoldSkill | null> {
+  try {
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data } = await (supabaseAdmin as any)
+      .from("site_config")
+      .select("value")
+      .eq("key", GOLD_SKILL_CONFIG_KEY)
+      .maybeSingle();
+    return readGoldSkill((data as { value?: unknown } | null)?.value ?? null);
+  } catch (e) {
+    console.warn("[GoldSkill] load failed; falling back to built-in prompts:", e);
+    return null;
+  }
+}
+
 /** Read admin-configured AI model from the site_config table (service-role only). */
 async function loadAiConfig(): Promise<AiProviderConfig | null> {
   try {
@@ -603,17 +800,18 @@ async function loadAiConfig(): Promise<AiProviderConfig | null> {
       .maybeSingle();
     const raw = (data as { value?: unknown } | null)?.value;
     if (!raw) return null;
-    const cfg = typeof raw === "string" ? JSON.parse(raw) : raw;
-    if (cfg?.provider && cfg?.apiKey && cfg?.model) {
-      // Defensive sanitization. `apiKey` may hold a POOL (comma/newline separated).
-      // splitGeminiKeys() heals a single whitespace-mangled key (old behaviour) while
-      // preserving a real multi-key pool; we re-join on "," as the canonical form.
-      // Blind `.replace(/\s+/g,"")` would fuse newline-separated keys into garbage.
-      cfg.apiKey = normalizeApiKey(cfg.provider, cfg.apiKey);
-      if (cfg.baseUrl) cfg.baseUrl = String(cfg.baseUrl).trim().replace(/\/+$/, "");
-      return cfg as AiProviderConfig;
-    }
-    return null;
+    // readModelQueue() 同时认新的 sequence 形态和旧的单配置/逗号 key 池，所以这里
+    // 拿到的永远是一个规整的序列。本函数为兼容老调用方而存在，只回**序列 1**；
+    // 需要「失败顺位下一个」的调用方请改用 loadAiQueue() + runModelQueue()。
+    const q = readModelQueue(typeof raw === "string" ? JSON.parse(raw) : raw);
+    const first = q.sequence[0];
+    if (!first) return null;
+    return {
+      provider: first.provider,
+      apiKey: first.apiKey,
+      model: first.model,
+      baseUrl: first.baseUrl,
+    };
   } catch (e) {
     console.warn("[AI Config] Failed to load ai_model_config from site_config:", e);
     return null;
@@ -641,6 +839,85 @@ function addUsage(a: AiTokenUsage, b: AiTokenUsage | null | undefined): AiTokenU
   };
 }
 
+// ─── 优先调用序列：执行器 ────────────────────────────────────────────────────
+// 按 1→n 依次尝试，可降级的失败（额度用尽 / key 无效 / 模型不存在 / 服务端故障 /
+// 网络错误）就顺位交给下一项；不可降级的失败（400，请求本身有毛病）立刻抛出。
+
+/**
+ * 从一个抛出的错误里还原 HTTP 状态码。各家调用函数抛的都是
+ * `…(HTTP 401)…` / `…（HTTP 429）…` 这种带码的中文消息（半角与全角括号都有），
+ * 没有码就当作网络错误（0）—— 网络错误本来也该降级。
+ */
+function httpStatusOf(e: unknown): number {
+  const withStatus = e as { status?: unknown };
+  if (typeof withStatus?.status === "number") return withStatus.status;
+  const m = /HTTP\s*(\d{3})/.exec(e instanceof Error ? e.message : String(e));
+  return m ? Number(m[1]) : 0;
+}
+
+/**
+ * 依次跑完整个序列，返回第一个成功的结果。
+ * 全挂时抛出的错误里带**每一项各自的失败原因**（key 打码）—— 不然管理员只会看到
+ * 最后一项的报错，根本不知道前面几项为什么没顶上。
+ */
+async function runModelQueue<T>(
+  sequence: ModelSlot[],
+  callSlot: (slot: ModelSlot, index: number) => Promise<T>,
+  label: string,
+  /**
+   * `requireVision` = 这条链路要给模型看图。**已被视觉准入检测判定为 blind 的项会被跳过**
+   * （见 vision-probe.ts 的事故背景：看不见图的模型会凭空编一个物种出来、还返回 200，
+   * 靠 shouldFailOver 永远拦不住，因为它压根没报错）。
+   *
+   * 只跳过**明确测出 blind** 的项；没测过的照跑不误 —— 否则本功能上线当天就会把所有
+   * 未检测的序列清空，比事故本身更糟。
+   */
+  opts?: { requireVision?: boolean },
+): Promise<T> {
+  if (!sequence.length) throw new Error(`${label} 暂不可用：优先调用序列为空，请在控制台配置。`);
+
+  if (opts?.requireVision) {
+    const blind = sequence.filter(isKnownBlind);
+    if (blind.length) {
+      const usable = sequence.filter((s) => !isKnownBlind(s));
+      console.warn(
+        `[${label}] 跳过 ${blind.length} 个已测出「不读图」的序列项：${blind.map((s) => s.model).join("、")}`,
+      );
+      if (!usable.length)
+        throw new Error(
+          `${label} 暂不可用：序列里 ${sequence.length} 个模型**全部**被视觉准入检测判定为看不见图` +
+            `（${blind.map((s) => s.model).join("、")}）。这条链路必须给模型看照片，` +
+            `继续用它们只会得到凭空编造的结果。请在控制台换成实测支持视觉的模型。`,
+        );
+      sequence = usable;
+    }
+  }
+  const failures: string[] = [];
+  for (const [i, slot] of sequence.entries()) {
+    try {
+      return await callSlot(slot, i);
+    } catch (e) {
+      const status = httpStatusOf(e);
+      const msg = e instanceof Error ? e.message : String(e);
+      failures.push(`${slotLabel(slot, i)}（${maskKey(slot.apiKey)}）：${msg.slice(0, 160)}`);
+      if (!shouldFailOver(status, msg) || i === sequence.length - 1) {
+        if (sequence.length === 1) throw e;
+        // 报「试了几个」而不是「一共几个」—— 遇到不可降级的错误（400）会提前停，
+        // 说成「N 个都没出结果」会让人以为后面的替补试过了、白白去查没问题的配置。
+        const tried = failures.length;
+        const stoppedEarly = tried < sequence.length;
+        throw new Error(
+          `${label} 失败：已依次尝试 ${tried} / ${sequence.length} 个序列` +
+            (stoppedEarly ? "（末项的错误无法靠换模型解决，已停止顺位）" : "") +
+            `：\n${failures.join("\n")}`,
+        );
+      }
+      // 可降级 → 继续下一项。
+    }
+  }
+  throw new Error(`${label} 暂不可用：优先调用序列为空。`);
+}
+
 /** Stage 1 of the two-stage pipeline: a quick species ID from an OpenAI-compatible
  *  vision relay (e.g. glm-5v-turbo). A small request the reasoning model handles
  *  reliably; returns just the Chinese + Latin name (or null on any failure, so the
@@ -650,26 +927,22 @@ async function quickIdentify(
   cfg: AiProviderConfig,
 ): Promise<{ title: string; scientific_name: string; usage: AiTokenUsage; model: string } | null> {
   const apiBase = cfg.baseUrl || "https://api.openai.com/v1";
-  const resp = await fetch(`${apiBase}/chat/completions`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${cfg.apiKey}`, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: cfg.model,
-      messages: [
-        {
-          role: "user",
-          content: [
-            {
-              type: "text",
-              text: '识别这张照片里的植物，只返回一个 JSON 对象（不要 markdown、不要多余文字），格式：{"title":"中文物种名","scientific_name":"拉丁学名（尽量精确到种）"}。若不确定，title 用最可能的中文名并在前面加「疑似」。',
-            },
-            { type: "image_url", image_url: { url: photoDataUrl } },
-          ],
-        },
-      ],
-      max_tokens: 3000,
-      temperature: 0,
-    }),
+  const resp = await postOpenAICompat(`${apiBase}/chat/completions`, cfg.apiKey, {
+    model: cfg.model,
+    messages: [
+      {
+        role: "user",
+        content: [
+          {
+            type: "text",
+            text: '识别这张照片里的植物，只返回一个 JSON 对象（不要 markdown、不要多余文字），格式：{"title":"中文物种名","scientific_name":"拉丁学名（尽量精确到种）"}。若不确定，title 用最可能的中文名并在前面加「疑似」。',
+          },
+          { type: "image_url", image_url: { url: photoDataUrl } },
+        ],
+      },
+    ],
+    max_tokens: 3000,
+    temperature: 0,
   });
   if (!resp.ok) {
     console.warn("[quickIdentify] HTTP", resp.status);
@@ -779,6 +1052,10 @@ async function markPlantNetQuotaExhausted(): Promise<void> {
 async function plantNetIdentify(
   photoDataUrl: string,
   apiKey: string,
+  /** 同一株植物的额外角度照（data URL）。Pl@ntNet 官方支持一次提交多张图并**综合**给分，
+   *  这是它自家推荐的提准手段（多角度比单张更容易定到种），所以补拍带来的 2 张一起发。
+   *  非 JPEG/PNG 的会被就地跳过，绝不因为一张格式不对而拖垮整次请求。 */
+  extraDataUrls: string[] = [],
 ): Promise<{
   verdict: PlantNetVerdict | null;
   quotaExhausted: boolean;
@@ -811,6 +1088,24 @@ async function plantNetIdentify(
   const form = new FormData();
   form.append("images", new Blob([new Uint8Array(bytes)], { type: mime }), `plant.${ext}`);
   form.append("organs", "auto");
+  // 额外角度照：每张都要 images + organs **成对**追加，Pl@ntNet 按顺序一一对应，
+  // 少一个 organs 就会整体 400。上限 4 张（连主图 5 张，是 Pl@ntNet 单次请求的上限）。
+  for (const [i, du] of extraDataUrls.slice(0, 4).entries()) {
+    const em = du.match(/^data:([^;]+);base64,(.+)$/);
+    const emime = em?.[1] ?? "image/jpeg";
+    if (!/(jpeg|jpg|png)/i.test(emime)) {
+      console.warn(`[Pl@ntNet] 跳过额外角度照 #${i + 1}：不支持的格式 ${emime}`);
+      continue;
+    }
+    const eb64 = em?.[2] ?? du;
+    const eext = emime.includes("png") ? "png" : "jpg";
+    form.append(
+      "images",
+      new Blob([new Uint8Array(Buffer.from(eb64, "base64"))], { type: emime }),
+      `plant-${i + 2}.${eext}`,
+    );
+    form.append("organs", "auto");
+  }
 
   // project=all (k-world-flora)：PlantNet 公共库没有专门的中国/内蒙 flora，盲切区域库反而
   // 可能漏掉本地种；若日后确认有可用亚洲库再切 project。
@@ -891,15 +1186,15 @@ async function loadSecondOpinionConfig(): Promise<SecondOpinionConfig | null> {
       rows.find((r) => r.key === "doubao_vision_config");
     const raw = pick?.value;
     if (raw) {
-      const cfg = typeof raw === "string" ? JSON.parse(raw) : raw;
-      const apiKey = String(cfg?.apiKey ?? "").replace(/\s+/g, "");
-      const model = String(cfg?.model ?? "").trim();
-      if (apiKey && model) {
-        const baseUrl =
-          String(cfg?.baseUrl ?? SECOND_OPINION_DEFAULT_BASE)
-            .trim()
-            .replace(/\/+$/, "") || SECOND_OPINION_DEFAULT_BASE;
-        return { apiKey, model, baseUrl };
+      // 同上：认新旧两种形态，本函数只回序列 1（顺位降级见 loadSecondOpinionQueue()）。
+      const q = readModelQueue(typeof raw === "string" ? JSON.parse(raw) : raw);
+      const first = q.sequence[0];
+      if (first?.apiKey && first?.model) {
+        return {
+          apiKey: first.apiKey,
+          model: first.model,
+          baseUrl: first.baseUrl || SECOND_OPINION_DEFAULT_BASE,
+        };
       }
     }
   } catch (e) {
@@ -912,10 +1207,117 @@ async function loadSecondOpinionConfig(): Promise<SecondOpinionConfig | null> {
   const envModel = (process.env.SECOND_OPINION_MODEL ?? process.env.DOUBAO_MODEL ?? "").trim();
   if (envKey && envModel) {
     const baseUrl =
-      (process.env.SECOND_OPINION_API_BASE ?? process.env.DOUBAO_API_BASE ?? SECOND_OPINION_DEFAULT_BASE)
-        .trim()
-        .replace(/\/+$/, "") || SECOND_OPINION_DEFAULT_BASE;
+      normalizeBaseUrl(
+        process.env.SECOND_OPINION_API_BASE ??
+          process.env.DOUBAO_API_BASE ??
+          SECOND_OPINION_DEFAULT_BASE,
+      ) || SECOND_OPINION_DEFAULT_BASE;
     return { apiKey: envKey, model: envModel, baseUrl };
+  }
+  return null;
+}
+
+/**
+ * 按二次复核的**优先调用序列**依次尝试，返回第一个出结果的。
+ * 两个消费点本来就是「任何失败都返回 null」的优雅风格，所以降级就是
+ * 「挨个试到有结果为止」—— 不会因为序列 1 挂了就整个功能哑掉。
+ * 序列为空时退回 loadSecondOpinionConfig()（它自带 .env 兜底）。
+ */
+/**
+ * 复核失败的**真实原因**。
+ *
+ * 为什么要有这个：原先复核一失败就统一报「模型限流、超时或未配置」—— 那是一句**猜测**，
+ * 而且三个猜测里没一个对得上真实故障（真凶是 response_format 被中转拒收）。用户在后台
+ * 看到「连通体检 ✅ 视觉自检 ✅」，前台却说「未配置」，只能一脸问号。
+ * 现在把每个序列项的实际失败写进来，原样呈给用户。
+ */
+let secondOpinionFailures: string[] = [];
+function noteFailure(msg: string) {
+  if (secondOpinionFailures.length < 4) secondOpinionFailures.push(msg);
+}
+/** 取出并清空本次识别累积的复核失败原因。 */
+function takeSecondOpinionFailures(): string {
+  const s = secondOpinionFailures.join("；");
+  secondOpinionFailures = [];
+  return s;
+}
+
+/**
+ * 整轮二次复核的**总时间预算**（毫秒），跨全部序列项共享。
+ *
+ * 为什么必须是「总预算」而不是「每项 N 秒」（2026-07-24 用户实测）：
+ * 原来每项固定 30 秒，配 3 个序列项 → 最坏 90 秒。而 phase-1 是**前台 HTTP 请求**，
+ * Cloudflare 边缘 100 秒就掐断，等于把整次识别一起赔进去。所以顺位必须在总预算内进行：
+ * 预算见底就不再起新的一项，如实告诉用户「预算已用完，还剩几项没试」。
+ *
+ * 45 秒是这么定的：phase-1 里 Pl@ntNet + 出卡模型通常占 10–25 秒，留 45 秒给复核后
+ * 仍有约 30 秒余量应付上传与写库。**不要为了迁就某个慢模型往上调** —— 该换模型，
+ * 或者在控制台把它排到序列后面。
+ */
+const SECOND_OPINION_TOTAL_BUDGET_MS = 45_000;
+/** 单项上限。留出余量让下一项还有机会跑，别让第一个慢模型独吞整个预算。 */
+const SECOND_OPINION_SLOT_CAP_MS = 28_000;
+/** 起一项新调用至少要剩这么多时间，否则起了也只是白等一次超时。 */
+const SECOND_OPINION_MIN_SLOT_MS = 8_000;
+
+/** 本轮复核的截止时刻（epoch ms）。withSecondOpinionSlots 进入时设定。 */
+let secondOpinionDeadline = 0;
+
+/** 当前这一项能用的超时（毫秒）；已无预算返回 0。 */
+function secondOpinionSlotTimeout(): number {
+  const left = secondOpinionDeadline - Date.now();
+  if (left < SECOND_OPINION_MIN_SLOT_MS) return 0;
+  return Math.min(left, SECOND_OPINION_SLOT_CAP_MS);
+}
+
+async function withSecondOpinionSlots<T>(
+  fn: (cfg: SecondOpinionConfig) => Promise<T | null>,
+): Promise<T | null> {
+  secondOpinionFailures = [];
+  secondOpinionDeadline = Date.now() + SECOND_OPINION_TOTAL_BUDGET_MS;
+  const { sequence } = await loadSecondOpinionQueue();
+  // 复核链路**必须**能看照片（它的全部工作就是重看一遍图）。已测出 blind 的项直接剔除 ——
+  // 留着它只会得到一个凭空编造的"复核结论"，而且因为它 HTTP 200，顺位机制永远不会救场。
+  const seeing = sequence.filter((s) => !isKnownBlind(s));
+  if (seeing.length < sequence.length)
+    console.warn(`[二次复核] 跳过 ${sequence.length - seeing.length} 个已测出「不读图」的序列项`);
+  // ⚠️ 兜底只在**控制台压根没配序列**时才走。
+  // 曾经写成「seeing 为空就兜底」，结果 blind 过滤被自己架空：
+  // loadSecondOpinionConfig() 读的正是同一个控制台的 sequence[0] —— 也就是刚被判定
+  // 不读图、刚被剔除的那一个。于是照样把它打了一遍，白花一次调用、必然拿不到有效复核，
+  // 而且因为 slots 非空，上面那句「全部被测出不读图」的说明也不会报出来 ——
+  // 用户只看到一句语焉不详的「复核未能完成」，查不到真正原因（07-24 线上实测就是这样）。
+  const slots: SecondOpinionConfig[] = seeing.length
+    ? seeing.map((s) => ({
+        apiKey: s.apiKey,
+        model: s.model,
+        baseUrl: s.baseUrl || SECOND_OPINION_DEFAULT_BASE,
+      }))
+    : sequence.length
+      ? [] // 配了、但全是 blind → 直接放弃，别再拿同一个瞎模型试一次
+      : await loadSecondOpinionConfig().then((c) => (c ? [c] : []));
+  if (!slots.length) {
+    noteFailure(
+      sequence.length
+        ? `「二次复核」控制台的 ${sequence.length} 个序列项**全部被测出不读图**` +
+            `（${sequence.map((s) => s.model).join("、")}），已跳过 —— ` +
+            `请在该控制台换成能读图的视觉模型，并点「视觉自检」验证`
+        : "「二次复核」控制台没有配置任何模型",
+    );
+  }
+  for (const [i, cfg] of slots.entries()) {
+    // 预算见底就停 —— 起一项注定超时的调用，只会把 phase-1 整体推向边缘 100 秒上限。
+    if (secondOpinionSlotTimeout() === 0) {
+      noteFailure(
+        `复核总预算 ${Math.round(SECOND_OPINION_TOTAL_BUDGET_MS / 1000)} 秒已用完，` +
+          `剩余 ${slots.length - i} 个序列项（${slots.slice(i).map((s) => s.model).join("、")}）未再尝试`,
+      );
+      break;
+    }
+    const r = await fn(cfg);
+    if (r) return r;
+    if (i < slots.length - 1)
+      console.warn(`[二次复核] 序列 ${i + 1}（${cfg.model}）没出结果，顺位下一个`);
   }
   return null;
 }
@@ -929,12 +1331,13 @@ async function secondOpinionIdentify(
   hintPlace: string,
   ctx: { candidate?: string | null; plantNetHint?: string | null },
 ): Promise<{ meta: AiMeta; model: string; usage: AiTokenUsage } | null> {
-  const cfg = await loadSecondOpinionConfig();
-  if (!cfg) return null;
-
-  const prior = priorPhotos.slice(0, 4);
-  const cand = (ctx.candidate || "").trim();
-  const system = `你是资深植物分类学家，正在对一张实地拍摄的植物照片做「二次复核」识别。前序识别（Pl@ntNet 专业引擎 + Gemini）对本图把握不足、判为「疑似」。请你**独立判断**：若你有充分把握，可确认或**纠正**为你认为正确的物种（不必迁就前序判断）；若你同样无法确诊到种，请诚实给 low。
+  return withSecondOpinionSlots(async (cfg) => {
+    // 补拍照片从 4 张收到 2 张：图片是这次请求里**最重的输入**，每多一张都同时推高
+    // 上传耗时与首字延迟，而复核要的只是「再看一眼、给个物种」——第 3、4 张补拍照
+    // 对结论的边际贡献远不抵它们对超时风险的贡献。最新那张永远单独发（下面 photoDataUrl）。
+    const prior = priorPhotos.slice(0, 2);
+    const cand = (ctx.candidate || "").trim();
+    const system = `你是资深植物分类学家，正在对一张实地拍摄的植物照片做「二次复核」识别。前序识别（Pl@ntNet 专业引擎 + Gemini）对本图把握不足、判为「疑似」。请你**独立判断**：若你有充分把握，可确认或**纠正**为你认为正确的物种（不必迁就前序判断）；若你同样无法确诊到种，请诚实给 low。
 只返回一个 JSON 对象（不要 markdown、不要多余文字），字段如下。为了尽快出卡，**只输出下列字段，不要生成英文摘要、拍摄记录等额外内容**（与 phase-1 简介摘要卡的字段集保持一致）：
 {"title":"中文物种名","scientific_name":"拉丁学名（尽量精确到种）","common_name_en":"英文俗名","common_names_zh":"中文俗名（逗号分隔，可留空）","family":"科（中文+拉丁）","genus":"属（中文+拉丁）","summary_zh":"150–260 字趣味导语（博物学家口吻，讲与生活相关的趣闻/冷知识，勾起好奇心；不要罗列科属学名形态，也不要复述拍摄地点）","identification_confidence":"high 或 medium 或 low","needs_more_photos_zh":"","needs_more_photos_en":""}
 硬性规则：
@@ -943,69 +1346,135 @@ async function secondOpinionIdentify(
 - 拍摄地点真实性（硬性）：仅当下文给出拍摄地点时才可写具体地名；未提供则严禁编造或反推任何地名。
 - 中文用正式植物志措辞；不要在字段里使用 * 等 markdown 强调符。`;
 
-  const content: unknown[] = [
-    {
-      type: "text",
-      text:
-        `请复核识别这${prior.length ? "组" : "张"}植物照片。` +
-        (prior.length
-          ? `第 1 张是最新、最清晰的照片，随后 ${prior.length} 张是同一株植物先前拍摄的，请**综合全部 ${prior.length + 1} 张照片**判定。`
-          : "") +
-        (cand ? `前序倾向判断为「${cand}」，仅供参考、可以推翻。` : "") +
-        (ctx.plantNetHint ? `${ctx.plantNetHint}` : "") +
-        (hintPlace ? `拍摄地点：${hintPlace}。` : "") +
-        `只按上面的 JSON 结构返回。`,
-    },
-    { type: "image_url", image_url: { url: photoDataUrl } },
-    ...prior.map((im) => ({
-      type: "image_url",
-      image_url: { url: `data:${im.mimeType};base64,${im.base64}` },
-    })),
-  ];
-
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 30_000);
-  try {
-    const resp = await fetch(`${cfg.baseUrl}/chat/completions`, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${cfg.apiKey}`, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: cfg.model,
-        messages: [
-          { role: "system", content: system },
-          { role: "user", content },
-        ],
-        response_format: { type: "json_object" },
-        max_tokens: 3000,
-        temperature: 0,
-      }),
-      signal: controller.signal,
-    });
-    if (!resp.ok) {
-      console.warn("[SecondOpinion] HTTP", resp.status, (await resp.text().catch(() => "")).slice(0, 300));
-      return null;
-    }
-    const data = await resp.json();
-    const text = data.choices?.[0]?.message?.content;
-    if (!text) return null;
-    const meta = JSON.parse(cleanJson(text)) as AiMeta;
-    const u = data.usage ?? {};
-    return {
-      meta,
-      model: cfg.model,
-      usage: {
-        prompt_tokens: u.prompt_tokens ?? 0,
-        completion_tokens: u.completion_tokens ?? 0,
-        total_tokens: u.total_tokens ?? 0,
+    const content: unknown[] = [
+      {
+        type: "text",
+        text:
+          `请复核识别这${prior.length ? "组" : "张"}植物照片。` +
+          (prior.length
+            ? `第 1 张是最新、最清晰的照片，随后 ${prior.length} 张是同一株植物先前拍摄的，请**综合全部 ${prior.length + 1} 张照片**判定。`
+            : "") +
+          (cand ? `前序倾向判断为「${cand}」，仅供参考、可以推翻。` : "") +
+          (ctx.plantNetHint ? `${ctx.plantNetHint}` : "") +
+          (hintPlace ? `拍摄地点：${hintPlace}。` : "") +
+          `只按上面的 JSON 结构返回。`,
       },
-    };
-  } catch (e) {
-    // Non-fatal by design: a failed second opinion just means we keep the 疑似 verdict.
-    console.warn("[SecondOpinion] second opinion failed:", e instanceof Error ? e.message : e);
-    return null;
-  } finally {
-    clearTimeout(timer);
-  }
+      { type: "image_url", image_url: { url: photoDataUrl } },
+      ...prior.map((im) => ({
+        type: "image_url",
+        image_url: { url: `data:${im.mimeType};base64,${im.base64}` },
+      })),
+    ];
+
+    const budgetMs = secondOpinionSlotTimeout();
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), budgetMs);
+    const startedAt = Date.now();
+    try {
+      // ⚠️ **流式**，不是普通 POST。这正是 2026-07-24 用户报「换了好几个模型、自检三条链路
+      // 全过，二次复核照样不运行」的直接原因之一：复核配的多半是第三方聚合中转，中转在
+      // 上游没吐完之前**一个字节都不回**，于是整段生成时间全砸在「等第一个字节」上。
+      // 开了流以后 token 是边生成边回的，同样的模型往往能在预算内完成。
+      // postOpenAICompatStream 会把 SSE 增量拼回与普通响应同形的 JSON，下面的解析不用改；
+      // 中转要是压根不支持流式，它会回 599，我们再退回非流式重来一次（见 catch 之外那段）。
+      let resp = await postOpenAICompatStream(
+        `${cfg.baseUrl}/chat/completions`,
+        cfg.apiKey,
+        {
+          model: cfg.model,
+          messages: [
+            { role: "system", content: system },
+            { role: "user", content },
+          ],
+          // 关思考。复核模型常是推理模型，默认先写一大段思维链 —— 对「再看一眼图报个物种」
+          // 这件事几乎没有增益，却能把 8 秒的调用拖到 40 秒以上，必然撞超时。
+          // 三种写法一起发，不认的那个会被 postOpenAICompat 从 400 报错里认出来并摘掉。
+          ...THINKING_OFF,
+          // ⚠️ **刻意不发 `response_format: {type:"json_object"}`**。
+          // 复核链路配的基本都是第三方中转（能列出两百多个模型的那种聚合站），而中转对这个
+          // 参数的支持五花八门：不认的直接 400，认一半的返回空字符串。callAiIdentify
+          // （见下方 `provider === "custom"` 那处）和 `send()` 早就因为同样的原因绕开了它，
+          // 这里是漏网的一处 —— 症状极具迷惑性：**后台「连通体检」和「视觉自检」全绿**
+          // （那两个请求都不带这个参数），偏偏一到真复核就失败，于是报成「未配置」。
+          // prompt 里已经写死「只返回一个 JSON 对象」，且 cleanJson() 能剥掉 ``` 围栏。
+          // 3000 → 1200：这张卡最长的字段是 150–260 字导语，加上其余字段 1200 token 绰绰有余。
+          // 上限本身不影响正常返回，但它是**推理模型思维链的天花板** —— 调小相当于给
+          // 「想太久」封了顶，超时时也能更快落地到下一个序列项。
+          max_tokens: 1200,
+          temperature: 0,
+        },
+        { signal: controller.signal },
+      );
+      // 中转把 stream 参数吃掉了（回了 200 但不是 SSE）→ postOpenAICompatStream 约定回 599。
+      // 这不是模型的问题，退回非流式再打一次，别白白判这一项失败。
+      if (resp.status === 599) {
+        console.warn(`[SecondOpinion] ${cfg.model} 的中转不支持流式，退回非流式重试`);
+        resp = await postOpenAICompat(
+          `${cfg.baseUrl}/chat/completions`,
+          cfg.apiKey,
+          {
+            model: cfg.model,
+            messages: [
+              { role: "system", content: system },
+              { role: "user", content },
+            ],
+            ...THINKING_OFF,
+            max_tokens: 1200,
+            temperature: 0,
+          },
+          { signal: controller.signal },
+        );
+      }
+      if (!resp.ok) {
+        const body = (await resp.text().catch(() => "")).slice(0, 300);
+        console.warn("[SecondOpinion] HTTP", resp.status, body);
+        noteFailure(`${cfg.model} 返回 HTTP ${resp.status}${body ? "：" + body.slice(0, 120) : ""}`);
+        return null;
+      }
+      const data = await resp.json();
+      const text = data.choices?.[0]?.message?.content;
+      if (!text) {
+        console.warn("[SecondOpinion] 空响应", cfg.model, JSON.stringify(data).slice(0, 200));
+        noteFailure(`${cfg.model} 返回了空内容（HTTP 200 但 choices[0].message.content 为空）`);
+        return null;
+      }
+      const meta = JSON.parse(cleanJson(text)) as AiMeta;
+      const u = data.usage ?? {};
+      console.log(`[SecondOpinion] ${cfg.model} 复核完成，耗时 ${Date.now() - startedAt} ms`);
+      return {
+        meta,
+        model: cfg.model,
+        usage: {
+          prompt_tokens: u.prompt_tokens ?? 0,
+          completion_tokens: u.completion_tokens ?? 0,
+          total_tokens: u.total_tokens ?? 0,
+        },
+      };
+    } catch (e) {
+      // Non-fatal by design: a failed second opinion just means we keep the 疑似 verdict.
+      const msg = e instanceof Error ? e.message : String(e);
+      const spent = Math.round((Date.now() - startedAt) / 1000);
+      console.warn(`[SecondOpinion] second opinion failed after ${spent}s:`, msg);
+      noteFailure(
+        controller.signal.aborted
+          ? // ⚠️ 这句话必须点破「自检全绿 ≠ 真复核能跑完」。用户实测里最费解的一点就是：
+            // 后台三条自检全过，前台却说复核没运行。原因是自检发的是一张 846 字节的
+            // 四色小图 + 只要四个词的回答（约 2 秒），而真复核发的是整张实拍照片（外加
+            // 补拍照）+ 要一段 150–260 字的导语 —— 两者的耗时根本不是一个量级。
+            // 自检回答的是「这个 key 能用吗 / 这个模型看得见图吗」，从来不回答「它够不够快」。
+            `${cfg.model} 在 ${Math.round(budgetMs / 1000)} 秒内没返回（实际等了 ${spent} 秒）。` +
+            `注意：后台「连通体检 / 视觉自检」发的是一张几百字节的小图、只要四个词的回答，` +
+            `全绿只说明 key 可用、模型能读图，**测不出它答一次真实复核要多久** —— ` +
+            `推理模型（qwen3 / glm / deepseek 的 thinking 版等）常常要 40 秒以上。` +
+            `建议在「二次复核」控制台换成非推理的视觉模型（或该模型的 non-thinking / turbo 版本），` +
+            `并把慢的那个排到序列后面。`
+          : `${cfg.model} 调用出错（第 ${spent} 秒）：${msg.slice(0, 140)}`,
+      );
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  });
 }
 
 /** 二次复核模型顶替 Pl@ntNet 做「一线专业定种」——只在 Pl@ntNet 不可用（每日 500 次免费额度用尽 /
@@ -1015,91 +1484,94 @@ async function secondOpinionPrimaryVerdict(
   photoDataUrl: string,
   priorPhotos: InlineImage[],
 ): Promise<{ hint: string; label: string; usage: AiTokenUsage; model: string } | null> {
-  const cfg = await loadSecondOpinionConfig();
-  if (!cfg) return null;
-
-  const prior = priorPhotos.slice(0, 4);
-  const system = `你是专业植物分类引擎。识别照片里的植物，只返回一个 JSON 对象（不要 markdown、不要多余文字）：
+  return withSecondOpinionSlots(async (cfg) => {
+    const prior = priorPhotos.slice(0, 4);
+    const system = `你是专业植物分类引擎。识别照片里的植物，只返回一个 JSON 对象（不要 markdown、不要多余文字）：
 {"scientific_name":"最可能物种的拉丁学名（尽量到种）","family":"科（拉丁）","genus":"属（拉丁）","confidence":0到100的整数,"candidates":["候选学名（xx%）","…最多 4 个，按可能性降序"]}
 规则：confidence 是你对首选物种的把握（0–100 整数），**必须诚实**——照片不足以确诊到种时就给低分，不要为了给出答案而虚高。candidates 至少包含首选本身。`;
 
-  const content: unknown[] = [
-    {
-      type: "text",
-      text:
-        `识别这${prior.length ? "组" : "张"}植物照片。` +
-        (prior.length ? `共 ${prior.length + 1} 张同一株植物的不同角度，请综合判定。` : "") +
-        `只按上面的 JSON 结构返回。`,
-    },
-    { type: "image_url", image_url: { url: photoDataUrl } },
-    ...prior.map((im) => ({
-      type: "image_url",
-      image_url: { url: `data:${im.mimeType};base64,${im.base64}` },
-    })),
-  ];
-
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 25_000);
-  try {
-    const resp = await fetch(`${cfg.baseUrl}/chat/completions`, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${cfg.apiKey}`, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: cfg.model,
-        messages: [
-          { role: "system", content: system },
-          { role: "user", content },
-        ],
-        response_format: { type: "json_object" },
-        max_tokens: 600,
-        temperature: 0,
-      }),
-      signal: controller.signal,
-    });
-    if (!resp.ok) {
-      console.warn(
-        "[SecondOpinion] primary verdict HTTP",
-        resp.status,
-        (await resp.text().catch(() => "")).slice(0, 300),
-      );
-      return null;
-    }
-    const data = await resp.json();
-    const text = data.choices?.[0]?.message?.content;
-    if (!text) return null;
-    const v = JSON.parse(cleanJson(text)) as {
-      scientific_name?: string;
-      family?: string;
-      genus?: string;
-      confidence?: number;
-      candidates?: string[];
-    };
-    const sci = (v.scientific_name || "").toString().trim();
-    if (!sci) return null;
-    const pct = Math.max(0, Math.min(100, Math.round(Number(v.confidence) || 0)));
-    const cands = Array.isArray(v.candidates) ? v.candidates.slice(0, 4).map(String) : [];
-    const u = data.usage ?? {};
-    return {
-      label: `${sci}@${pct}%`,
-      hint:
-        `【专业识别判定（二次复核模型视觉 · Pl@ntNet 额度用尽时顶替）】最可能物种：${sci}` +
-        `${v.family ? `（科 ${v.family}${v.genus ? ` / 属 ${v.genus}` : ""}）` : ""}` +
-        `，置信度 ${pct}%。${cands.length ? `备选：${cands.join("、")}。` : ""}` +
-        `请以此判定为基准核对照片；若置信度偏低（低于 30%）或与照片明显不符，` +
-        `请在 summary_zh 开头标注「疑似」并简述分歧依据。`,
-      model: cfg.model,
-      usage: {
-        prompt_tokens: u.prompt_tokens ?? 0,
-        completion_tokens: u.completion_tokens ?? 0,
-        total_tokens: u.total_tokens ?? 0,
+    const content: unknown[] = [
+      {
+        type: "text",
+        text:
+          `识别这${prior.length ? "组" : "张"}植物照片。` +
+          (prior.length ? `共 ${prior.length + 1} 张同一株植物的不同角度，请综合判定。` : "") +
+          `只按上面的 JSON 结构返回。`,
       },
-    };
-  } catch (e) {
-    console.warn("[SecondOpinion] primary verdict failed:", e instanceof Error ? e.message : e);
-    return null;
-  } finally {
-    clearTimeout(timer);
-  }
+      { type: "image_url", image_url: { url: photoDataUrl } },
+      ...prior.map((im) => ({
+        type: "image_url",
+        image_url: { url: `data:${im.mimeType};base64,${im.base64}` },
+      })),
+    ];
+
+    const controller = new AbortController();
+    // 与复核共用同一份总预算（都走 withSecondOpinionSlots）。这条路只要几个字段、
+    // 不写导语，本来就快得多，所以给 20 秒封顶就够。
+    const timer = setTimeout(() => controller.abort(), Math.min(secondOpinionSlotTimeout() || 1, 20_000));
+    try {
+      const resp = await postOpenAICompat(
+        `${cfg.baseUrl}/chat/completions`,
+        cfg.apiKey,
+        {
+          model: cfg.model,
+          messages: [
+            { role: "system", content: system },
+            { role: "user", content },
+          ],
+          // 同复核：顶替定种只要一个学名和一个分数，思维链纯属拖时间。
+          ...THINKING_OFF,
+          response_format: { type: "json_object" },
+          max_tokens: 600,
+          temperature: 0,
+        },
+        { signal: controller.signal },
+      );
+      if (!resp.ok) {
+        console.warn(
+          "[SecondOpinion] primary verdict HTTP",
+          resp.status,
+          (await resp.text().catch(() => "")).slice(0, 300),
+        );
+        return null;
+      }
+      const data = await resp.json();
+      const text = data.choices?.[0]?.message?.content;
+      if (!text) return null;
+      const v = JSON.parse(cleanJson(text)) as {
+        scientific_name?: string;
+        family?: string;
+        genus?: string;
+        confidence?: number;
+        candidates?: string[];
+      };
+      const sci = (v.scientific_name || "").toString().trim();
+      if (!sci) return null;
+      const pct = Math.max(0, Math.min(100, Math.round(Number(v.confidence) || 0)));
+      const cands = Array.isArray(v.candidates) ? v.candidates.slice(0, 4).map(String) : [];
+      const u = data.usage ?? {};
+      return {
+        label: `${sci}@${pct}%`,
+        hint:
+          `【专业识别判定（二次复核模型视觉 · Pl@ntNet 额度用尽时顶替）】最可能物种：${sci}` +
+          `${v.family ? `（科 ${v.family}${v.genus ? ` / 属 ${v.genus}` : ""}）` : ""}` +
+          `，置信度 ${pct}%。${cands.length ? `备选：${cands.join("、")}。` : ""}` +
+          `请以此判定为基准核对照片；若置信度偏低（低于 30%）或与照片明显不符，` +
+          `请在 summary_zh 开头标注「疑似」并简述分歧依据。`,
+        model: cfg.model,
+        usage: {
+          prompt_tokens: u.prompt_tokens ?? 0,
+          completion_tokens: u.completion_tokens ?? 0,
+          total_tokens: u.total_tokens ?? 0,
+        },
+      };
+    } catch (e) {
+      console.warn("[SecondOpinion] primary verdict failed:", e instanceof Error ? e.message : e);
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  });
 }
 
 /** Token-saving helper: given a species key (normalized scientific name), query the
@@ -1216,7 +1688,46 @@ async function generateFieldNotesOnly(
   }
 }
 
+/**
+ * 识别一线调用：按管理员配置的**优先调用序列**依次尝试，序列 1 失败（额度用尽 /
+ * 限流 / key 失效 / 模型不存在 / 服务端故障）就顺位交给 2、3…。
+ * 序列为空时回退到 .env（保持老部署可用）。
+ */
 async function callAiIdentify(
+  photoDataUrl: string,
+  hintPlace: string,
+  speciesHint?: { title?: string; scientificName?: string } | null,
+  webResearch?: { digest: string; sources: { title: string; uri: string }[] },
+  // 哪条链路在调用：拍照出卡走「出卡AI」序列；enrichDraft 的重活走「草稿生成模型」
+  // 序列。两者未单独配置时都自动回退到「AI 模型控制台」。
+  queueKind: "card" | "enrich" = "card",
+): Promise<{ meta: AiMeta; model: string; provider: string; usage: AiTokenUsage }> {
+  const { sequence } = queueKind === "enrich" ? await loadEnrichQueue() : await loadCardQueue();
+  // 没配序列 → 传 null，让下游走 .env Gemini 兜底（与改造前行为一致）。
+  if (!sequence.length)
+    return callAiIdentifyWithConfig(null, photoDataUrl, hintPlace, speciesHint, webResearch);
+  return runModelQueue(
+    sequence,
+    (slot) =>
+      callAiIdentifyWithConfig(
+        { provider: slot.provider, apiKey: slot.apiKey, model: slot.model, baseUrl: slot.baseUrl },
+        photoDataUrl,
+        hintPlace,
+        speciesHint,
+        webResearch,
+      ),
+    queueKind === "enrich" ? "草稿生成" : "出卡AI",
+    // 两条链路都要把用户拍的照片喂给模型 —— 正是 deepseek-v4-flash 事故的现场。
+    { requireVision: true },
+  );
+}
+
+/**
+ * 用**指定的一套配置**跑一次完整识别。外面的 callAiIdentify() 负责按优先调用序列
+ * 依次喂不同的配置进来 —— 这里只管「用这一套跑通」，不关心降级。
+ */
+async function callAiIdentifyWithConfig(
+  slotConfig: AiProviderConfig | null,
   photoDataUrl: string,
   hintPlace: string,
   // When the species is ALREADY decided (e.g. phase-2 enrich of a phase-1 card),
@@ -1228,8 +1739,8 @@ async function callAiIdentify(
   // prompt as authoritative reference material for accuracy + timeliness.
   webResearch?: { digest: string; sources: { title: string; uri: string }[] },
 ): Promise<{ meta: AiMeta; model: string; provider: string; usage: AiTokenUsage }> {
-  // Load admin-configured model from DB (affects ALL users); fall back to env vars
-  let dbConfig = await loadAiConfig();
+  // 这一套配置由调用方（序列执行器）给定；null = 走 .env 兜底路径。
+  const dbConfig = slotConfig;
 
   // ── Two-stage: glm 快速识别 + Gemini 出草稿 ─────────────────────────────────
   // A custom relay (great at a quick vision ID, unreliable on the heavy 21-field draft)
@@ -1237,7 +1748,6 @@ async function callAiIdentify(
   // ID as a hint. Needs a saved `custom` config AND an env Gemini key. If the quick ID
   // fails we still fall through to a Gemini-only draft, so identify never breaks.
   let stageModel = "";
-  let stageUsage: AiTokenUsage | null = null;
   let idHint = "";
   // A pinned species short-circuits re-identification and locks the name.
   const pinnedSci = (speciesHint?.scientificName || "").trim();
@@ -1281,28 +1791,38 @@ async function callAiIdentify(
     }
   }
 
-  if (!pinned && dbConfig?.provider === "custom" && dbConfig.apiKey && process.env.GEMINI_API_KEY) {
-    const quick = await quickIdentify(photoDataUrl, dbConfig).catch((e) => {
-      console.warn("[Two-stage] quick ID failed; falling back to Gemini-only:", e);
-      return null;
-    });
-    if (quick && (quick.title || quick.scientific_name)) {
-      if (!earlySpeciesName && quick.scientific_name) earlySpeciesName = quick.scientific_name;
-      idHint += `\n\n【初步识别提示】另一视觉模型已将本图判定为：「${quick.title}」${quick.scientific_name ? `（${quick.scientific_name}）` : ""}。请结合照片核对该判定并据此生成草稿；若你认为该判定有误，请以你的判断为准，并在 summary_zh 中简要说明分歧。`;
-      stageModel = stageModel ? `${stageModel}+${quick.model}` : quick.model;
-      stageUsage = quick.usage;
-    }
-    dbConfig = null; // route the heavy draft to the env Gemini path below
-  }
+  // 【已移除：custom → env Gemini 的改道】
+  // 旧设计假设 custom 只是个「弱视觉中转」，让它做快速定种、再把写文案的重活交给
+  // env 里的 Gemini。在「优先调用序列」下这个假设不成立了：每个序列项都是管理员
+  // **明确指定**的完整配置，把序列 1 的 Kimi 偷偷换成 env Gemini 既违背配置意图，
+  // 又会在 env key 失效/额度耗尽时报出一个与所配模型毫不相干的错误
+  // （实际发生过：序列 1 明明是 kimi-k2.6，报的却是「Gemini API key 无效」）。
+  // 现在一律用当前序列项自己的模型跑完整份草稿。
 
-  // ── Token-saving branch: if we got a species ID from the cheap stages, try to reuse
-  // an existing draft's universal content and only regenerate the photo-specific field_notes.
-  // Fully non-fatal: any failure falls through to the normal full-draft generation below.
+  // ── 复用分支：物种级内容只写一次，全站共享 ──────────────────────────────────
+  // 命中时**只重新生成拍摄记录**（唯一因人而异的字段），其余照搬。整条链路对失败
+  // 完全非致命：任何一步不成就落到下面的完整生成。
+  //
+  // 查两层，顺序刻意：
+  //   ① species_dossiers —— 正式的资料包表（CP3）。
+  //   ② 旧的「扫最近 50 条草稿」启发式 —— 表刚建、还没攒下资料包的过渡期靠它兜底。
+  //      等资料包铺开后可以删掉②。
+  let dossierHit: { id?: string; hitCount: number } | null = null;
   if (earlySpeciesName) {
-    const existing = await findExistingSpeciesDraft(earlySpeciesName).catch((e) => {
-      console.warn("[TokenSave] Query failed:", e);
-      return null;
-    });
+    let existing: AiMeta | null = null;
+    const dossier = await loadDossier(earlySpeciesName);
+    if (dossier && isDossierUsable(dossier.body)) {
+      existing = dossier.body as AiMeta;
+      dossierHit = { id: dossier.id, hitCount: dossier.hitCount };
+      console.log(
+        `[Dossier] 命中「${dossier.speciesKey}」（${dossier.status}，已被复用 ${dossier.hitCount} 次）`,
+      );
+    } else {
+      existing = await findExistingSpeciesDraft(earlySpeciesName).catch((e) => {
+        console.warn("[TokenSave] Query failed:", e);
+        return null;
+      });
+    }
     if (existing) {
       const fieldNotesResult = await generateFieldNotesOnly(
         photoDataUrl,
@@ -1315,20 +1835,31 @@ async function callAiIdentify(
       });
 
       if (fieldNotesResult && fieldNotesResult.field_notes_zh) {
-        // Success: merge the existing universal content with the new field_notes
-        const meta: AiMeta = {
-          ...existing,
-          field_notes_zh: fieldNotesResult.field_notes_zh,
-          field_notes_en: fieldNotesResult.field_notes_en,
-        };
+        // 通用内容 + 这张照片的个人信息。走 assembleDraftMeta 而不是直接展开，是为了
+        // **剥掉所有照片级字段**再合并 —— 旧代码只覆盖了 field_notes，把来源草稿的
+        // identification_confidence 和 needs_more_photos_* 一起继承了过来：甲那张糊照
+        // 的「疑似 + 请补拍花的特写」会原样出现在乙的清晰照草稿上。见
+        // species-dossier.ts 的 PHOTO_SPECIFIC_FIELDS。
+        const meta = assembleDraftMeta(
+          {
+            body: existing as Record<string, unknown>,
+            scientificName: existing.scientific_name || earlySpeciesName,
+            title: existing.title ?? null,
+          },
+          {
+            field_notes_zh: fieldNotesResult.field_notes_zh,
+            field_notes_en: fieldNotesResult.field_notes_en,
+          },
+        ) as AiMeta;
+        if (dossierHit?.id) void bumpDossierHit(dossierHit.id, dossierHit.hitCount);
         const totalUsage: AiTokenUsage = {
-          prompt_tokens: (stageUsage?.prompt_tokens ?? 0) + fieldNotesResult.usage.prompt_tokens,
-          completion_tokens:
-            (stageUsage?.completion_tokens ?? 0) + fieldNotesResult.usage.completion_tokens,
-          total_tokens: (stageUsage?.total_tokens ?? 0) + fieldNotesResult.usage.total_tokens,
+          prompt_tokens: fieldNotesResult.usage.prompt_tokens,
+          completion_tokens: fieldNotesResult.usage.completion_tokens,
+          total_tokens: fieldNotesResult.usage.total_tokens,
         };
+        const via = dossierHit ? "dossier" : "legacy-scan";
         console.log(
-          `[TokenSave] Reused existing draft, only regenerated field_notes. Tokens: ${totalUsage.total_tokens}`,
+          `[TokenSave] 复用${via === "dossier" ? "物种资料包" : "历史草稿"}，只重生成拍摄记录。Tokens: ${totalUsage.total_tokens}`,
         );
         return {
           meta,
@@ -1379,7 +1910,7 @@ async function callAiIdentify(
 - summary_zh：150–260 字，一段引人入胜的「开篇导语」，以一位博学的博物学家兼科普博主的口吻来写。**主题是这种植物与人们生活相关的趣闻、要闻、冷知识或近期资讯**——例如它奇特的生存智慧、与人类饮食/医药/民俗/生态的意外联系、常被认错的趣事、名字背后的故事、或与之相关的新闻热点等，目的是勾起读者的好奇心。语气生动、有画面感、带一点惊叹与幽默，但严谨不编造。**切勿在此罗列科属、拉丁学名、形态特征或生境概要（这些放到下方各分区），也不要复述「本次拍摄于……」这类拍摄记录**，避免与页面其它部分重复。如不确定物种，开头用「疑似……」并简述判断依据。summary_en：50–90 词，同样是趣味导语式的精炼意译，而非形态总览。
 - field_notes_zh：120–220 字，这是「拍摄记录」栏，**主题必须是对用户上传的这一张照片的分析，以及你据此定种的判断依据**，与 summary 内容完全不同、不得重复。具体写：① 照片里实际可见的诊断性特征（例如叶序/叶形/叶缘、花色花瓣数与排列、果实、茎/刺/毛被、拍摄季节物候等——只描述照片中真正能看到的，不要脑补看不见的部位）；② 由这些可见特征如何推导到该物种/属，哪些特征可与易混近缘种相区分；③ 若照片信息不足以确诊，如实说明还需要哪些部位或角度的照片（如花的特写、果实、叶背）才能进一步确定。口吻是植物学家在做实物鉴定，客观、就图论图。field_notes_en：45–85 词，对应意译。
 - common_names_zh：包含该植物的所有中文俗名、别名、以及花卉市场常见的商品名/交易名，用半角逗号隔开（例如 "发财树, 瓜栗, 招财树"）。
-- name_origin_zh：220–360 字，分两部分：① 中文名（俗名、古名、地方名）的字源、典籍出处；② 拉丁学名属名 + 种加词的词根含义、命名人/命名年代背景。name_origin_en：80–140 词。
+- name_origin_zh：220–360 字，本节标题是「名称和分类趣闻」，所以**名称与分类各占一半、都要写出「趣」来**：① 名称——中文名（俗名、古名、地方名）的字源与典籍出处，以及拉丁学名属名 + 种加词的词根含义、命名人/命名年代背景；② 分类趣闻——本种在分类学上值得一说的事，例如曾被归入哪个属、后来因分子系统学证据被移出（写清改到哪个属）、种下等级或异名的争议、与哪个常被张冠李戴的同名/近似种长期混淆、以及所属科属本身的特点。**不要写成词源的流水账**：挑真正有意思的点讲，宁可只讲一件事讲透。分类学上的改动若记不清确切文献就只作定性表述，绝不编造年份、人名与期刊。name_origin_en：80–140 词。
 - morphology_zh：320–500 字，按 株型/根 → 茎 → 叶 → 花 → 果实/种子 顺序描述，包含具体数值（如高度 cm、叶长 mm、花期月份）。morphology_en：100–160 词。
 - habitat_zh：260–400 字，包含：典型生境与海拔/土壤、世界分布范围、中国分布省份，以及本次拍摄地点的生态记录。${hintPlace ? `本段必须自然带入「本次拍摄于 ${hintPlace}」一句。` : "⚠️ 本次未提供可靠的拍摄定位：严禁臆造、推断或填入任何具体拍摄地名（省/市/区/县/街道均不可），如需提及拍摄地点只能写「本次拍摄地点未知」。"}habitat_en：90–140 词。
 - culture_zh：360–600 字，本部分的主题是「植物人文」，请尽量分点覆盖以下维度（无相关内容的维度可略写，但严禁编造）：① 文化与民俗；② 植物民族志——世界不同民族/地区对该植物的认知、命名与地方性知识；③ 文学——若有名篇名句或典籍记载，请引用原文片段并注明出处/作者；④ 食用与药用；⑤ 茶饮（若相关）；⑥ 商贸与经济价值；⑦ 博物学史（被发现、引种、命名、栽培传播的历史）。若该物种确无人文记载，则转而详述其生态角色与近缘种的文化对比。culture_en：120–180 词，对应中文要点的精炼意译。
@@ -1402,7 +1933,7 @@ async function callAiIdentify(
   // ── 1. Google Gemini ──────────────────────────────────────────────────────
   if (geminiKey) {
     try {
-      let model =
+      const model =
         dbConfig?.provider === "gemini" && dbConfig.model
           ? dbConfig.model
           : process.env.AI_MODEL || "gemini-3-flash-preview";
@@ -1466,9 +1997,9 @@ async function callAiIdentify(
           model: stageModel ? `${stageModel}→${model}` : model,
           provider: stageModel ? `${stageModel}+gemini` : "gemini",
           usage: {
-            prompt_tokens: (u.promptTokenCount ?? 0) + (stageUsage?.prompt_tokens ?? 0),
-            completion_tokens: (u.candidatesTokenCount ?? 0) + (stageUsage?.completion_tokens ?? 0),
-            total_tokens: (u.totalTokenCount ?? 0) + (stageUsage?.total_tokens ?? 0),
+            prompt_tokens: u.promptTokenCount ?? 0,
+            completion_tokens: u.candidatesTokenCount ?? 0,
+            total_tokens: u.totalTokenCount ?? 0,
           },
         };
       } catch (e) {
@@ -1576,7 +2107,7 @@ async function callAiIdentify(
       `[AI Identify] Routing to OpenAI-compatible API: ${apiBase} using model: ${model}${dbConfig ? " (db config)" : ""}`,
     );
 
-    const requestBody = JSON.stringify({
+    const requestBody: Record<string, unknown> = {
       model,
       messages: [
         { role: "system", content: systemPrompt },
@@ -1602,7 +2133,7 @@ async function callAiIdentify(
       max_tokens: 16000,
       temperature: 0.0,
       ...(dbConfig?.provider === "custom" ? {} : { response_format: { type: "json_object" } }),
-    });
+    };
 
     // 429 = rate limit, 503 = overloaded — both transient on relay/中转 endpoints
     // (which often have strict per-account rate limits). Retry with backoff so a
@@ -1612,14 +2143,28 @@ async function callAiIdentify(
     let resp: Response | null = null;
     while (attempts < maxAttempts) {
       attempts++;
-      resp = await fetch(`${apiBase}/chat/completions`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${openaiKey}`,
-          "Content-Type": "application/json",
-        },
-        body: requestBody,
-      });
+      // postOpenAICompat：某个可调参数被 400 拒收时（如 Kimi K3 只允许 temperature=1）
+      // 自动去掉该参数重试一次。
+      resp = await postOpenAICompat(`${apiBase}/chat/completions`, openaiKey, requestBody);
+
+      // 524/504/408 = 网关等不到上游吐字节就判超时。整份草稿要生成几十秒到几分钟，
+      // 慢模型（Kimi K3 这类推理模型）每次都会同样慢 → 重试多少次都还是超时。
+      // 改用流式：token 边生成边回，网关一直看得到数据就不会超时。
+      // 若对方压根不支持流式（回 599 = 拿到的不是 SSE），就退回原来的非流式结果。
+      if (resp.status === 524 || resp.status === 504 || resp.status === 408) {
+        console.warn(`[AI Identify] HTTP ${resp.status} 网关超时，改用流式重试`);
+        const streamed = await postOpenAICompatStream(
+          `${apiBase}/chat/completions`,
+          openaiKey,
+          requestBody,
+        );
+        if (streamed.ok) {
+          resp = streamed;
+          break;
+        }
+        console.warn(`[AI Identify] 流式重试也失败（HTTP ${streamed.status}），回到常规重试`);
+      }
+
       // 429 = rate limit; 5xx = relay/中转 gateway hiccup (these endpoints often 502/504
       // on slow, heavy generations like the full draft). Both transient → retry.
       if (
@@ -1882,7 +2427,7 @@ async function reverseGeocode(lat: number, lng: number): Promise<string> {
 
   if (geminiKey) {
     try {
-      let model = process.env.AI_MODEL || "gemini-3-flash-preview";
+      const model = process.env.AI_MODEL || "gemini-3-flash-preview";
       const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiKey}`;
       const resp = await fetch(url, {
         method: "POST",
@@ -1960,11 +2505,14 @@ async function reverseGeocode(lat: number, lng: number): Promise<string> {
   return "";
 }
 
-/** Fetch real, distinct field photos of a species from public biodiversity APIs
- *  (iNaturalist research-grade → GBIF → Wikimedia), for the draft's body sections.
- *  Server-side sibling of the client `searchPlantImages`. Never throws — returns
- *  as many distinct full-size URLs as it can (≤ n), or [] on total failure. */
-async function fetchSpeciesPhotos(term: string, n: number): Promise<string[]> {
+/**
+ * 找该物种的公开实拍图。返回**带许可与署名的候选**，不再是裸 URL —— 2026-07-20 起
+ * 每张图都必须能回答「谁拍的、什么许可、原始页在哪」，否则不许用（见 species-photos.ts）。
+ *
+ * 四级数据源，按「对读者的价值」排序：iNat 实拍 → GBIF 观测 → Commons → 腊叶标本/图版。
+ * 每一级都先过许可闸门再进多样性挑选。
+ */
+async function fetchSpeciesPhotos(term: string, n: number): Promise<PhotoCandidate[]> {
   const q = (term || "").trim();
   if (!q) return [];
   const timeoutFetch = async (url: string) => {
@@ -1983,30 +2531,29 @@ async function fetchSpeciesPhotos(term: string, n: number): Promise<string[]> {
     }
   };
 
-  const urls: string[] = [];
+  const picked: PhotoCandidate[] = [];
   const seen = new Set<string>();
-  const add = (u?: string | null) => {
-    const s = (u || "").trim();
-    if (s && !seen.has(s)) {
-      seen.add(s);
-      urls.push(s);
-    }
+  /** 每一级被许可闸门拦下多少张 —— 必须打日志，否则「图变少了」会变成玄学问题。 */
+  let droppedTotal = 0;
+
+  const add = (c: PhotoCandidate | null | undefined) => {
+    if (!c?.url || seen.has(c.url)) return;
+    seen.add(c.url);
+    picked.push(c);
   };
 
   // Greedy diversity pick: never take two photos that share a place / season /
   // photographer until we're forced to. Without this the top-voted photos of one
   // species are usually the SAME plant shot by the same person on the same day.
-  // `part` = which organ the shot shows ("leaf"/"flower"/"fruit"/"plant"/"" general),
-  // so the picker can spread the chosen photos across plant parts rather than return
-  // five near-identical flower close-ups.
-  type Cand = { url: string; place: string; season: string; who: string; part: string };
-  const pickDiverse = (cands: Cand[], want: number): string[] => {
-    const out: string[] = [];
+  // `organ` = which part the shot shows, so the picker can spread the chosen photos
+  // across plant parts rather than return five near-identical flower close-ups.
+  const pickDiverse = (cands: PhotoCandidate[], want: number): PhotoCandidate[] => {
+    const out: PhotoCandidate[] = [];
     const places = new Set<string>();
     const seasons = new Set<string>();
     const whos = new Set<string>();
-    const parts = new Set<string>();
-    // pass 3 = all axes (incl. plant part) must be new; pass 2 = place must be new; pass 1 = anything.
+    const organs = new Set<string>();
+    // pass 3 = all axes (incl. organ) must be new; pass 2 = place must be new; pass 1 = anything.
     for (const strict of [3, 2, 1]) {
       for (const c of cands) {
         if (out.length >= want) return out;
@@ -2016,16 +2563,16 @@ async function fetchSpeciesPhotos(term: string, n: number): Promise<string[]> {
           ((c.place && places.has(c.place)) ||
             (c.season && seasons.has(c.season)) ||
             (c.who && whos.has(c.who)) ||
-            (c.part && parts.has(c.part)))
+            (c.organ && organs.has(c.organ)))
         )
           continue;
         if (strict === 2 && c.place && places.has(c.place)) continue;
         seen.add(c.url);
-        out.push(c.url);
+        out.push(c);
         if (c.place) places.add(c.place);
         if (c.season) seasons.add(c.season);
         if (c.who) whos.add(c.who);
-        if (c.part) parts.add(c.part);
+        if (c.organ) organs.add(c.organ);
       }
     }
     return out;
@@ -2034,10 +2581,10 @@ async function fetchSpeciesPhotos(term: string, n: number): Promise<string[]> {
   /** Take the best candidate from `pool` that doesn't repeat a place/photographer
    *  already used. Used to guarantee one shot per organ before any filler. */
   const takeOne = (
-    pool: Cand[],
+    pool: PhotoCandidate[],
     places: Set<string>,
     whos: Set<string>,
-  ): string | null => {
+  ): PhotoCandidate | null => {
     for (const relax of [false, true]) {
       for (const c of pool) {
         if (seen.has(c.url)) continue;
@@ -2045,10 +2592,17 @@ async function fetchSpeciesPhotos(term: string, n: number): Promise<string[]> {
         seen.add(c.url);
         if (c.place) places.add(c.place);
         if (c.who) whos.add(c.who);
-        return c.url;
+        return c;
       }
     }
     return null;
+  };
+
+  /** 过许可闸门 + 记账。所有数据源共用。 */
+  const licensed = (cands: PhotoCandidate[]): PhotoCandidate[] => {
+    const { kept, dropped } = filterLicensed(cands);
+    droppedTotal += dropped;
+    return kept;
   };
 
   // 1) iNaturalist — best for real, vetted species field photos. Pull a general
@@ -2060,10 +2614,11 @@ async function fetchSpeciesPhotos(term: string, n: number): Promise<string[]> {
   //    14 Fruits or Seeds, 21 No Flowers or Fruits (= vegetative → whole-plant/habitat).
   //
   //    Reality check that shapes the code below: for the rare Ordos species this site
-  //    cares about, the annotated pools are nearly EMPTY (沙冬青 has leaf=1, flower=0,
-  //    fruit=0 research-grade observations, but 20 in the general pool). So the organ
-  //    pools are treated as a best-effort *bonus* on top of the general pool, never as
-  //    the only source — otherwise rare species would come back with no photos at all.
+  //    cares about, the annotated pools are nearly EMPTY (2026-07-20 实测：沙冬青
+  //    20 条 research-grade 里只有 1 条带器官标注，柠条锦鸡儿 4/40，蒲公英 4/40)。
+  //    So the organ pools are treated as a best-effort *bonus* on top of the general
+  //    pool, never as the only source — otherwise rare species come back with nothing.
+  //    真正把器官对上号要靠 CP4b 的视觉验证，标注只是免费的先验。
   try {
     const tx = await timeoutFetch(
       "https://api.inaturalist.org/v1/taxa?" +
@@ -2077,9 +2632,9 @@ async function fetchSpeciesPhotos(term: string, n: number): Promise<string[]> {
     // each), while the general pool stays deep because it does the filling.
     const fetchPool = async (
       extra: Record<string, string>,
-      part: string,
+      organ: Organ,
       size = "15",
-    ): Promise<Cand[]> => {
+    ): Promise<PhotoCandidate[]> => {
       const params = new URLSearchParams({
         photos: "true",
         per_page: size,
@@ -2091,7 +2646,7 @@ async function fetchSpeciesPhotos(term: string, n: number): Promise<string[]> {
       if (taxonId) params.set("taxon_id", String(taxonId));
       else params.set("q", q);
       const j = await timeoutFetch("https://api.inaturalist.org/v1/observations?" + params);
-      const out: Cand[] = [];
+      const out: PhotoCandidate[] = [];
       for (const obs of j?.results ?? []) {
         // ONE photo per observation — extra photos of the same observation are the
         // same individual from near-identical angles.
@@ -2102,13 +2657,20 @@ async function fetchSpeciesPhotos(term: string, n: number): Promise<string[]> {
           url: String(ph.url)
             .replace(/\/square\./, "/large.")
             .replace(/\/medium\./, "/large."),
+          organ,
           place: obs?.place_guess || coords.map((c) => Math.round(c)).join(","),
           season: (obs?.observed_on || "").slice(5, 7), // month → different phenology/生境
-          who: obs?.user?.login || "",
-          part,
+          // 署名优先用真名，没有再用 login。
+          who: obs?.user?.name || obs?.user?.login || "",
+          // ⚠️ iNat 用 license_code: null 表示「保留所有权利」。空串会被
+          // isReusableLicense 判为不可用 —— 这正是我们要的行为。
+          license: ph?.license_code ?? "",
+          attribution: ph?.attribution ?? "",
+          sourceUrl: obs?.uri || "",
+          sourceName: "iNaturalist",
         });
       }
-      return out;
+      return licensed(out);
     };
 
     const [general, leaves, flowering, fruiting, vegetative] = await Promise.all([
@@ -2126,27 +2688,27 @@ async function fetchSpeciesPhotos(term: string, n: number): Promise<string[]> {
     const usedPlaces = new Set<string>();
     const usedWhos = new Set<string>();
     for (const pool of [fruiting, flowering, leaves, vegetative]) {
-      if (urls.length >= n) break;
-      const u = takeOne(pool, usedPlaces, usedWhos);
-      if (u) urls.push(u);
+      if (picked.length >= n) break;
+      const c = takeOne(pool, usedPlaces, usedWhos);
+      if (c) picked.push(c);
     }
 
     // Pass B — fill the rest from every pool, still spreading across
     // place / season / photographer / organ (`seen` already excludes Pass A picks).
-    if (urls.length < n) {
-      const cands: Cand[] = [];
+    if (picked.length < n) {
+      const cands: PhotoCandidate[] = [];
       const pools = [fruiting, flowering, leaves, vegetative, general];
       const maxLen = Math.max(...pools.map((p) => p.length));
       for (let i = 0; i < maxLen; i++) for (const p of pools) if (p[i]) cands.push(p[i]);
-      for (const u of pickDiverse(cands, n - urls.length)) urls.push(u);
+      for (const c of pickDiverse(cands, n - picked.length)) picked.push(c);
     }
-    if (urls.length >= n) return urls;
+    if (picked.length >= n) return finish();
   } catch {
     /* fall through to next source */
   }
 
   // 2) GBIF occurrences with media.
-  if (urls.length < n) {
+  if (picked.length < n) {
     try {
       const m = await timeoutFetch(
         "https://api.gbif.org/v1/species/match?" + new URLSearchParams({ name: q }),
@@ -2156,27 +2718,32 @@ async function fetchSpeciesPhotos(term: string, n: number): Promise<string[]> {
       if (key) params.set("taxonKey", String(key));
       else params.set("q", q);
       const j = await timeoutFetch("https://api.gbif.org/v1/occurrence/search?" + params);
-      const cands: Cand[] = [];
+      const cands: PhotoCandidate[] = [];
       for (const occ of j?.results ?? []) {
         const media = occ?.media?.[0]; // one image per occurrence
         if (!media?.identifier) continue;
         cands.push({
           url: String(media.identifier),
+          organ: "",
           place: occ?.stateProvince || occ?.country || occ?.locality || "",
           season: String(occ?.month ?? ""),
-          who: occ?.recordedBy || "",
-          part: "",
+          who: media?.rightsHolder || media?.creator || occ?.recordedBy || "",
+          license: media?.license ?? "",
+          attribution: "",
+          sourceUrl: media?.references || "",
+          sourceName: media?.publisher ? `GBIF · ${media.publisher}` : "GBIF",
         });
       }
-      for (const u of pickDiverse(cands, n - urls.length)) urls.push(u);
-      if (urls.length >= n) return urls;
+      for (const c of pickDiverse(licensed(cands), n - picked.length)) picked.push(c);
+      if (picked.length >= n) return finish();
     } catch {
       /* fall through */
     }
   }
 
   // 3) Wikimedia Commons live photos.
-  const commonsSearch = async (search: string, limit: string) => {
+  //    extmetadata 才带 License / Artist —— 没有它就无从判断能不能用，必须请求。
+  const commonsSearch = async (search: string, limit: string, organ: Organ = "") => {
     const j = await timeoutFetch(
       "https://commons.wikimedia.org/w/api.php?" +
         new URLSearchParams({
@@ -2188,25 +2755,39 @@ async function fetchSpeciesPhotos(term: string, n: number): Promise<string[]> {
           gsrsearch: search,
           gsrlimit: limit,
           prop: "imageinfo",
-          iiprop: "url|mime",
+          iiprop: "url|mime|extmetadata",
+          iiextmetadatafilter: "License|LicenseShortName|Artist|Credit",
           iiurlwidth: "1200",
         }),
     );
     const pages = j?.query?.pages ?? {};
+    const cands: PhotoCandidate[] = [];
     for (const k of Object.keys(pages)) {
       const ii = pages[k]?.imageinfo?.[0];
       if (!ii?.url || (ii.mime || "").includes("svg")) continue;
-      // `url` is the FULL-SIZE original (often 10–50 MB). `thumburl` is the scaled
-      // 1200px render — always prefer it so we store a sane file.
-      add(ii.thumburl || ii.url);
-      if (urls.length >= n) return true;
+      const em = ii.extmetadata ?? {};
+      cands.push({
+        // `url` is the FULL-SIZE original (often 10–50 MB). `thumburl` is the scaled
+        // 1200px render — always prefer it so we store a sane file.
+        url: ii.thumburl || ii.url,
+        organ,
+        place: "",
+        season: "",
+        // Artist 是 HTML（常带 <a> 链接），署名要落到图注上，先拆成纯文本。
+        who: stripHtml(em.Artist?.value ?? ""),
+        license: em.License?.value ?? "",
+        attribution: stripHtml(em.Credit?.value ?? ""),
+        sourceUrl: ii.descriptionurl || "",
+        sourceName: "Wikimedia Commons",
+      });
     }
-    return urls.length >= n;
+    for (const c of pickDiverse(licensed(cands), n - picked.length)) picked.push(c);
+    return picked.length >= n;
   };
 
-  if (urls.length < n) {
+  if (picked.length < n) {
     try {
-      if (await commonsSearch(q + " filetype:bitmap", "30")) return urls;
+      if (await commonsSearch(q + " filetype:bitmap", "30")) return finish();
     } catch {
       /* fall through */
     }
@@ -2217,7 +2798,7 @@ async function fetchSpeciesPhotos(term: string, n: number): Promise<string[]> {
   //    about a living plant than a field photo, so these only fill slots that real
   //    photos could not. Rare species (few/no iNat observations) are exactly the case
   //    where this tier saves a draft from shipping with blank image slots.
-  if (urls.length < n) {
+  if (picked.length < n) {
     try {
       const params = new URLSearchParams({
         mediaType: "StillImage",
@@ -2226,39 +2807,165 @@ async function fetchSpeciesPhotos(term: string, n: number): Promise<string[]> {
         q,
       });
       const j = await timeoutFetch("https://api.gbif.org/v1/occurrence/search?" + params);
-      const cands: Cand[] = [];
+      const cands: PhotoCandidate[] = [];
       for (const occ of j?.results ?? []) {
         const media = occ?.media?.[0];
         if (!media?.identifier) continue;
         cands.push({
           url: String(media.identifier),
+          organ: "specimen",
           // Herbarium sheets: spread across collections rather than place/season.
           place: occ?.institutionCode || occ?.collectionCode || "",
           season: "",
-          who: occ?.recordedBy || "",
-          part: "specimen",
+          who: media?.rightsHolder || media?.creator || occ?.recordedBy || "",
+          license: media?.license ?? "",
+          attribution: "",
+          sourceUrl: media?.references || "",
+          sourceName: occ?.institutionCode ? `标本 · ${occ.institutionCode}` : "腊叶标本",
         });
       }
-      for (const u of pickDiverse(cands, n - urls.length)) urls.push(u);
-      if (urls.length >= n) return urls;
+      for (const c of pickDiverse(licensed(cands), n - picked.length)) picked.push(c);
+      if (picked.length >= n) return finish();
     } catch {
       /* fall through */
     }
   }
 
-  if (urls.length < n) {
+  if (picked.length < n) {
     try {
       // Commons hosts the classic plates (Flora of China / Curtis's / BHL scans) and
       // line drawings under these terms.
       for (const term of ["illustration", "botanical illustration", "line drawing"]) {
-        if (await commonsSearch(`${q} ${term} filetype:bitmap`, "15")) return urls;
+        if (await commonsSearch(`${q} ${term} filetype:bitmap`, "15", "specimen")) return finish();
       }
     } catch {
       /* give up gracefully */
     }
   }
 
-  return urls;
+  return finish();
+
+  function finish(): PhotoCandidate[] {
+    if (droppedTotal)
+      console.log(
+        `[SpeciesPhotos] 「${q}」：采用 ${picked.length} 张，因许可不明/保留所有权利丢弃 ${droppedTotal} 张`,
+      );
+    return picked;
+  }
+}
+
+/**
+ * 让视觉模型**现看现标**每张候选图展示的是哪个器官。
+ *
+ * 为什么必须有它：数据源自带的器官标注覆盖率低到没法用（2026-07-20 实测 iNat
+ * research-grade 观测里带标注的只有 沙冬青 1/20、柠条锦鸡儿 4/40、蒲公英 4/40）。
+ * 不现看一遍，「配图能展示叶、花、果、生境」就只是一句口号 —— 页面会继续把随机图
+ * 按位置塞进「花」的位置。
+ *
+ * 三条刻意的设计：
+ * 1. **在转存之前分类**。分类用数据源的小图（iNat 的 /medium.），只有被选中的图才会
+ *    进 rehostImages —— 省带宽、省 Supabase 存储，也不用为丢弃的图付转存成本。
+ * 2. **完全非致命**。模型不通/超时/返回乱码，一律原样返回候选（退回数据源标注），
+ *    绝不让分类失败连累出稿。
+ * 3. **认不出就置空**，不猜。空器官不会被任何槽的 want 命中 = 自动弃用，
+ *    这比猜一个安全（见 photo-slots.ts 的 normalizeOrgan）。
+ */
+async function classifyPhotoOrgans(
+  cands: PhotoCandidate[],
+  speciesName: string,
+): Promise<PhotoCandidate[]> {
+  if (!cands.length) return cands;
+  // 一次最多看 14 张：再多既撑 payload 又拖慢，而 9 个槽用不了那么多候选。
+  const batch = cands.slice(0, 14);
+  try {
+    // iNat 的 /large. 换成 /medium.（≈500px）够判器官了，省一半以上流量。
+    const thumbs = await fetchInlineImages(
+      batch.map((c) => c.url.replace(/\/large\./, "/medium.")),
+    );
+    if (thumbs.length !== batch.length) {
+      console.warn(
+        `[PhotoOrgans] 只取到 ${thumbs.length}/${batch.length} 张缩略图，跳过分类（保留数据源标注）`,
+      );
+      return cands;
+    }
+
+    const system =
+      `你在为一份植物科普页面挑配图。用户会依次给你 ${batch.length} 张照片，` +
+      `它们**据称**都是「${speciesName}」。请**只描述你实际看到的画面**，不要依赖对该物种的既有知识。\n` +
+      `对每张图判断它主要展示什么，只返回一个 JSON 数组，不要 markdown、不要多余文字：\n` +
+      `[{"i":0,"organ":"leaf","usable":true,"caption_zh":"一句话说明画面内容，20字以内"}, …]\n` +
+      `organ 只能取以下之一：\n` +
+      `- leaf 叶片特写（主体是叶）\n` +
+      `- flower 花特写（能看清花的结构）\n` +
+      `- fruit 果实或种子特写\n` +
+      `- plant 整株或枝条（看得出植株形态，但没有花果特写）\n` +
+      `- habitat 生境/群落广角（画面里植物是环境的一部分）\n` +
+      `- specimen 腊叶标本台纸、科学绘图或线描图版\n` +
+      `- other 以上都不是\n` +
+      `usable=false 的情形：画面主体是人、动物、建筑、文字标签、截图、水印严重、` +
+      `严重模糊或过曝、或根本看不出是植物。\n` +
+      `**判不准就给 other，不要猜**——一张标错器官的图比一个空位有害得多。` +
+      `数组必须恰好 ${batch.length} 项，i 从 0 到 ${batch.length - 1}。`;
+
+    const { text } = await xiaopTextCall({
+      contents: [
+        {
+          role: "user",
+          parts: [{ text: `请依次判断这 ${batch.length} 张照片各自展示的部位。` }],
+        },
+      ],
+      system,
+      images: thumbs,
+    });
+
+    const parsed = JSON.parse(cleanJson(text));
+    if (!Array.isArray(parsed)) throw new Error("返回的不是数组");
+
+    const byIndex = new Map<number, { organ: Organ; usable: boolean; caption: string }>();
+    for (const row of parsed) {
+      const i = Number(row?.i);
+      if (!Number.isInteger(i) || i < 0 || i >= batch.length) continue;
+      byIndex.set(i, {
+        organ: normalizeOrgan(row?.organ),
+        // 只有**显式** false 才算弃用；字段缺失按可用处理，免得模型漏写就把图全毙了。
+        usable: row?.usable !== false,
+        caption: String(row?.caption_zh ?? "").slice(0, 40),
+      });
+    }
+
+    const out: PhotoCandidate[] = [];
+    let dropped = 0;
+    batch.forEach((c, i) => {
+      const v = byIndex.get(i);
+      if (!v) {
+        out.push(c); // 模型漏了这一张 → 保留数据源标注
+        return;
+      }
+      if (!v.usable) {
+        dropped++;
+        return;
+      }
+      out.push({ ...c, organ: v.organ });
+    });
+    // 超出 batch 的候选原样带上，别白扔。
+    out.push(...cands.slice(14));
+
+    const tally = out.reduce<Record<string, number>>((a, c) => {
+      const k = c.organ || "(未知)";
+      a[k] = (a[k] ?? 0) + 1;
+      return a;
+    }, {});
+    console.log(
+      `[PhotoOrgans]「${speciesName}」看图 ${batch.length} 张，弃用 ${dropped} 张，器官分布：${JSON.stringify(tally)}`,
+    );
+    return out;
+  } catch (e) {
+    console.warn(
+      "[PhotoOrgans] 视觉分类失败，退回数据源标注：",
+      e instanceof Error ? e.message : e,
+    );
+    return cands;
+  }
 }
 
 /**
@@ -2281,8 +2988,10 @@ async function fetchSpeciesPhotos(term: string, n: number): Promise<string[]> {
  *     MAX_STORE_BYTES. Workers has no sharp/canvas, so anything still oversized after
  *     (1)+(2) is skipped rather than stored.
  */
-async function rehostImages(urls: string[], prefix: string): Promise<string[]> {
-  const out: string[] = [];
+async function rehostImages(cands: PhotoCandidate[], prefix: string): Promise<PhotoCandidate[]> {
+  // 返回**候选对象**而不是裸 URL：署名/许可必须跟着图一路走到渲染层。转存只换 url，
+  // 其余字段原样保留 —— 图存进了我们自己的 bucket，并不改变它的著作权归属。
+  const out: PhotoCandidate[] = [];
   const MAX_STORE_BYTES = 5 * 1024 * 1024; // never persist more than 5 MB per image
   const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
 
@@ -2319,8 +3028,9 @@ async function rehostImages(urls: string[], prefix: string): Promise<string[]> {
     }
   };
 
-  for (let i = 0; i < urls.length; i++) {
-    const src = urls[i];
+  for (let i = 0; i < cands.length; i++) {
+    const cand = cands[i];
+    const src = cand.url;
     try {
       // Resized first; fall back to the plain original if resizing isn't available.
       const got = (await download(src, true)) ?? (await download(src, false));
@@ -2344,7 +3054,10 @@ async function rehostImages(urls: string[], prefix: string): Promise<string[]> {
         console.warn(`[RehostImages] upload failed for ${src}:`, error.message);
         continue;
       }
-      out.push(supabaseAdmin.storage.from("plant-images").getPublicUrl(path).data.publicUrl);
+      out.push({
+        ...cand,
+        url: supabaseAdmin.storage.from("plant-images").getPublicUrl(path).data.publicUrl,
+      });
     } catch (e) {
       console.warn(`[RehostImages] failed for ${src}:`, e instanceof Error ? e.message : e);
     }
@@ -2566,15 +3279,26 @@ async function identifyQuick(
     plantNetHint?: string;
   },
 ): Promise<{ meta: AiMeta; model: string; provider: string; usage: AiTokenUsage } | null> {
-  // Prefer the admin-configured Gemini model/key so the quick summary card uses the
-  // SAME model as the rest of the site (e.g. gemini-3.5-flash). The quick path is
-  // Gemini-only, so a non-Gemini admin config falls back to the env Gemini key.
-  const dbConfig = await loadAiConfig();
-  const useDbGemini = dbConfig?.provider === "gemini" && !!dbConfig.apiKey;
-  const geminiKey = useDbGemini ? dbConfig!.apiKey : process.env.GEMINI_API_KEY;
-  if (!geminiKey) return null;
-  const model =
-    useDbGemini && dbConfig!.model ? dbConfig!.model : process.env.AI_MODEL || "gemini-3-flash-preview";
+  // 快速出卡是 Gemini 专用链路，所以只取序列里的 Gemini 项 —— 但要取**全部**，
+  // 一个额度用尽就换下一个。序列里没有 Gemini 项时退回 .env。
+  // 走「出卡AI」控制台（未单独配置时自动回退到「AI 模型控制台」）。
+  const { sequence } = await loadCardQueue();
+  const geminiSlots = sequence.filter((s) => s.provider === "gemini" && s.apiKey);
+  const envFallback: ModelSlot[] = process.env.GEMINI_API_KEY
+    ? [
+        {
+          provider: "gemini",
+          apiKey: process.env.GEMINI_API_KEY,
+          baseUrl: "",
+          model: process.env.AI_MODEL || "gemini-3-flash-preview",
+        },
+      ]
+    : [];
+  const quickSlots = geminiSlots.length ? geminiSlots : envFallback;
+  if (!quickSlots.length) return null;
+  // 序列里还有非 Gemini 的替补（如 Kimi）能接手重链路吗？有的话，快速链路全挂时
+  // 就**不该**把错误抛给用户 —— 抛了等于在降级发生之前先把流程掐死。
+  const hasNonGeminiBackup = sequence.some((s) => s.provider !== "gemini" && s.apiKey);
 
   // 补拍复核语境：把上一轮判断和「必须出结论」的硬指令拼进 system prompt。
   const hintTitle = (opts?.speciesHint?.title || "").trim();
@@ -2607,50 +3331,64 @@ async function identifyQuick(
       ? `本次为同一株植物的补拍：第 1 张是最新、最清晰的照片，随后 ${prior.length} 张是先前拍摄的照片。请**综合全部 ${prior.length + 1} 张照片**（不同角度/部位/光线）做出定种判断。`
       : "";
 
-  try {
-    const parts: unknown[] = [
-      {
-        text: `请识别这${prior.length ? "组" : "张"}植物照片。${multiNote}${hintPlace ? `拍摄地点：${hintPlace}。` : ""}只按指定 JSON 结构返回简介摘要卡字段。`,
-      },
-      { inlineData: { mimeType, data: base64Data } },
-      ...prior.map((im) => ({ inlineData: { mimeType: im.mimeType, data: im.base64 } })),
-    ];
-    const data = await callGeminiWithRotation(splitGeminiKeys(geminiKey), {
-      model,
-      timeoutMs: 45_000,
-      label: "identifyQuick",
-      body: {
-        contents: [{ role: "user", parts }],
-        systemInstruction: { parts: [{ text: system }] },
-        generationConfig: {
-          responseMimeType: "application/json",
-          responseSchema: AI_QUICK_SCHEMA,
-          temperature: 0.0,
+  return runModelQueue(
+    quickSlots,
+    async (slot) => {
+      const parts: unknown[] = [
+        {
+          text: `请识别这${prior.length ? "组" : "张"}植物照片。${multiNote}${hintPlace ? `拍摄地点：${hintPlace}。` : ""}只按指定 JSON 结构返回简介摘要卡字段。`,
         },
-      },
-    });
-    const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (!text) return null;
-    const meta = JSON.parse(cleanJson(text)) as AiMeta;
-    const u = data.usageMetadata ?? {};
-    return {
-      meta,
-      model,
-      provider: "gemini-quick",
-      usage: {
-        prompt_tokens: u.promptTokenCount ?? 0,
-        completion_tokens: u.candidatesTokenCount ?? 0,
-        total_tokens: u.totalTokenCount ?? 0,
-      },
-    };
-  } catch (e) {
-    // Rotation already tried every key. A hard, described failure (quota exhausted on
-    // ALL keys, invalid config…) must reach the user with its explanation rather than
-    // silently falling back to the heavy path, which would hit the same wall.
+        { inlineData: { mimeType, data: base64Data } },
+        ...prior.map((im) => ({ inlineData: { mimeType: im.mimeType, data: im.base64 } })),
+      ];
+      const data = await callGeminiWithRotation(splitGeminiKeys(slot.apiKey), {
+        model: slot.model,
+        timeoutMs: 45_000,
+        label: "identifyQuick",
+        body: {
+          contents: [{ role: "user", parts }],
+          systemInstruction: { parts: [{ text: system }] },
+          generationConfig: {
+            responseMimeType: "application/json",
+            responseSchema: AI_QUICK_SCHEMA,
+            temperature: 0.0,
+          },
+        },
+      });
+      const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+      if (!text) return null;
+      const meta = JSON.parse(cleanJson(text)) as AiMeta;
+      const u = data.usageMetadata ?? {};
+      return {
+        meta,
+        model: slot.model,
+        provider: "gemini-quick",
+        usage: {
+          prompt_tokens: u.promptTokenCount ?? 0,
+          completion_tokens: u.candidatesTokenCount ?? 0,
+          total_tokens: u.totalTokenCount ?? 0,
+        },
+      };
+    },
+    "快速出卡",
+    { requireVision: true },
+  ).catch((e) => {
+    // 走到这里说明**每个 Gemini 序列项都挂了**。
+    // 序列里还有非 Gemini 的替补（Kimi 等）时，返回 null 让流程继续走重链路 ——
+    // 重链路会按序列降级到那些替补。旧代码在这里直接 throw，那是「只有一个厂商、
+    // 重链路必撞同一堵墙」时代的判断，现在会在降级发生之前就把流程掐死。
+    if (hasNonGeminiBackup) {
+      console.warn(
+        "[identifyQuick] 所有 Gemini 序列项均失败，转交重链路的非 Gemini 替补：",
+        e instanceof Error ? e.message : e,
+      );
+      return null;
+    }
+    // 没有任何替补 → 重链路同样无解，把带解释的错误如实抛给用户。
     if (e instanceof AiError) throw e;
     console.warn("[identifyQuick] soft failure, falling back:", e instanceof Error ? e.message : e);
     return null;
-  }
+  });
 }
 
 /**
@@ -2671,6 +3409,8 @@ async function buildDraftContent(opts: {
   speciesHint?: { title?: string; scientificName?: string } | null;
   /** Web research digest (from enrichDraft联网调研 step), injected into AI prompt. */
   webResearch?: { digest: string; sources: { title: string; uri: string }[] };
+  /** 走哪套模型序列：拍照出卡用「出卡AI」控制台，enrichDraft 的重活用「草稿生成模型」。 */
+  queueKind?: "card" | "enrich";
 }): Promise<{
   meta: AiMeta;
   usedModel: string;
@@ -2689,7 +3429,7 @@ async function buildDraftContent(opts: {
     model: usedModel,
     provider: usedProvider,
     usage,
-  } = await callAiIdentify(dataUrl, place, speciesHint, webResearch);
+  } = await callAiIdentify(dataUrl, place, speciesHint, webResearch, opts.queueKind ?? "card");
 
   // 去掉模型写进字段的 markdown 强调符（学名/属名/俗名/摘要都是当纯文本渲染的）。
   // 正文 html 里的 `*Latin*` 另行转 <em>（见下方 html 组装处）。
@@ -2700,17 +3440,46 @@ async function buildDraftContent(opts: {
   if (speciesHint?.title) meta.title = speciesHint.title;
   if (speciesHint?.scientificName) meta.scientific_name = speciesHint.scientificName;
 
+  // 【正名核对】以《中国生物物种名录 2025·植物界》为准把名字对齐。
+  // 位置刻意选在**配图与 HTML 渲染之前** —— 正文里的科名、图注、标题全从 meta 取，
+  // 放在渲染之后就得改两处，迟早对不上。
+  // 拿不准（同名异物 / 不在名录）时 applyNameAuthority 一个字都不改，只留痕。
+  {
+    const { applyNameAuthority } = await import("./name-authority.functions");
+    const { stamp, changed } = await applyNameAuthority(meta);
+    (meta as unknown as Record<string, unknown>)._name_authority = stamp;
+    console.log(
+      `[NameAuthority] 草稿「${meta.title}」：${stamp.status}/${stamp.matchedBy}` +
+        `${changed ? " · 已按名录改写" : ""}${stamp.note ? " · " + stamp.note.slice(0, 120) : ""}`,
+    );
+  }
+
   // Find real online field photos of the species for the body sections (the hero
   // keeps the user's own photo). Re-host into our own bucket so the page doesn't
   // hotlink foreign hosts (broken/slow from China). Non-fatal.
-  let sectionImages: string[] = [];
+  let sectionPhotos: (PhotoCandidate | null)[] = [];
+  let sectionMissing: string[] = [];
   try {
     const sci = (meta.scientific_name || "").trim().split(/\s+/).slice(0, 2).join(" ");
     const term = sci || meta.common_name_en || meta.title || "";
     if (term) {
-      const external = await fetchSpeciesPhotos(term, 5);
-      const rehosted = await rehostImages(external, "drafts/species/section");
-      sectionImages = rehosted.length ? rehosted : external;
+      // 多抓一些候选，分槽才有得挑（5 个槽 × 器官各异，只抓 5 张必然对不上号）。
+      // 12→8：草稿一趟要卡在 Cloudflare 免费版「50 子请求/次调用」以内，而 classifyPhotoOrgans
+      // 会把每个候选都抓一张缩略图（12 张≈12 个子请求）。8 张对 5 个槽够挑，且更容易全数抓到、
+      // 让分类真正生效（thumbs 差一张就整批跳过分类，见 classifyPhotoOrgans）。
+      const external = await fetchSpeciesPhotos(term, 8);
+      // 现看现标器官 → 按标签入槽。**分类在转存之前**，只有中选的图才进 bucket。
+      const labelled = await classifyPhotoOrgans(external, term);
+      const assigned = assignSlots(labelled, DRAFT_SLOTS);
+      console.log(`[PhotoSlots] 草稿「${term}」：${describeAssignment(assigned)}`);
+      const chosen = assigned.map((a) => a.photo).filter(Boolean) as PhotoCandidate[];
+      const rehosted = await rehostImages(chosen, "drafts/species/section");
+      // 转存失败就退回原始外链（署名字段一样在），总比没有图好。
+      const finalPhotos = rehosted.length === chosen.length ? rehosted : chosen;
+      // 回填到槽位顺序上，空槽保持 null —— 模板据此渲染「暂无……公开照片」而不是塞图。
+      let k = 0;
+      sectionPhotos = assigned.map((a) => (a.photo ? (finalPhotos[k++] ?? null) : null));
+      sectionMissing = assigned.map((a) => (a.photo ? "" : a.spec.missingNote));
     }
   } catch (e) {
     console.warn("[buildDraftContent] species photo search failed:", e);
@@ -2831,7 +3600,10 @@ async function buildDraftContent(opts: {
   const rawHtml = renderDraftHtml({
     ...meta,
     photo_url: photoUrl,
-    section_images: sectionImages,
+    section_images: sectionPhotos.map((c) => c?.url ?? ""),
+    section_credits: sectionPhotos.map((c) => (c ? creditLine(c) : "")),
+    section_sources: sectionPhotos.map((c) => c?.sourceUrl ?? ""),
+    section_missing: sectionMissing,
     invasive: invasiveCard,
     conservation: conservationBadgesList,
     conservation_card: conservationCardObj,
@@ -2855,18 +3627,18 @@ async function buildDraftContent(opts: {
 // medium 却在 summary_zh 里说「疑似」（反之亦然），导致标题不带疑似但正文带、补拍不激活。
 // 这里把 meta 就地规范化为唯一真相：任一处露出疑似 → 全部疑似（confidence=low，激活补拍），
 // 并保证 summary 带疑似前缀、needs_more_photos_zh 非空（补拍横幅依赖它）。
-const TENTATIVE_RE = /^\s*（?\s*疑似\s*）?/;
-function stripTentativePrefix(s: string): string {
-  return (s || "").replace(TENTATIVE_RE, "").trim();
-}
-
+// 判据与拼名收在 lib/tentative.ts（纯函数，可独立测试）。
 function normalizeIdentification(meta: AiMeta): void {
   // 先去掉模型写进字段的 markdown 强调符（`*Allium*` / `葱属 *Allium*`）—— 这些字段当纯文本
   // 渲染，星号会原样露出来。要在「疑似前缀」逻辑之前跑，否则 `疑似` 会加在残留的 * 后面。
   stripMetaMarkdown(meta);
+  // 再清掉模型的元话语与复读残留（2026-07-25 线上：整段「任务完成。请查收。祝好！再见！」
+  // 写进了字段内部）。**必须在疑似前缀逻辑之前跑** —— 否则「疑似」会被加在一段闲聊前面，
+  // 而消毒后剩下的真内容反倒没有前缀。整段都是闲聊时留空串，交给下面的兜底文案。
+  meta.summary_zh = stripModelChatter(meta.summary_zh as string);
+  meta.summary_en = stripModelChatter(meta.summary_en as string);
   const summaryZh = (meta.summary_zh || "").toString();
-  const tentative =
-    meta.identification_confidence === "low" || TENTATIVE_RE.test(summaryZh.trim().slice(0, 6));
+  const tentative = isTentative(meta);
   if (tentative) {
     meta.identification_confidence = "low";
     // summary 以「疑似」开头（剥掉已有前缀再统一加，避免「疑似疑似」）。
@@ -2882,6 +3654,11 @@ function normalizeIdentification(meta: AiMeta): void {
     // 非疑似：清掉正文里任何残留的疑似前缀，保持与「不疑似」一致。
     if (TENTATIVE_RE.test(summaryZh.trim().slice(0, 6))) {
       meta.summary_zh = stripTentativePrefix(summaryZh);
+    }
+    // 消毒后整段没了（模型这一趟基本只吐了闲聊）→ 给一句诚实的占位，别留白卡。
+    // 疑似分支不需要这条：它上面已有「疑似（依据现有照片暂无法确诊到种）」兜底。
+    if (!(meta.summary_zh || "").toString().trim()) {
+      meta.summary_zh = "本次未能生成简介文案（模型返回内容异常）。物种判定见上方名称，可点「进一步生成草稿」重新撰写。";
     }
   }
 }
@@ -2931,17 +3708,32 @@ async function lookupRegistryChips(
 }
 
 /** Inline chip pills for the summary card — mirrors <RegistryChips> / the share card. */
-function registryChipsHtml(chips: { kind: string; label: string }[]): string {
+function registryChipsHtml(chips: { kind: string; label: string; tone?: number }[]): string {
   if (!chips.length) return "";
+  // 手动主题标签的绿色系，与网页 <RegistryChips> / 分享卡同一组色号（见 manualTagTone）。
+  const MANUAL_GREENS = [
+    { fg: "#245a42", bd: "#2d6a4f" },
+    { fg: "#125e58", bd: "#17726b" },
+    { fg: "#496523", bd: "#5b7c2a" },
+    { fg: "#2f7548", bd: "#3f8f5a" },
+  ];
+  // 一名录一色系（与网页 <RegistryChips> / 分享卡同源）：国家保护=粉 / 地区保护=黄 /
+  // CITES=紫 / GTS=蓝 / GRIIS 入侵=橙 / 手动主题标签=绿。旧值 protected 保留兜底。
   const TONE: Record<string, { fg: string; bd: string }> = {
+    tag_manual: { fg: "#1f7a44", bd: "#2e9e5b" },
+    protected_national: { fg: "#a63a6b", bd: "#c85a8a" },
+    protected_regional: { fg: "#8a6410", bd: "#c99a2e" },
     protected: { fg: "#1f7a44", bd: "#2e9e5b" },
     cites: { fg: "#5f45a3", bd: "#7a5cc4" },
-    gts: { fg: "#8a6a20", bd: "#c79a3a" },
-    griis: { fg: "#c8452f", bd: "#c8452f" },
+    gts: { fg: "#2c5488", bd: "#3f74b8" },
+    griis: { fg: "#b3600f", bd: "#dd8324" },
   };
   const pills = chips
     .map((c) => {
-      const t = TONE[c.kind] ?? { fg: "#8a6b4a", bd: "#e2ddd1" };
+      const t =
+        c.kind === "tag_manual"
+          ? MANUAL_GREENS[(c.tone ?? 0) % MANUAL_GREENS.length]
+          : (TONE[c.kind] ?? { fg: "#8a6b4a", bd: "#e2ddd1" });
       return (
         `<span style="display:inline-block;border:1.5px solid ${t.bd};color:${t.fg};` +
         `border-radius:999px;padding:2px 10px;font-size:12px;font-weight:600;line-height:1.6">` +
@@ -2950,6 +3742,47 @@ function registryChipsHtml(chips: { kind: string; label: string }[]): string {
     })
     .join("");
   return `<div style="display:flex;flex-wrap:wrap;gap:6px;margin:.5em 0 .2em">${pills}</div>`;
+}
+
+// ── 识别过程痕迹 → 简介卡上的「识别过程 · 综合可信度」 ──────────────────────
+// 类型与算法都在 lib/identify-trace.ts（纯函数）：草稿页的 React 卡片要用同一套算法算
+// 同一个数字，各写一份迟早算出两个不一样的百分比。
+
+/** 把痕迹渲染成简介卡底部那块「识别过程」。分享卡不含此块（分享出去只要结论）。 */
+function identifyTraceHtml(t: IdentifyTrace, finalSci: string, finalConf: string): string {
+  const { pct, basis } = computeIdentifyConfidence(t, finalSci, finalConf);
+  const steps: string[] = [];
+  if (t.primaryEngine === "plantnet") {
+    steps.push(
+      `<li><b>专业引擎 Pl@ntNet</b>：${htmlEsc(t.primaryLabel)} —— 引擎置信度 ${t.primaryPct}%</li>`,
+    );
+  } else if (t.primaryEngine === "vision") {
+    steps.push(
+      `<li><b>专业引擎 Pl@ntNet</b>：未参与（额度用尽或未配置）→ 由复核模型顶替一线定种：${htmlEsc(t.primaryLabel)}</li>`,
+    );
+  } else {
+    steps.push(`<li><b>专业引擎 Pl@ntNet</b>：未参与</li>`);
+  }
+  steps.push(
+    `<li><b>一线识别模型</b>${t.phase1Model ? `（${htmlEsc(t.phase1Model)}）` : ""}：${confZh(t.phase1Confidence)}</li>`,
+  );
+  if (t.review.ran) {
+    steps.push(
+      `<li><b>二次自动复核</b>（${htmlEsc(t.review.model)}）：${confZh(t.review.confidence)} · ` +
+        `${t.review.action === "confirm" ? "确认原判" : "纠正物种"} → ` +
+        `${t.review.adopted ? "<b>已采纳，跳过补拍</b>" : "未采纳，维持疑似"}</li>`,
+    );
+  } else {
+    steps.push(`<li><b>二次自动复核</b>：未运行 —— ${htmlEsc(t.review.reason)}</li>`);
+  }
+  if (t.retakeCount > 0) steps.push(`<li><b>补拍</b>：这是第 ${t.retakeCount} 次补拍后的结果</li>`);
+  return (
+    `<div style="margin-top:14px;padding:10px 12px;border:1px solid #e3d6c3;border-radius:10px;background:#fbf7f0">` +
+    `<p style="margin:0 0 6px;font-size:13px;font-weight:700;color:#6e4c28">识别过程 · 综合可信度 ${pct}%</p>` +
+    `<ol style="margin:0;padding-left:1.2em;font-size:12px;color:#6b5a45;line-height:1.75">${steps.join("")}</ol>` +
+    `<p style="margin:6px 0 0;font-size:11px;color:#8a6b4a">可信度依据：${htmlEsc(basis)}</p>` +
+    `</div>`
+  );
 }
 
 function buildSummaryCardHtml(opts: {
@@ -2961,6 +3794,8 @@ function buildSummaryCardHtml(opts: {
   genus?: string | null;
   tentative?: boolean;
   chips?: { kind: string; label: string }[];
+  trace?: IdentifyTrace | null;
+  finalConfidence?: string;
 }): string {
   const { photos, sci, summaryZh, family, genus, tentative } = opts;
   const cleanTitle = stripTentativePrefix(opts.title) || "待鉴定植物";
@@ -2997,6 +3832,7 @@ function buildSummaryCardHtml(opts: {
     famGenLine +
     registryChipsHtml(opts.chips ?? []) +
     `<p>${htmlEsc(summaryZh)}</p>` +
+    (opts.trace ? identifyTraceHtml(opts.trace, sci, opts.finalConfidence || "") : "") +
     `<p style="color:#8a6b4a;font-size:13px">— 简介摘要卡（点击「让 AI 生成进一步介绍草稿」可生成含多张配图的完整科普草稿）</p>` +
     `</div>`
   );
@@ -3021,6 +3857,31 @@ const SubmitInput = z.object({
   // 补拍复核时携带：把新照片合并进这份既有草稿（不再新建一份），照片追加进 user_photos、
   // 覆盖封面与摘要卡、刷新置信度/补拍建议。为空则走新建逻辑。
   merge_draft_id: z.string().uuid().optional(),
+  /** 原始文件字节的 SHA-256，客户端在压缩前算好传来。用于「这张照片已经识别过」查重。 */
+  photo_sha256: z
+    .string()
+    .regex(/^[a-f0-9]{64}$/)
+    .optional(),
+  /**
+   * 同一株植物的**额外角度照**，与 photo_base64 一起本轮同时识别（补拍时最多再带 2 张，
+   * 连主图共 3 张）。
+   *
+   * 上限 2 是**对齐模型侧既有的 3 张上限**定的，不是随手取的：secondOpinionIdentify 一直
+   * `prior.slice(0, 2)` + 当前 1 张 —— 图片是这个请求里最重的输入，每多一张都同时推高上传
+   * 耗时与首字延迟，而第 4 张往后对结论的边际贡献抵不上它带来的超时风险。
+   */
+  extra_photos: z
+    .array(
+      z.object({
+        base64: z.string().min(100).max(8_000_000),
+        mime: z
+          .string()
+          .regex(/^image\/(jpeg|jpg|png|webp)$/i)
+          .default("image/jpeg"),
+      }),
+    )
+    .max(2)
+    .optional(),
 });
 
 export const submitPlantDraft = createServerFn({ method: "POST" })
@@ -3096,7 +3957,7 @@ export const submitPlantDraft = createServerFn({ method: "POST" })
     // glm-5v-turbo etc. sometimes return a partial JSON missing `title` (a NOT NULL
     // column). Fall back so a meaningful name always persists — and the usage log shows
     // that name instead of the bare draft UUID — for an editor to curate.
-    const safeTitle = (meta.title || meta.scientific_name || "待鉴定植物").toString().slice(0, 200);
+    const safeTitle = draftTitleFor(meta);
 
     // Persist draft row.
     const { data: row, error: insErr } = await supabaseAdmin
@@ -3284,6 +4145,28 @@ export const quickIdentifyDraft = createServerFn({ method: "POST" })
         (e) => ({ error: { message: e instanceof Error ? e.message : String(e) } }),
       );
 
+    // ── 本轮同时上传的额外角度照（补拍最多 2 张）────────────────────────────────
+    // 与主图**并行**上传，理由同上：识别只吃 base64，不必等任何一张传完。
+    // 与主图的关键差别是**失败不致命** —— 主图传不上去整次识别就没有封面、必须报错；
+    // 额外角度照只是多一个视角，传失败就当这一张没有（识别仍照常用它的 base64，因为模型
+    // 吃的是内存里的字节、根本不经过存储）。绝不能让第 2 张的存储抖动毁掉整次识别。
+    const extras = (data.extra_photos ?? []).slice(0, 2);
+    const extraDataUrls = extras.map((ph) => `data:${ph.mime};base64,${ph.base64}`);
+    const extraUploads = extras.map((ph) => {
+      const ex = ph.mime.includes("png") ? "png" : ph.mime.includes("webp") ? "webp" : "jpg";
+      const p = `drafts/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ex}`;
+      return {
+        path: p,
+        p: supabaseAdmin.storage
+          .from("plant-images")
+          .upload(p, Buffer.from(ph.base64, "base64"), { contentType: ph.mime, upsert: false })
+          .then(
+            (r) => r as { error: { message?: string } | null },
+            (e) => ({ error: { message: e instanceof Error ? e.message : String(e) } }),
+          ),
+      };
+    });
+
     let meta: AiMeta;
     let usedModel: string;
     let usedProvider: string;
@@ -3301,6 +4184,32 @@ export const quickIdentifyDraft = createServerFn({ method: "POST" })
       to: string;
       plantnet: string;
     } | null = null;
+
+    // ── 全链路识别痕迹 ────────────────────────────────────────────────────────
+    // 与 secondOpinion 的区别：那个只在「复核改变了结论」时才有，这个**每次识别都记**，
+    // 包括复核压根没跑（限流/超时/没配模型）的情况。
+    // 起因：用户发现「出现疑似时用量表只有 plantnet+gemini-quick，补拍后才出现 review-adopted」，
+    // 追下来是 secondOpinionIdentify 在 429 限流/30s 超时时**静默返回 null**，用户被直接推去补拍，
+    // 完全无从知道「说好的自动复核」到底跑没跑。痕迹渲染进简介卡后，这件事永久透明。
+    const trace: {
+      primaryEngine: string;
+      primaryLabel: string;
+      primaryPct: number | null;
+      phase1Model: string;
+      phase1Confidence: string;
+      review:
+        | { ran: false; reason: string }
+        | { ran: true; model: string; confidence: string; action: string; adopted: boolean };
+      retakeCount: number;
+    } = {
+      primaryEngine: "none",
+      primaryLabel: "",
+      primaryPct: null,
+      phase1Model: "",
+      phase1Confidence: "",
+      review: { ran: false, reason: "未触发（结果不是疑似）" },
+      retakeCount: 0,
+    };
 
     const retakeCount = data.retake_count ?? 0;
     const speciesHint =
@@ -3350,6 +4259,15 @@ export const quickIdentifyDraft = createServerFn({ method: "POST" })
         );
       }
     }
+    // 本轮同时拍的额外角度照**排在历史补拍照前面**：下游一律 slice 取前几张，谁排前面谁
+    // 真正进模型。这一轮的照片是用户刚刚按提示补拍的同一株植物，比几轮以前的旧照片更该被看见。
+    // 它们的字节已经在内存里（就是请求体），不必像历史照片那样再从存储 fetch 回来。
+    if (extras.length) {
+      priorInline = [
+        ...extras.map((ph) => ({ mimeType: ph.mime, base64: ph.base64 })),
+        ...priorInline,
+      ];
+    }
 
     // ── Stage 0（phase-1）：专业识别引擎作为一线信号 ────────────────────────────
     // 先做一次专业定种，判定作为「定种基准」提示喂给 Gemini —— Gemini 的置信度因此吸收了
@@ -3364,6 +4282,8 @@ export const quickIdentifyDraft = createServerFn({ method: "POST" })
     // 额度耗尽（HTTP 429）会被持久标记进 site_config.plantnet_quota_state，之后的请求直接
     // 跳过 Pl@ntNet，不用每次都撞一发必定 429 的往返；1 小时后自动重试，额度一重置就切回。
     let plantNetHint: string | undefined;
+    // Pl@ntNet 的判定留一份：两条出卡链路都失败时用它兜底出摘要卡，避免「待鉴定植物」。
+    let primaryFallback: { sci: string; family: string; genus: string; pct: number } | null = null;
     let primaryLabel = "none";
     let primaryEngine: "plantnet" | "vision" | "none" = "none";
     let secondPrimary: { usage: AiTokenUsage; model: string } | null = null;
@@ -3371,7 +4291,7 @@ export const quickIdentifyDraft = createServerFn({ method: "POST" })
     const quotaKnownExhausted = plantNetKey ? await isPlantNetQuotaExhausted() : false;
 
     if (plantNetKey && !quotaKnownExhausted) {
-      const pnRes = await plantNetIdentify(dataUrl, plantNetKey).catch((e) => {
+      const pnRes = await plantNetIdentify(dataUrl, plantNetKey, extraDataUrls).catch((e) => {
         console.warn("[Pl@ntNet] quick-path identify failed; falling back:", e);
         return { verdict: null, quotaExhausted: false, status: 0, body: "" };
       });
@@ -3381,6 +4301,19 @@ export const quickIdentifyDraft = createServerFn({ method: "POST" })
         const pct = Math.round((pn.score ?? 0) * 100);
         primaryEngine = "plantnet";
         primaryLabel = `${pn.scientific_name}@${pct}%`;
+        // 痕迹：Pl@ntNet 的 score 是引擎给的真实置信分，是整条链路上唯一「非模型自评」的
+        // 客观数字，最终可信度%就以它为锚（见 computeIdentifyConfidence）。
+        trace.primaryEngine = "plantnet";
+        trace.primaryLabel = pn.scientific_name;
+        trace.primaryPct = pct;
+        // 出卡链路全挂时用它兜底出摘要卡（见下方 else 分支）——有 Pl@ntNet 的学名，
+        // 就绝不该把草稿命名成「待鉴定植物」。
+        primaryFallback = {
+          sci: pn.scientific_name,
+          family: (pn.family || "").toString(),
+          genus: (pn.genus || "").toString(),
+          pct,
+        };
         plantNetHint =
           `【专业识别引擎 Pl@ntNet 判定】最可能物种：${pn.scientific_name}` +
           `${pn.family ? `（科 ${pn.family}${pn.genus ? ` / 属 ${pn.genus}` : ""}）` : ""}` +
@@ -3398,6 +4331,10 @@ export const quickIdentifyDraft = createServerFn({ method: "POST" })
         primaryLabel = `${dv.label}（二次复核模型顶替）`;
         plantNetHint = dv.hint;
         secondPrimary = { usage: dv.usage, model: dv.model };
+        // 顶替模式没有 Pl@ntNet 那种客观分数，只有模型自评 → primaryPct 保持 null，
+        // 可信度%改由 phase-1/复核的置信档决定，卡片上也会如实写「Pl@ntNet 未参与」。
+        trace.primaryEngine = "vision";
+        trace.primaryLabel = dv.label;
       }
     }
     console.log(
@@ -3405,13 +4342,34 @@ export const quickIdentifyDraft = createServerFn({ method: "POST" })
         (quotaKnownExhausted ? " · Pl@ntNet 额度已标记用尽，本次跳过" : ""),
     );
 
-    const quick = await identifyQuick(dataUrl, place, {
+    let quick = await identifyQuick(dataUrl, place, {
       speciesHint,
       retakeCount,
       forceResult: retakeCount >= 3, // 补拍满 3 次必须出结论（哪怕疑似）
       priorPhotos: priorInline,
       plantNetHint,
     });
+
+    // identifyQuick 是 **Gemini 专用**链路，「出卡AI」序列里没有 Gemini 项时它返回 null
+    // （管理员配的是 Kimi / 自建 custom 就属于这种）。这时改用序列本身再识别一次 ——
+    // 关键是**仍然只出摘要卡**。
+    //
+    // 这里以前是直接掉进下面的 `else` 跑完整 buildDraftContent 并把草稿标成
+    // enriched=true，于是换成非 Gemini 模型后，用户根本没点「进一步生成草稿」，
+    // 草稿却已经被完整生成了 —— 既莫名其妙，也白烧一次长文的钱。
+    if (!quick) {
+      quick = await callAiIdentify(
+        dataUrl,
+        place,
+        speciesHint ? { title: speciesHint.title, scientificName: speciesHint.sci } : null,
+        undefined,
+        "card",
+      ).catch((e) => {
+        // 失败不在这里报错：下面的 `else` 还有一条完整流水线兜底。
+        console.warn("[Phase1] 出卡AI 序列识别失败，回退完整流水线：", e);
+        return null;
+      });
+    }
 
     // 识别已出结果 —— 到这一步才真正需要 photoUrl（建卡 / 写库）。上传是和地名反查、
     // Pl@ntNet、识别**并行**跑的，此刻通常早已完成，这个 await 基本不耗时。
@@ -3422,12 +4380,43 @@ export const quickIdentifyDraft = createServerFn({ method: "POST" })
         `照片上传失败（STORAGE_UPLOAD_FAILED）：无法把照片存入云端存储。原因：${upErr.message}。请检查网络后重试。`,
       );
     const photoUrl = supabaseAdmin.storage.from("plant-images").getPublicUrl(path).data.publicUrl;
-    const allPhotos = [photoUrl, ...priorPhotos].filter(Boolean).slice(0, 12);
+    // 本轮同时上传的额外角度照：**传成功的才进相册**。失败的那张识别照样用过（模型吃的是内存里
+    // 的字节），只是存储里没有它——把一个不存在的 URL 写进 user_photos 只会在草稿页显示裂图。
+    const extraUrls: string[] = [];
+    for (const u of extraUploads) {
+      const { error } = await u.p;
+      if (error) {
+        console.warn("[QuickIdentify] 额外角度照上传失败（忽略，不影响本次识别）:", error.message);
+        continue;
+      }
+      extraUrls.push(
+        supabaseAdmin.storage.from("plant-images").getPublicUrl(u.path).data.publicUrl,
+      );
+    }
+    const allPhotos = [photoUrl, ...extraUrls, ...priorPhotos].filter(Boolean).slice(0, 12);
     // 补回完整地名（上面为了不拖慢识别只等了 4s；此刻反查早已结束）。
     place = (await geoP) || place;
 
     if (quick) {
       meta = quick.meta;
+      // 模型有时**什么名字都不给**（title 与 scientific_name 双空）。以前这种情况会一路走到
+      // draftTitleFor 的最后一档，草稿被命名成「待鉴定植物」——用户明确不接受这个结果。
+      // 手上既然有 Pl@ntNet 的学名，就用它回填：宁可写「疑似 X」，也不要一个没有信息量的名字。
+      if (
+        primaryFallback &&
+        !(meta.title || "").toString().trim() &&
+        !(meta.scientific_name || "").toString().trim()
+      ) {
+        console.warn(
+          `[Phase1] 出卡模型未给出任何名称，用 Pl@ntNet 学名回填：${primaryFallback.sci}`,
+        );
+        meta.title = primaryFallback.sci;
+        meta.scientific_name = primaryFallback.sci;
+        if (!(meta.family || "").toString().trim()) meta.family = primaryFallback.family;
+        if (!(meta.genus || "").toString().trim()) meta.genus = primaryFallback.genus;
+        // 模型自己都没定出名字 → 一律按疑似，交给补拍/复核去坐实。
+        meta.identification_confidence = "low";
+      }
       usedModel = quick.model;
       usedProvider = quick.provider;
       usage = quick.usage;
@@ -3445,6 +4434,11 @@ export const quickIdentifyDraft = createServerFn({ method: "POST" })
       }
       // 统一疑似信号：名称/正文/补拍横幅三者一致（详见 normalizeIdentification）。
       normalizeIdentification(meta);
+      // 痕迹要记 normalize **之后**的档位：模型常不写 confidence 而把「疑似」写进正文，
+      // normalize 会把这种情况回填成 low，复核闸门读的也是这个回填后的值。
+      trace.phase1Model = usedModel;
+      trace.phase1Confidence = (meta.identification_confidence || "").toString();
+      trace.retakeCount = retakeCount;
 
       // ── 二次复核视觉模型 ──────────────────────────────────
       // 仅在 phase-1 判为「疑似」且仍有补拍名额时，才咨询第二个视觉模型：它有把握 → 整卡
@@ -3466,7 +4460,21 @@ export const quickIdentifyDraft = createServerFn({ method: "POST" })
           candidate,
           plantNetHint,
         });
-        if (second) {
+        if (!second) {
+          // **这就是用户那个疑问的真凶**：复核该跑、也确实被调用了，但 429 限流 / 30s 超时 /
+          // 没配二次复核模型都会让 secondOpinionIdentify 静默返回 null，于是用量表上只有
+          // plantnet+gemini-quick、用户被直接推去补拍，看不出「说好的自动复核」跑没跑。
+          // 现在如实记进痕迹并渲染到简介卡上（具体是哪种失败在服务端日志 [SecondOpinion] 里）。
+          console.warn(
+            `[SecondOpinion] 复核未能完成（限流/超时/未配置），维持疑似 → 进补拍。primary=${primaryEngine}(${primaryLabel})`,
+          );
+          // 报**真实**原因，不再拿「限流/超时/未配置」三选一去猜（见 noteFailure 注释）。
+          const why = takeSecondOpinionFailures();
+          trace.review = {
+            ran: false,
+            reason: why || "复核未能完成（未拿到具体原因）",
+          };
+        } else {
           // 无论结论是否被采纳，这次复核的 token 都已经花掉了 —— 必须计入用量，
           // 否则被否决的复核会变成一笔查不到的隐形开销。
           usage = addUsage(usage, second.usage);
@@ -3500,7 +4508,33 @@ export const quickIdentifyDraft = createServerFn({ method: "POST" })
             usedProvider = `${usedProvider}+review-declined`;
             usedModel = `${usedModel}+${second.model}`;
           }
+          trace.review = {
+            ran: true,
+            model: second.model,
+            confidence: (second.meta.identification_confidence || "").toString(),
+            action,
+            adopted: resolved,
+          };
         }
+      } else if (meta.identification_confidence === "low") {
+        // 确实是疑似，但被闸门另外两个条件挡下了 —— 同样要说清为什么没复核，
+        // 否则用户又会遇到「疑似了却没见复核」的同一个困惑。
+        trace.review = {
+          ran: false,
+          reason:
+            retakeCount >= 3
+              ? "已补拍 3 次，进入终局裁定，不再复核"
+              : "一线定种已由复核模型顶替，同一模型不重复复核",
+        };
+      }
+
+      // 补拍满 3 次必须收口 —— 代码层硬保证，不依赖模型听话。
+      // Gemini 链路本来是靠 prompt 里那段「最终裁定（硬性）」做到的，但那有两个漏洞：
+      // ① 模型可以不照做；② 非 Gemini 的兜底链路（callAiIdentify）根本没有那段 prompt。
+      // 补拍建议一旦非空，草稿页的补拍关卡就会继续拦人，用户会被困在补拍循环里出不来。
+      if (retakeCount >= 3) {
+        meta.needs_more_photos_zh = "";
+        meta.needs_more_photos_en = "";
       }
 
       // Summary-card HTML with the full gallery of the user's own shots (newest first).
@@ -3511,28 +4545,76 @@ export const quickIdentifyDraft = createServerFn({ method: "POST" })
         summaryZh: meta.summary_zh || "",
         family: meta.family,
         genus: meta.genus,
-        tentative: meta.identification_confidence === "low",
+        tentative: isTentative(meta), // 与标题、正文用同一套判据
         chips: await lookupRegistryChips(meta.scientific_name, meta.family),
+        // 识别过程写进简介卡（分享卡不含 —— 分享出去只要结论，不要过程）。
+        trace,
+        finalConfidence: (meta.identification_confidence || "").toString(),
       });
     } else {
-      // Gemini quick path unavailable → full pipeline (slower but robust).
-      const full = await buildDraftContent({ dataUrl, photoUrl, place, lat, lng });
-      meta = full.meta;
-      usedModel = full.usedModel;
-      usedProvider = full.usedProvider;
-      usage = full.usage;
-      html = full.html;
-      isInvasive = full.isInvasive;
-      gbifTaxonKey = full.gbifTaxonKey;
-      enriched = true;
+      // ── 两条出卡链路都失败的兜底 ────────────────────────────────────────────
+      // **绝不再自动跑完整流水线（buildDraftContent）**。以前这里那么干，一次性造成三个
+      // 线上问题（2026-07-21 实测同时出现）：
+      //   ① 标 enriched=true → 用户根本没点「生成进一步介绍草稿」，整篇草稿却已经生成，
+      //      白烧一次长文的钱，也让「银叶换草稿」这层设计形同虚设；
+      //   ② 不走 buildSummaryCardHtml → 简介卡上没有识别过程 / 综合可信度；
+      //   ③ 配图走 section photos，抓不到时页面上是一堆重复的用户原图。
+      // 改为：用 Pl@ntNet 的专业判定兜底出一张**摘要卡**，enriched=false —— 生成正文这件事
+      // 永远由用户自己按按钮决定。
+      if (!primaryFallback) {
+        // 连 Pl@ntNet 都没有判定 → 手上真的什么都没有。此时**宁可如实报错**，也不要造一张
+        // 叫「待鉴定植物」的空卡骗用户（那正是用户明确不接受的那种结果）。
+        throw new AiError(
+          "IDENTIFY_FAILED",
+          "识别失败（IDENTIFY_FAILED）：出卡模型序列与专业识别引擎都没能给出结果。请稍后重试；若反复出现，请在管理后台检查「出卡AI」序列与 Pl@ntNet 额度。",
+        );
+      }
+      console.warn(
+        `[Phase1] 出卡链路全部失败，用 Pl@ntNet 判定兜底出摘要卡：${primaryFallback.sci}（${primaryFallback.pct}%）`,
+      );
+      meta = {
+        title: primaryFallback.sci,
+        scientific_name: primaryFallback.sci,
+        family: primaryFallback.family,
+        genus: primaryFallback.genus,
+        // 只有专业引擎的判定、没有模型复核过 → 一律按疑似处理，让用户走补拍把它坐实。
+        identification_confidence: "low",
+        summary_zh: `由专业识别引擎 Pl@ntNet 判定为 ${primaryFallback.sci}（置信度 ${primaryFallback.pct}%）。本次出卡模型未能返回结果，因此暂不做进一步描述——建议补拍关键部位以确认到种。`,
+      } as AiMeta;
+      normalizeIdentification(meta);
+      // Pl@ntNet 不消耗 token，所以这一趟的用量是 0 —— 用量表上出现 provider=plantnet-fallback
+      // 且 token 为 0 的记录，就代表「出卡模型全挂、靠专业引擎兜底出的卡」。
+      usedProvider = "plantnet-fallback";
+      usedModel = `plantnet(${primaryFallback.sci})`;
+      usage = ZERO_USAGE;
+      trace.phase1Model = "（出卡模型未返回，Pl@ntNet 兜底）";
+      trace.phase1Confidence = "low";
+      trace.review = { ran: false, reason: "出卡模型未返回结果，无可复核的候选" };
+      html = buildSummaryCardHtml({
+        photos: allPhotos,
+        title: meta.title || "",
+        sci: meta.scientific_name || "",
+        summaryZh: meta.summary_zh || "",
+        family: meta.family,
+        genus: meta.genus,
+        tentative: true,
+        chips: await lookupRegistryChips(meta.scientific_name, meta.family),
+        trace,
+        finalConfidence: "low",
+      });
+      enriched = false;
     }
 
-    const safeTitle = (meta.title || meta.scientific_name || "待鉴定植物").toString().slice(0, 200);
+    const safeTitle = draftTitleFor(meta);
     const aiPayload = JSON.parse(
       JSON.stringify({
         ...meta,
         _enriched: enriched,
         ...(secondOpinion ? { _second_opinion: secondOpinion } : {}),
+        // 全链路痕迹：简介卡渲染它，管理员复盘也读它（复核到底跑没跑、为什么没跑）。
+        _identify_trace: trace,
+        // 照片指纹：下次同一张图再传上来，识别前就能提示「这张已经识别过」。
+        ...(data.photo_sha256 ? { _photo_sha256: data.photo_sha256 } : {}),
       }),
     );
 
@@ -3716,238 +4798,432 @@ export const submitDraftForReviewFn = createServerFn({ method: "POST" })
 // won't touch an already-approved (收录) entry.
 const EnrichInput = z.object({ draft_id: z.string().uuid() });
 
-export const enrichDraft = createServerFn({ method: "POST" })
+/** enrichDraft 的返回值形状（后台任务完成后原样存进 job.result）。 */
+export type EnrichResult = {
+  draftId: string;
+  alreadyEnriched?: boolean;
+  isInvasive?: boolean;
+  silverCharged?: boolean;
+  silverRemaining?: number | null;
+};
+
+/**
+ * 「进一步生成草稿」的**快速前置校验**：草稿在不在、是否已收录、有没有原图、银叶够不够。
+ * 全是几十毫秒的库查询，所以放在前台请求里同步做 —— 用户点下去立刻知道能不能干，
+ * 而不是等一个后台任务两秒后失败。真正的重活在 runEnrichCore 里。
+ */
+async function enrichPreflight(draftId: string, userId: string, email: string | null) {
+  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+
+  const { data: draftRow, error: loadErr } = await supabaseAdmin
+    .from("plant_drafts")
+    .select(
+      "id, photo_url, capture_lat, capture_lng, capture_place, ai_payload, status, title, scientific_name, common_name_en, common_names_zh, family, genus",
+    )
+    .eq("id", draftId)
+    .maybeSingle();
+  const draft = draftRow as any;
+  if (loadErr || !draft)
+    throw new AiError(
+      "DRAFT_NOT_FOUND",
+      "生成失败（DRAFT_NOT_FOUND）：找不到这份草稿，可能已被删除。",
+    );
+  if (draft.status === "approved")
+    throw new AiError(
+      "DRAFT_ALREADY_APPROVED",
+      "生成失败（DRAFT_ALREADY_APPROVED）：这份草稿已通过审核并收录，不能再重新生成内容。",
+    );
+  if (draft.ai_payload?._enriched)
+    return { alreadyEnriched: true as const, draft, leaves: null, silverExempt: false };
+
+  // 进一步草稿消耗 1 枚银叶（owner 无限）。先校验余额；真正扣叶放在生成成功之后，
+  // 避免生成失败仍扣叶。银叶来自贡献积分，因此该步骤要求登录。
+  // 已通过申请的编辑（editor/admin 角色）免银叶——他们是审稿人，生成属工作职责。
+  const leaves = await serverLeafBalance(userId, email);
+  const { data: roleRows } = await supabaseAdmin
+    .from("user_roles")
+    .select("role")
+    .eq("user_id", userId);
+  const isEditorUser = (roleRows ?? []).some(
+    (r: { role: string }) => r.role === "editor" || r.role === "admin",
+  );
+  const silverExempt = leaves.isOwner || isEditorUser;
+  if (!silverExempt && leaves.silverAvailable < 1) {
+    throw new AiError(
+      "SILVER_INSUFFICIENT",
+      `生成失败（SILVER_INSUFFICIENT）：生成进一步草稿需消耗 1 枚银叶，你当前可用银叶为 0（已获得 ${leaves.silver} 枚，已用 ${leaves.silverUsed} 枚）。每 10 枚铜叶兑 1 枚银叶——多识别、多修文换图即可累积。（通过申请成为编辑后，此操作免银叶。）`,
+    );
+  }
+
+  if (!draft.photo_url)
+    throw new AiError(
+      "DRAFT_NO_PHOTO",
+      "生成失败（DRAFT_NO_PHOTO）：这份草稿没有原图，无法重新送 AI 生成。请重新拍照识别。",
+    );
+
+  return { alreadyEnriched: false as const, draft, leaves, silverExempt };
+}
+
+type EnrichPreflight = Awaited<ReturnType<typeof enrichPreflight>>;
+
+/**
+ * 「进一步生成草稿」的重活：取原图 → 联网调研 → 长文生成 → 写回 → 记账 → 扣叶。
+ * 几十秒到几分钟，**必须在后台跑**（见 lib/background-jobs.ts 顶部注释）。
+ * `onPhase` 把阶段文案写进任务行，前端轮询时显示「正在联网调研…」这类提示。
+ */
+async function runEnrichCore(
+  pre: Extract<EnrichPreflight, { alreadyEnriched: false }>,
+  userId: string,
+  email: string | null,
+  onPhase: (phase: string, progress: number) => void,
+): Promise<EnrichResult> {
+  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+  const { draft, leaves, silverExempt } = pre;
+
+  // Re-fetch the stored user photo → data URL for the multimodal call.
+  onPhase("正在读取原图…", 5);
+  const photoUrl = draft.photo_url as string;
+  const r = await fetch(photoUrl);
+  if (!r.ok)
+    throw new AiError(
+      "PHOTO_FETCH_FAILED",
+      `生成失败（PHOTO_FETCH_FAILED）：无法从云端存储读取这张原图（HTTP ${r.status}）。可能是图片已被删除或存储服务暂时不可用，请稍后重试。`,
+    );
+  const ct = r.headers.get("content-type") || "image/jpeg";
+  const ab = await r.arrayBuffer();
+  const dataUrl = `data:${ct};base64,${Buffer.from(ab).toString("base64")}`;
+
+  const place = (draft.capture_place as string) || "";
+  const lat = (draft.capture_lat as number | null) ?? null;
+  const lng = (draft.capture_lng as number | null) ?? null;
+
+  // 【联网调研 step】在生成完整草稿前，先联网查询该物种的最新研究成果、保护状态、
+  // 分布更新等权威信息，提升内容的准确性和时效性（仅 Gemini 可用，其他 provider 跳过）。
+  let webResearch: { digest: string; sources: { title: string; uri: string }[] } | null = null;
+  const speciesName = draft.title || draft.scientific_name || "";
+  if (speciesName) {
+    onPhase("正在联网调研该物种的权威资料…", 20);
+    const query = `${speciesName}（${draft.scientific_name || ""}）植物的最新研究进展、保护状态、分布范围、生态作用、栽培技术的权威资料（优先中国植物志、GBIF、IUCN、学术期刊）`;
+    webResearch = await xiaopGroundedSearch(query, null);
+    if (webResearch) {
+      console.log(
+        `[EnrichDraft] Web research for "${speciesName}": ${webResearch.sources.length} sources, ${webResearch.digest.length} chars`,
+      );
+    }
+  }
+
+  // Pin the phase-1 species so the enriched draft can't be renamed to a different
+  // plant than the summary card the user already saw.
+  onPhase("正在撰写完整草稿正文（中英双语，含配图）…", 45);
+  const { meta, usedModel, usedProvider, usage, html, isInvasive, gbifTaxonKey } =
+    await buildDraftContent({
+      dataUrl,
+      photoUrl,
+      place,
+      lat,
+      lng,
+      speciesHint: {
+        title: draft.title || undefined,
+        scientificName: draft.scientific_name || undefined,
+      },
+      webResearch: webResearch || undefined, // 传递联网调研结果给内容生成函数
+      queueKind: "enrich", // 「进一步生成草稿」走它自己的模型序列
+    });
+
+  // Identity is LOCKED to phase-1 (with meta as fallback for anything phase-1 left
+  // blank). Guarantees card ↔ draft name consistency even if the model drifts.
+  const lockTitle = (draft.title || meta.title || meta.scientific_name || "待鉴定植物")
+    .toString()
+    .slice(0, 200);
+  const lockSci = draft.scientific_name || meta.scientific_name || null;
+  const lockFamily = draft.family || meta.family || null;
+  const lockGenus = draft.genus || meta.genus || null;
+  const lockEn = draft.common_name_en || meta.common_name_en || null;
+  const lockZh = draft.common_names_zh || meta.common_names_zh || null;
+  const aiPayload = JSON.parse(
+    JSON.stringify({
+      ...(draft.ai_payload || {}),
+      ...meta,
+      title: lockTitle,
+      scientific_name: lockSci ?? "",
+      family: lockFamily ?? "",
+      genus: lockGenus ?? "",
+      common_name_en: lockEn ?? "",
+      common_names_zh: lockZh ?? "",
+      _enriched: true,
+    }),
+  );
+
+  // 【质量闸门】落库、存资料包、扣叶之前先验收。不合格就抛 —— 三件事都在下面，
+  // 抛出去等于「用户没拿到东西，也没被扣钱」。在此之前只要 JSON 能 parse 就照收不误。
+  {
+    const gate = checkDraftQuality(aiPayload);
+    console.log(`[QualityGate] enrich draft ${draft.id}: ${describeIssues(gate)}`);
+    if (!gate.ok) throw new AiError("DRAFT_QUALITY_FAILED", gate.summary);
+  }
+
+  onPhase("正在保存草稿…", 88);
+  const { error: updErr } = await (supabaseAdmin as any)
+    .from("plant_drafts")
+    .update({
+      ai_model: usedModel,
+      ai_payload: aiPayload,
+      title: lockTitle,
+      scientific_name: lockSci,
+      common_name_en: lockEn,
+      common_names_zh: lockZh,
+      family: lockFamily,
+      genus: lockGenus,
+      summary: (meta.summary_zh || meta.summary_en || "").toString().slice(0, 600),
+      tags: meta.tags ?? [],
+      iucn_status: meta.iucn_status || null,
+      html_content: html,
+      // 生成完整草稿 = 正式提交审核。UI 一直承诺「自动进入待审批草稿库」，但在此之前
+      // 只有「保存为待审批草稿」按钮会翻这个字段，而那个按钮 enrich 后就消失了 ——
+      // 于是 enrich 过的草稿永远进不了队列，用户白花 1 枚银叶还以为交了。
+      // （fetchPendingDrafts 按 submitted_for_review=true 筛，见 drafts.ts。）
+      submitted_for_review: true,
+    })
+    .eq("id", draft.id);
+  if (updErr)
+    throw new AiError(
+      "DRAFT_UPDATE_FAILED",
+      `生成失败（DRAFT_UPDATE_FAILED）：内容已生成，但写回数据库时出错。原因：${updErr.message}。`,
+    );
+
+  // 把这次的成果沉淀成**物种资料包**，下一个拍到同种植物的人就不用再等 3–10 分钟。
+  // 完全非致命：内容已经生成好、也已经存进草稿了，缓存没存上不该让用户白等一场。
+  // curated（人工校订过）的资料包不会被覆盖 —— 保护逻辑在 upsertDossier 里。
+  // **放在写库之后**：dossier 的查询/写入也算子请求，摆在草稿写回之后，能保证「保存草稿」
+  // 这步先拿到 Cloudflare 免费版那 50 个子请求的配额（fire-and-forget，失败也无害）。
+  void upsertDossier({
+    scientificName: lockSci || "",
+    title: lockTitle,
+    commonNameEn: lockEn,
+    commonNamesZh: lockZh,
+    family: lockFamily,
+    genus: lockGenus,
+    gbifTaxonKey: gbifTaxonKey ?? null,
+    body: toDossierBody(aiPayload),
+    research: webResearch,
+    aiModel: usedModel,
+    sourceDraftId: draft.id as string,
+  });
+
+  // Record the ACTUAL enriching user (this fn requires auth), not a hardcoded
+  // "enrich" label — the usage table was showing 👻 enrich for everyone.
+  let enricherLabel = email?.split("@")[0] || "编辑";
+  try {
+    const { data: prof } = await (supabaseAdmin as any)
+      .from("profiles")
+      .select("display_name")
+      .eq("id", userId)
+      .maybeSingle();
+    if (prof?.display_name) enricherLabel = prof.display_name;
+  } catch {
+    /* fall back to email prefix */
+  }
+  try {
+    await (supabaseAdmin as any).from("ai_usage_logs").insert({
+      user_id: userId,
+      user_label: `${enricherLabel}（进一步草稿）`,
+      provider: usedProvider,
+      model: usedModel,
+      prompt_tokens: usage.prompt_tokens,
+      completion_tokens: usage.completion_tokens,
+      total_tokens: usage.total_tokens,
+      capture_place: place || null,
+      capture_lat: lat,
+      capture_lng: lng,
+      draft_id: draft.id,
+      draft_title: lockTitle,
+      task_type: "enrich_draft", // Silver leaf full draft enrichment
+    });
+  } catch (e) {
+    console.warn("[EnrichDraft] usage log failed:", e);
+  }
+
+  if (gbifTaxonKey != null || isInvasive) {
+    try {
+      await (supabaseAdmin as any)
+        .from("plant_drafts")
+        .update({ is_invasive: isInvasive, gbif_taxon_key: gbifTaxonKey })
+        .eq("id", draft.id);
+    } catch (e) {
+      console.warn("[EnrichDraft] invasive flag update failed:", e);
+    }
+  }
+
+  // Charge the silver leaf LAST (content already exists) and only for non-owners.
+  // Marks the draft so a later 驳回 can refund it exactly once. Non-fatal: if the
+  // columns aren't migrated yet, enrich still succeeds (just uncharged) — logged.
+  let silverCharged = false;
+  if (!silverExempt) {
+    try {
+      const { data: spent } = await (supabaseAdmin as any)
+        .from("profiles")
+        .update({ silver_used: leaves.silverUsed + 1 })
+        .eq("id", userId)
+        .eq("silver_used", leaves.silverUsed) // optimistic-concurrency: no double spend
+        .select("id");
+      if (spent?.length) {
+        silverCharged = true;
+        await (supabaseAdmin as any)
+          .from("plant_drafts")
+          .update({ enrich_silver_spent: true })
+          .eq("id", draft.id);
+      } else {
+        console.warn(
+          `[EnrichDraft] silver not charged (concurrent update?) user ${userId} draft ${draft.id}`,
+        );
+      }
+    } catch (e) {
+      console.warn(
+        "[EnrichDraft] silver charge skipped (migration not applied?):",
+        e instanceof Error ? e.message : e,
+      );
+    }
+  }
+
+  return {
+    draftId: draft.id as string,
+    isInvasive,
+    silverCharged,
+    silverRemaining: silverExempt
+      ? null
+      : Math.max(0, leaves.silverAvailable - (silverCharged ? 1 : 0)),
+  };
+}
+
+/**
+ * 启动「进一步生成草稿」的后台任务。**立刻返回**（只做前置校验 + 建任务行），
+ * 重活交给 keepAlive/waitUntil 在响应之后跑 —— 这就是绕开 Cloudflare 边缘 100s
+ * 响应上限的整个办法。前端拿 jobId 去 pollJobFn 轮询。
+ *
+ * 草稿早已 enrich 过时不建任务，直接返回 `alreadyEnriched`，省掉一次无谓的轮询。
+ */
+export const startEnrichDraftFn = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .inputValidator((input) => EnrichInput.parse(input))
   .handler(async ({ data, context }) => {
     const { userId } = context;
     const email = (context.claims as { email?: string } | undefined)?.email ?? null;
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { createJob, pruneExpiredJobs } = await import("./background-jobs");
+    const { keepAlive } = await import("./worker-ctx");
+    const { enqueueJob } = await import("./job-queue");
 
-    const { data: draftRow, error: loadErr } = await supabaseAdmin
-      .from("plant_drafts")
-      .select(
-        "id, photo_url, capture_lat, capture_lng, capture_place, ai_payload, status, title, scientific_name, common_name_en, common_names_zh, family, genus",
-      )
-      .eq("id", data.draft_id)
-      .maybeSingle();
-    const draft = draftRow as any;
-    if (loadErr || !draft)
-      throw new AiError(
-        "DRAFT_NOT_FOUND",
-        "生成失败（DRAFT_NOT_FOUND）：找不到这份草稿，可能已被删除。",
-      );
-    if (draft.status === "approved")
-      throw new AiError(
-        "DRAFT_ALREADY_APPROVED",
-        "生成失败（DRAFT_ALREADY_APPROVED）：这份草稿已通过审核并收录，不能再重新生成内容。",
-      );
-    if (draft.ai_payload?._enriched) return { draftId: draft.id as string, alreadyEnriched: true };
-
-    // 进一步草稿消耗 1 枚银叶（owner 无限）。先校验余额；真正扣叶放在生成成功之后，
-    // 避免生成失败仍扣叶。银叶来自贡献积分，因此该步骤要求登录。
-    // 已通过申请的编辑（editor/admin 角色）免银叶——他们是审稿人，生成属工作职责。
-    const leaves = await serverLeafBalance(userId, email);
-    const { data: roleRows } = await supabaseAdmin
-      .from("user_roles")
-      .select("role")
-      .eq("user_id", userId);
-    const isEditorUser = (roleRows ?? []).some(
-      (r: { role: string }) => r.role === "editor" || r.role === "admin",
-    );
-    const silverExempt = leaves.isOwner || isEditorUser;
-    if (!silverExempt && leaves.silverAvailable < 1) {
-      throw new AiError(
-        "SILVER_INSUFFICIENT",
-        `生成失败（SILVER_INSUFFICIENT）：生成进一步草稿需消耗 1 枚银叶，你当前可用银叶为 0（已获得 ${leaves.silver} 枚，已用 ${leaves.silverUsed} 枚）。每 10 枚铜叶兑 1 枚银叶——多识别、多修文换图即可累积。（通过申请成为编辑后，此操作免银叶。）`,
-      );
+    // 这里先跑一次前置校验，是为了让「叶子不够」「已经生成过」这类问题**当场**报给用户，
+    // 而不是排进队列、三十秒后才在轮询里冒出来。消费者会再跑一次（见 runQueuedJob）。
+    const pre = await enrichPreflight(data.draft_id, userId, email);
+    if (pre.alreadyEnriched) {
+      return { alreadyEnriched: true as const, jobId: null, draftId: data.draft_id };
     }
 
-    // Re-fetch the stored user photo → data URL for the multimodal call.
-    const photoUrl = draft.photo_url as string;
-    if (!photoUrl)
-      throw new AiError(
-        "DRAFT_NO_PHOTO",
-        "生成失败（DRAFT_NO_PHOTO）：这份草稿没有原图，无法重新送 AI 生成。请重新拍照识别。",
-      );
-    const r = await fetch(photoUrl);
-    if (!r.ok)
-      throw new AiError(
-        "PHOTO_FETCH_FAILED",
-        `生成失败（PHOTO_FETCH_FAILED）：无法从云端存储读取这张原图（HTTP ${r.status}）。可能是图片已被删除或存储服务暂时不可用，请稍后重试。`,
-      );
-    const ct = r.headers.get("content-type") || "image/jpeg";
-    const ab = await r.arrayBuffer();
-    const dataUrl = `data:${ct};base64,${Buffer.from(ab).toString("base64")}`;
+    void pruneExpiredJobs();
+    const job = await createJob({
+      kind: "enrich_draft",
+      userId,
+      draftId: data.draft_id,
+      phase: "已排队，正在启动…",
+      // 队列消息里只放 jobId，真实入参存这儿（见 job-queue.ts 的说明）。
+      payload: { email },
+    });
 
-    const place = (draft.capture_place as string) || "";
-    const lat = (draft.capture_lat as number | null) ?? null;
-    const lng = (draft.capture_lng as number | null) ?? null;
+    // 正路：交给 Queues（消费者有 15 分钟）。绑定不可用时（本地 dev / 队列没建）
+    // 才退回 waitUntil —— 那条路只有约 26 秒，冷启动多半跑不完，但总比什么都不做强。
+    if (!(await enqueueJob(job.id))) keepAlive(runQueuedJob(job.id));
 
-    // 【联网调研 step】在生成完整草稿前，先联网查询该物种的最新研究成果、保护状态、
-    // 分布更新等权威信息，提升内容的准确性和时效性（仅 Gemini 可用，其他 provider 跳过）。
-    let webResearch: { digest: string; sources: { title: string; uri: string }[] } | null = null;
-    const speciesName = draft.title || draft.scientific_name || "";
-    if (speciesName) {
-      const query = `${speciesName}（${draft.scientific_name || ""}）植物的最新研究进展、保护状态、分布范围、生态作用、栽培技术的权威资料（优先中国植物志、GBIF、IUCN、学术期刊）`;
-      webResearch = await xiaopGroundedSearch(query, null);
-      if (webResearch) {
-        console.log(
-          `[EnrichDraft] Web research for "${speciesName}": ${webResearch.sources.length} sources, ${webResearch.digest.length} chars`,
-        );
-      }
+    return { alreadyEnriched: false as const, jobId: job.id, draftId: data.draft_id };
+  });
+
+/**
+ * 执行一个已建好的后台任务 —— **队列消费者和 waitUntil 退路共用的唯一入口**。
+ *
+ * 为什么要重跑一次 preflight（server fn 里刚跑过）：
+ * 队列消息里只有 jobId，拿不到那个 `pre` 对象；而且重跑本身是好事 —— 消息可能延迟
+ * 投递或重投，草稿状态、叶子余额在这期间都可能变了，用陈旧快照去扣费才是真的危险。
+ *
+ * **幂等**：Queues 允许重复投递（重试、至少一次语义）。任务已经不是 running 就直接
+ * 返回，绝不重跑 —— 否则一次重投会让用户被扣两次叶子、库里多出一个重复页面。
+ */
+export async function runQueuedJob(jobId: string): Promise<void> {
+  const { readJob, bindJobUpdates } = await import("./background-jobs");
+
+  const job = await readJob(jobId);
+  if (!job) {
+    console.warn(`[job-runner] 任务 ${jobId} 不存在（可能已过期被清），跳过`);
+    return;
+  }
+  if (job.status !== "running") {
+    console.log(`[job-runner] 任务 ${jobId} 已是 ${job.status}，跳过（队列重投的幂等保护）`);
+    return;
+  }
+
+  // 所有进度/心跳/收尾更新都绑定到内存里的这份 job，每次只做一次 blind upsert
+  // （不再先 read 后 write）—— 这是把整趟生成的子请求数压到 Cloudflare 免费版 50 上限
+  // 以下的关键一步，见 background-jobs.ts 的 bindJobUpdates 说明。
+  const jobs = bindJobUpdates(job);
+
+  const payload = (job.payload ?? {}) as { email?: string | null; userModel?: unknown };
+  const email = payload.email ?? null;
+  const onPhase = (phase: string, progress: number) => {
+    // 不 await：进度写库不该拖慢生成，写失败也已在 flush 里吞掉。
+    void jobs.phase(phase, progress);
+  };
+
+  // 心跳独立于阶段推进：撰稿是一整个 await，慢模型能跑五分钟以上，
+  // 光靠阶段更新推 updatedAt 会让前端把还在干活的任务判成「已中断」。
+  const stopHeartbeat = jobs.startHeartbeat();
+  try {
+    let result: unknown;
+    if (job.kind === "enrich_draft") {
+      const pre = await enrichPreflight(job.draftId, job.userId, email);
+      result = pre.alreadyEnriched
+        ? { alreadyEnriched: true as const, draftId: job.draftId }
+        : await runEnrichCore(pre, job.userId, email, onPhase);
+    } else {
+      const pre = await goldPreflight(job.draftId, job.userId, email);
+      // 用户自带模型配置来自客户端，重放前**必须重新校验** —— 它在库里存了一段时间，
+      // 不能当成已经过 inputValidator 的可信数据直接喂给调用层。
+      const userModel = UserModelInput.parse(payload.userModel ?? undefined);
+      result = await runGoldCore(pre, job.userId, email, userModel, onPhase);
     }
+    stopHeartbeat();
+    await jobs.finish(result);
+  } catch (e) {
+    stopHeartbeat();
+    const msg =
+      e instanceof Error && e.message ? e.message : "生成失败（UNKNOWN）：发生了未知错误，请重试。";
+    console.error(`[job-runner] 任务 ${jobId}（${job.kind}）失败：`, e);
+    await jobs.fail(msg);
+  } finally {
+    // 上面两条路都已经停过表；这里兜住「stopHeartbeat 之前就抛了」的漏网情况。
+    stopHeartbeat();
+  }
+}
 
-    // Pin the phase-1 species so the enriched draft can't be renamed to a different
-    // plant than the summary card the user already saw.
-    const { meta, usedModel, usedProvider, usage, html, isInvasive, gbifTaxonKey } =
-      await buildDraftContent({
-        dataUrl,
-        photoUrl,
-        place,
-        lat,
-        lng,
-        speciesHint: {
-          title: draft.title || undefined,
-          scientificName: draft.scientific_name || undefined,
-        },
-        webResearch: webResearch || undefined, // 传递联网调研结果给内容生成函数
-      });
-
-    // Identity is LOCKED to phase-1 (with meta as fallback for anything phase-1 left
-    // blank). Guarantees card ↔ draft name consistency even if the model drifts.
-    const lockTitle = (draft.title || meta.title || meta.scientific_name || "待鉴定植物")
-      .toString()
-      .slice(0, 200);
-    const lockSci = draft.scientific_name || meta.scientific_name || null;
-    const lockFamily = draft.family || meta.family || null;
-    const lockGenus = draft.genus || meta.genus || null;
-    const lockEn = draft.common_name_en || meta.common_name_en || null;
-    const lockZh = draft.common_names_zh || meta.common_names_zh || null;
-    const aiPayload = JSON.parse(
-      JSON.stringify({
-        ...(draft.ai_payload || {}),
-        ...meta,
-        title: lockTitle,
-        scientific_name: lockSci ?? "",
-        family: lockFamily ?? "",
-        genus: lockGenus ?? "",
-        common_name_en: lockEn ?? "",
-        common_names_zh: lockZh ?? "",
-        _enriched: true,
-      }),
-    );
-
-    const { error: updErr } = await (supabaseAdmin as any)
-      .from("plant_drafts")
-      .update({
-        ai_model: usedModel,
-        ai_payload: aiPayload,
-        title: lockTitle,
-        scientific_name: lockSci,
-        common_name_en: lockEn,
-        common_names_zh: lockZh,
-        family: lockFamily,
-        genus: lockGenus,
-        summary: (meta.summary_zh || meta.summary_en || "").toString().slice(0, 600),
-        tags: meta.tags ?? [],
-        iucn_status: meta.iucn_status || null,
-        html_content: html,
-        // 生成完整草稿 = 正式提交审核。UI 一直承诺「自动进入待审批草稿库」，但在此之前
-        // 只有「保存为待审批草稿」按钮会翻这个字段，而那个按钮 enrich 后就消失了 ——
-        // 于是 enrich 过的草稿永远进不了队列，用户白花 1 枚银叶还以为交了。
-        // （fetchPendingDrafts 按 submitted_for_review=true 筛，见 drafts.ts。）
-        submitted_for_review: true,
-      })
-      .eq("id", draft.id);
-    if (updErr)
-      throw new AiError(
-        "DRAFT_UPDATE_FAILED",
-        `生成失败（DRAFT_UPDATE_FAILED）：内容已生成，但写回数据库时出错。原因：${updErr.message}。`,
-      );
-
-    // Record the ACTUAL enriching user (this fn requires auth), not a hardcoded
-    // "enrich" label — the usage table was showing 👻 enrich for everyone.
-    let enricherLabel = email?.split("@")[0] || "编辑";
-    try {
-      const { data: prof } = await (supabaseAdmin as any)
-        .from("profiles")
-        .select("display_name")
-        .eq("id", userId)
-        .maybeSingle();
-      if (prof?.display_name) enricherLabel = prof.display_name;
-    } catch {
-      /* fall back to email prefix */
-    }
-    try {
-      await (supabaseAdmin as any).from("ai_usage_logs").insert({
-        user_id: userId,
-        user_label: `${enricherLabel}（进一步草稿）`,
-        provider: usedProvider,
-        model: usedModel,
-        prompt_tokens: usage.prompt_tokens,
-        completion_tokens: usage.completion_tokens,
-        total_tokens: usage.total_tokens,
-        capture_place: place || null,
-        capture_lat: lat,
-        capture_lng: lng,
-        draft_id: draft.id,
-        draft_title: lockTitle,
-        task_type: "enrich_draft", // Silver leaf full draft enrichment
-      });
-    } catch (e) {
-      console.warn("[EnrichDraft] usage log failed:", e);
-    }
-
-    if (gbifTaxonKey != null || isInvasive) {
-      try {
-        await (supabaseAdmin as any)
-          .from("plant_drafts")
-          .update({ is_invasive: isInvasive, gbif_taxon_key: gbifTaxonKey })
-          .eq("id", draft.id);
-      } catch (e) {
-        console.warn("[EnrichDraft] invasive flag update failed:", e);
-      }
-    }
-
-    // Charge the silver leaf LAST (content already exists) and only for non-owners.
-    // Marks the draft so a later 驳回 can refund it exactly once. Non-fatal: if the
-    // columns aren't migrated yet, enrich still succeeds (just uncharged) — logged.
-    let silverCharged = false;
-    if (!silverExempt) {
-      try {
-        const { data: spent } = await (supabaseAdmin as any)
-          .from("profiles")
-          .update({ silver_used: leaves.silverUsed + 1 })
-          .eq("id", userId)
-          .eq("silver_used", leaves.silverUsed) // optimistic-concurrency: no double spend
-          .select("id");
-        if (spent?.length) {
-          silverCharged = true;
-          await (supabaseAdmin as any)
-            .from("plant_drafts")
-            .update({ enrich_silver_spent: true })
-            .eq("id", draft.id);
-        } else {
-          console.warn(
-            `[EnrichDraft] silver not charged (concurrent update?) user ${userId} draft ${draft.id}`,
-          );
-        }
-      } catch (e) {
-        console.warn(
-          "[EnrichDraft] silver charge skipped (migration not applied?):",
-          e instanceof Error ? e.message : e,
-        );
-      }
-    }
-
+/**
+ * 轮询任务进度。前端每几秒打一次；只读自己的任务。
+ * `stale` = 还挂在 running 但很久没更新过阶段（isolate 被回收之类），前端据此
+ * 停止无休止的轮询并提示重试，而不是转圈到天荒地老。
+ */
+export const pollJobFn = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input) => z.object({ jobId: z.string().min(1).max(80) }).parse(input))
+  .handler(async ({ data, context }) => {
+    const { userId } = context;
+    const { readJob, isJobStale } = await import("./background-jobs");
+    const rec = await readJob(data.jobId, userId);
+    if (!rec) return { found: false as const };
     return {
-      draftId: draft.id as string,
-      isInvasive,
-      silverCharged,
-      silverRemaining: silverExempt
-        ? null
-        : Math.max(0, leaves.silverAvailable - (silverCharged ? 1 : 0)),
+      found: true as const,
+      status: rec.status,
+      phase: rec.phase,
+      progress: rec.progress,
+      kind: rec.kind,
+      result: rec.result ?? null,
+      error: rec.error ?? null,
+      stale: isJobStale(rec),
     };
   });
 
@@ -4185,7 +5461,439 @@ async function gatherVerifiedFacts(draft: any): Promise<VerifiedFacts> {
   };
 }
 
-export const createGoldDetailPageFn = createServerFn({ method: "POST" })
+export type GoldPageResult = {
+  plantId: string;
+  slug: string;
+  goldRemaining: number | null;
+};
+
+/** 金叶详页的**快速前置校验**：金叶够不够、草稿在不在、有没有学名。同步做，见 enrichPreflight。 */
+async function goldPreflight(draftId: string, userId: string, email: string | null) {
+  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+
+  // 1. Gate on a SERVER-computed leaf balance. The owner is unlimited (Infinity).
+  const leaves = await serverLeafBalance(userId, email);
+  if (leaves.goldAvailable < 1) {
+    throw new AiError(
+      "GOLD_INSUFFICIENT",
+      `创建失败（GOLD_INSUFFICIENT）：你当前没有可用金叶（已获得 ${leaves.gold} 枚，已使用 ${leaves.goldUsed} 枚）。每 100 枚铜叶兑 1 枚金叶。`,
+    );
+  }
+
+  // 2. Load the draft.
+  const { data: draftRow, error: loadErr } = await supabaseAdmin
+    .from("plant_drafts")
+    .select(
+      "id, title, scientific_name, common_name_en, common_names_zh, family, genus, photo_url, capture_place, iucn_status, tags, summary",
+    )
+    .eq("id", draftId)
+    .maybeSingle();
+  const draft = draftRow as any;
+  if (loadErr || !draft)
+    throw new AiError(
+      "DRAFT_NOT_FOUND",
+      "创建失败（DRAFT_NOT_FOUND）：找不到这份草稿，可能已被删除。",
+    );
+  if (!draft.scientific_name) {
+    throw new AiError(
+      "DRAFT_NO_SPECIES",
+      "创建失败（DRAFT_NO_SPECIES）：这份草稿还没有确定的学名，无法生成详细科普页。请先确认物种。",
+    );
+  }
+
+  return { draft, leaves };
+}
+
+/**
+ * 金叶详页的重活：名录取证 → 配图检索 → **3 次联网调研** → **3 段长文生成** →
+ * 渲染上传 → 写库 → 记账 → 扣叶。这是全站最重的一条链路，比 enrich 还慢，
+ * 必须在后台跑。以前它只是前端 `void` 掉 Promise，请求仍是同一个前台 HTTP 请求
+ * ——所以才有那句「请勿关闭或刷新标签页」。现在真的可以关了。
+ */
+async function runGoldCore(
+  pre: Awaited<ReturnType<typeof goldPreflight>>,
+  userId: string,
+  email: string | null,
+  userModel: z.infer<typeof UserModelInput>,
+  onPhase: (phase: string, progress: number) => void,
+): Promise<GoldPageResult> {
+  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+  const { draft, leaves } = pre;
+  /** 正名核对留痕，落库时写进 plants，页面据此渲染别名与「待人工核对」提示。 */
+  let goldNameStamp: import("./name-authority.functions").NameAuthorityStamp | null = null;
+
+  // 3. Ground-truth facts from the real registries.
+  onPhase("正在核对权威名录（保护级别、入侵名录、GBIF）…", 5);
+  const facts = await gatherVerifiedFacts(draft);
+
+  // 【正名核对】金叶详页会**直接落进公开档案 plants**，是全站名字最该准的一处。
+  // 在三轮撰稿之前对齐，撰稿 prompt 里的「已核实事实」区块拿到的就是正名与正确的科属；
+  // 放到落库前才改，正文里那些「本种隶属 XX 科」就已经按旧名写死了。
+  // 草稿在识别时已经核对过一次，这里再核一次是为了两种情况：老草稿（本机制上线前建的）、
+  // 以及用户在草稿页手工改过名字。
+  {
+    const { applyNameAuthority } = await import("./name-authority.functions");
+    const named = {
+      title: facts.title,
+      scientific_name: facts.scientificName,
+      family: draft.family,
+      genus: draft.genus,
+      common_names_zh: draft.common_names_zh,
+    };
+    const { stamp, changed } = await applyNameAuthority(named);
+    if (changed) {
+      facts.title = named.title ?? facts.title;
+      facts.scientificName = named.scientific_name ?? facts.scientificName;
+      draft.family = named.family ?? draft.family;
+      draft.genus = named.genus ?? draft.genus;
+      draft.common_names_zh = named.common_names_zh ?? draft.common_names_zh;
+      if (named.family) {
+        const [fz, fl] = named.family.split(" ");
+        facts.familyZh = fz || facts.familyZh;
+        facts.familyLa = fl || facts.familyLa;
+      }
+      if (named.genus) {
+        const [gz, gl] = named.genus.split(" ");
+        facts.genusZh = gz || facts.genusZh;
+        facts.genusLa = gl || facts.genusLa;
+      }
+    }
+    goldNameStamp = stamp;
+    console.log(
+      `[NameAuthority] 金叶「${facts.title}」：${stamp.status}/${stamp.matchedBy}` +
+        `${changed ? " · 已按名录改写" : ""}${stamp.note ? " · " + stamp.note.slice(0, 120) : ""}`,
+    );
+  }
+
+  // 管理员粘贴的创作指导（没配就是 null = 走内置底版）。三轮撰稿共用同一份，
+  // 且**在这里读一次就锁定** —— 生成中途管理员换了 skill，也不会让同一个页面
+  // 前三节按 v19 写、后两节按 v20 写，页尾署名也才对得上正文。
+  const goldSkill = activeGoldSkill(await loadGoldSkill());
+  if (goldSkill) {
+    console.log(
+      `[GoldPage] using skill "${skillSignature(goldSkill) || "(未命名)"}" (${goldSkill.content.length} chars)`,
+    );
+  }
+
+  // 4. Fill the 9 body image slots (hero stays the user's own photo).
+  //    fetchSpeciesPhotos already diversifies by place/season/photographer;
+  //    rehostImages compresses (1280px webp) before storing in Supabase.
+  onPhase("正在检索并转存配图…", 12);
+  let photos: (PhotoCandidate | null)[] = [];
+  let photoMissing: string[] = GOLD_SLOTS.map((s) => s.missingNote);
+  try {
+    const term =
+      facts.scientificName.split(/\s+/).slice(0, 2).join(" ") || facts.commonNameEn || facts.title;
+    // 9 个槽要覆盖 根株/茎/叶/花/果/物候/生境/标本/人文，候选必须给够挑选余地。
+    const external = await fetchSpeciesPhotos(term, 14);
+    const labelled = await classifyPhotoOrgans(external, term);
+    const assigned = assignSlots(labelled, GOLD_SLOTS);
+    console.log(`[PhotoSlots] 金叶「${term}」：${describeAssignment(assigned)}`);
+    const chosen = assigned.map((a) => a.photo).filter(Boolean) as PhotoCandidate[];
+    const rehosted = await rehostImages(chosen, `plants/gold/${draft.id}`);
+    const finalPhotos = rehosted.length === chosen.length ? rehosted : chosen;
+    let k = 0;
+    photos = assigned.map((a) => (a.photo ? (finalPhotos[k++] ?? null) : null));
+    photoMissing = assigned.map((a) => (a.photo ? "" : a.spec.missingNote));
+  } catch (e) {
+    console.warn("[GoldPage] image fetch failed; slots will render as .broken:", e);
+  }
+
+  // Resolve model override (needed for web research calls below)
+  const overrideSequence = toOverrideSlots(userModel);
+
+  // 【联网调研 step】金叶页面生成前，先联网查询该物种的最新研究、文献、保护动态，
+  // 分三个维度准备权威参考资料（形态生境、人文博物、生态演化），提升内容深度。
+  let webResearch1: {
+    digest: string;
+    sources: { title: string; uri: string }[];
+    usage: AiTokenUsage;
+  } | null = null;
+  let webResearch2: {
+    digest: string;
+    sources: { title: string; uri: string }[];
+    usage: AiTokenUsage;
+  } | null = null;
+  let webResearch3: {
+    digest: string;
+    sources: { title: string; uri: string }[];
+    usage: AiTokenUsage;
+  } | null = null;
+
+  // Running token total for this whole gold-page build (3 grounding searches + 3 LLM passes).
+  let goldUsage: AiTokenUsage = { ...ZERO_USAGE };
+
+  const speciesFullName = `${facts.title}（${facts.scientificName}）`;
+
+  onPhase("正在联网调研 1/3：形态、生境、近缘种…", 20);
+  // Phase 1 调研：形态、生境、近缘种区分
+  const query1 = `${speciesFullName} 的形态特征、生境分布、近缘种区分要点、栽培养护的最新权威资料（优先中国植物志、Flora of China、园艺文献）`;
+  webResearch1 = await xiaopGroundedSearch(query1, overrideSequence);
+  goldUsage = addUsage(goldUsage, webResearch1?.usage);
+  if (webResearch1) {
+    console.log(`[GoldPage Phase1] Web research: ${webResearch1.sources.length} sources`);
+  }
+
+  onPhase("正在联网调研 2/3：人文、民俗、本草…", 28);
+  // Phase 2 调研：人文、民俗、文学、药用
+  const query2 = `${speciesFullName} 的人文历史、民俗用途、文学记载、本草典籍、食药用价值的权威资料（优先古籍数据库、民族植物学文献）`;
+  webResearch2 = await xiaopGroundedSearch(query2, overrideSequence);
+  goldUsage = addUsage(goldUsage, webResearch2?.usage);
+  if (webResearch2) {
+    console.log(`[GoldPage Phase2] Web research: ${webResearch2.sources.length} sources`);
+  }
+
+  onPhase("正在联网调研 3/3：生态功能、保护与科研进展…", 36);
+  // Phase 3 调研：生态功能、入侵状态、最新科研
+  const query3 = `${speciesFullName} 的生态功能、入侵风险、保护管理、近期重要科研进展（优先 IUCN、GBIF、学术期刊）`;
+  webResearch3 = await xiaopGroundedSearch(query3, overrideSequence);
+  goldUsage = addUsage(goldUsage, webResearch3?.usage);
+  if (webResearch3) {
+    console.log(`[GoldPage Phase3] Web research: ${webResearch3.sources.length} sources`);
+  }
+
+  // 5. Three LLM passes. One mega-call reliably blows the output-token ceiling and
+  //    comes back as truncated JSON, so each pass owns a bounded slice of the page.
+
+  // Helper to inject web research into system prompt
+  const withWebContext = (basePrompt: string, research: typeof webResearch1) => {
+    if (!research || !research.digest) return basePrompt;
+    const srcList = research.sources.length
+      ? "\n参考来源：\n" +
+        research.sources.map((s, i) => `[${i + 1}] ${s.title || s.uri} — ${s.uri}`).join("\n")
+      : "";
+    return (
+      basePrompt +
+      `\n\n【联网调研·权威参考资料】以下是该物种的最新权威信息，请据此确保内容准确、时效性强：\n${research.digest}${srcList}\n`
+    );
+  };
+
+  let goldProvider = "gemini";
+  let goldModel = process.env.AI_MODEL || "gemini-3-flash-preview";
+  const ask = async (system: string, schema: unknown, label: string) => {
+    const {
+      text: txt,
+      usage,
+      provider,
+      model,
+    } = await xiaopTextCall({
+      contents: [
+        {
+          role: "user",
+          parts: [{ text: `请为「${facts.title}（${facts.scientificName}）」生成本轮内容。` }],
+        },
+      ],
+      system,
+      schema,
+      overrideSequence,
+    });
+    goldUsage = addUsage(goldUsage, usage);
+    goldProvider = provider;
+    goldModel = model;
+    try {
+      return JSON.parse(cleanJson(txt));
+    } catch {
+      throw new AiError(
+        `GOLD_BAD_JSON_${label}`,
+        `创建失败（GOLD_BAD_JSON_${label}）：模型返回的内容不是完整 JSON，通常是生成被截断。请重试；反复出现可在管理后台给小P蛙换一个更强的模型。`,
+      );
+    }
+  };
+
+  // 【撰稿看得见图】把本页**实际拿到的配图清单**告诉模型，让它围绕真有的图写，
+  // 并且**知道哪些器官没有图**——否则它会写「如图所示的花冠……」，而那个槽是空的。
+  // 这是 CP4b 分槽的直接红利：在此之前根本不知道哪张图是什么。
+  const imageManifest = (() => {
+    const have = GOLD_SLOTS.map((spec, i) => ({ spec, photo: photos[i] })).filter((x) => x.photo);
+    const lack = GOLD_SLOTS.filter((_, i) => !photos[i]);
+    const lines: string[] = [];
+    if (have.length)
+      lines.push(`本页**已有**这些配图：${have.map((x) => x.spec.key).join("、")}。`);
+    if (lack.length)
+      lines.push(
+        `本页**没有**以下部位的配图：${lack.map((x) => x.key).join("、")}。` +
+          `涉及这些部位时，请正常描述形态，但**不要写「如图」「见下图」「照片中可见」**之类指图的话——` +
+          `那些位置是空的，读者看不到你说的图。`,
+      );
+    return lines.length
+      ? `\n\n【本页配图清单】\n${lines.join("\n")}\n有图的部位可以适度呼应画面，但仍以文字自足为准。`
+      : "";
+  })();
+
+  onPhase("正在撰稿 1/3（正文主体）…", 45);
+  const p1 = await ask(
+    withWebContext(premiumPrompt1(facts, goldSkill), webResearch1) + imageManifest,
+    PREMIUM_SCHEMA_1,
+    "1",
+  );
+  onPhase("正在撰稿 2/3（人文与应用）…", 58);
+  const p2 = await ask(
+    withWebContext(premiumPrompt2(facts, goldSkill), webResearch2) + imageManifest,
+    PREMIUM_SCHEMA_2,
+    "2",
+  );
+  onPhase("正在撰稿 3/3（生态与延伸阅读）…", 70);
+  const p3 = await ask(
+    withWebContext(premiumPrompt3(facts, goldSkill), webResearch3) + imageManifest,
+    PREMIUM_SCHEMA_3,
+    "3",
+  );
+  const fields = { ...p1, ...p2, ...p3 } as PremiumFields;
+
+  // 【质量闸门】比草稿严一档：它要收一枚金叶，且会直接落进公开档案 plants。
+  // 放在渲染之前 —— 渲染/上传/入库/扣费全在下面，抛出去就什么都没发生。
+  {
+    const gate = checkGoldQuality(fields as unknown as Record<string, unknown>);
+    console.log(`[QualityGate] gold ${draft.id}: ${describeIssues(gate)}`);
+    if (!gate.ok) {
+      // 被拦下时把三轮**实际返回的顶层键名**打出来。字段为空最常见的原因不是模型写不动，
+      // 而是它用了自己的键名（见 schemaInstruction 的事故说明）—— 有这一行，下次一眼就能
+      // 分清是「键名对不上」还是「模型真的写不出内容」，不必再靠猜。
+      const keysOf = (o: unknown) =>
+        o && typeof o === "object" ? Object.keys(o as object).join(",") : "(非对象)";
+      console.error(
+        `[QualityGate] gold ${draft.id} 各轮顶层键：p1=[${keysOf(p1)}] p2=[${keysOf(p2)}] ` +
+          `p3=[${keysOf(p3)}] · 模型=${goldProvider}/${goldModel}`,
+      );
+      throw new AiError("GOLD_QUALITY_FAILED", gate.summary);
+    }
+  }
+
+  onPhase("正在渲染并上传详页…", 82);
+  // 6. Render + upload the HTML body.
+  const html = renderPremiumHtml(
+    fields,
+    facts,
+    {
+      heroUrl: draft.photo_url as string,
+      // 署名跟着图走：每张图注渲染「摄影：X · CC BY-NC · iNaturalist」，可点回原始页。
+      images: photos.map((c, i) =>
+        c
+          ? { url: c.url, credit: creditLine(c), sourceUrl: c.sourceUrl }
+          : // 没有这个器官的公开照片 → 槽位如实写明缺什么，**不拿随机图糊过去**。
+            { url: "", missingNote: photoMissing[i] ?? "" },
+      ),
+    },
+    goldSkill,
+  );
+  const htmlPath = `${userId}/gold-${draft.id}.html`;
+  const { error: upErr } = await supabaseAdmin.storage
+    .from("plant-html")
+    .upload(htmlPath, new Blob([html], { type: "text/html" }), {
+      contentType: "text/html",
+      upsert: true,
+    });
+  if (upErr)
+    throw new AiError(
+      "HTML_UPLOAD_FAILED",
+      `创建失败（HTML_UPLOAD_FAILED）：详页 HTML 上传失败。原因：${upErr.message}。`,
+    );
+  const htmlUrl = supabaseAdmin.storage.from("plant-html").getPublicUrl(htmlPath).data.publicUrl;
+
+  onPhase("正在写入档案…", 90);
+  // 7. Unique slug, then insert the plants row.
+  let slug = slugify(facts.scientificName || facts.title || "");
+  if (!slug || slug.startsWith("p-")) slug = `gold-${draft.id.slice(0, 8)}`;
+  for (let i = 0; i < 5; i++) {
+    const { data: dup } = await supabaseAdmin
+      .from("plants")
+      .select("id")
+      .eq("slug", slug)
+      .maybeSingle();
+    if (!dup) break;
+    slug = `${slug}-${Math.random().toString(36).slice(2, 5)}`;
+  }
+
+  const { data: plant, error: pErr } = await supabaseAdmin
+    .from("plants")
+    .insert({
+      slug,
+      title: facts.title,
+      scientific_name: facts.scientificName,
+      common_name_en: draft.common_name_en,
+      common_names_zh: draft.common_names_zh,
+      family: draft.family,
+      genus: draft.genus,
+      summary: (fields.intro_zh || draft.summary || "").toString().slice(0, 600),
+      cover_url: draft.photo_url,
+      content_type: "html",
+      html_url: htmlUrl,
+      tags: draft.tags ?? [],
+      author_id: userId,
+      iucn_status: draft.iucn_status,
+      source: "gold_oneclick",
+      body_text: visibleBodyText(html),
+      name_authority: goldNameStamp ? JSON.parse(JSON.stringify(goldNameStamp)) : null,
+    })
+    .select("id")
+    .single();
+  if (pErr)
+    throw new AiError(
+      "PLANT_INSERT_FAILED",
+      `创建失败（PLANT_INSERT_FAILED）：写入档案时出错。原因：${pErr.message}。`,
+    );
+
+  // Log token usage for the whole gold-page build (3 grounding + 3 LLM passes).
+  // Awaited so the Workers isolate can't tear down before the row flushes; wrapped
+  // so a logging failure can't lose the user their (already-created) page.
+  try {
+    const { data: prof } = await (supabaseAdmin as any)
+      .from("profiles")
+      .select("display_name")
+      .eq("id", userId)
+      .maybeSingle();
+    const goldLabel = (prof?.display_name || email?.split("@")[0] || "用户") + "（金叶详页）";
+    const { error: usageErr } = await (supabaseAdmin as any).from("ai_usage_logs").insert({
+      user_id: userId,
+      user_label: goldLabel,
+      provider: goldProvider,
+      model: goldModel,
+      prompt_tokens: goldUsage.prompt_tokens,
+      completion_tokens: goldUsage.completion_tokens,
+      total_tokens: goldUsage.total_tokens,
+      capture_place: (draft.capture_place as string) || null,
+      draft_id: draft.id,
+      draft_title: facts.title,
+      task_type: "gold_page", // Full gold detail-page generation
+    });
+    if (usageErr) console.warn("[UsageLog] gold_page insert failed:", usageErr.message);
+  } catch (e) {
+    console.warn("[UsageLog] gold_page unexpected error:", e);
+  }
+
+  // 8. Spend the leaf — LAST, and only now that the page really exists. The owner
+  //    is unlimited, so never debit their account. The `.eq("gold_used", …)` guard
+  //    makes this optimistic-concurrency: two tabs racing can't spend twice.
+  if (!leaves.isOwner) {
+    const { data: spent, error: spendErr } = await (supabaseAdmin as any)
+      .from("profiles")
+      .update({ gold_used: leaves.goldUsed + 1 })
+      .eq("id", userId)
+      .eq("gold_used", leaves.goldUsed)
+      .select("id");
+    if (spendErr || !spent?.length) {
+      // The page exists and is valid; only the accounting failed. Don't fail the
+      // request (the user would lose the page) — log loudly for reconciliation.
+      console.error(
+        `[GoldPage] LEAF NOT SPENT for user ${userId}, plant ${plant.id}:`,
+        spendErr?.message ?? "concurrent update",
+      );
+    }
+  }
+
+  return {
+    plantId: plant.id as string,
+    slug,
+    // null = unlimited (owner). JSON can't carry Infinity, so the frontend shows ∞.
+    goldRemaining: leaves.isOwner ? null : Math.max(0, leaves.goldAvailable - 1),
+  };
+}
+
+/**
+ * 启动「金叶详页」的后台任务，立刻返回 jobId。与 startEnrichDraftFn 同构，
+ * 轮询同样走 pollJobFn。
+ */
+export const startGoldDetailPageFn = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   // `UserModelInput` is a const declared further down; reference it at REQUEST time
   // (inside the callback) rather than at module-init, where it isn't assigned yet.
@@ -4195,282 +5903,27 @@ export const createGoldDetailPageFn = createServerFn({ method: "POST" })
   .handler(async ({ data, context }) => {
     const { userId } = context;
     const email = (context.claims as { email?: string } | undefined)?.email ?? null;
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { createJob, pruneExpiredJobs } = await import("./background-jobs");
+    const { keepAlive } = await import("./worker-ctx");
+    const { enqueueJob } = await import("./job-queue");
 
-    // 1. Gate on a SERVER-computed leaf balance. The owner is unlimited (Infinity).
-    const leaves = await serverLeafBalance(userId, email);
-    if (leaves.goldAvailable < 1) {
-      throw new AiError(
-        "GOLD_INSUFFICIENT",
-        `创建失败（GOLD_INSUFFICIENT）：你当前没有可用金叶（已获得 ${leaves.gold} 枚，已使用 ${leaves.goldUsed} 枚）。每 100 枚铜叶兑 1 枚金叶。`,
-      );
-    }
+    // 同 enrich：当场校验金叶余额等前置条件，失败立刻报错而不是排队后再失败。
+    await goldPreflight(data.draft_id, userId, email);
 
-    // 2. Load the draft.
-    const { data: draftRow, error: loadErr } = await supabaseAdmin
-      .from("plant_drafts")
-      .select(
-        "id, title, scientific_name, common_name_en, common_names_zh, family, genus, photo_url, capture_place, iucn_status, tags, summary",
-      )
-      .eq("id", data.draft_id)
-      .maybeSingle();
-    const draft = draftRow as any;
-    if (loadErr || !draft)
-      throw new AiError(
-        "DRAFT_NOT_FOUND",
-        "创建失败（DRAFT_NOT_FOUND）：找不到这份草稿，可能已被删除。",
-      );
-    if (!draft.scientific_name) {
-      throw new AiError(
-        "DRAFT_NO_SPECIES",
-        "创建失败（DRAFT_NO_SPECIES）：这份草稿还没有确定的学名，无法生成详细科普页。请先确认物种。",
-      );
-    }
+    void pruneExpiredJobs();
+    const job = await createJob({
+      kind: "gold_page",
+      userId,
+      draftId: data.draft_id,
+      phase: "已排队，正在启动…",
+      // userModel 里可能带用户自己的 API Key —— 存 site_config（service-role 才读得到），
+      // **不进队列消息**（队列消息在 CF 侧最长留存 24 小时）。
+      payload: { email, userModel: data.userModel },
+    });
 
-    // 3. Ground-truth facts from the real registries.
-    const facts = await gatherVerifiedFacts(draft);
+    if (!(await enqueueJob(job.id))) keepAlive(runQueuedJob(job.id));
 
-    // 4. Fill the 9 body image slots (hero stays the user's own photo).
-    //    fetchSpeciesPhotos already diversifies by place/season/photographer;
-    //    rehostImages compresses (1280px webp) before storing in Supabase.
-    let images: string[] = [];
-    try {
-      const term =
-        facts.scientificName.split(/\s+/).slice(0, 2).join(" ") ||
-        facts.commonNameEn ||
-        facts.title;
-      const external = await fetchSpeciesPhotos(term, 9);
-      images = await rehostImages(external, `plants/gold/${draft.id}`);
-    } catch (e) {
-      console.warn("[GoldPage] image fetch failed; slots will render as .broken:", e);
-    }
-
-    // Resolve model override (needed for web research calls below)
-    const override = toOverride(data.userModel);
-
-    // 【联网调研 step】金叶页面生成前，先联网查询该物种的最新研究、文献、保护动态，
-    // 分三个维度准备权威参考资料（形态生境、人文博物、生态演化），提升内容深度。
-    let webResearch1: {
-      digest: string;
-      sources: { title: string; uri: string }[];
-      usage: AiTokenUsage;
-    } | null = null;
-    let webResearch2: {
-      digest: string;
-      sources: { title: string; uri: string }[];
-      usage: AiTokenUsage;
-    } | null = null;
-    let webResearch3: {
-      digest: string;
-      sources: { title: string; uri: string }[];
-      usage: AiTokenUsage;
-    } | null = null;
-
-    // Running token total for this whole gold-page build (3 grounding searches + 3 LLM passes).
-    let goldUsage: AiTokenUsage = { ...ZERO_USAGE };
-
-    const speciesFullName = `${facts.title}（${facts.scientificName}）`;
-
-    // Phase 1 调研：形态、生境、近缘种区分
-    const query1 = `${speciesFullName} 的形态特征、生境分布、近缘种区分要点、栽培养护的最新权威资料（优先中国植物志、Flora of China、园艺文献）`;
-    webResearch1 = await xiaopGroundedSearch(query1, override);
-    goldUsage = addUsage(goldUsage, webResearch1?.usage);
-    if (webResearch1) {
-      console.log(`[GoldPage Phase1] Web research: ${webResearch1.sources.length} sources`);
-    }
-
-    // Phase 2 调研：人文、民俗、文学、药用
-    const query2 = `${speciesFullName} 的人文历史、民俗用途、文学记载、本草典籍、食药用价值的权威资料（优先古籍数据库、民族植物学文献）`;
-    webResearch2 = await xiaopGroundedSearch(query2, override);
-    goldUsage = addUsage(goldUsage, webResearch2?.usage);
-    if (webResearch2) {
-      console.log(`[GoldPage Phase2] Web research: ${webResearch2.sources.length} sources`);
-    }
-
-    // Phase 3 调研：生态功能、入侵状态、最新科研
-    const query3 = `${speciesFullName} 的生态功能、入侵风险、保护管理、近期重要科研进展（优先 IUCN、GBIF、学术期刊）`;
-    webResearch3 = await xiaopGroundedSearch(query3, override);
-    goldUsage = addUsage(goldUsage, webResearch3?.usage);
-    if (webResearch3) {
-      console.log(`[GoldPage Phase3] Web research: ${webResearch3.sources.length} sources`);
-    }
-
-    // 5. Three LLM passes. One mega-call reliably blows the output-token ceiling and
-    //    comes back as truncated JSON, so each pass owns a bounded slice of the page.
-
-    // Helper to inject web research into system prompt
-    const withWebContext = (basePrompt: string, research: typeof webResearch1) => {
-      if (!research || !research.digest) return basePrompt;
-      const srcList = research.sources.length
-        ? "\n参考来源：\n" +
-          research.sources.map((s, i) => `[${i + 1}] ${s.title || s.uri} — ${s.uri}`).join("\n")
-        : "";
-      return (
-        basePrompt +
-        `\n\n【联网调研·权威参考资料】以下是该物种的最新权威信息，请据此确保内容准确、时效性强：\n${research.digest}${srcList}\n`
-      );
-    };
-
-    let goldProvider = "gemini";
-    let goldModel = process.env.AI_MODEL || "gemini-3-flash-preview";
-    const ask = async (system: string, schema: unknown, label: string) => {
-      const {
-        text: txt,
-        usage,
-        provider,
-        model,
-      } = await xiaopTextCall({
-        contents: [
-          {
-            role: "user",
-            parts: [{ text: `请为「${facts.title}（${facts.scientificName}）」生成本轮内容。` }],
-          },
-        ],
-        system,
-        schema,
-        override,
-      });
-      goldUsage = addUsage(goldUsage, usage);
-      goldProvider = provider;
-      goldModel = model;
-      try {
-        return JSON.parse(cleanJson(txt));
-      } catch {
-        throw new AiError(
-          `GOLD_BAD_JSON_${label}`,
-          `创建失败（GOLD_BAD_JSON_${label}）：模型返回的内容不是完整 JSON，通常是生成被截断。请重试；反复出现可在管理后台给小P蛙换一个更强的模型。`,
-        );
-      }
-    };
-
-    const p1 = await ask(
-      withWebContext(premiumPrompt1(facts), webResearch1),
-      PREMIUM_SCHEMA_1,
-      "1",
-    );
-    const p2 = await ask(
-      withWebContext(premiumPrompt2(facts), webResearch2),
-      PREMIUM_SCHEMA_2,
-      "2",
-    );
-    const p3 = await ask(
-      withWebContext(premiumPrompt3(facts), webResearch3),
-      PREMIUM_SCHEMA_3,
-      "3",
-    );
-    const fields = { ...p1, ...p2, ...p3 } as PremiumFields;
-
-    // 6. Render + upload the HTML body.
-    const html = renderPremiumHtml(fields, facts, { heroUrl: draft.photo_url as string, images });
-    const htmlPath = `${userId}/gold-${draft.id}.html`;
-    const { error: upErr } = await supabaseAdmin.storage
-      .from("plant-html")
-      .upload(htmlPath, new Blob([html], { type: "text/html" }), {
-        contentType: "text/html",
-        upsert: true,
-      });
-    if (upErr)
-      throw new AiError(
-        "HTML_UPLOAD_FAILED",
-        `创建失败（HTML_UPLOAD_FAILED）：详页 HTML 上传失败。原因：${upErr.message}。`,
-      );
-    const htmlUrl = supabaseAdmin.storage.from("plant-html").getPublicUrl(htmlPath).data.publicUrl;
-
-    // 7. Unique slug, then insert the plants row.
-    let slug = slugify(facts.scientificName || facts.title || "");
-    if (!slug || slug.startsWith("p-")) slug = `gold-${draft.id.slice(0, 8)}`;
-    for (let i = 0; i < 5; i++) {
-      const { data: dup } = await supabaseAdmin
-        .from("plants")
-        .select("id")
-        .eq("slug", slug)
-        .maybeSingle();
-      if (!dup) break;
-      slug = `${slug}-${Math.random().toString(36).slice(2, 5)}`;
-    }
-
-    const { data: plant, error: pErr } = await supabaseAdmin
-      .from("plants")
-      .insert({
-        slug,
-        title: facts.title,
-        scientific_name: facts.scientificName,
-        common_name_en: draft.common_name_en,
-        common_names_zh: draft.common_names_zh,
-        family: draft.family,
-        genus: draft.genus,
-        summary: (fields.intro_zh || draft.summary || "").toString().slice(0, 600),
-        cover_url: draft.photo_url,
-        content_type: "html",
-        html_url: htmlUrl,
-        tags: draft.tags ?? [],
-        author_id: userId,
-        iucn_status: draft.iucn_status,
-        source: "gold_oneclick",
-        body_text: visibleBodyText(html),
-      })
-      .select("id")
-      .single();
-    if (pErr)
-      throw new AiError(
-        "PLANT_INSERT_FAILED",
-        `创建失败（PLANT_INSERT_FAILED）：写入档案时出错。原因：${pErr.message}。`,
-      );
-
-    // Log token usage for the whole gold-page build (3 grounding + 3 LLM passes).
-    // Awaited so the Workers isolate can't tear down before the row flushes; wrapped
-    // so a logging failure can't lose the user their (already-created) page.
-    try {
-      const { data: prof } = await (supabaseAdmin as any)
-        .from("profiles")
-        .select("display_name")
-        .eq("id", userId)
-        .maybeSingle();
-      const goldLabel = (prof?.display_name || email?.split("@")[0] || "用户") + "（金叶详页）";
-      const { error: usageErr } = await (supabaseAdmin as any).from("ai_usage_logs").insert({
-        user_id: userId,
-        user_label: goldLabel,
-        provider: goldProvider,
-        model: goldModel,
-        prompt_tokens: goldUsage.prompt_tokens,
-        completion_tokens: goldUsage.completion_tokens,
-        total_tokens: goldUsage.total_tokens,
-        capture_place: (draft.capture_place as string) || null,
-        draft_id: draft.id,
-        draft_title: facts.title,
-        task_type: "gold_page", // Full gold detail-page generation
-      });
-      if (usageErr) console.warn("[UsageLog] gold_page insert failed:", usageErr.message);
-    } catch (e) {
-      console.warn("[UsageLog] gold_page unexpected error:", e);
-    }
-
-    // 8. Spend the leaf — LAST, and only now that the page really exists. The owner
-    //    is unlimited, so never debit their account. The `.eq("gold_used", …)` guard
-    //    makes this optimistic-concurrency: two tabs racing can't spend twice.
-    if (!leaves.isOwner) {
-      const { data: spent, error: spendErr } = await (supabaseAdmin as any)
-        .from("profiles")
-        .update({ gold_used: leaves.goldUsed + 1 })
-        .eq("id", userId)
-        .eq("gold_used", leaves.goldUsed)
-        .select("id");
-      if (spendErr || !spent?.length) {
-        // The page exists and is valid; only the accounting failed. Don't fail the
-        // request (the user would lose the page) — log loudly for reconciliation.
-        console.error(
-          `[GoldPage] LEAF NOT SPENT for user ${userId}, plant ${plant.id}:`,
-          spendErr?.message ?? "concurrent update",
-        );
-      }
-    }
-
-    return {
-      plantId: plant.id as string,
-      slug,
-      // null = unlimited (owner). JSON can't carry Infinity, so the frontend shows ∞.
-      goldRemaining: leaves.isOwner ? null : Math.max(0, leaves.goldAvailable - 1),
-    };
+    return { jobId: job.id };
   });
 
 export const gbifChinaOccurrencesFn = createServerFn({ method: "POST" })
@@ -4706,8 +6159,11 @@ export const approvePlantDraft = createServerFn({ method: "POST" })
     }
 
     // Upload the HTML body to plant-html bucket.
+    // 发布前顺手清掉「已经换上真图的槽位却还挂着『暂无该物种的…公开照片』」——
+    // 老草稿的正文里存着这种自相矛盾的组合，收录时照抄就会带到正式条目页上去。
     const htmlPath = `${dbUserId}/draft-${draft.id}.html`;
-    const blob = new Blob([draft.html_content as string], { type: "text/html" });
+    const publishHtml = stripStaleMissingNotes(String(draft.html_content || ""));
+    const blob = new Blob([publishHtml], { type: "text/html" });
     const { error: upErr } = await supabaseAdmin.storage
       .from("plant-html")
       .upload(htmlPath, blob, { contentType: "text/html", upsert: true });
@@ -4733,7 +6189,7 @@ export const approvePlantDraft = createServerFn({ method: "POST" })
         author_id: dbUserId,
         iucn_status: draft.iucn_status,
         source: "ai_identify",
-        body_text: visibleBodyText(String(draft.html_content || "")),
+        body_text: visibleBodyText(publishHtml),
       })
       .select("id")
       .single();
@@ -4903,13 +6359,15 @@ async function loadXiaoPConfig(): Promise<AiProviderConfig | null> {
       .maybeSingle();
     const raw = (data as { value?: unknown } | null)?.value;
     if (!raw) return null;
-    const cfg = typeof raw === "string" ? JSON.parse(raw) : raw;
-    if (cfg?.provider && cfg?.apiKey && cfg?.model) {
-      cfg.apiKey = normalizeApiKey(cfg.provider, cfg.apiKey);
-      if (cfg.baseUrl) cfg.baseUrl = String(cfg.baseUrl).trim().replace(/\/+$/, "");
-      return cfg as AiProviderConfig;
-    }
-    return null;
+    const q = readModelQueue(typeof raw === "string" ? JSON.parse(raw) : raw);
+    const first = q.sequence[0];
+    if (!first) return null;
+    return {
+      provider: first.provider,
+      apiKey: first.apiKey,
+      model: first.model,
+      baseUrl: first.baseUrl,
+    };
   } catch (e) {
     console.warn("[小P Config] load failed:", e);
     return null;
@@ -5088,6 +6546,36 @@ async function geminiChat(
 }
 
 /** OpenAI-compatible chat (covers provider `openai` and `custom` relays; optional vision). */
+/**
+ * 把 JSON Schema 写进 system prompt。
+ *
+ * 只有 Gemini 那条路是真·结构化输出（`generationConfig.responseSchema`）。OpenAI 兼容中转
+ * 与 Anthropic 这两条路原先只在 prompt 末尾加一句「只返回一个 JSON 对象」——
+ * **字段名从头到尾没有告诉过模型**。于是模型自己造键名（intro / introduction / 开篇导语…），
+ * JSON 能 parse、闸门却发现 intro_zh / habitat_zh / eco_function_zh 全是空的，
+ * 用户看到的就是「生成的详页不完整（…全是空的）」。
+ * （2026-07-23 金叶详页事故。讽刺的是三轮撰稿的 prompt 里白纸黑字写着「严格按给定 JSON
+ * 结构返回」，而那个「给定结构」压根没随请求发出去。）
+ *
+ * **刻意不用** OpenAI 的 `response_format: {type:"json_schema"}`：中转五花八门，不认这个
+ * 参数的直接 400，认一半的会返回空串（见 send() 里关于 json_object 的那条注释）。
+ * 写进 prompt 是唯一对所有中转都成立的办法，最差也只是模型不听话，不会整条链路挂掉。
+ */
+function schemaInstruction(schema: unknown): string {
+  let text = "";
+  try {
+    text = JSON.stringify(schema);
+  } catch {
+    /* 循环引用之类 —— 退回原来那句泛泛的要求 */
+  }
+  if (!text) return "\n\n只返回一个 JSON 对象，不要 markdown、不要多余文字。";
+  return (
+    `\n\n【输出格式 · 硬性要求】只返回**一个** JSON 对象，不要 markdown 代码块、不要任何解释文字。\n` +
+    `键名必须**逐字照抄**下面这份 JSON Schema（大小写、下划线、_zh / _en 后缀一个字符都不能改），` +
+    `required 里列出的键一个都不能少，不要自行增加或包裹外层结构：\n${text}`
+  );
+}
+
 async function openaiCompatChat(
   apiKey: string,
   baseUrl: string,
@@ -5097,7 +6585,7 @@ async function openaiCompatChat(
   schema?: unknown,
   images?: InlineImage[],
 ): Promise<AiTextResult> {
-  const apiBase = (baseUrl || "https://api.openai.com/v1").replace(/\/+$/, "");
+  const apiBase = normalizeBaseUrl(baseUrl) || "https://api.openai.com/v1";
 
   // Build the OpenAI messages. `useImages` attaches the photo(s) to the last user
   // turn as image_url parts — dropped on the text-only retry below.
@@ -5106,9 +6594,7 @@ async function openaiCompatChat(
     return [
       {
         role: "system",
-        content: schema
-          ? `${system}\n\n只返回一个 JSON 对象，不要 markdown、不要多余文字。`
-          : system,
+        content: schema ? `${system}${schemaInstruction(schema)}` : system,
       },
       ...contents.map((c, i) => {
         const text = c.parts.map((p) => p.text).join("\n");
@@ -5130,9 +6616,16 @@ async function openaiCompatChat(
     ];
   };
 
+  // The console keeps ONE key pool shared across providers, so `apiKey` can be a
+  // comma-joined pool that includes OTHER vendors' keys. Sending the joined string
+  // as a bearer token is an automatic 401 — split it and rotate (the panel already
+  // promises "OpenAI/Anthropic/自定义接口也支持轮换").
+  const keyPool = splitKeyPool(apiKey);
+  if (!keyPool.length) keyPool.push(apiKey);
+
   // One request with its own network retry + timeout. Returns the Response, or
   // throws a described network/timeout error.
-  const send = async (useImages: boolean): Promise<Response> => {
+  const send = async (useImages: boolean, key: string): Promise<Response> => {
     // NOTE: deliberately DO NOT send response_format:json_object — some relays /
     // reasoning models return an EMPTY reply when it's set. We instruct JSON in the
     // system prompt + cleanJson() instead.
@@ -5149,7 +6642,7 @@ async function openaiCompatChat(
         const r = await fetch(`${apiBase}/chat/completions`, {
           method: "POST",
           signal: controller.signal,
-          headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+          headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
           body: JSON.stringify(body),
         });
         clearTimeout(timer);
@@ -5176,7 +6669,15 @@ async function openaiCompatChat(
     );
   };
 
-  let resp = await send(!!images?.length);
+  // 401/403 → that key belongs to another vendor or was revoked; 429 → it is rate
+  // limited. Both mean the NEXT key in the pool is worth trying; anything else is a
+  // real error we should surface immediately.
+  let usedKey = keyPool[0];
+  let resp = await send(!!images?.length, usedKey);
+  for (let i = 1; i < keyPool.length && !resp.ok && keyRejected(resp.status); i++) {
+    usedKey = keyPool[i];
+    resp = await send(!!images?.length, usedKey);
+  }
   // Text-only models (e.g. DeepSeek deepseek-chat) reject the vision `image_url`
   // part with a 400. Rather than fail the whole chat, retry once WITHOUT images so
   // text conversation still works — the user just can't get image-based answers.
@@ -5187,7 +6688,7 @@ async function openaiCompatChat(
         t,
       )
     ) {
-      resp = await send(false);
+      resp = await send(false, usedKey);
     }
   }
   if (!resp.ok) {
@@ -5218,7 +6719,7 @@ async function anthropicChat(
   schema?: unknown,
   images?: InlineImage[],
 ): Promise<AiTextResult> {
-  const apiBase = (baseUrl || "https://api.anthropic.com/v1").replace(/\/+$/, "");
+  const apiBase = normalizeBaseUrl(baseUrl) || "https://api.anthropic.com/v1";
   const idx = images?.length ? lastUserIndex(contents) : -1;
   const messages = contents.map((c, i) => {
     const text = c.parts.map((p) => p.text).join("\n");
@@ -5237,7 +6738,7 @@ async function anthropicChat(
     }
     return { role, content: text };
   });
-  const sys = schema ? `${system}\n\n只返回一个 JSON 对象，不要 markdown、不要多余文字。` : system;
+  const sys = schema ? `${system}${schemaInstruction(schema)}` : system;
   const resp = await fetch(`${apiBase}/messages`, {
     method: "POST",
     headers: {
@@ -5245,7 +6746,9 @@ async function anthropicChat(
       "anthropic-version": "2023-06-01",
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ model, system: sys, messages, max_tokens: 8000 }),
+    // 16000 与 OpenAI 兼容路径取齐：金叶详页第一轮要一次写出 6 张特征卡 + 导语 + 株型总览
+    // 的中英双语，8000 挡不住，截断后 JSON.parse 直接抛 GOLD_BAD_JSON。
+    body: JSON.stringify({ model, system: sys, messages, max_tokens: 16000 }),
   });
   if (!resp.ok) {
     const t = await resp.text();
@@ -5276,54 +6779,72 @@ async function xiaopTextCall(opts: {
   images?: InlineImage[];
   /** Per-user model config (sent from the client) takes priority over the
    *  admin site config; falls back to env Gemini when neither is set. */
-  override?: AiProviderConfig | null;
+  overrideSequence?: ModelSlot[] | null;
 }): Promise<AiTextResult & { provider: string; model: string }> {
-  const cfg = opts.override && opts.override.apiKey ? opts.override : await loadXiaoPConfig();
-  const provider = cfg?.provider ?? "gemini";
+  // 每一项序列都是一套完整自洽的配置，所以「换一项重试」就是原样再跑一遍这段。
+  const callSlot = async (
+    slot: ModelSlot,
+  ): Promise<AiTextResult & { provider: string; model: string }> => {
+    if (slot.provider === "gemini") {
+      const r = await geminiChat(
+        slot.apiKey,
+        slot.model,
+        opts.contents,
+        opts.system,
+        opts.schema,
+        opts.maxRetry ?? 3,
+        opts.images,
+      );
+      return { ...r, provider: "gemini", model: slot.model };
+    }
+    if (slot.provider === "anthropic") {
+      const r = await anthropicChat(
+        slot.apiKey,
+        slot.baseUrl,
+        slot.model,
+        opts.contents,
+        opts.system,
+        opts.schema,
+        opts.images,
+      );
+      return { ...r, provider: "anthropic", model: slot.model };
+    }
+    // openai + custom share the OpenAI-compatible path
+    const r = await openaiCompatChat(
+      slot.apiKey,
+      slot.baseUrl,
+      slot.model,
+      opts.contents,
+      opts.system,
+      opts.schema,
+      opts.images,
+    );
+    return { ...r, provider: slot.provider, model: slot.model };
+  };
 
-  if (provider === "gemini") {
-    const apiKey =
-      cfg?.provider === "gemini" && cfg.apiKey ? cfg.apiKey : process.env.GEMINI_API_KEY;
-    if (!apiKey) throw new Error("小P 暂不可用：未配置模型，且服务器无 GEMINI_API_KEY。");
-    const model =
-      cfg?.provider === "gemini" && cfg.model
-        ? cfg.model
-        : process.env.AI_MODEL || "gemini-3-flash-preview";
-    const r = await geminiChat(
-      apiKey,
-      model,
-      opts.contents,
-      opts.system,
-      opts.schema,
-      opts.maxRetry ?? 3,
-      opts.images,
-    );
-    return { ...r, provider: "gemini", model };
+  // 用户自带配置优先；否则走管理员配的序列；两者都空则退回 .env 的 Gemini。
+  // 用户自带序列优先（整条都用，能自己降级）；否则走管理员配的序列。
+  let sequence: ModelSlot[] = opts.overrideSequence?.length
+    ? opts.overrideSequence
+    : (await loadXiaoPQueue()).sequence;
+
+  if (!sequence.length) {
+    const envKey = process.env.GEMINI_API_KEY;
+    if (!envKey) throw new Error("小P 暂不可用：未配置模型，且服务器无 GEMINI_API_KEY。");
+    sequence = [
+      {
+        provider: "gemini",
+        apiKey: envKey,
+        baseUrl: "",
+        model: process.env.AI_MODEL || "gemini-3-flash-preview",
+      },
+    ];
   }
-  if (!cfg) throw new Error("小P 暂不可用：模型未配置。");
-  if (provider === "anthropic") {
-    const r = await anthropicChat(
-      cfg.apiKey,
-      cfg.baseUrl || "",
-      cfg.model,
-      opts.contents,
-      opts.system,
-      opts.schema,
-      opts.images,
-    );
-    return { ...r, provider: "anthropic", model: cfg.model };
-  }
-  // openai + custom share the OpenAI-compatible path
-  const r = await openaiCompatChat(
-    cfg.apiKey,
-    cfg.baseUrl || "",
-    cfg.model,
-    opts.contents,
-    opts.system,
-    opts.schema,
-    opts.images,
-  );
-  return { ...r, provider, model: cfg.model };
+  // 小P蛙**有时**带图（问某张配图 / 复核详页插图），有时纯问答。只在真带了图这一次
+  // 要求视觉 —— 纯文本提问没必要把一个只会写字的好模型排除掉。
+  return runModelQueue(sequence, callSlot, "小P", {
+    requireVision: !!opts.images?.length,
+  });
 }
 
 // ── 小P蛙 联网检索（Google 搜索 grounding，仅 Gemini）───────────────────────────
@@ -5333,23 +6854,20 @@ async function xiaopTextCall(opts: {
 
 /** Resolve the effective Gemini key/model for 小P (mirrors xiaopTextCall's gemini branch). */
 async function resolveXiaoPGemini(
-  override: AiProviderConfig | null,
+  overrideSequence: ModelSlot[] | null,
 ): Promise<{ apiKey: string; model: string } | null> {
-  const cfg = override && override.apiKey ? override : await loadXiaoPConfig();
-  const provider = cfg?.provider ?? "gemini";
-  if (provider !== "gemini") return null; // google_search grounding is Gemini-only
-  const apiKey = cfg?.provider === "gemini" && cfg.apiKey ? cfg.apiKey : process.env.GEMINI_API_KEY;
-  if (!apiKey) return null;
-  const model =
-    cfg?.provider === "gemini" && cfg.model
-      ? cfg.model
-      : process.env.AI_MODEL || "gemini-3-flash-preview";
-  return { apiKey, model };
+  // grounding 只有 Gemini 支持 —— 从序列里挑**第一个 Gemini 项**；一个都没有就退回 .env。
+  const sequence = overrideSequence?.length ? overrideSequence : (await loadXiaoPQueue()).sequence;
+  const gem = sequence.find((s) => s.provider === "gemini" && s.apiKey);
+  if (gem) return { apiKey: gem.apiKey, model: gem.model };
+  const envKey = process.env.GEMINI_API_KEY;
+  if (!envKey) return null;
+  return { apiKey: envKey, model: process.env.AI_MODEL || "gemini-3-flash-preview" };
 }
 
 async function xiaopGroundedSearch(
   query: string,
-  override: AiProviderConfig | null,
+  override: ModelSlot[] | null,
 ): Promise<{
   digest: string;
   sources: { title: string; uri: string }[];
@@ -5377,7 +6895,7 @@ async function xiaopGroundedSearch(
       },
     });
     const cand = data.candidates?.[0];
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+
     const digest = (cand?.content?.parts || [])
       .map((p: any) => p.text)
       .filter(Boolean)
@@ -5420,14 +6938,14 @@ async function xiaopAskWithGrounding(opts: {
   system: string;
   schema: unknown;
   images?: InlineImage[];
-  override: AiProviderConfig | null;
+  overrideSequence: ModelSlot[] | null;
 }): Promise<AiTextResult & { provider: string; model: string }> {
   const first = await xiaopTextCall({
     contents: opts.contents,
     system: opts.system,
     schema: opts.schema,
     images: opts.images,
-    override: opts.override,
+    overrideSequence: opts.overrideSequence,
   });
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let parsed: any;
@@ -5439,7 +6957,7 @@ async function xiaopAskWithGrounding(opts: {
   const wants = parsed?.needsWebSearch === true && String(parsed?.webQuery || "").trim();
   if (!wants) return first;
 
-  const search = await xiaopGroundedSearch(String(parsed.webQuery).trim(), opts.override);
+  const search = await xiaopGroundedSearch(String(parsed.webQuery).trim(), opts.overrideSequence);
   if (!search) return first; // grounding unavailable → keep the first answer
 
   const srcBlock = search.sources.length
@@ -5462,7 +6980,7 @@ async function xiaopAskWithGrounding(opts: {
     system: opts.system,
     schema: opts.schema,
     images: opts.images,
-    override: opts.override,
+    overrideSequence: opts.overrideSequence,
   });
   // Total cost of this grounded turn = first pass + grounded search + second pass.
   const usage = addUsage(addUsage(first.usage, search.usage), second.usage);
@@ -5493,18 +7011,37 @@ const UserModelInput = z
     apiKey: z.string().min(1).max(2000),
     model: z.string().min(1).max(200),
     baseUrl: z.string().max(300).optional().or(z.literal("")),
+    // 新客户端会带上整个「优先调用序列」；老客户端只有上面的扁平字段（= 序列 1）。
+    sequence: z
+      .array(
+        z.object({
+          provider: z.enum(["gemini", "openai", "anthropic", "custom"]),
+          apiKey: z.string().min(1).max(2000),
+          baseUrl: z.string().max(300).optional().or(z.literal("")),
+          model: z.string().min(1).max(200),
+        }),
+      )
+      .max(12)
+      .optional(),
   })
   .optional();
 
-/** Normalize a client-sent user model into an AiProviderConfig (or null). */
-function toOverride(um: z.infer<typeof UserModelInput>): AiProviderConfig | null {
-  if (!um || !um.apiKey || !um.model) return null;
-  return {
+/**
+ * 把客户端传来的用户模型配置折算成调用序列。
+ * 带 sequence 就用它；只有扁平字段（老客户端 / 老 localStorage）则走 readModelQueue，
+ * 顺带把历史的逗号 key 池展开成多项。
+ */
+function toOverrideSlots(um: z.infer<typeof UserModelInput>): ModelSlot[] {
+  if (!um || !um.apiKey || !um.model) return [];
+  if (um.sequence?.length) {
+    return readModelQueue({ sequence: um.sequence }).sequence;
+  }
+  return readModelQueue({
     provider: um.provider,
-    apiKey: normalizeApiKey(um.provider, um.apiKey),
-    model: String(um.model).trim(),
-    baseUrl: um.baseUrl ? String(um.baseUrl).trim().replace(/\/+$/, "") : undefined,
-  };
+    apiKey: um.apiKey,
+    model: um.model,
+    baseUrl: um.baseUrl ?? "",
+  }).sequence;
 }
 
 const AskDraftAgentInput = z.object({
@@ -5553,25 +7090,41 @@ export const askDraftAgentFn = createServerFn({ method: "POST" })
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     const { data: draft } = await supabaseAdmin
       .from("plant_drafts")
-      .select("title,scientific_name,html_content,photo_url")
+      .select(
+        "title,scientific_name,html_content,photo_url,user_photos,summary,common_names_zh,common_name_en,family,genus",
+      )
       .eq("id", data.draftId)
       .maybeSingle();
     if (!draft) throw new Error("草稿不存在");
 
+    // 简介卡这个 scope 不在 html_content 里（是 plant_drafts 的列），所以图片喂用户自己
+    // 拍的那几张（卡上显示的正是它们），文本另外附一份卡面快照。
+    const cardScope = data.scope === DRAFT_CARD_SCOPE;
+    const cardFields = pickDraftCardFields(draft as Record<string, unknown>);
+
     // Scope-aware vision: an annotated section → only THAT section's images; the
     // whole draft (no scope) → visitor's uploaded photo + every draft illustration.
     const draftHtml = draft.html_content || "";
-    const visionUrls = xiaopVisionUrls({
-      html: draftHtml,
-      scope: data.scope,
-      coverUrl: draft.photo_url,
-    });
+    const visionUrls = cardScope
+      ? [
+          ...(draft.photo_url ? [draft.photo_url] : []),
+          ...(((draft as { user_photos?: string[] | null }).user_photos ?? []) as string[]),
+        ]
+          .filter(Boolean)
+          .slice(0, MAX_XIAOP_IMAGES)
+      : xiaopVisionUrls({
+          html: draftHtml,
+          scope: data.scope,
+          coverUrl: draft.photo_url,
+        });
     const photos = await fetchInlineImages(visionUrls);
 
     const docText = htmlToText(draftHtml);
-    const scopeLine = data.scope
-      ? `编辑本轮把讨论范围限定在草稿的「${data.scope}」部分。请只围绕这一处回答与建议。`
-      : "本轮未限定范围，针对整份草稿回答。";
+    const scopeLine = cardScope
+      ? `编辑本轮把讨论范围限定在【${DRAFT_CARD_SCOPE}】—— 就是草稿页顶部那张卡：中文名（标题）、拉丁学名、中文俗名/商品名、英文俗名、科、属、摘要。它不在下面的正文 HTML 里，而是草稿自己的字段。请只围绕这几项回答与建议；提出修改时，说清要改哪一项、改成什么。`
+      : data.scope
+        ? `编辑本轮把讨论范围限定在草稿的「${data.scope}」部分。请只围绕这一处回答与建议。`
+        : "本轮未限定范围，针对整份草稿回答。";
     const system = `你是「小P蛙」，Plantspedia（鄂尔多斯植物百科）的双语审稿助手，性格友好、专业、简洁。
 编辑正在审核一份由 AI 生成的植物科普草稿，可能对其中内容有疑问。${scopeLine}你的职责：
 - 用【中文】回答编辑关于该草稿的问题，必要时给出基于植物学常识的核对与修改建议；${data.scope ? "范围已限定时，回答与改动只应涉及该部分；" : ""}
@@ -5597,7 +7150,14 @@ export const askDraftAgentFn = createServerFn({ method: "POST" })
         role: "user",
         parts: [
           {
-            text: `【待审草稿：${draft.title}${draft.scientific_name ? "（" + draft.scientific_name + "）" : ""}】\n以下是草稿正文纯文本：\n${docText}`,
+            text:
+              `【待审草稿：${draft.title}${draft.scientific_name ? "（" + draft.scientific_name + "）" : ""}】\n` +
+              // 简介卡快照始终附上：即使范围是整页，编辑也常问「卡上的学名对不对」。
+              `以下是${DRAFT_CARD_SCOPE}（草稿字段，不在正文 HTML 里）：\n${draftCardToText(cardFields)}\n\n` +
+              (cardScope
+                ? "本轮讨论范围就是上面这张卡；下面的正文仅供参考。\n"
+                : "") +
+              `以下是草稿正文纯文本：\n${docText}`,
           },
         ],
       },
@@ -5660,7 +7220,7 @@ export const askDraftAgentFn = createServerFn({ method: "POST" })
       system,
       schema,
       images: photos.length ? photos : undefined,
-      override: toOverride(data.userModel),
+      overrideSequence: toOverrideSlots(data.userModel),
     });
     await logChatUsage(ans, {
       draftId: data.draftId,
@@ -5679,7 +7239,9 @@ const ApplyDraftAgentEditInput = z.object({
 
 /** Apply an agreed edit: 小P rewrites the FULL draft HTML in place per the
  *  instruction (structure/style preserved). Auth-gated; returns the new HTML for
- *  the client to persist via saveDraftHtmlContentFn. */
+ *  the client to persist via saveDraftHtmlContentFn.
+ *  scope === DRAFT_CARD_SCOPE 是**另一条路**：简介卡不在 html_content 里，改的是
+ *  plant_drafts 的列，所以这里直接写库并返回改动清单（不返回 html）。 */
 export const applyDraftAgentEditFn = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .inputValidator((input) => ApplyDraftAgentEditInput.parse(input))
@@ -5687,11 +7249,83 @@ export const applyDraftAgentEditFn = createServerFn({ method: "POST" })
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     const { data: draft } = await supabaseAdmin
       .from("plant_drafts")
-      .select("status,html_content")
+      .select(
+        "status,html_content,title,scientific_name,summary,common_names_zh,common_name_en,family,genus",
+      )
       .eq("id", data.draftId)
       .maybeSingle();
     if (!draft) throw new Error("草稿不存在");
     if (draft.status === "approved") throw new Error("已收录的草稿不可再修改");
+
+    // ── 简介卡：改字段，不改 HTML ─────────────────────────────────────────────
+    if (data.scope === DRAFT_CARD_SCOPE) {
+      const before = pickDraftCardFields(draft as Record<string, unknown>);
+      const cardSystem = `你是「小P」，植物百科草稿的字段编辑器。你会收到一张「${DRAFT_CARD_SCOPE}」的当前内容和一条修改指令。
+严格遵守：
+1. 只改指令要求改的字段，其余字段**原样照抄**（一个字都不要动，包括标点）。
+2. 拉丁学名只写「属名 + 种加词」（可含 subsp./var.），不要作者名、不要中文；中文名不要带「疑似」二字。
+3. 摘要保持原有语气与长度量级（150–260 字的中文导语），不要改成形态罗列，不要编造事实。
+4. 不确定的内容一律保留原值，宁可不改也不要猜。
+5. 只返回 JSON 对象，键固定为：title、scientific_name、common_names_zh、common_name_en、family、genus、summary，全部为字符串（无内容用空字符串）。不要 markdown 代码块、不要解释。`;
+      const cardSchema = {
+        type: "object",
+        properties: Object.fromEntries(
+          DRAFT_CARD_FIELD_KEYS.map((k) => [
+            k,
+            { type: "string", description: DRAFT_CARD_FIELD_LABELS[k] },
+          ]),
+        ),
+        required: [...DRAFT_CARD_FIELD_KEYS],
+      };
+      const { text: cardTxt } = await xiaopTextCall({
+        contents: [
+          {
+            role: "user",
+            parts: [
+              {
+                text: `修改指令：${data.instruction}\n\n当前${DRAFT_CARD_SCOPE}内容：\n${draftCardToText(before)}\n\n请按指令返回修改后的完整 JSON（未涉及的字段原样照抄）。`,
+              },
+            ],
+          },
+        ],
+        system: cardSystem,
+        schema: cardSchema,
+        maxRetry: 2,
+        overrideSequence: toOverrideSlots(data.userModel),
+      });
+      let parsed: Record<string, unknown>;
+      try {
+        parsed = JSON.parse(cleanJson(cardTxt)) as Record<string, unknown>;
+      } catch {
+        throw new Error("小P 返回的简介卡内容无法解析，请重试或换种说法。");
+      }
+      // 只接受**字符串**字段：模型漏字段、或给了 null/对象，都按「没提这一项」处理，
+      // 用原值补齐 —— 决不能因为模型少说一句就把学名/摘要清空。
+      const provided = Object.fromEntries(
+        Object.entries(parsed).filter(([, v]) => typeof v === "string"),
+      );
+      const after = pickDraftCardFields({ ...before, ...provided });
+      // 形状闸门：名称字段有过「模型把一整段元话语塞进 title」的先例（见 tentative.ts），
+      // 这里按名称/摘要各自的合理量级封顶，清成空则退回原值。
+      const capName = (v: string, fallback: string) =>
+        sanitizeSpeciesName(v) || fallback;
+      after.title = capName(after.title, before.title);
+      after.scientific_name = capName(after.scientific_name, before.scientific_name);
+      after.common_names_zh = after.common_names_zh.slice(0, 200);
+      after.common_name_en = after.common_name_en.slice(0, 200);
+      after.family = after.family.slice(0, 60);
+      after.genus = after.genus.slice(0, 60);
+      after.summary = after.summary.slice(0, 2000);
+      const changes = diffDraftCard(before, after);
+      if (!changes.length) throw new Error("小P 这次没有改动简介卡的任何字段。");
+      const { error: upErr } = await supabaseAdmin
+        .from("plant_drafts")
+        .update(after)
+        .eq("id", data.draftId);
+      if (upErr) throw new Error(`简介卡保存失败：${upErr.message}`);
+      return { card: { before, after, changes } };
+    }
+
     const original = draft.html_content || "";
     if (!/<\/html>/i.test(original)) throw new Error("草稿 HTML 不完整，无法自动修改。");
 
@@ -5721,7 +7355,7 @@ ${scopeLine}
       contents,
       system,
       maxRetry: 2,
-      override: toOverride(data.userModel),
+      overrideSequence: toOverrideSlots(data.userModel),
     });
     let html = txt.trim();
     if (html.startsWith("```")) {
@@ -5873,7 +7507,7 @@ ${scopeLine}
       system,
       schema,
       images: photos.length ? photos : undefined,
-      override: toOverride(data.userModel),
+      overrideSequence: toOverrideSlots(data.userModel),
     });
     await logChatUsage(ans, { draftTitle: title, label: "小P对话（详情页）" });
     return harvestImageIntent(parseAgentReply(ans.text));
@@ -5922,7 +7556,7 @@ ${scopeLine}
       contents,
       system,
       maxRetry: 2,
-      override: toOverride(data.userModel),
+      overrideSequence: toOverrideSlots(data.userModel),
     });
     let html = txt.trim();
     if (html.startsWith("```")) {
@@ -5959,7 +7593,7 @@ export const saveXiaoPConfigFn = createServerFn({ method: "POST" })
       provider: data.provider,
       apiKey: normalizeApiKey(data.provider, data.apiKey),
       model: (data.model ?? "").trim(),
-      baseUrl: (data.baseUrl ?? "").trim().replace(/\/+$/, "") || null,
+      baseUrl: normalizeBaseUrl(data.baseUrl) || null,
       updatedAt: new Date().toISOString(),
       updatedBy: userId,
     };
@@ -5981,6 +7615,11 @@ const ListModelsInput = z.object({
   baseUrl: z.string().max(300).optional().or(z.literal("")),
 });
 
+/** Never echo a full key back into an error toast — the panel renders it verbatim. */
+function maskKey(k: string): string {
+  return k.length <= 10 ? "…" : `${k.slice(0, 4)}…${k.slice(-4)}`;
+}
+
 function dedupSortModels(a: string[]): string[] {
   return [...new Set(a.filter(Boolean))].sort((x, y) => x.localeCompare(y));
 }
@@ -5989,56 +7628,82 @@ export const listProviderModelsFn = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .inputValidator((input) => ListModelsInput.parse(input))
   .handler(async ({ data }): Promise<{ models: string[] }> => {
-    // A Gemini pool can't go in a URL — probe with the first key (they share a model list).
-    const key = normalizeApiKey(data.provider, data.apiKey).split(",")[0];
-    const base = (data.baseUrl || "").trim().replace(/\/+$/, "");
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 20_000);
-    const fail = async (label: string, r: Response) => {
-      throw new Error(
-        `${label} 拉取失败（HTTP ${r.status}）：${(await r.text().catch(() => "")).slice(0, 180)}`,
-      );
+    // The console keeps ONE key pool shared across providers, so the pool routinely
+    // holds keys belonging to other vendors (a Gemini "AQ.…" sitting above a Moonshot
+    // "sk-…"). Probing only pool[0] then reports that vendor's 401 as if the whole
+    // config were broken. Try each key in priority order and take the first that works.
+    const keyPool = normalizeApiKey(data.provider, data.apiKey)
+      .split(",")
+      .map((k) => k.trim())
+      .filter(Boolean)
+      .slice(0, 6);
+    if (!keyPool.length) throw new Error("请先填写 API Key，再拉取可用模型");
+    const base = normalizeBaseUrl(data.baseUrl);
+
+    const probe = async (key: string): Promise<string[]> => {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 20_000);
+      const fail = async (label: string, r: Response) => {
+        throw new Error(
+          `${label} 拉取失败（HTTP ${r.status}）：${(await r.text().catch(() => "")).slice(0, 180)}`,
+        );
+      };
+      try {
+        if (data.provider === "gemini") {
+          const root = base || "https://generativelanguage.googleapis.com/v1beta";
+          const r = await fetch(`${root}/models?key=${encodeURIComponent(key)}&pageSize=1000`, {
+            signal: ctrl.signal,
+          });
+          if (!r.ok) await fail("Gemini", r);
+          const j: any = await r.json();
+          return (j.models || [])
+            .filter((m: any) => (m.supportedGenerationMethods || []).includes("generateContent"))
+            .map((m: any) => String(m.name || "").replace(/^models\//, ""));
+        }
+        if (data.provider === "anthropic") {
+          const root = base || "https://api.anthropic.com/v1";
+          const r = await fetch(`${root}/models?limit=1000`, {
+            signal: ctrl.signal,
+            headers: { "x-api-key": key, "anthropic-version": "2023-06-01" },
+          });
+          if (!r.ok) await fail("Anthropic", r);
+          const j: any = await r.json();
+          return (j.data || []).map((m: any) => String(m.id || ""));
+        }
+        // openai / custom — the OpenAI-compatible GET /models endpoint.
+        const root = base || "https://api.openai.com/v1";
+        const r = await fetch(`${root}/models`, {
+          signal: ctrl.signal,
+          headers: { Authorization: `Bearer ${key}` },
+        });
+        if (!r.ok) await fail("模型", r);
+        const j: any = await r.json();
+        const list = Array.isArray(j.data) ? j.data : Array.isArray(j) ? j : [];
+        return list.map((m: any) => String(m.id || m.name || ""));
+      } catch (e) {
+        if ((e as Error)?.name === "AbortError")
+          throw new Error("拉取模型超时，请检查网络 / 中转地址（国内可能需挂 VPN）。");
+        throw e instanceof Error ? e : new Error("拉取模型失败");
+      } finally {
+        clearTimeout(timer);
+      }
     };
-    try {
-      if (data.provider === "gemini") {
-        const root = base || "https://generativelanguage.googleapis.com/v1beta";
-        const r = await fetch(`${root}/models?key=${encodeURIComponent(key)}&pageSize=1000`, {
-          signal: ctrl.signal,
-        });
-        if (!r.ok) await fail("Gemini", r);
-        const j: any = await r.json();
-        const models = (j.models || [])
-          .filter((m: any) => (m.supportedGenerationMethods || []).includes("generateContent"))
-          .map((m: any) => String(m.name || "").replace(/^models\//, ""));
-        return { models: dedupSortModels(models) };
+
+    const errors: string[] = [];
+    for (const [i, key] of keyPool.entries()) {
+      try {
+        return { models: dedupSortModels(await probe(key)) };
+      } catch (e) {
+        errors.push(
+          `Key ${i + 1}（${maskKey(key)}）：${e instanceof Error ? e.message : String(e)}`,
+        );
       }
-      if (data.provider === "anthropic") {
-        const root = base || "https://api.anthropic.com/v1";
-        const r = await fetch(`${root}/models?limit=1000`, {
-          signal: ctrl.signal,
-          headers: { "x-api-key": key, "anthropic-version": "2023-06-01" },
-        });
-        if (!r.ok) await fail("Anthropic", r);
-        const j: any = await r.json();
-        return { models: dedupSortModels((j.data || []).map((m: any) => String(m.id || ""))) };
-      }
-      // openai / custom — the OpenAI-compatible GET /models endpoint.
-      const root = base || "https://api.openai.com/v1";
-      const r = await fetch(`${root}/models`, {
-        signal: ctrl.signal,
-        headers: { Authorization: `Bearer ${key}` },
-      });
-      if (!r.ok) await fail("模型", r);
-      const j: any = await r.json();
-      const list = Array.isArray(j.data) ? j.data : Array.isArray(j) ? j : [];
-      return { models: dedupSortModels(list.map((m: any) => String(m.id || m.name || ""))) };
-    } catch (e) {
-      if ((e as Error)?.name === "AbortError")
-        throw new Error("拉取模型超时，请检查网络 / 中转地址（国内可能需挂 VPN）。");
-      throw e instanceof Error ? e : new Error("拉取模型失败");
-    } finally {
-      clearTimeout(timer);
     }
+    throw new Error(
+      keyPool.length === 1
+        ? errors[0]
+        : `${keyPool.length} 个 Key 都拉不到模型 —— 这个接口只认它自己的 Key，池子里若混着别家的 Key，那几个报 401 属正常。\n${errors.join("\n")}`,
+    );
   });
 
 export const getXiaoPConfigFn = createServerFn({ method: "GET" })
@@ -6315,10 +7980,14 @@ export const extractPlantMetaFn = createServerFn({ method: "POST" })
     // Pool = admin-configured Gemini keys (site_config) + the env key, deduped —
     // batch extraction fires many requests, so rely on the rotating pool instead
     // of a single env key that 429s after the first few.
-    const aiCfg = await loadAiConfig();
+    // 走「优先调用序列」里的所有 Gemini 项（这条链路是 Gemini 专用），再并上 .env 的
+    // key 兜底。以前只取 aiCfg（= 序列 1），序列 1 额度用尽这个工具就整个不可用了。
+    const { sequence: aiSequence } = await loadAiQueue();
     const geminiPool = Array.from(
       new Set([
-        ...(aiCfg?.provider === "gemini" ? splitGeminiKeys(aiCfg.apiKey) : []),
+        ...aiSequence
+          .filter((x) => x.provider === "gemini")
+          .flatMap((x) => splitGeminiKeys(x.apiKey)),
         ...splitGeminiKeys(geminiKey),
       ]),
     );
@@ -6349,7 +8018,9 @@ export const extractPlantMetaFn = createServerFn({ method: "POST" })
 
     if (geminiPool.length > 0) {
       const model =
-        (aiCfg?.provider === "gemini" && aiCfg.model) || process.env.AI_MODEL || "gemini-3-flash-preview";
+        aiSequence.find((x) => x.provider === "gemini")?.model ||
+        process.env.AI_MODEL ||
+        "gemini-3-flash-preview";
       const schema = {
         type: "object",
         properties: {
@@ -6766,7 +8437,7 @@ export const saveAiConfigFn = createServerFn({ method: "POST" })
     // "Invalid token" 401 on every identify. Strip ALL whitespace from the key,
     // and trim + drop trailing slashes from the base URL (we append "/chat/completions").
     const cleanKey = normalizeApiKey(data.provider, data.apiKey);
-    const cleanBaseUrl = (data.baseUrl ?? "").trim().replace(/\/+$/, "");
+    const cleanBaseUrl = normalizeBaseUrl(data.baseUrl);
     const configValue = {
       provider: data.provider,
       apiKey: cleanKey,
@@ -6828,6 +8499,359 @@ export const getAiConfigFn = createServerFn({ method: "GET" })
       keyCount: keys.length,
       updatedAt: cfg.updatedAt as string | null,
     };
+  });
+
+// ─── Admin: 优先调用序列 CRUD（三个控制台共用同一组 server fn）────────────────
+// 以前每个控制台一套 get/save/clear，三份几乎一样的代码各自漂移。现在只按
+// consoleId 分发到不同的 site_config key。
+
+const ConsoleIdSchema = z.enum(["ai", "card", "enrich", "second_opinion", "xiaop"]);
+
+const ModelSlotSchema = z.object({
+  provider: z.enum(["gemini", "openai", "anthropic", "custom"]),
+  apiKey: z.string().min(1).max(2000),
+  baseUrl: z.string().max(300).optional().or(z.literal("")),
+  model: z.string().min(1).max(200),
+});
+
+const SaveQueueInput = z.object({
+  consoleId: ConsoleIdSchema,
+  // 12 项已经远超任何真实用途，纯粹是防手滑/防脏数据的上限。
+  sequence: z.array(ModelSlotSchema).min(1).max(12),
+});
+
+/** 管理员编辑界面要能看到并拖动完整 key，所以这里回全量（和旧面板行为一致）。 */
+export const getModelQueueFn = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input) => z.object({ consoleId: ConsoleIdSchema }).parse(input))
+  .handler(async ({ data, context }): Promise<{ sequence: ModelSlot[]; updatedAt?: string }> => {
+    const { supabase, userId } = context;
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    await assertAdmin(supabase, userId, "查看 AI 配置");
+    const q = await loadModelQueue(data.consoleId);
+    return { sequence: q.sequence, updatedAt: q.updatedAt };
+  });
+
+export const saveModelQueueFn = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input) => SaveQueueInput.parse(input))
+  .handler(async ({ data, context }) => {
+    const { supabase, userId } = context;
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    await assertAdmin(supabase, userId, "修改 AI 配置");
+    const value = writeModelQueue(
+      data.sequence.map((s) => ({
+        provider: s.provider,
+        apiKey: normalizeApiKey(s.provider, s.apiKey),
+        baseUrl: s.baseUrl ?? "",
+        model: s.model,
+      })),
+      userId,
+    );
+    if (!value.sequence.length) throw new Error("序列为空：请至少配置「优先调用序列 1」。");
+    const { error } = await (supabaseAdmin as any)
+      .from("site_config")
+      .upsert({ key: CONSOLE_CONFIG_KEYS[data.consoleId], value }, { onConflict: "key" });
+    if (error) throw new Error(`保存失败：${error.message}`);
+    return { ok: true, count: value.sequence.length };
+  });
+
+export const clearModelQueueFn = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input) => z.object({ consoleId: ConsoleIdSchema }).parse(input))
+  .handler(async ({ data, context }) => {
+    const { supabase, userId } = context;
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    await assertAdmin(supabase, userId, "修改 AI 配置");
+    const { error } = await (supabaseAdmin as any)
+      .from("site_config")
+      .delete()
+      .eq("key", CONSOLE_CONFIG_KEYS[data.consoleId]);
+    if (error) throw new Error(`清除失败：${error.message}`);
+    return { ok: true, label: CONSOLE_LABELS[data.consoleId] };
+  });
+
+// ─── Admin: 视觉准入检测（逐项测「这个模型到底看没看见图」）────────────────────
+// 背景与判据见 vision-probe.ts 顶部注释。这里只负责：发两次请求（带图 / 不带图）、
+// 判卷、把结论写回该序列项。
+
+/** 用给定 slot 跑一次纯文本 / 带图调用，只取文字与 prompt_tokens。 */
+async function callSlotForProbe(
+  slot: ModelSlot,
+  prompt: string,
+  images: InlineImage[],
+): Promise<{ text: string; promptTokens: number }> {
+  const contents: ChatContents = [{ role: "user", parts: [{ text: prompt }] }];
+  const system = "你是一个图像识别助手。严格按用户要求作答，不要解释。";
+  let r: AiTextResult;
+  if (slot.provider === "gemini") {
+    r = await geminiChat(slot.apiKey, slot.model, contents, system, undefined, 1, images);
+  } else if (slot.provider === "anthropic") {
+    r = await anthropicChat(
+      slot.apiKey,
+      slot.baseUrl,
+      slot.model,
+      contents,
+      system,
+      undefined,
+      images,
+    );
+  } else {
+    r = await openaiCompatChat(
+      slot.apiKey,
+      slot.baseUrl,
+      slot.model,
+      contents,
+      system,
+      undefined,
+      images,
+    );
+  }
+  return { text: r.text, promptTokens: r.usage?.prompt_tokens ?? 0 };
+}
+
+export const probeSlotVisionFn = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input) =>
+    z.object({ consoleId: ConsoleIdSchema, index: z.number().int().min(0).max(11) }).parse(input),
+  )
+  .handler(async ({ data, context }) => {
+    const { supabase, userId } = context;
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    await assertAdmin(supabase, userId, "运行视觉准入检测");
+
+    const queue = await loadModelQueue(data.consoleId);
+    const slot = queue.sequence[data.index];
+    if (!slot) throw new Error(`序列 ${data.index + 1} 不存在，请先保存配置再检测。`);
+
+    const probeImage: InlineImage = {
+      mimeType: VISION_PROBE_MIME,
+      base64: VISION_PROBE_PNG_B64,
+    };
+
+    let answer = "";
+    let promptTokens = 0;
+    let callError: string | null = null;
+    // 量一下这次自检花了多久。自检本身**测不出真复核要多久**（它发的是 846 字节小图 +
+    // 只要四个词的回答），但它是一个下限：连这么小的请求都要十几秒的模型，去跑真复核
+    // 必超预算。把这个数字摆出来，管理员才可能自己看出「全绿但复核永远不运行」的原因。
+    const probeStart = Date.now();
+    try {
+      const r = await callSlotForProbe(slot, VISION_PROBE_PROMPT, [probeImage]);
+      answer = r.text;
+      promptTokens = r.promptTokens;
+    } catch (e) {
+      callError = e instanceof Error ? e.message.slice(0, 200) : String(e).slice(0, 200);
+    }
+    const probeMs = Date.now() - probeStart;
+
+    // 对照组：同一段文字、不带图。**失败不致命** —— 拿不到它就只剩内容证据，
+    // judgeVisionProbe 会据此把 token 那一项标为"无结论"。
+    let textOnlyTokens: number | null = null;
+    if (!callError) {
+      try {
+        const t = await callSlotForProbe(slot, VISION_PROBE_TEXT_ONLY_PROMPT, []);
+        textOnlyTokens = t.promptTokens || null;
+      } catch (e) {
+        console.warn("[VisionProbe] text-only control failed:", e);
+      }
+    }
+
+    const judged = judgeVisionProbe({
+      grade: gradeVisionAnswer(answer),
+      promptTokens,
+      textOnlyTokens,
+      callError,
+    });
+    const vision: SlotVision = {
+      verdict: judged.verdict,
+      at: new Date().toISOString(),
+      note: `${judged.note}${speedNote(probeMs)}`,
+      imageTokenDelta: judged.imageTokenDelta,
+      model: slot.model,
+    };
+
+    // unknown 不写库：它不是结论，只是「这次没测出来」。写进去只会把上一次的有效结论
+    // （可能是 pass）覆盖掉，反而让运行时失去判断依据。
+    if (judged.verdict !== "unknown") {
+      const next = queue.sequence.map((s, i) => (i === data.index ? { ...s, vision } : s));
+      const value = writeModelQueue(next, userId);
+      const { error } = await (supabaseAdmin as any)
+        .from("site_config")
+        .upsert({ key: CONSOLE_CONFIG_KEYS[data.consoleId], value }, { onConflict: "key" });
+      if (error) console.warn("[VisionProbe] 结论写回失败:", error.message);
+    }
+
+    console.log(
+      `[VisionProbe] admin=${userId} ${data.consoleId}#${data.index + 1} ${slot.model} → ${judged.verdict}`,
+    );
+    return { ...judged, at: vision.at, model: slot.model, index: data.index };
+  });
+
+// ─── Admin: 金叶详页创作指导 Skill ───────────────────────────────────────────
+// 管理员把一整份 skill markdown 粘进来，它会注入金叶三轮撰稿的 prompt，版本号署在页尾。
+// 存 site_config.gold_skill_config，改完**全站立即生效、不需要部署**（与四套模型配置同款）。
+
+const GoldSkillInput = z.object({
+  content: z.string().min(1).max(GOLD_SKILL_MAX_CHARS),
+  // 留空则由服务端从正文里解析（`name: ccplants-v19` / frontmatter `version:` / 标题里的 v19）。
+  name: z.string().max(60).optional(),
+  version: z.string().max(40).optional(),
+  enabled: z.boolean().optional(),
+});
+
+export const getGoldSkillFn = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .handler(async ({ context }) => {
+    const { supabase, userId } = context;
+    await assertAdmin(supabase, userId, "查看金叶创作指导");
+    const skill = await loadGoldSkill();
+    return {
+      configured: !!skill,
+      name: skill?.name ?? "",
+      version: skill?.version ?? "",
+      content: skill?.content ?? "",
+      enabled: skill?.enabled ?? true,
+      updatedAt: skill?.updatedAt ?? null,
+      signature: skillSignature(skill),
+      maxChars: GOLD_SKILL_MAX_CHARS,
+    };
+  });
+
+export const saveGoldSkillFn = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input) => GoldSkillInput.parse(input))
+  .handler(async ({ data, context }) => {
+    const { supabase, userId } = context;
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    await assertAdmin(supabase, userId, "修改金叶创作指导");
+
+    // 管理员没填的字段用正文解析结果补上；两者都空就留空 —— **绝不自动编一个版本号**，
+    // 页尾那行是给读者看的溯源信息，宁可不显示也不能显示假的。
+    const guess = suggestSkillMeta(data.content);
+    const name = (data.name ?? "").trim() || guess.name;
+    const version = (data.version ?? "").trim() || guess.version;
+
+    const value = {
+      name,
+      version,
+      content: data.content,
+      enabled: data.enabled !== false,
+      updatedAt: new Date().toISOString(),
+      updatedBy: userId,
+    };
+    const { error } = await (supabaseAdmin as any)
+      .from("site_config")
+      .upsert({ key: GOLD_SKILL_CONFIG_KEY, value }, { onConflict: "key" });
+    if (error) throw new Error(`保存失败：${error.message}`);
+    return {
+      ok: true,
+      name,
+      version,
+      signature: skillSignature({ name, version }),
+      chars: data.content.length,
+    };
+  });
+
+export const clearGoldSkillFn = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .handler(async ({ context }) => {
+    const { supabase, userId } = context;
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    await assertAdmin(supabase, userId, "修改金叶创作指导");
+    const { error } = await (supabaseAdmin as any)
+      .from("site_config")
+      .delete()
+      .eq("key", GOLD_SKILL_CONFIG_KEY);
+    if (error) throw new Error(`清除失败：${error.message}`);
+    return { ok: true };
+  });
+
+// ─── Admin: 各序列项的余额 / 配额 ─────────────────────────────────────────────
+// 只有少数厂商公开了「余额查询」接口，多数（Gemini 免费额度、OpenAI、Anthropic）
+// 根本查不到。所以这里的原则是：**能查的查真数据，查不到的如实说查不到**，
+// 绝不用估算值冒充余额 —— 一个编出来的数字比没有数字更危险。
+
+type SlotBalance = {
+  index: number;
+  provider: string;
+  model: string;
+  /** "ok" 查到了；"unsupported" 该厂商没有余额接口；"error" 查了但失败 */
+  state: "ok" | "unsupported" | "error";
+  /** 人类可读的余额，如 "¥49.59（含赠金 ¥46.59）" */
+  text: string;
+  /** 余额数值（能拿到才有），用于前端画进度/预警 */
+  value?: number;
+  currency?: string;
+};
+
+/** Moonshot / Kimi：GET {base}/users/me/balance（官方文档有，实测可用）。 */
+async function moonshotBalance(baseUrl: string, apiKey: string): Promise<SlotBalance | null> {
+  if (!/moonshot|kimi/i.test(baseUrl)) return null;
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 10_000);
+    const r = await fetch(`${baseUrl}/users/me/balance`, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+      signal: ctrl.signal,
+    });
+    clearTimeout(timer);
+    if (!r.ok)
+      return {
+        index: -1,
+        provider: "",
+        model: "",
+        state: "error",
+        text: `查询失败 HTTP ${r.status}`,
+      };
+    const j: any = await r.json();
+    const d = j?.data ?? {};
+    const avail = Number(d.available_balance);
+    if (!Number.isFinite(avail))
+      return { index: -1, provider: "", model: "", state: "error", text: "返回格式不符" };
+    const voucher = Number(d.voucher_balance) || 0;
+    return {
+      index: -1,
+      provider: "",
+      model: "",
+      state: "ok",
+      text:
+        voucher > 0
+          ? `¥${avail.toFixed(2)}（含赠金 ¥${voucher.toFixed(2)}）`
+          : `¥${avail.toFixed(2)}`,
+      value: avail,
+      currency: "CNY",
+    };
+  } catch {
+    return { index: -1, provider: "", model: "", state: "error", text: "查询超时 / 网络错误" };
+  }
+}
+
+export const getQueueBalancesFn = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input) => z.object({ consoleId: ConsoleIdSchema }).parse(input))
+  .handler(async ({ data, context }): Promise<{ balances: SlotBalance[] }> => {
+    const { supabase, userId } = context;
+    await assertAdmin(supabase, userId, "查看 AI 配置");
+    const q = await loadModelQueue(data.consoleId);
+    const balances = await Promise.all(
+      q.sequence.map(async (slot, index): Promise<SlotBalance> => {
+        const base = { index, provider: slot.provider, model: slot.model };
+        if (slot.provider === "custom" || slot.provider === "openai") {
+          const b = await moonshotBalance(slot.baseUrl, slot.apiKey);
+          if (b) return { ...b, ...base };
+        }
+        // 其余厂商：说清楚为什么查不到，并给出真正能看到额度的地方。
+        const why: Record<string, string> = {
+          gemini: "Google 未提供余额接口；免费额度按项目计，请在 AI Studio / Cloud Console 查看",
+          anthropic: "Anthropic 未提供余额接口，请在官方控制台查看",
+          openai: "该接口未提供余额查询，请在服务商控制台查看",
+          custom: "该服务商未提供余额接口，请在其控制台查看",
+        };
+        return { ...base, state: "unsupported", text: why[slot.provider] ?? "不支持查询" };
+      }),
+    );
+    return { balances };
   });
 
 // ── Editor application approval (server-side, with email auto-confirm) ─────────
@@ -7000,7 +9024,7 @@ export const saveSecondOpinionConfigFn = createServerFn({ method: "POST" })
     const value = {
       apiKey: (data.apiKey ?? "").replace(/\s+/g, ""),
       model: (data.model ?? "").trim(),
-      baseUrl: (data.baseUrl ?? "").trim().replace(/\/+$/, "") || SECOND_OPINION_DEFAULT_BASE,
+      baseUrl: normalizeBaseUrl(data.baseUrl) || SECOND_OPINION_DEFAULT_BASE,
       updatedAt: new Date().toISOString(),
       updatedBy: userId,
     };
@@ -7008,7 +9032,9 @@ export const saveSecondOpinionConfigFn = createServerFn({ method: "POST" })
       .from("site_config")
       .upsert({ key: "second_opinion_config", value }, { onConflict: "key" });
     if (error) throw new Error(`保存失败：${error.message}`);
-    console.log(`[SecondOpinion] Admin ${userId} updated Doubao vision config (model=${value.model})`);
+    console.log(
+      `[SecondOpinion] Admin ${userId} updated Doubao vision config (model=${value.model})`,
+    );
     return { ok: true };
   });
 
@@ -7031,14 +9057,20 @@ export const getSecondOpinionConfigFn = createServerFn({ method: "GET" })
       rows.find((r) => r.key === "second_opinion_config") ??
       rows.find((r) => r.key === "doubao_vision_config");
     if (!picked?.value) return null;
-    const cfg = typeof picked.value === "string" ? JSON.parse(picked.value) : picked.value;
-    const key: string = cfg?.apiKey ?? "";
-    if (!key) return null;
+    // 必须走 readModelQueue：新界面存的是 sequence 形态，直读 cfg.apiKey 会拿到
+    // undefined → 状态条显示「未启用」，可模型其实正在跑。
+    const q = readModelQueue(
+      typeof picked.value === "string" ? JSON.parse(picked.value) : picked.value,
+    );
+    const first = q.sequence[0];
+    if (!first) return null;
     return {
-      apiKeyMasked: key.length <= 10 ? key : `${key.slice(0, 4)}…${key.slice(-4)}`,
-      model: (cfg?.model ?? "") as string,
-      baseUrl: (cfg?.baseUrl ?? SECOND_OPINION_DEFAULT_BASE) as string,
-      updatedAt: cfg?.updatedAt ?? null,
+      apiKeyMasked: maskKey(first.apiKey),
+      model: first.model,
+      baseUrl: first.baseUrl || SECOND_OPINION_DEFAULT_BASE,
+      updatedAt: q.updatedAt ?? null,
+      // 序列里还有几个替补 —— 面板可以据此显示「1 主 + N 备」。
+      sequenceCount: q.sequence.length,
     };
   });
 
@@ -7102,9 +9134,12 @@ export const listVisionModelsFn = createServerFn({ method: "POST" })
 
     const saved = await loadSecondOpinionConfig();
     const apiKey = (data.apiKey || "").replace(/\s+/g, "") || saved?.apiKey || "";
-    const baseUrl =
-      (data.baseUrl || "").trim().replace(/\/+$/, "") || saved?.baseUrl || SECOND_OPINION_DEFAULT_BASE;
-    const empty = { ok: false, total: 0, models: [] as { id: string; callable: boolean; note: string }[] };
+    const baseUrl = normalizeBaseUrl(data.baseUrl) || saved?.baseUrl || SECOND_OPINION_DEFAULT_BASE;
+    const empty = {
+      ok: false,
+      total: 0,
+      models: [] as { id: string; callable: boolean; note: string }[],
+    };
     if (!apiKey) return { ...empty, hint: "请先填入方舟 ARK API Key（或先保存一次配置）。" };
 
     const H = { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" };
@@ -7333,16 +9368,266 @@ export const testIdentifyEnginesFn = createServerFn({ method: "POST" })
       }
     }
 
+    // ── 出卡模型：Pl@ntNet 判定可信时，由它把结论写成简介摘要卡（consoleId="card"）。
+    // 这一环以前没测过 —— 于是「Pl@ntNet 通、复核通」全绿，实际却因为出卡模型不通而出不了卡。
+    const card = { ok: false, detail: "" };
+    try {
+      const seq = (await loadModelQueue("card")).sequence;
+      if (!seq.length) {
+        card.detail = "未配置出卡AI序列（识别会退回兜底「AI 模型控制台」）";
+      } else {
+        const oks: string[] = [];
+        const bads: string[] = [];
+        // 逐个测**每一项**，而不是只测第一项：序列的意义就是「第一个挂了还有下一个」，
+        // 只测第一项等于没测出冗余到底还在不在。
+        for (const [i, s] of seq.entries()) {
+          const label = `序列${i + 1}(${s.model || "未填模型"})`;
+          if (!s.apiKey?.trim()) {
+            bads.push(`${label}: 未填 Key`);
+            continue;
+          }
+          try {
+            const r = await fetch(`${s.baseUrl || SECOND_OPINION_DEFAULT_BASE}/chat/completions`, {
+              method: "POST",
+              headers: {
+                Authorization: `Bearer ${s.apiKey}`,
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({
+                model: s.model,
+                messages: [{ role: "user", content: "ping" }],
+                max_tokens: 4,
+              }),
+            });
+            if (r.ok) oks.push(label);
+            else bads.push(`${label}: HTTP ${r.status}`);
+          } catch (e) {
+            bads.push(`${label}: ${e instanceof Error ? e.message : String(e)}`);
+          }
+        }
+        card.ok = oks.length > 0;
+        card.detail = card.ok
+          ? `${oks.length}/${seq.length} 项可用（${oks.join("、")}）` +
+            (bads.length ? `；不可用：${bads.join("、")}` : "")
+          : `全部 ${seq.length} 项都不可用：${bads.join("、")}`;
+      }
+    } catch (e) {
+      card.detail = `读取出卡AI配置失败：${e instanceof Error ? e.message : String(e)}`;
+    }
+
     console.log(
-      `[EngineTest] admin=${userId} plantnet=${plantnet.ok ? "OK" : "FAIL"} review=${review.ok ? "OK" : "FAIL"}`,
+      `[EngineTest] admin=${userId} plantnet=${plantnet.ok ? "OK" : "FAIL"} review=${review.ok ? "OK" : "FAIL"} card=${card.ok ? "OK" : "FAIL"}`,
     );
+
+    // ── 按**运行时真实链路**组织结论 ────────────────────────────────────────
+    // 以前只报「Pl@ntNet / 复核模型」两个孤立的点，管理员看到两个 ✅ 仍然不知道
+    // 「拍一张照到底能不能出卡」——因为出卡模型这一环根本没被测。改成三条端到端链路，
+    // 每条对应一种真实走法（见 quickIdentify 的分支）。
+    const chains = [
+      {
+        name: "① Pl@ntNet 判定可信 → 出卡AI 写卡",
+        ok: plantnet.ok && card.ok,
+        steps: [
+          { label: "Pl@ntNet", ok: plantnet.ok, detail: plantnet.detail },
+          { label: "出卡AI", ok: card.ok, detail: card.detail },
+        ],
+        note: "最常走的一条：专业引擎给出物种，出卡模型只负责把它写成卡片。",
+      },
+      {
+        name: "② Pl@ntNet 存疑/不可用 → 一线识别模型顶替定种",
+        ok: review.ok && card.ok,
+        steps: [
+          { label: "一线识别（复核模型顶替）", ok: review.ok, detail: review.detail },
+          { label: "出卡AI", ok: card.ok, detail: card.detail },
+        ],
+        note: "Pl@ntNet 额度用尽或没把握时走这条，由视觉模型直接定种。",
+      },
+      {
+        name: "③ 一线仍判疑似 → 二次复核模型再看一遍",
+        ok: review.ok,
+        steps: [{ label: "二次复核模型", ok: review.ok, detail: review.detail }],
+        note: "复核有把握就直接出确诊卡、跳过补拍；它也没把握才让用户补拍。",
+      },
+    ];
+
     return {
       plantnet,
       review,
+      card,
+      chains,
       plantNetQuotaFlagged: await isPlantNetQuotaExhausted(),
       sample: sampleNote,
     };
   });
+
+// ═══ MCP 摄入：外部 agent 自带引擎，本站只负责「统一标准 + 统一表达」 ═══════════
+//
+// 设计要害：**agent 只能提交「证据」，不能提交「结论」。**
+// 它交上来的是 Pl@ntNet 的原始 score 和自己模型的三档自评；**可信度百分比由本站用
+// `computeIdentifyConfidence()` 算、卡片由 `buildSummaryCardHtml()` 渲染**，与站内识别
+// 走的是同一段代码。这样接入几个不同的 agent 都不会出现格式漂移或口径不一。
+//
+// 刻意不收：`confidence_pct`（agent 自报的百分比）、`card_html`（agent 自己写的卡片）。
+// 一旦收了，标准就回到「靠 agent 自觉」，这个功能的意义也就没了。
+//
+// ⚠️ 已知局限（用户已确认接受，因为只有 owner 自己用）：本站**无法验证 agent 是否真的
+// 调了 Pl@ntNet** —— score 可以伪造。缓解靠 `_identify_trace.source="mcp"` 溯源。
+
+export type McpIdentifyInput = {
+  photo_base64: string;
+  photo_mime: string;
+  lat?: number | null;
+  lng?: number | null;
+  place?: string | null;
+  tags?: string[];
+  plantnet?: { scientific_name: string; score: number; family?: string; genus?: string } | null;
+  model_verdict: {
+    scientific_name: string;
+    title?: string;
+    common_name_en?: string;
+    common_names_zh?: string;
+    family?: string;
+    genus?: string;
+    confidence: "high" | "medium" | "low";
+    summary_zh: string;
+    model: string;
+  };
+  photo_sha256?: string;
+};
+
+/** 把外部 agent 交来的结构化证据，走**站内同一条流水线**建成一张简介摘要卡草稿。 */
+export async function ingestMcpIdentification(input: McpIdentifyInput): Promise<{
+  draftId: string;
+  title: string;
+  confidencePct: number;
+  tentative: boolean;
+}> {
+  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+
+  const buffer = Buffer.from(input.photo_base64, "base64");
+  const ext = input.photo_mime.includes("png")
+    ? "png"
+    : input.photo_mime.includes("webp")
+      ? "webp"
+      : "jpg";
+  const path = `drafts/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
+  const { error: upErr } = await supabaseAdmin.storage
+    .from("plant-images")
+    .upload(path, buffer, { contentType: input.photo_mime, upsert: false });
+  if (upErr) throw new Error(`照片上传失败：${upErr.message}`);
+  const photoUrl = supabaseAdmin.storage.from("plant-images").getPublicUrl(path).data.publicUrl;
+
+  const v = input.model_verdict;
+  const meta = {
+    title: v.title || v.scientific_name,
+    scientific_name: v.scientific_name,
+    common_name_en: v.common_name_en || "",
+    common_names_zh: v.common_names_zh || "",
+    family: v.family || "",
+    genus: v.genus || "",
+    identification_confidence: v.confidence,
+    summary_zh: v.summary_zh,
+  } as AiMeta;
+  // 与站内识别用同一个规范化器：疑似信号（标题/正文/补拍横幅）三处一致。
+  normalizeIdentification(meta);
+
+  const pnPct =
+    input.plantnet && Number.isFinite(input.plantnet.score)
+      ? Math.round(input.plantnet.score * 100)
+      : null;
+  const trace: IdentifyTrace & { source?: string } = {
+    primaryEngine: input.plantnet ? "plantnet" : "none",
+    primaryLabel: input.plantnet?.scientific_name ?? "",
+    primaryPct: pnPct,
+    phase1Model: v.model,
+    phase1Confidence: (meta.identification_confidence || "").toString(),
+    // MCP 链路不跑站内的二次复核（agent 那边自己决定要不要复核），如实写明。
+    review: { ran: false, reason: "由外部 agent 经 MCP 提交，未走站内二次复核" },
+    retakeCount: 0,
+    source: "mcp",
+  };
+
+  const conf = computeIdentifyConfidence(
+    trace,
+    (meta.scientific_name || "").toString(),
+    (meta.identification_confidence || "").toString(),
+  );
+
+  const html = buildSummaryCardHtml({
+    photos: [photoUrl],
+    title: meta.title || "",
+    sci: meta.scientific_name || "",
+    summaryZh: meta.summary_zh || "",
+    family: meta.family,
+    genus: meta.genus,
+    tentative: isTentative(meta),
+    chips: await lookupRegistryChips(meta.scientific_name, meta.family),
+    trace,
+    finalConfidence: (meta.identification_confidence || "").toString(),
+  });
+
+  const aiPayload = JSON.parse(
+    JSON.stringify({
+      ...meta,
+      _enriched: false, // 只有简介卡；要正文仍需显式点「生成进一步介绍草稿」
+      _identify_trace: trace,
+      ...(input.photo_sha256 ? { _photo_sha256: input.photo_sha256 } : {}),
+    }),
+  );
+
+  const { data: row, error } = await (supabaseAdmin as any)
+    .from("plant_drafts")
+    .insert({
+      photo_url: photoUrl,
+      user_photos: [photoUrl],
+      capture_lat: input.lat ?? null,
+      capture_lng: input.lng ?? null,
+      capture_place: input.place ?? "",
+      ai_model: v.model,
+      ai_payload: aiPayload,
+      title: draftTitleFor(meta),
+      scientific_name: meta.scientific_name || null,
+      common_name_en: meta.common_name_en || null,
+      common_names_zh: meta.common_names_zh || null,
+      family: meta.family || null,
+      genus: meta.genus || null,
+      summary: (meta.summary_zh || "").toString().slice(0, 600),
+      tags: input.tags ?? [],
+      html_content: html,
+      creator_label: "MCP 批量",
+      status: "pending",
+    })
+    .select("id")
+    .single();
+  if (error) throw new Error(`建卡失败：${error.message}`);
+
+  // 用量留痕：Pl@ntNet 与 agent 的模型都不消耗本站 token，但**必须留下记录**，
+  // 否则站内会凭空多出一批查不到出处的草稿。
+  try {
+    await (supabaseAdmin as any).from("ai_usage_logs").insert({
+      provider: input.plantnet ? "mcp+plantnet" : "mcp",
+      model: v.model,
+      prompt_tokens: 0,
+      completion_tokens: 0,
+      total_tokens: 0,
+      draft_id: row.id,
+      draft_title: draftTitleFor(meta),
+      task_type: "mcp_ingest",
+      capture_place: input.place ?? null,
+      capture_lat: input.lat ?? null,
+      capture_lng: input.lng ?? null,
+    });
+  } catch {
+    /* 留痕失败不影响建卡 */
+  }
+
+  return {
+    draftId: row.id as string,
+    title: draftTitleFor(meta),
+    confidencePct: conf.pct,
+    tentative: isTentative(meta),
+  };
+}
 
 // ─── Admin: AI Usage Statistics ───────────────────────────────────────────────
 
@@ -7374,26 +9659,54 @@ export const fetchAiUsageFn = createServerFn({ method: "GET" })
     const { data: rows, count, error } = await query;
     if (error) throw new Error(`查询失败：${error.message}`);
 
+    // 以前只 select total_tokens —— 于是「花在哪」完全看不出来。现在把输入/输出、
+    // 任务类型、时间维度都取回来：token 账单的大头通常是**输入**（每次都要塞照片
+    // 和长 prompt），只看总数会以为是模型话多。
     const { data: agg } = await (supabaseAdmin as any)
       .from("ai_usage_logs")
-      .select("total_tokens, provider, model");
+      .select(
+        "total_tokens, prompt_tokens, completion_tokens, provider, model, task_type, created_at",
+      );
 
+    const zero = () => ({ calls: 0, tokens: 0, input: 0, output: 0 });
     const stats = {
       total_calls: agg?.length ?? 0,
-      total_tokens: agg?.reduce((s: number, r: any) => s + (r.total_tokens ?? 0), 0) ?? 0,
-      by_provider: {} as Record<string, { calls: number; tokens: number }>,
-      by_model: {} as Record<string, { calls: number; tokens: number }>,
+      total_tokens: 0,
+      total_input: 0,
+      total_output: 0,
+      /** 最近 24h / 7d / 30d 的用量，用来看趋势而不是只看历史总和 */
+      window: { d1: zero(), d7: zero(), d30: zero() },
+      by_provider: {} as Record<string, ReturnType<typeof zero>>,
+      by_model: {} as Record<string, ReturnType<typeof zero>>,
+      /** 按任务类型拆：识别 / 草稿生成 / 小P蛙… 这才看得出钱花在哪个环节 */
+      by_task: {} as Record<string, ReturnType<typeof zero>>,
+    };
+
+    const now = Date.now();
+    const DAY = 86_400_000;
+    const add = (b: ReturnType<typeof zero>, r: any) => {
+      b.calls++;
+      b.tokens += r.total_tokens ?? 0;
+      b.input += r.prompt_tokens ?? 0;
+      b.output += r.completion_tokens ?? 0;
     };
 
     for (const r of agg ?? []) {
+      stats.total_tokens += r.total_tokens ?? 0;
+      stats.total_input += r.prompt_tokens ?? 0;
+      stats.total_output += r.completion_tokens ?? 0;
+
       const p = r.provider ?? "unknown";
       const m = r.model ?? "unknown";
-      if (!stats.by_provider[p]) stats.by_provider[p] = { calls: 0, tokens: 0 };
-      stats.by_provider[p].calls++;
-      stats.by_provider[p].tokens += r.total_tokens ?? 0;
-      if (!stats.by_model[m]) stats.by_model[m] = { calls: 0, tokens: 0 };
-      stats.by_model[m].calls++;
-      stats.by_model[m].tokens += r.total_tokens ?? 0;
+      const t = r.task_type ?? "unknown";
+      ((stats.by_provider[p] ??= zero()), add(stats.by_provider[p], r));
+      ((stats.by_model[m] ??= zero()), add(stats.by_model[m], r));
+      ((stats.by_task[t] ??= zero()), add(stats.by_task[t], r));
+
+      const age = r.created_at ? now - new Date(r.created_at).getTime() : Infinity;
+      if (age <= DAY) add(stats.window.d1, r);
+      if (age <= 7 * DAY) add(stats.window.d7, r);
+      if (age <= 30 * DAY) add(stats.window.d30, r);
     }
 
     return { rows: rows ?? [], total: count ?? 0, stats };

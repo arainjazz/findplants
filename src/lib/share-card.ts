@@ -4,6 +4,7 @@ import leafSilverUrl from "@/assets/leaf-silver.png";
 import leafGoldUrl from "@/assets/leaf-gold.png";
 import { proxyImageDataUrlFn } from "@/lib/image-proxy.functions";
 import type { RegistryChip, RegistryChipKind } from "@/lib/conservation";
+import { CONFIDENCE_STARS_TOTAL, confidenceStars } from "@/lib/identify-trace";
 
 /**
  * Renders a plant-identification "share card" to a PNG Blob for social sharing
@@ -48,6 +49,15 @@ export type ShareCardData = {
   /** Registry chips (重点保护 / CITES / GTS / GRIIS / 地区名录 / tag) — same set the
    *  draft page and detail page show. Drawn as a pill row under the name block. */
   chips?: RegistryChip[];
+  /**
+   * 综合可信度%（computeIdentifyConfidence 的结果）。给了就在照片**右上角**画一枚
+   * 「置信度：x 颗星」的十星徽标。
+   *
+   * 为什么画在照片上而不是版面别处：分享卡多数时候是被截图或转发出去的，看到的人只扫一眼
+   * 图 —— 结论旁边就得有把握程度，否则一张「疑似」卡会被当成确诊结果传出去。
+   * 留空（已发布详页的分享卡）则整枚徽标不画，不留空位。
+   */
+  confidencePct?: number | null;
   /** Visual theme for the card background/text. Default "light" (paper). */
   theme?: "light" | "dark";
   /** Language for the card's own chrome text (brand line, CTAs, footer). The plant's
@@ -77,6 +87,18 @@ const PALETTES = {
     silver: "#8a9aa3",
     gold: "#c79a3a",
     cites: "#5f45a3",
+    // 卡签一名录一色系（与网页 <RegistryChips> 同源）：国家保护=粉 / 地区保护=黄 /
+    // GTS=蓝 / GRIIS 入侵=橙。CITES 沿用上面的 cites 紫、手动主题标签沿用 leafDeep 绿。
+    protNat: "#c05680",
+    protReg: "#a97e17",
+    gtsBlue: "#3565a8",
+    griisOrange: "#c26a15",
+    // 手动主题标签的绿色系（一标签一绿，色号由 manualTagTone 哈希得出）。四个键而不是一个
+    // 数组：Palette 类型是「PALETTES.light 的每个键 → string」，塞数组会把这个约束撑破。
+    manual0: "#2d6a4f",
+    manual1: "#17726b",
+    manual2: "#5b7c2a",
+    manual3: "#3f8f5a",
   },
   // Deep green-black background with light ink; greens/metals brightened so they
   // keep contrast against the dark paper.
@@ -93,6 +115,15 @@ const PALETTES = {
     silver: "#aab6bd",
     gold: "#dcb85a",
     cites: "#a992e8",
+    protNat: "#e88bb0",
+    protReg: "#dcc063",
+    gtsBlue: "#84acdf",
+    griisOrange: "#e79a58",
+    // 同四色的提亮版 —— 深底上照搬浅色主题的深绿会糊成一团黑。
+    manual0: "#6fc79a",
+    manual1: "#55c3ba",
+    manual2: "#a8ca6a",
+    manual3: "#74d19a",
   },
 } as const;
 
@@ -106,6 +137,7 @@ const STRINGS = {
     thisRoundBronze: (n: number) => `本轮铜叶 +${n}`,
     invite: (name: string) => `${name} 邀请你加入 plantspedia.club`,
     inviteSub: "一起认识更多身边的植物朋友",
+    confidenceStars: (n: number) => `置信度：${n} 颗星`,
   },
   en: {
     brandSub: "Xiao-P · AI Plant ID",
@@ -115,6 +147,7 @@ const STRINGS = {
     thisRoundBronze: (n: number) => `+${n} bronze leaf`,
     invite: (name: string) => `${name} invites you to plantspedia.club`,
     inviteSub: "Discover more plants around you",
+    confidenceStars: (n: number) => `Confidence: ${n}/10`,
   },
 } as const;
 
@@ -259,17 +292,30 @@ function drawFitLine(
 }
 
 /** Chip colours per registry, per theme. Mirrors the on-site <RegistryChips> tones:
- *  保护=绿, CITES=紫, GTS=金, GRIIS(入侵)=红, 名录/tag=中性. */
-function chipColors(kind: RegistryChipKind, C: Palette): { fg: string; bd: string } {
+ *  手动主题标签=绿(加粗边), 国家保护=粉, 地区保护=黄, CITES=紫, GTS=蓝, GRIIS(入侵)=橙, 名录/特征词=中性. */
+function chipColors(
+  kind: RegistryChipKind,
+  C: Palette,
+  /** tag_manual 的绿号（manualTagTone 的结果）。其它 kind 用不到。 */
+  tone = 0,
+): { fg: string; bd: string; bold?: boolean } {
   switch (kind) {
-    case "protected":
-      return { fg: C.leafDeep, bd: C.leafDeep };
+    // 与页面上的 tag_manual 同一套绿、同一个色号。`bold` 让描边加粗，对应网页那边的
+    // border-2 —— 卡上没有 hover、没有链接，只剩颜色和线宽能表达「这条是人特意挂的」。
+    case "tag_manual": {
+      const greens = [C.manual0, C.manual1, C.manual2, C.manual3];
+      return { fg: greens[tone % greens.length], bd: greens[tone % greens.length], bold: true };
+    }
+    case "protected_national":
+      return { fg: C.protNat, bd: C.protNat };
+    case "protected_regional":
+      return { fg: C.protReg, bd: C.protReg };
     case "cites":
       return { fg: C.cites, bd: C.cites };
     case "gts":
-      return { fg: C.gold, bd: C.gold };
+      return { fg: C.gtsBlue, bd: C.gtsBlue };
     case "griis":
-      return { fg: C.vermilion, bd: C.vermilion };
+      return { fg: C.griisOrange, bd: C.griisOrange };
     default:
       return { fg: C.inkFaint, bd: C.rule };
   }
@@ -316,11 +362,11 @@ function drawChips(
   for (const row of rows) {
     let x = x0;
     for (const { chip, w } of row) {
-      const { fg, bd } = chipColors(chip.kind, C);
+      const { fg, bd, bold } = chipColors(chip.kind, C, chip.tone ?? 0);
       ctx.save();
       roundRect(ctx, x, cursorY, w, CHIP_H, CHIP_H / 2);
       ctx.strokeStyle = bd;
-      ctx.lineWidth = 2;
+      ctx.lineWidth = bold ? 4 : 2;
       ctx.stroke();
       ctx.clip();
       // Tint fill — same idea as the CSS chips' 10% background wash.
@@ -342,6 +388,82 @@ function drawChips(
 
 /** Count how many lines drawWrapped will need (same wrap algorithm, no drawing).
  *  Callers must set ctx.font to the final summary font before measuring. */
+/**
+ * 画一颗五角星，外接圆半径 r，中心 (cx, cy)。
+ *
+ * 为什么手画而不是 `fillText("★")`：卡片要在 iOS / Android / 桌面浏览器上出**同一张图**，
+ * 而 ★ 这个字符各系统字体里的字面大小、基线、字重差得很远 —— 十颗排一行会高低不齐，
+ * 空心星更是有的字体压根没有 ☆ 的对应字重。路径是自己算的，到哪都一样。
+ */
+function starPath(ctx: CanvasRenderingContext2D, cx: number, cy: number, r: number) {
+  ctx.beginPath();
+  for (let i = 0; i < 10; i++) {
+    // 十个顶点交替落在外接圆与内接圆上；-90° 起手让尖角朝正上方。
+    const rad = i % 2 === 0 ? r : r * 0.42;
+    const a = (Math.PI / 5) * i - Math.PI / 2;
+    const x = cx + Math.cos(a) * rad;
+    const y = cy + Math.sin(a) * rad;
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  }
+  ctx.closePath();
+}
+
+/**
+ * 照片右上角的「置信度：x 颗星」徽标。
+ *
+ * 画在照片**上面**（不是照片下方另起一行）是刻意的：分享卡多半被截图转发，看到的人
+ * 只扫一眼图。把握程度必须和照片同框，否则一张「疑似」卡会被当成确诊结果传播。
+ * 底衬一层半透明深色圆角块 —— 照片本身的亮度不可控，纯描边星在浅色天空上会看不见。
+ *
+ * 空心星也画：只画亮的那几颗，读者数不出满分是多少。
+ */
+function drawConfidenceBadge(
+  ctx: CanvasRenderingContext2D,
+  opts: { right: number; top: number; filled: number; total: number; label: string },
+) {
+  const { right, top, filled, total, label } = opts;
+  const starR = 13;
+  const starGap = 5;
+  const padX = 22;
+  const padY = 16;
+  const labelPx = 24;
+  const rowGap = 14;
+
+  ctx.save();
+  ctx.font = `700 ${labelPx}px ${FONT}`;
+  const labelW = ctx.measureText(label).width;
+  const starsW = total * (starR * 2) + (total - 1) * starGap;
+  const boxW = Math.max(labelW, starsW) + padX * 2;
+  const boxH = padY * 2 + labelPx + rowGap + starR * 2;
+  const boxX = right - boxW;
+
+  ctx.fillStyle = "rgba(16, 24, 20, 0.62)";
+  roundRect(ctx, boxX, top, boxW, boxH, 18);
+  ctx.fill();
+
+  ctx.textAlign = "center";
+  ctx.textBaseline = "alphabetic";
+  ctx.fillStyle = "#ffffff";
+  ctx.fillText(label, boxX + boxW / 2, top + padY + labelPx - 3);
+
+  const starsY = top + padY + labelPx + rowGap + starR;
+  let sx = boxX + (boxW - starsW) / 2 + starR;
+  for (let i = 0; i < total; i++) {
+    starPath(ctx, sx, starsY, starR);
+    if (i < filled) {
+      ctx.fillStyle = "#f2b93f";
+      ctx.fill();
+    } else {
+      ctx.strokeStyle = "rgba(255, 255, 255, 0.55)";
+      ctx.lineWidth = 1.8;
+      ctx.stroke();
+    }
+    sx += starR * 2 + starGap;
+  }
+  ctx.restore();
+}
+
 function countWrappedLines(ctx: CanvasRenderingContext2D, text: string, maxWidth: number): number {
   const chars = Array.from(text.trim());
   let line = "";
@@ -573,6 +695,19 @@ export async function renderShareCard(data: ShareCardData): Promise<Blob> {
     roundRect(ctx, PAD, y, CW, photoH, 28);
     ctx.fill();
   }
+
+  // 置信度十星徽标 —— 压在照片右上角。识别卡才有（已发布详页的分享卡不传这个字段）。
+  if (data.confidencePct != null) {
+    const filled = confidenceStars(data.confidencePct);
+    drawConfidenceBadge(ctx, {
+      right: PAD + CW - 24,
+      top: y + 24,
+      filled,
+      total: CONFIDENCE_STARS_TOTAL,
+      label: T.confidenceStars(filled),
+    });
+  }
+
   y += photoH + 44;
 
   // ── 发现者信息区（头像 + 名字 + 本轮铜叶统计，占两行）───────────────────

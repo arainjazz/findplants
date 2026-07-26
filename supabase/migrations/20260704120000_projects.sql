@@ -32,7 +32,7 @@ create policy "projects_read_published" on public.projects
 drop policy if exists "projects_read_own" on public.projects;
 create policy "projects_read_own" on public.projects
   for select using (
-    auth.uid() = author_id or public.has_role(auth.uid(), 'admin'::app_role)
+    auth.uid() = author_id or private.has_role(auth.uid(), 'admin'::app_role)
   );
 
 -- Approved editors create their own; admins may act on any.
@@ -40,20 +40,20 @@ drop policy if exists "projects_insert" on public.projects;
 create policy "projects_insert" on public.projects
   for insert with check (
     auth.uid() = author_id and (
-      private.is_approved_editor(auth.uid()) or public.has_role(auth.uid(), 'admin'::app_role)
+      private.is_approved_editor(auth.uid()) or private.has_role(auth.uid(), 'admin'::app_role)
     )
   );
 
 drop policy if exists "projects_update" on public.projects;
 create policy "projects_update" on public.projects
   for update using (
-    auth.uid() = author_id or public.has_role(auth.uid(), 'admin'::app_role)
+    auth.uid() = author_id or private.has_role(auth.uid(), 'admin'::app_role)
   );
 
 drop policy if exists "projects_delete" on public.projects;
 create policy "projects_delete" on public.projects
   for delete using (
-    auth.uid() = author_id or public.has_role(auth.uid(), 'admin'::app_role)
+    auth.uid() = author_id or private.has_role(auth.uid(), 'admin'::app_role)
   );
 
 create index if not exists projects_published_date_idx

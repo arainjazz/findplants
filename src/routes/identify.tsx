@@ -4,15 +4,14 @@ import { useState, useEffect, useRef } from "react";
 import { useServerFn } from "@tanstack/react-start";
 import { SiteHeader, SiteFooter } from "@/components/site-header";
 import { CameraIdentify } from "@/components/camera-identify";
+import { ModelQueueConsole } from "@/components/model-queue-console";
 import { DraftCard } from "@/components/draft-card";
 import { fetchPendingDrafts } from "@/lib/drafts";
+import { checkKeyHealthFn, type KeyHealth } from "@/lib/key-health.functions";
 import { displayPlace } from "@/lib/editor-stats";
 import { useAuth } from "@/hooks/use-auth";
 import { supabase } from "@/integrations/supabase/client";
 import {
-  saveAiConfigFn,
-  getAiConfigFn,
-  clearAiConfigFn,
   listProviderModelsFn,
   fetchAiUsageFn,
   savePlantNetKeyFn,
@@ -25,7 +24,10 @@ import {
   listVisionModelsFn,
 } from "@/lib/identify-plant.functions";
 import { XiaoPModelPanel } from "@/components/xiaop-model-panel";
+import { GoldSkillPanel } from "@/components/gold-skill-panel";
 import { toast } from "sonner";
+import { explainError } from "@/lib/explain-error";
+import { normalizeBaseUrl } from "@/lib/ai-base-url";
 
 export const Route = createFileRoute("/identify")({
   // Retake context carried from a draft's「去补拍」: retake=第几次补拍, st=物种中文名, ss=学名。
@@ -132,6 +134,24 @@ function PlantNetPanel() {
   const saveFn = useServerFn(savePlantNetKeyFn);
   const getFn = useServerFn(getPlantNetKeyFn);
   const clearFn = useServerFn(clearPlantNetKeyFn);
+  const healthFn = useServerFn(checkKeyHealthFn);
+  const [health, setHealth] = useState<KeyHealth | null>(null);
+
+  const healthMutation = useMutation({
+    // 传入框里正在编辑的 key（还没保存也能先测）；为空则服务端回落到库里已保存的那个。
+    mutationFn: () =>
+      healthFn({
+        data: { target: "plantnet" as const, apiKey: apiKey.replace(/\s+/g, "") || undefined },
+      }) as Promise<KeyHealth>,
+    onSuccess: (r) => setHealth(r),
+    onError: (e: unknown) =>
+      setHealth({
+        ok: false,
+        detail: explainError(e, { action: "检测 Pl@ntNet Key" }),
+        remaining: null,
+        limit: null,
+      }),
+  });
 
   const { data: active, isLoading } = useQuery({
     queryKey: ["plantnet-key"],
@@ -150,7 +170,8 @@ function PlantNetPanel() {
       setIsOpen(false);
       setApiKey("");
     },
-    onError: (e: Error) => toast.error(e.message),
+    onError: (e: Error) =>
+      toast.error(explainError(e, { action: "保存 Pl@ntNet 配置" }), { duration: 10000 }),
   });
 
   const clearMutation = useMutation({
@@ -159,7 +180,8 @@ function PlantNetPanel() {
       qc.invalidateQueries({ queryKey: ["plantnet-key"] });
       toast.success("已停用 Pl@ntNet（识别回退为纯大模型）");
     },
-    onError: (e: Error) => toast.error(e.message),
+    onError: (e: Error) =>
+      toast.error(explainError(e, { action: "停用 Pl@ntNet" }), { duration: 10000 }),
   });
 
   return (
@@ -242,6 +264,32 @@ function PlantNetPanel() {
               在 my.plantnet.org 免费注册获取（每日 500 次额度）。Key 加密存储在服务端数据库。
             </p>
           </div>
+          {/* 独立的「连通 + 配额」体检。以前 Pl@ntNet 的每日 500 次额度是个黑盒 —— 只有识别
+              撞上 429 的那一刻才知道用光了。这里按需查（不做轮询：查询本身也走它的网关）。 */}
+          <div className="mb-2">
+            <button
+              onClick={() => healthMutation.mutate()}
+              disabled={healthMutation.isPending}
+              className="w-full py-2 text-xs rounded-lg border border-emerald-600/50 text-emerald-700 hover:bg-emerald-600 hover:text-white transition-all cursor-pointer disabled:opacity-60"
+            >
+              {healthMutation.isPending ? "检测中…" : "检测连通性与剩余额度"}
+            </button>
+            {health && (
+              <div
+                className={`mt-2 text-[11px] leading-relaxed rounded-lg p-2 border ${
+                  health.ok
+                    ? "border-emerald-600/40 bg-emerald-500/10 text-emerald-800"
+                    : "border-red-500/40 bg-red-500/10 text-red-700"
+                }`}
+              >
+                <p>
+                  {health.ok ? "✅ " : "❌ "}
+                  {health.detail}
+                </p>
+                {health.localState && <p className="mt-1 opacity-80">· {health.localState}</p>}
+              </div>
+            )}
+          </div>
           <div className="flex gap-2">
             <button
               onClick={() => saveMutation.mutate()}
@@ -294,6 +342,100 @@ const VISION_VENDOR_PRESETS: { label: string; baseUrl: string; hint: string }[] 
   },
 ];
 
+/** 引擎自检 —— 独立于任何一个模型面板。
+ *  它测的是「Pl@ntNet + 疑似复核模型」这两个**定种引擎**串起来通不通，跨越了两块配置，
+ *  所以挂在复核模型面板里名不副实（用户会以为只测复核模型）。现在收到「三重奏」栏末尾，
+ *  位置对应它的语义：三块都配完了，最后跑一次端到端验证。 */
+function EngineSelfTestPanel() {
+  const testFn = useServerFn(testIdentifyEnginesFn);
+
+  type ChainStep = { label: string; ok: boolean; detail: string };
+  type EngineTest = {
+    plantnet: { ok: boolean; detail: string };
+    review: { ok: boolean; detail: string };
+    card: { ok: boolean; detail: string };
+    chains: { name: string; ok: boolean; steps: ChainStep[]; note: string }[];
+    plantNetQuotaFlagged: boolean;
+    sample: string;
+  };
+  const [testResult, setTestResult] = useState<EngineTest | null>(null);
+
+  const testMutation = useMutation({
+    mutationFn: async () => (await testFn({ data: undefined })) as EngineTest,
+    onSuccess: (r) => setTestResult(r),
+    onError: (e: Error) =>
+      toast.error(explainError(e, { action: "引擎自检" }), { duration: 10000 }),
+  });
+
+  return (
+    <div className="mt-2 pt-4 border-t border-rule/50">
+      <div className="flex items-center gap-3 mb-2">
+        <span className="text-[11px] font-semibold tracking-widest uppercase text-ink-faint">
+          三重奏 · 链路自检
+        </span>
+        <div className="flex-1 h-px bg-rule/50" />
+      </div>
+      <p className="text-[11px] text-ink-faint leading-relaxed mb-2">
+        用站内一张<b>真实植物照片</b>跑三条**端到端链路**（不是只 ping key），每条对应识别时的一种
+        真实走法 —— 只报「引擎通不通」是不够的，出卡模型不通照样出不了卡。
+      </p>
+      <button
+        onClick={() => testMutation.mutate()}
+        disabled={testMutation.isPending}
+        className="inline-flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg border border-rule bg-paper hover:bg-ink hover:text-background transition-all cursor-pointer disabled:opacity-50"
+      >
+        {testMutation.isPending ? "自检中…" : "自检三条链路"}
+      </button>
+
+      {testResult && (
+        <div className="mt-3 p-3 rounded-xl border border-rule bg-paper space-y-2 text-[11px] leading-relaxed">
+          <div className="font-semibold text-ink-soft">
+            链路自检结果{testResult.sample ? `（样本：${testResult.sample}）` : ""}
+          </div>
+          {/* 按**运行时真实链路**分组，而不是罗列孤立的引擎。以前只报「Pl@ntNet / 复核模型」
+              两个点，两个都 ✅ 也仍然回答不了「拍一张照到底能不能出卡」—— 因为出卡模型
+              那一环根本没被测到。 */}
+          {(testResult.chains ?? []).map((c) => (
+            <div key={c.name} className="rounded-lg border border-rule/70 p-2">
+              <div className="flex gap-2 items-start">
+                <span className={c.ok ? "text-emerald-600" : "text-destructive"}>
+                  {c.ok ? "✅" : "❌"}
+                </span>
+                <div className="flex-1">
+                  <div className="font-semibold text-ink-soft">{c.name}</div>
+                  <div className="text-ink-faint mt-0.5">{c.note}</div>
+                  <div className="mt-1 space-y-0.5">
+                    {c.steps.map((s) => (
+                      <div key={s.label} className="flex gap-1.5">
+                        <span className={s.ok ? "text-emerald-600" : "text-destructive"}>
+                          {s.ok ? "•" : "×"}
+                        </span>
+                        <span>
+                          <b>{s.label}</b>：{s.detail}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            </div>
+          ))}
+          {testResult.plantNetQuotaFlagged && (
+            <div className="pt-1 text-amber-700">
+              ⚠️ Pl@ntNet 当前被标记为「额度已用尽」，识别正由二次复核模型顶一线；额度重置后最迟 1
+              小时自动切回。
+            </div>
+          )}
+          <div className="pt-1 text-ink-faint">
+            提示：Pl@ntNet 不消耗 token，所以它<b>不会</b>在用量统计里出现独立记录；它是否参与要看
+            provider 列的前缀（如 <code>plantnet+gemini-quick</code>）。
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function SecondOpinionPanel() {
   const qc = useQueryClient();
   const [isOpen, setIsOpen] = useState(false);
@@ -305,21 +447,6 @@ function SecondOpinionPanel() {
   const saveFn = useServerFn(saveSecondOpinionConfigFn);
   const getFn = useServerFn(getSecondOpinionConfigFn);
   const clearFn = useServerFn(clearSecondOpinionConfigFn);
-  const testFn = useServerFn(testIdentifyEnginesFn);
-
-  type EngineTest = {
-    plantnet: { ok: boolean; detail: string };
-    review: { ok: boolean; detail: string };
-    plantNetQuotaFlagged: boolean;
-    sample: string;
-  };
-  const [testResult, setTestResult] = useState<EngineTest | null>(null);
-
-  const testMutation = useMutation({
-    mutationFn: async () => (await testFn({ data: undefined })) as EngineTest,
-    onSuccess: (r) => setTestResult(r),
-    onError: (e: Error) => toast.error(e.message),
-  });
 
   const modelsFn = useServerFn(listVisionModelsFn);
   type ModelList = {
@@ -345,7 +472,8 @@ function SecondOpinionPanel() {
       if (usable) toast.success(`实测到 ${usable} 个可用的视觉模型`);
       else toast.warning("没有可直接调用的视觉模型，需创建推理接入点（ep-…）");
     },
-    onError: (e: Error) => toast.error(e.message),
+    onError: (e: Error) =>
+      toast.error(explainError(e, { action: "拉取模型" }), { duration: 10000 }),
   });
 
   const { data: active, isLoading } = useQuery({
@@ -372,7 +500,8 @@ function SecondOpinionPanel() {
       setIsOpen(false);
       setApiKey("");
     },
-    onError: (e: Error) => toast.error(e.message),
+    onError: (e: Error) =>
+      toast.error(explainError(e, { action: "保存复核模型配置" }), { duration: 10000 }),
   });
 
   const clearMutation = useMutation({
@@ -381,7 +510,8 @@ function SecondOpinionPanel() {
       qc.invalidateQueries({ queryKey: ["second-opinion-config"] });
       toast.success("已停用二次复核（疑似结果直接进补拍）");
     },
-    onError: (e: Error) => toast.error(e.message),
+    onError: (e: Error) =>
+      toast.error(explainError(e, { action: "停用复核模型" }), { duration: 10000 }),
   });
 
   return (
@@ -406,20 +536,6 @@ function SecondOpinionPanel() {
       </div>
 
       <div className="flex items-center gap-2 flex-wrap">
-        <button
-          onClick={() => setIsOpen((v) => !v)}
-          className="inline-flex items-center gap-2 text-xs font-medium px-3 py-1.5 rounded-lg border border-rule bg-paper hover:bg-ink hover:text-background transition-all cursor-pointer"
-        >
-          <LeafIcon className="w-3.5 h-3.5" />
-          {isOpen ? "收起" : active ? "修改配置" : "配置复核模型"}
-        </button>
-        <button
-          onClick={() => testMutation.mutate()}
-          disabled={testMutation.isPending}
-          className="inline-flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg border border-rule bg-paper hover:bg-ink hover:text-background transition-all cursor-pointer disabled:opacity-50"
-        >
-          {testMutation.isPending ? "自检中…" : "自检两个引擎"}
-        </button>
         {active && (
           <button
             onClick={() => clearMutation.mutate()}
@@ -431,647 +547,177 @@ function SecondOpinionPanel() {
         )}
       </div>
 
-      {/* 自检结果：用站内一张真实植物照片跑完整链路，而非只 ping key */}
-      {testResult && (
-        <div className="mt-3 p-3 rounded-xl border border-rule bg-paper space-y-2 text-[11px] leading-relaxed">
-          <div className="font-semibold text-ink-soft">
-            引擎自检结果{testResult.sample ? `（样本：${testResult.sample}）` : ""}
-          </div>
-          {(
-            [
-              ["Pl@ntNet", testResult.plantnet],
-              ["二次复核模型", testResult.review],
-            ] as const
-          ).map(([label, r]) => (
-            <div key={label} className="flex gap-2">
-              <span className={r.ok ? "text-emerald-600" : "text-destructive"}>
-                {r.ok ? "✅" : "❌"}
-              </span>
-              <span>
-                <b>{label}</b>：{r.detail}
-              </span>
-            </div>
-          ))}
-          {testResult.plantNetQuotaFlagged && (
-            <div className="pt-1 text-amber-700">
-              ⚠️ Pl@ntNet 当前被标记为「额度已用尽」，识别正由二次复核模型顶一线；额度重置后最迟 1
-              小时自动切回。
-            </div>
-          )}
-          <div className="pt-1 text-ink-faint">
-            提示：Pl@ntNet 不消耗 token，所以它<b>不会</b>在用量统计里出现独立记录；它是否参与要看
-            provider 列的前缀（如 <code>plantnet+gemini-quick</code>）。
-          </div>
-        </div>
-      )}
-
-      {isOpen && (
-        <div className="mt-3 p-4 rounded-2xl border border-sky-500/30 bg-sky-500/5 space-y-4 animate-in fade-in slide-in-from-top-1 duration-200">
-          <div className="flex gap-2 p-2.5 rounded-lg bg-sky-50 border border-sky-200 text-[11px] text-sky-900 leading-relaxed">
-            <span>🔍</span>
-            <span>
-              这个模型承担<b>两个角色</b>：①<b>疑似复核</b>——识别判为「疑似」时先让它独立复核，
-              它有把握就直接出确诊卡、<b>跳过补拍</b>（可确认也可纠正物种），它同样没把握才引导用户补拍；
-              ②<b>顶替 Pl@ntNet</b>——Pl@ntNet 每日免费额度（500 次）用尽后，自动改由它承担一线专业定种，
-              额度重置后自动切回。角色 ① 只在疑似时才调用，不拖慢正常识别。全站立即生效，无需重新部署。
-              <br />
-              <b>厂商无关</b>：任何提供 OpenAI 兼容 <code>/chat/completions</code> 的服务都能用
-              （方舟豆包 / 通义千问 / OpenAI / 智谱…），换厂商只改下面三个字段，不用改代码。
-            </span>
-          </div>
-          <div>
-            <label className="block text-xs font-semibold text-ink-soft mb-1.5">
-              API Key
-            </label>
-            <div className="relative">
-              <input
-                type={showKey ? "text" : "password"}
-                value={apiKey}
-                onChange={(e) => setApiKey(e.target.value)}
-                placeholder="方舟控制台生成的 API Key"
-                className="w-full pr-10 pl-3 py-2 text-xs rounded-lg border border-rule bg-background font-mono focus:outline-none focus:border-sky-400 transition-colors"
-              />
-              <button
-                type="button"
-                onClick={() => setShowKey((v) => !v)}
-                className="absolute right-2 top-1/2 -translate-y-1/2 text-ink-faint hover:text-ink transition-colors cursor-pointer"
-              >
-                {showKey ? (
-                  <EyeOffIcon className="w-3.5 h-3.5" />
-                ) : (
-                  <EyeIcon className="w-3.5 h-3.5" />
-                )}
-              </button>
-            </div>
-            <p className="mt-1 text-[11px] text-ink-faint">
-              用<b>推理（数据面）</b>的 API Key。各家控制台的 AK/SK（Access Key / Secret Key）是
-              管理面签名用的，填进来会报 <code>AuthenticationError</code>。方舟的 API Key 约 36
-              字符；粘进来一百多字符的多半是填错了。
-            </p>
-            <p className="mt-1 text-[11px] text-amber-700">
-              注：出于安全，已保存的 Key <b>不会回填</b>到这个输入框（框里是空的属正常）。上方状态条
-              显示「已启用」就说明库里存着；要换 Key 直接填新的覆盖即可。
-            </p>
-          </div>
-          <div>
-            <label className="block text-xs font-semibold text-ink-soft mb-1.5">
-              API Base（OpenAI 兼容端点）
-            </label>
-            {/* 厂商预设：免得管理员去翻各家文档找兼容端点地址 */}
-            <div className="flex flex-wrap gap-1.5 mb-1.5">
-              {VISION_VENDOR_PRESETS.map((v) => (
-                <button
-                  key={v.label}
-                  type="button"
-                  title={v.hint}
-                  onClick={() => setBaseUrl(v.baseUrl)}
-                  className={
-                    "text-[11px] px-2 py-1 rounded-md border transition-all cursor-pointer " +
-                    (baseUrl.replace(/\/+$/, "") === v.baseUrl
-                      ? "bg-sky-500 text-white border-sky-500"
-                      : "border-rule text-ink-soft hover:border-sky-400 hover:text-sky-700")
-                  }
-                >
-                  {v.label}
-                </button>
-              ))}
-            </div>
-            <input
-              value={baseUrl}
-              onChange={(e) => setBaseUrl(e.target.value)}
-              placeholder={SECOND_OPINION_BASE_PLACEHOLDER}
-              className="w-full px-3 py-2 text-xs rounded-lg border border-rule bg-background font-mono focus:outline-none focus:border-sky-400 transition-colors"
-            />
-            <p className="mt-1 text-[11px] text-ink-faint">
-              点上方预设一键填入，也可手填任意 OpenAI 兼容端点。留空即用{" "}
-              {SECOND_OPINION_BASE_PLACEHOLDER}。
-            </p>
-          </div>
-
-          {/* 拉取 + 实测：目录里有 ≠ 你的账号能调用，所以每个候选都真发一次请求验证 */}
-          <div>
-            <div className="flex items-center gap-2 mb-1.5">
-              <label className="block text-xs font-semibold text-ink-soft">模型</label>
-              <button
-                type="button"
-                onClick={() => modelsMutation.mutate()}
-                disabled={modelsMutation.isPending}
-                className="text-[11px] px-2 py-1 rounded-md border border-sky-400 text-sky-700 hover:bg-sky-500 hover:text-white transition-all cursor-pointer disabled:opacity-50"
-              >
-                {modelsMutation.isPending ? "拉取并实测中…" : "拉取可用模型"}
-              </button>
-            </div>
-
-            {modelList && (
-              <div className="mb-2 p-2.5 rounded-lg border border-rule bg-background space-y-2">
-                <p className="text-[11px] text-ink-soft leading-relaxed">{modelList.hint}</p>
-                {modelList.models.length > 0 && (
-                  <div className="max-h-48 overflow-y-auto space-y-1">
-                    {modelList.models.map((m) => (
-                      <button
-                        key={m.id}
-                        type="button"
-                        disabled={!m.callable}
-                        onClick={() => setModel(m.id)}
-                        className={
-                          "w-full text-left px-2 py-1.5 rounded-md text-[11px] font-mono transition-all " +
-                          (m.callable
-                            ? model === m.id
-                              ? "bg-sky-500 text-white cursor-pointer"
-                              : "border border-emerald-500/40 bg-emerald-500/5 text-emerald-800 hover:bg-emerald-500/15 cursor-pointer"
-                            : "border border-rule/50 text-ink-faint line-through cursor-not-allowed opacity-60")
-                        }
-                      >
-                        {m.callable ? "✅" : "❌"} {m.id}
-                        <span className="not-italic font-sans ml-1 opacity-75">（{m.note}）</span>
-                      </button>
-                    ))}
-                  </div>
-                )}
-              </div>
-            )}
-
-            <input
-              value={model}
-              onChange={(e) => setModel(e.target.value)}
-              placeholder="点上方绿色项选用，或手填 ep-2025xxxx-xxxxx"
-              className="w-full px-3 py-2 text-xs rounded-lg border border-rule bg-background font-mono focus:outline-none focus:border-sky-400 transition-colors"
-            />
-            <p className="mt-1 text-[11px] text-ink-faint">
-              必须是<b>多模态（视觉）</b>模型，纯文本模型无法复核照片。
-              <b>推理接入点（ep-…）不会出现在上面的列表里</b>（那是模型目录，接入点要用控制台权限才能列出），
-              自己创建的接入点请手动粘贴到这个框。
-            </p>
-          </div>
-          <div className="flex gap-2">
-            <button
-              onClick={() => saveMutation.mutate()}
-              disabled={saveMutation.isPending}
-              className="flex-1 py-2 text-xs font-bold rounded-lg bg-sky-500 text-white hover:bg-sky-600 transition-all cursor-pointer disabled:opacity-60"
-            >
-              {saveMutation.isPending ? "保存中…" : "保存并全站启用"}
-            </button>
-            <button
-              onClick={() => setIsOpen(false)}
-              className="px-4 py-2 text-xs rounded-lg border border-rule text-ink-soft hover:bg-paper-deep transition-all cursor-pointer"
-            >
-              取消
-            </button>
-          </div>
-        </div>
-      )}
+      {/* 配置表单与「AI 模型」「小P蛙」两个控制台共用同一套「优先调用序列」机制。
+          上面的启用状态是复核模型独有的，保留在这里；引擎自检已上移到三重奏栏末尾。 */}
+      <ModelQueueConsole
+        consoleId="second_opinion"
+        visionProbe
+        title="疑似复核模型 · 优先调用序列"
+        openLabel="配置复核模型"
+        intro={
+          <p className="text-[11px] text-ink-faint leading-relaxed">
+            这个模型承担<b>两个角色</b>：①<b>疑似复核</b>——识别判为「疑似」时先让它独立复核，
+            有把握就直接出确诊卡、<b>跳过补拍</b>；②<b>顶替 Pl@ntNet</b>——Pl@ntNet 每日免费额度
+            用尽后由它承担一线专业定种。必须是<b>多模态（视觉）</b>模型，纯文本模型无法复核照片。
+          </p>
+        }
+      />
     </div>
   );
 }
 
 // ── Admin Model Panel ────────────────────────────────────────────────────────
 
-function AdminModelPanel() {
-  const qc = useQueryClient();
-  const [isOpen, setIsOpen] = useState(false); // 默认折叠（点「修改配置」展开）
-  const [provider, setProvider] = useState<Provider>("gemini");
-  // One input PER key — clearer than a single comma-separated field (which was easy
-  // to mistype). Joined with "," only at save/fetch time; the server pools them.
-  const [keys, setKeys] = useState<string[]>([""]);
-  const joinedKey = keys
-    .map((k) => k.trim())
-    .filter(Boolean)
-    .join(",");
-  const [model, setModel] = useState("gemini-3-flash-preview");
-  const [customModel, setCustomModel] = useState("");
-  const [baseUrl, setBaseUrl] = useState("https://api.openai.com/v1");
-  const [showKey, setShowKey] = useState(true); // owner 需看到完整 key 来拖动排序，默认显示
-  // Live-fetched model IDs (from the key's real list-models endpoint). Overrides
-  // the static presets so a new-format key can pick a model that actually exists.
-  const [fetchedModels, setFetchedModels] = useState<string[]>([]);
-  const [fetching, setFetching] = useState(false);
+// ── 模型配置总开关 ───────────────────────────────────────────────────────────
+// 识别页原本平铺着五块管理员面板，等于每次进来都要先滚过一屏配置才能拍照。
+// 现在全部收进一个「配置 AI 模型」按钮，默认收起。
 
-  const saveFn = useServerFn(saveAiConfigFn);
-  const getFn = useServerFn(getAiConfigFn);
-  const clearFn = useServerFn(clearAiConfigFn);
-  const listFn = useServerFn(listProviderModelsFn);
-
-  // Load current active config from server
-  const { data: activeConfig, isLoading } = useQuery({
-    queryKey: ["ai-config"],
-    queryFn: () => getFn({ data: undefined }),
-    retry: false,
-  });
-
-  // Seed the editable form from the saved config (once) so the owner sees ALL
-  // configured keys + the current model/provider/baseUrl and can drag-reorder key
-  // priority, rather than starting from a blank form. Keys come back in full from the
-  // admin-only getter; shown in plain text (showKey defaults on).
-  const seededRef = useRef(false);
-  useEffect(() => {
-    if (seededRef.current || !activeConfig) return;
-    seededRef.current = true;
-    setProvider(activeConfig.provider as Provider);
-    const savedKeys = (activeConfig.apiKeys ?? []).filter(Boolean);
-    if (savedKeys.length) setKeys(savedKeys);
-    if (activeConfig.model) setModel(activeConfig.model);
-    if (activeConfig.baseUrl) setBaseUrl(activeConfig.baseUrl);
-  }, [activeConfig]);
-
-  const saveMutation = useMutation({
-    mutationFn: async () => {
-      const effectiveModel = customModel.trim() || model;
-      if (!joinedKey) throw new Error("请至少填写一个 API Key");
-      if (!effectiveModel) throw new Error("请选择或填写模型名称");
-      const meta = PROVIDERS.find((p) => p.id === provider)!;
-      if (meta.needsBaseUrl && !baseUrl.trim()) throw new Error("请填写 API Base URL");
-
-      await saveFn({
-        data: {
-          provider,
-          // Each field is one key; join with "," so the server pools them (Gemini
-          // rotates across the pool on 429). The server re-sanitizes as a safety net.
-          apiKey: joinedKey,
-          model: effectiveModel,
-          baseUrl: meta.needsBaseUrl ? baseUrl.trim().replace(/\/+$/, "") : "",
-        },
-      });
-    },
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["ai-config"] });
-      toast.success("✅ AI 配置已保存，全站生效（包括手机端访客）");
-      setIsOpen(false);
-      setKeys([""]);
-    },
-    onError: (e: Error) => toast.error(e.message),
-  });
-
-  const clearMutation = useMutation({
-    mutationFn: () => clearFn({ data: undefined }),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["ai-config"] });
-      toast.success("已恢复默认 AI 配置（使用 .env 中的 Key）");
-    },
-    onError: (e: Error) => toast.error(e.message),
-  });
-
-  const meta = PROVIDERS.find((p) => p.id === provider)!;
-  const effectiveModel = customModel.trim() || model;
-  // Real model list if fetched, else the (possibly stale) presets.
-  const optionModels = fetchedModels.length > 0 ? fetchedModels : meta.models;
-
-  const handleProviderChange = (p: Provider) => {
-    const m = PROVIDERS.find((x) => x.id === p)!;
-    setProvider(p);
-    setModel(m.defaultModel);
-    setCustomModel("");
-    setFetchedModels([]);
-    if (p === "openai") setBaseUrl("https://api.openai.com/v1");
-    else if (p === "anthropic") setBaseUrl("https://api.anthropic.com/v1");
-    else if (p === "custom") setBaseUrl("");
-  };
-
-  // Live-list the models THIS key can actually call — the reliable way to pick a
-  // model that isn't deprecated for the key's project (e.g. a new-format key can't
-  // use gemini-2.5-flash; this surfaces the model names it *can* use).
-  const fetchModels = async () => {
-    if (!joinedKey) return toast.error("请先填写 API Key，再拉取可用模型");
-    if (meta.needsBaseUrl && !baseUrl.trim()) return toast.error("请先填写 API Base URL");
-    setFetching(true);
-    try {
-      const res = (await listFn({
-        data: {
-          provider,
-          apiKey: joinedKey,
-          baseUrl: meta.needsBaseUrl ? baseUrl.trim().replace(/\/+$/, "") : "",
-        },
-      })) as { models: string[] };
-      if (!res.models.length) return toast.error("没有拉取到可用模型（key 或接口可能不对）");
-      setFetchedModels(res.models);
-      if (!res.models.includes(effectiveModel)) {
-        setModel(res.models[0]);
-        setCustomModel("");
-      }
-      toast.success(`已拉取 ${res.models.length} 个可用模型`);
-    } catch (e) {
-      toast.error((e as Error).message);
-    } finally {
-      setFetching(false);
-    }
-  };
-
-  const providerLabel = (id: string) => PROVIDERS.find((p) => p.id === id)?.label ?? id;
-  const providerIcon = (id: string) => PROVIDERS.find((p) => p.id === id)?.icon ?? "🤖";
-
+/**
+ * 「识别复核出卡AI三重奏」—— 拍一张照片到出分享卡，全程只由这三块决定，
+ * 所以它们必须放在一起看、一起调，且排在配置区第一位。
+ *
+ * 三重奏 = ① Pl@ntNet（专业定种引擎）② 疑似复核视觉模型（顶一线 + 复核）
+ *          ③ 出卡AI（写出简介摘要卡 / 分享卡）。
+ * 「草稿生成」「小P蛙」不在此列 —— 它们是出卡**之后**的事，慢一点无所谓，
+ * 把它们混进来正是之前调参调乱的原因。
+ *
+ * ③ 以前直接借用「AI 模型控制台」，导致「一线出卡」和「其它杂项」共用一套配置、
+ * 动一个必然影响另一个。现在它有了自己的控制台（consoleId="card"），
+ * 「AI 模型控制台」已移出本折叠栏、降级为兜底 + 批量导入元数据提取。
+ */
+function IdentifyTrioSection() {
+  const [open, setOpen] = useState(true);
   return (
-    <div className="mb-6 animate-in fade-in slide-in-from-top-2 duration-300">
-      {/* Header row */}
-      <div className="flex items-center gap-3 mb-2">
-        <span className="text-[11px] font-semibold tracking-widest uppercase text-ink-faint">
-          管理员 · AI 模型控制台
-        </span>
-        <div className="flex-1 h-px bg-rule/50" />
-        {isLoading ? (
-          <span className="text-[11px] text-ink-faint">加载中…</span>
-        ) : activeConfig ? (
-          <span className="inline-flex items-center gap-1.5 text-[11px] font-semibold px-2.5 py-1 rounded-full bg-emerald-500/10 text-emerald-600 border border-emerald-500/25">
-            <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
-            {providerIcon(activeConfig.provider)} {providerLabel(activeConfig.provider)} ·{" "}
-            {activeConfig.model}
-          </span>
-        ) : (
-          <span className="inline-flex items-center gap-1.5 text-[11px] text-ink-faint px-2.5 py-1 rounded-full border border-rule/50">
-            使用 .env 默认配置
-          </span>
-        )}
-      </div>
-
-      {/* Button row */}
-      <div className="flex items-center gap-2 flex-wrap">
-        <button
-          id="admin-model-panel-toggle"
-          onClick={() => setIsOpen((v) => !v)}
-          className="inline-flex items-center gap-2 text-xs font-medium px-3 py-1.5 rounded-lg border border-rule bg-paper hover:bg-ink hover:text-background transition-all cursor-pointer"
-        >
-          <WrenchIcon className="w-3.5 h-3.5" />
-          {isOpen ? "收起" : activeConfig ? "修改配置" : "配置模型"}
-        </button>
-
-        {activeConfig && (
-          <button
-            onClick={() => clearMutation.mutate()}
-            disabled={clearMutation.isPending}
-            className="inline-flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg border border-rule/60 text-ink-soft hover:border-destructive hover:text-destructive hover:bg-destructive/5 transition-all cursor-pointer disabled:opacity-50"
-          >
-            <XCircleIcon className="w-3.5 h-3.5" />
-            {clearMutation.isPending ? "清除中…" : "恢复 .env 默认"}
-          </button>
-        )}
-
-        {activeConfig && (
-          <span className="text-[11px] text-ink-faint break-all min-w-0">
-            Key：{activeConfig.apiKeyMasked}
-          </span>
-        )}
-      </div>
-
-      {/* Expanded panel */}
-      {isOpen && (
-        <div className="mt-3 p-4 rounded-2xl border border-amber-500/30 bg-amber-500/5 space-y-4 animate-in fade-in slide-in-from-top-1 duration-200">
-          {/* Notice */}
-          <div className="flex gap-2 p-2.5 rounded-lg bg-amber-50 border border-amber-200 text-[11px] text-amber-800 leading-relaxed">
-            <span>🌐</span>
-            <span>
-              保存后全站立即生效——所有用户（含手机端访客）的 AI 识别都将使用您选择的模型。
-            </span>
-          </div>
-
-          {/* Provider tabs */}
-          <div>
-            <label className="block text-xs font-semibold text-ink-soft mb-2">AI 服务商</label>
-            <div className="grid grid-cols-2 gap-2">
-              {PROVIDERS.map((p) => (
-                <button
-                  key={p.id}
-                  onClick={() => handleProviderChange(p.id)}
-                  className={`py-2 px-3 rounded-lg text-xs font-bold border transition-all cursor-pointer text-left ${
-                    provider === p.id
-                      ? "bg-ink text-background border-ink"
-                      : "bg-paper text-ink-soft border-rule hover:border-ink/50"
-                  }`}
-                >
-                  {p.icon} {p.label}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          {/* API Key(s) — one input per key, add/remove rows, drag to reorder priority. */}
-          <div>
-            <div className="flex items-center justify-between mb-1.5">
-              <label className="block text-xs font-semibold text-ink-soft">
-                API Key（可加多个，拖动调整优先级）
-              </label>
-              <button
-                type="button"
-                onClick={() => setShowKey((v) => !v)}
-                className="text-[11px] text-ink-faint hover:text-ink transition-colors cursor-pointer inline-flex items-center gap-1"
-              >
-                {showKey ? (
-                  <EyeOffIcon className="w-3.5 h-3.5" />
-                ) : (
-                  <EyeIcon className="w-3.5 h-3.5" />
-                )}
-                {showKey ? "隐藏" : "显示"}
-              </button>
-            </div>
-            <div className="space-y-2">
-              {keys.map((k, i) => (
-                <div
-                  key={i}
-                  draggable={keys.length > 1}
-                  onDragStart={(e) => {
-                    e.dataTransfer.effectAllowed = "move";
-                    e.dataTransfer.setData("text/plain", String(i));
-                    (e.currentTarget as HTMLElement).style.opacity = "0.5";
-                  }}
-                  onDragEnd={(e) => {
-                    (e.currentTarget as HTMLElement).style.opacity = "1";
-                  }}
-                  onDragOver={(e) => {
-                    e.preventDefault();
-                    e.dataTransfer.dropEffect = "move";
-                  }}
-                  onDrop={(e) => {
-                    e.preventDefault();
-                    const fromIndex = parseInt(e.dataTransfer.getData("text/plain"), 10);
-                    const toIndex = i;
-                    if (fromIndex !== toIndex) {
-                      setKeys((arr) => {
-                        const newArr = [...arr];
-                        const [moved] = newArr.splice(fromIndex, 1);
-                        newArr.splice(toIndex, 0, moved);
-                        return newArr;
-                      });
-                    }
-                  }}
-                  className={`flex items-center gap-2 ${keys.length > 1 ? "cursor-move" : ""} group`}
-                >
-                  {keys.length > 1 && (
-                    <div
-                      className="shrink-0 text-ink-faint group-hover:text-ink transition-colors"
-                      title="拖动调整优先级"
-                    >
-                      <svg
-                        className="w-4 h-4"
-                        fill="none"
-                        stroke="currentColor"
-                        viewBox="0 0 24 24"
-                      >
-                        <path
-                          strokeLinecap="round"
-                          strokeLinejoin="round"
-                          strokeWidth={2}
-                          d="M4 8h16M4 16h16"
-                        />
-                      </svg>
-                    </div>
-                  )}
-                  <input
-                    type={showKey ? "text" : "password"}
-                    value={k}
-                    onChange={(e) =>
-                      setKeys((arr) => arr.map((x, j) => (j === i ? e.target.value : x)))
-                    }
-                    placeholder={`${meta.placeholder}${keys.length > 1 ? `（优先级 ${i + 1}）` : ""}`}
-                    className="flex-1 min-w-0 px-3 py-2 text-xs rounded-lg border border-rule bg-background font-mono focus:outline-none focus:border-amber-400 transition-colors"
-                  />
-                  {keys.length > 1 && (
-                    <button
-                      type="button"
-                      onClick={() => setKeys((arr) => arr.filter((_, j) => j !== i))}
-                      title="移除这个 key"
-                      className="shrink-0 w-7 h-7 rounded-lg border border-rule text-ink-faint hover:border-destructive hover:text-destructive transition-colors cursor-pointer inline-flex items-center justify-center"
-                    >
-                      ×
-                    </button>
-                  )}
-                </div>
-              ))}
-            </div>
-            <button
-              type="button"
-              onClick={() => setKeys((arr) => [...arr, ""])}
-              className="mt-2 text-[11px] text-amber-700 hover:text-amber-800 font-medium cursor-pointer inline-flex items-center gap-1"
-            >
-              ＋ 再加一个 API Key
-            </button>
-            <p className="mt-1.5 text-[11px] text-ink-faint leading-relaxed">
-              ⚠️ Key 完整显示在此页面，请注意屏幕分享时遮挡。Key 加密存储在服务端。 多个 key
-              按顺序优先使用；Gemini
-              限流时（429）自动换下一个，OpenAI/Anthropic/自定义接口也支持轮换。
-            </p>
-          </div>
-
-          {/* Base URL (only for providers that need it) — filled BEFORE fetching models. */}
-          {meta.needsBaseUrl ? (
-            <div>
-              <label className="block text-xs font-semibold text-ink-soft mb-1.5">
-                API Base URL
-                <span className="ml-1.5 font-normal text-ink-faint">
-                  （中转 / 代理 / 自定义接口）
-                </span>
-              </label>
-              <input
-                id="admin-ai-base-url"
-                type="text"
-                value={baseUrl}
-                onChange={(e) => setBaseUrl(e.target.value)}
-                placeholder="https://api.openai.com/v1"
-                className="w-full px-3 py-2 text-xs rounded-lg border border-rule bg-background font-mono focus:outline-none focus:border-amber-400 transition-colors"
-              />
-              <p className="mt-1 text-[11px] text-ink-faint leading-relaxed">
-                {provider === "openai"
-                  ? "OpenAI 官方填 https://api.openai.com/v1；中转填到 /v1 为止。系统请求 {BaseURL}/chat/completions。"
-                  : "OpenAI 兼容格式，填到 /v1 为止（例：https://你的中转域名/v1）。系统请求 {BaseURL}/chat/completions；兼容硅基流动 / One API / 通义 / DeepSeek 等。"}
-              </p>
-            </div>
-          ) : (
-            <p className="text-[11px] text-ink-faint leading-relaxed">
-              {provider === "gemini"
-                ? "Gemini 无需填 Base URL（走 Google 官方 generativelanguage.googleapis.com）。填好 Key 后点下方「拉取可用模型」。"
-                : "Anthropic 无需填 Base URL（走官方 api.anthropic.com）。填好 Key 后点下方「拉取可用模型」。"}
-            </p>
-          )}
-
-          {/* Model — placed AFTER Base URL, with a live Fetch to auto-detect real models. */}
-          <div>
-            <div className="flex items-center justify-between mb-1.5">
-              <label className="block text-xs font-semibold text-ink-soft">模型</label>
-              <button
-                type="button"
-                onClick={fetchModels}
-                disabled={fetching}
-                title="用上面的 Key / Base URL 向服务商拉取你实际可用的模型列表"
-                className="inline-flex items-center gap-1 text-[11px] px-2 py-1 rounded-md border border-amber-400/60 text-amber-700 hover:bg-amber-500 hover:text-white transition-all cursor-pointer disabled:opacity-50"
-              >
-                {fetching ? "拉取中…" : "拉取可用模型"}
-              </button>
-            </div>
-            {optionModels.length > 0 ? (
-              <select
-                id="admin-ai-model-select"
-                value={customModel ? "__custom__" : model}
-                onChange={(e) => {
-                  if (e.target.value === "__custom__") {
-                    setCustomModel(" ");
-                  } else {
-                    setModel(e.target.value);
-                    setCustomModel("");
-                  }
-                }}
-                className="w-full px-3 py-2 text-xs rounded-lg border border-rule bg-background focus:outline-none focus:border-amber-400 transition-colors cursor-pointer"
-              >
-                {optionModels.map((m) => (
-                  <option key={m} value={m}>
-                    {m}
-                  </option>
-                ))}
-                <option value="__custom__">✏️ 手动输入其他模型名…</option>
-              </select>
-            ) : null}
-            {(optionModels.length === 0 || customModel !== "") && (
-              <input
-                id="admin-ai-model-custom"
-                type="text"
-                value={customModel.trim() || model}
-                onChange={(e) => setCustomModel(e.target.value)}
-                placeholder="例：deepseek-vision / qwen-vl-plus"
-                className="mt-1.5 w-full px-3 py-2 text-xs rounded-lg border border-rule bg-background font-mono focus:outline-none focus:border-amber-400 transition-colors"
-              />
-            )}
-            {fetchedModels.length > 0 && (
-              <p className="mt-1 text-[11px] text-emerald-600">
-                ✓ 已按你的 Key 列出 {fetchedModels.length} 个可用模型，请从中选一个
-              </p>
-            )}
-            <p className="mt-1 text-[11px] text-ink-faint leading-relaxed">
-              旧模型名（如 gemini-2.5-flash）对新申请的 key 可能已停用而报
-              404。点「拉取可用模型」按你的 key 列出真实可用的模型再选。
-            </p>
-          </div>
-
-          {/* Preview */}
-          <div className="p-2.5 rounded-lg bg-background border border-rule/50 text-[11px] text-ink-soft font-mono">
-            Provider: <strong>{provider}</strong> &nbsp;|&nbsp; Model:{" "}
-            <strong>{effectiveModel || "（未填）"}</strong>
-            {meta.needsBaseUrl && baseUrl && (
-              <>
-                {" "}
-                &nbsp;|&nbsp; URL: <strong>{baseUrl}</strong>
-              </>
-            )}
-          </div>
-
-          {/* Actions */}
-          <div className="flex gap-2">
-            <button
-              id="admin-model-save-btn"
-              onClick={() => saveMutation.mutate()}
-              disabled={saveMutation.isPending}
-              className="flex-1 py-2 text-xs font-bold rounded-lg bg-amber-500 text-white hover:bg-amber-600 transition-all cursor-pointer disabled:opacity-60"
-            >
-              {saveMutation.isPending ? "保存中…" : "保存并全站生效"}
-            </button>
-            <button
-              onClick={() => setIsOpen(false)}
-              className="px-4 py-2 text-xs rounded-lg border border-rule text-ink-soft hover:bg-paper-deep transition-all cursor-pointer"
-            >
-              取消
-            </button>
-          </div>
+    <div className="mb-4 rounded-xl border border-leaf-deep/30 bg-leaf-deep/[0.03]">
+      <button
+        onClick={() => setOpen((v) => !v)}
+        className="w-full flex items-center gap-2 px-3 py-2.5 text-xs font-semibold text-left cursor-pointer"
+      >
+        <LeafIcon className="w-3.5 h-3.5 text-leaf-deep" />
+        识别复核出卡AI三重奏
+        <span className="ml-auto opacity-60 font-normal">{open ? "▲ 收起" : "▼ 展开"}</span>
+      </button>
+      {open && (
+        <div className="px-3 pb-3 animate-in fade-in slide-in-from-top-1 duration-200">
+          <p className="text-[11px] text-ink-faint leading-relaxed mb-3">
+            <b>这三块决定「拍照 → 出简介摘要卡 / 分享卡」的全部速度与准确度</b>，请只在这里调它们：
+            ①<b>Pl@ntNet</b> 专业定种打头阵 → ②<b>疑似复核视觉模型</b>（Pl@ntNet 拿不到结果时顶一线，
+            识别判「疑似」时二次判定）→ ③<b>出卡AI</b> 写卡。
+            <br />
+            ⚠️ 快速出卡那条链路<b>只会调用序列里的 Gemini 项</b>，其它厂商（Kimi 等）在这条链路上会被
+            跳过；把它们放进来只会在 Gemini 全部失效时才顶上，那一次必然又慢又贵。想用 Kimi 写长文，
+            请配到下面的<b>「草稿生成模型控制台」</b>。
+          </p>
+          <PlantNetPanel />
+          <SecondOpinionPanel />
+          <CardModelPanel />
+          <EngineSelfTestPanel />
         </div>
       )}
     </div>
   );
 }
 
-// ── Page ─────────────────────────────────────────────────────────────────────
+function AdminModelHub() {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="mb-6">
+      <button
+        onClick={() => setOpen((v) => !v)}
+        className="inline-flex items-center gap-2 text-xs font-medium px-3 py-1.5 rounded-lg border border-rule bg-paper hover:bg-ink hover:text-background transition-all cursor-pointer"
+      >
+        <WrenchIcon className="w-3.5 h-3.5" />
+        配置 AI 模型
+        <span className="opacity-60">{open ? "▲ 收起" : "▼ 展开"}</span>
+      </button>
+      {open && (
+        <div className="mt-3 border border-rule rounded-md p-4 bg-paper/40 space-y-2 animate-in fade-in slide-in-from-top-1 duration-200">
+          <p className="text-[11px] text-ink-faint leading-relaxed mb-2">
+            最上面的<b>三重奏</b>负责「拍照 → 出卡」这条一线链路；下面几块管的是出卡之后、
+            或与出卡无关的事：<b>草稿生成</b>写整份科普草稿、<b>小P蛙</b>负责对话与改写、
+            <b>AI 模型控制台</b>只兜底剩下的杂项。
+            每套都可配「优先调用序列」，前一个失败自动顺位。
+            <br />
+            最后一块<b>金叶详页 · 创作指导 Skill</b> 管的不是「用哪个模型」而是「按什么章法写」——
+            粘一份 skill 进去，金叶详页就按它写，版本号会署在详页页尾。
+          </p>
+          <IdentifyTrioSection />
+          <AdminModelPanel />
+          <EnrichModelPanel />
+          <XiaoPModelPanel />
+          {/* 金叶详页只有「怎么写」可配，模型走小P蛙序列，所以它排在模型控制台之后。 */}
+          <GoldSkillPanel />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function EnrichModelPanel() {
+  return (
+    <ModelQueueConsole
+      consoleId="enrich"
+      visionProbe
+      title="管理员 · 草稿生成模型控制台"
+      titleIcon={<WrenchIcon className="w-3.5 h-3.5" />}
+      openLabel="配置草稿生成模型"
+      intro={
+        <p className="text-[11px] text-ink-faint leading-relaxed">
+          点「进一步生成草稿」时写整份中英双语科普草稿的模型。它和一线识别的诉求不同 —— 识别要
+          <b>快</b>、要便宜；写草稿要<b>长文能力</b>、能容忍慢，所以单独配一套。
+          <b>留空则自动沿用「AI 模型控制台」的序列</b>，不配也不会坏。
+        </p>
+      }
+    />
+  );
+}
+
+/** 三重奏第三块：拍照之后写出简介摘要卡 / 分享卡的模型。 */
+function CardModelPanel() {
+  return (
+    <ModelQueueConsole
+      consoleId="card"
+      visionProbe
+      title="出卡AI"
+      titleIcon={<WrenchIcon className="w-3.5 h-3.5" />}
+      openLabel="配置出卡AI"
+      intro={
+        <p className="text-[11px] text-ink-faint leading-relaxed">
+          拍照后<b>写出简介摘要卡 / 分享卡</b>的模型，三重奏的第三棒。保存后
+          <b>全站立即生效</b> —— 所有用户（含手机端访客）出卡都走这里配置的序列。
+          <br />
+          <b>留空则自动沿用「AI 模型控制台」的序列</b>，所以不配也不会坏；想把出卡单独调快、
+          调便宜，再来这里配。
+        </p>
+      }
+    />
+  );
+}
+
+/**
+ * 兜底控制台。出卡 / 草稿生成 / 疑似复核 / 小P蛙 都已各自独立，这里只剩两件事，
+ * 说明文案必须写清楚 —— 否则管理员会以为改这里能调识别，白折腾。
+ */
+function AdminModelPanel() {
+  return (
+    <ModelQueueConsole
+      consoleId="ai"
+      visionProbe
+      title="管理员 · AI 模型控制台（兜底）"
+      titleIcon={<WrenchIcon className="w-3.5 h-3.5" />}
+      intro={
+        <p className="text-[11px] text-ink-faint leading-relaxed">
+          <b>不负责一线出卡</b>（那是上面三重奏里的「出卡AI」）。拆分之后它只管两件事：
+          <br />①<b>批量导入条目时从 HTML 提取元数据</b>（管理后台「批量添加条目」的识别按钮，
+          Gemini 专用，会把序列里所有 Gemini key 当轮换池用）；
+          <br />②<b>兜底</b> —— 「出卡AI」「草稿生成模型」留空时，自动回退到这里的序列。
+          <br />
+          所以这里建议始终配一套<b>可用的通用 Gemini 序列</b>，别清空。
+        </p>
+      }
+    />
+  );
+}
 
 function IdentifyPage() {
   const { user } = useAuth();
@@ -1117,15 +763,9 @@ function IdentifyPage() {
           </p>
         </header>
 
-        {/* Admin-only model switcher — visible only to admin role */}
-        {isAdmin && <AdminModelPanel />}
-
-        {/* Admin-only professional plant-ID engine (Pl@ntNet) */}
-        {isAdmin && <PlantNetPanel />}
-        {isAdmin && <SecondOpinionPanel />}
-
-        {/* Admin-only 小P蛙 agent model config */}
-        {isAdmin && <XiaoPModelPanel />}
+        {/* 所有模型配置收进一个开关 —— 五块面板平铺在识别页顶上，把「拍照」这个
+            主任务挤到了折叠线以下。默认收起，要调再展开。 */}
+        {isAdmin && <AdminModelHub />}
 
         <CameraIdentify retake={retakeCtx} />
 
@@ -1178,6 +818,123 @@ function IdentifyPage() {
 
 // ── Admin Usage Panel ─────────────────────────────────────────────────────────
 
+// ── 用量总览 ─────────────────────────────────────────────────────────────────
+// 原来只有四张「总次数 / 总 token」的卡，看不出钱花在哪。这里回答三个问题：
+// ① 输入还是输出吃掉的？② 哪个环节吃的？③ 最近在涨还是在降？
+
+const TASK_LABELS: Record<string, string> = {
+  enrich_draft: "生成完整草稿",
+  quick_identify: "快速识别出卡",
+  identify: "识别",
+  second_opinion: "疑似复核",
+  xiaop: "小P蛙对话",
+  unknown: "未标注",
+};
+
+function UsageBar({ input, output }: { input: number; output: number }) {
+  const total = input + output;
+  if (!total) return null;
+  const ip = (input / total) * 100;
+  return (
+    <div className="flex h-2 w-full overflow-hidden rounded-full bg-paper-deep">
+      <div className="bg-vermilion" style={{ width: `${ip}%` }} title={`输入 ${input}`} />
+      <div className="bg-leaf-deep" style={{ width: `${100 - ip}%` }} title={`输出 ${output}`} />
+    </div>
+  );
+}
+
+function UsageOverview({ stats }: { stats: any }) {
+  const fmtN = (n: number) =>
+    n >= 1e6 ? `${(n / 1e6).toFixed(2)}M` : n >= 1e3 ? `${(n / 1e3).toFixed(1)}k` : String(n);
+  const pct = (a: number, b: number) => (b ? Math.round((a / b) * 100) : 0);
+  const tasks = Object.entries(stats.by_task ?? {})
+    .map(([k, v]: any) => ({ key: k, ...v }))
+    .sort((a, b) => b.tokens - a.tokens);
+  const maxTask = tasks[0]?.tokens || 1;
+
+  return (
+    <div className="mb-6 space-y-4">
+      {/* 三个时间窗：一眼看出最近在涨还是在降 */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+        {[
+          { label: "近 24 小时", d: stats.window?.d1 },
+          { label: "近 7 天", d: stats.window?.d7 },
+          { label: "近 30 天", d: stats.window?.d30 },
+          {
+            label: "累计",
+            d: {
+              calls: stats.total_calls,
+              tokens: stats.total_tokens,
+              input: stats.total_input,
+              output: stats.total_output,
+            },
+          },
+        ].map(({ label, d }) => (
+          <div key={label} className="p-3 rounded-xl border border-rule bg-paper/60">
+            <p className="text-[11px] text-ink-faint">{label}</p>
+            <p className="text-2xl font-bold font-mono text-vermilion leading-tight">
+              {fmtN(d?.tokens ?? 0)}
+            </p>
+            <p className="text-[10px] text-ink-faint">tokens · {d?.calls ?? 0} 次调用</p>
+            <div className="mt-1.5">
+              <UsageBar input={d?.input ?? 0} output={d?.output ?? 0} />
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {/* 输入 / 输出构成 —— token 账单的大头几乎总是输入（每次都要塞照片 + 长 prompt） */}
+      <div className="p-3 rounded-xl border border-rule bg-paper/60">
+        <div className="flex items-baseline justify-between mb-2">
+          <p className="text-[11px] font-semibold">Token 消耗构成</p>
+          <p className="text-[10px] text-ink-faint">
+            单次均耗 {fmtN(Math.round(stats.total_tokens / Math.max(stats.total_calls, 1)))} tokens
+          </p>
+        </div>
+        <UsageBar input={stats.total_input} output={stats.total_output} />
+        <div className="flex gap-4 mt-2 text-[11px]">
+          <span className="inline-flex items-center gap-1.5">
+            <span className="w-2.5 h-2.5 rounded-sm bg-vermilion inline-block" />
+            输入 {fmtN(stats.total_input)}（{pct(stats.total_input, stats.total_tokens)}%）
+            <span className="text-ink-faint">照片 + prompt</span>
+          </span>
+          <span className="inline-flex items-center gap-1.5">
+            <span className="w-2.5 h-2.5 rounded-sm bg-leaf-deep inline-block" />
+            输出 {fmtN(stats.total_output)}（{pct(stats.total_output, stats.total_tokens)}%）
+            <span className="text-ink-faint">生成的正文</span>
+          </span>
+        </div>
+      </div>
+
+      {/* 按环节拆：到底是识别费还是写草稿费 */}
+      {tasks.length > 0 && (
+        <div className="p-3 rounded-xl border border-rule bg-paper/60">
+          <p className="text-[11px] font-semibold mb-2">按环节拆分</p>
+          <div className="space-y-2">
+            {tasks.map((t) => (
+              <div key={t.key}>
+                <div className="flex items-baseline justify-between text-[11px]">
+                  <span className="font-medium">{TASK_LABELS[t.key] ?? t.key}</span>
+                  <span className="text-ink-faint font-mono">
+                    {fmtN(t.tokens)} tok · {t.calls} 次 · 均{" "}
+                    {fmtN(Math.round(t.tokens / Math.max(t.calls, 1)))}
+                  </span>
+                </div>
+                <div className="h-1.5 w-full rounded-full bg-paper-deep overflow-hidden mt-1">
+                  <div
+                    className="h-full bg-vermilion/70"
+                    style={{ width: `${Math.max((t.tokens / maxTask) * 100, 2)}%` }}
+                  />
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function AdminUsagePanel() {
   const fetchFn = useServerFn(fetchAiUsageFn);
   const [page, setPage] = useState(0);
@@ -1221,30 +978,8 @@ function AdminUsagePanel() {
         </button>
       </div>
 
-      {/* Summary stat cards */}
-      {data && (
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
-          <div className="p-3 rounded-xl border border-rule bg-paper/60 text-center">
-            <p className="text-2xl font-bold font-mono">{data.stats.total_calls}</p>
-            <p className="text-[11px] text-ink-faint mt-1">总识别次数</p>
-          </div>
-          <div className="p-3 rounded-xl border border-rule bg-paper/60 text-center">
-            <p className="text-2xl font-bold font-mono text-vermilion">
-              {fmt(data.stats.total_tokens)}
-            </p>
-            <p className="text-[11px] text-ink-faint mt-1">累计 Tokens</p>
-          </div>
-          {Object.entries(data.stats.by_provider)
-            .slice(0, 2)
-            .map(([p, s]) => (
-              <div key={p} className="p-3 rounded-xl border border-rule bg-paper/60 text-center">
-                <p className="text-2xl font-bold font-mono">{s.calls}</p>
-                <p className="text-[11px] text-ink-faint mt-1">{p} 调用</p>
-                <p className="text-[10px] text-ink-faint">{fmt(s.tokens)} tokens</p>
-              </div>
-            ))}
-        </div>
-      )}
+      {/* 用量总览：先回答「花了多少 / 花在哪 / 最近在涨吗」这三个问题 */}
+      {data && <UsageOverview stats={data.stats} />}
 
       {/* Model breakdown */}
       {data && Object.keys(data.stats.by_model).length > 0 && (

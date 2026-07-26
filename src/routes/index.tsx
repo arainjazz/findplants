@@ -7,7 +7,7 @@ import { useAuth } from "@/hooks/use-auth";
 import { supabase } from "@/integrations/supabase/client";
 import { toast } from "sonner";
 import { fetchAllCatalogs, fetchAllEntries, buildPlantMatcher, type RegionalCatalog, type CatalogEntry } from "@/lib/catalogs";
-import { fetchAllTags, fetchAllPlantTags, type TagWithCount } from "@/lib/tags";
+import { fetchAllTags, fetchTagMembership, type TagWithCount, type TagMembership } from "@/lib/tags";
 import { fetchPendingDrafts, type PlantDraft } from "@/lib/drafts";
 import { DraftCard } from "@/components/draft-card";
 import { useServerFn } from "@tanstack/react-start";
@@ -34,7 +34,12 @@ function HomePage() {
     queryFn: fetchAllPlants,
   });
   const { data: tags = [] } = useQuery({ queryKey: ["all-tags"], queryFn: fetchAllTags });
-  const { data: plantTags = [] } = useQuery({ queryKey: ["all-plant-tags"], queryFn: fetchAllPlantTags });
+  const { data: tagMembership = new Map<string, TagMembership>() } = useQuery({
+    queryKey: ["tag-membership"],
+    queryFn: () => fetchTagMembership(tags),
+    enabled: tags.length > 0,
+    staleTime: 60_000,
+  });
   const { data: blogPosts = [] } = useQuery({ queryKey: ["home-blog"], queryFn: fetchPublishedPosts });
   const editorColumnFn = useServerFn(fetchEditorColumnFn);
   const { data: editorColumn = [] } = useQuery({
@@ -145,7 +150,7 @@ function HomePage() {
         {tab === "regions" ? (
           <RegionsBrowser plants={allPlants} />
         ) : tab === "tags" ? (
-          <TagsBrowser tags={tags} plants={allPlants} plantTags={plantTags} />
+          <TagsBrowser tags={tags} plants={allPlants} membership={tagMembership} />
         ) : isLoading ? (
           <p className="text-ink-faint">载入中…</p>
         ) : !hero ? (
@@ -157,11 +162,12 @@ function HomePage() {
               <Link to="/plants/$slug" params={{ slug: hero.slug }} className="block group">
                 <div className="grid md:grid-cols-5 gap-8 items-start">
                   <div className="md:col-span-3 overflow-hidden border border-rule bg-paper-deep">
-                    {hero.cover_url ? (
-                      <img src={hero.cover_url} alt={hero.title} className="w-full h-auto block group-hover:scale-[1.02] transition-transform duration-700" />
-                    ) : (
-                      <div className="aspect-[4/3]"><PlantPattern /></div>
-                    )}
+                    <SafeImg
+                      src={hero.cover_url}
+                      alt={hero.title}
+                      className="w-full h-auto block group-hover:scale-[1.02] transition-transform duration-700"
+                      fallback={<div className="aspect-[4/3]"><PlantPattern /></div>}
+                    />
                   </div>
                   <div className="md:col-span-2 flex flex-col justify-center">
                     <p className="label text-vermilion mb-3">
@@ -215,11 +221,13 @@ function HomePage() {
                   {rest.map((p) => (
                     <Link key={p.id} to="/plants/$slug" params={{ slug: p.slug }} className="group block">
                       <div className="overflow-hidden border border-rule bg-paper-deep mb-2 aspect-square">
-                        {p.cover_url ? (
-                          <img src={p.cover_url} alt={p.title} className="w-full h-full object-cover group-hover:scale-[1.04] transition-transform duration-500" />
-                        ) : (
-                          <PlantPattern />
-                        )}
+                        <SafeImg
+                          src={p.cover_url}
+                          alt={p.title}
+                          loading="lazy"
+                          className="w-full h-full object-cover group-hover:scale-[1.04] transition-transform duration-500"
+                          fallback={<PlantPattern />}
+                        />
                       </div>
                       <h3 className="font-display text-sm sm:text-base font-semibold leading-tight line-clamp-2 group-hover:text-vermilion transition-colors">{p.title}</h3>
                       {p.scientific_name && <p className="italic text-[11px] text-ink-faint truncate">{p.scientific_name}</p>}
@@ -418,11 +426,13 @@ function PlantCard({
     <div>
       <Link to="/plants/$slug" params={{ slug: plant.slug }} className="group block">
         <div className="overflow-hidden border border-rule bg-paper-deep mb-4">
-          {plant.cover_url ? (
-            <img src={plant.cover_url} alt={plant.title} className="w-full h-auto block group-hover:scale-[1.03] transition-transform duration-500" />
-          ) : (
-            <div className="aspect-[4/3]"><PlantPattern /></div>
-          )}
+          <SafeImg
+            src={plant.cover_url}
+            alt={plant.title}
+            loading="lazy"
+            className="w-full h-auto block group-hover:scale-[1.03] transition-transform duration-500"
+            fallback={<div className="aspect-[4/3]"><PlantPattern /></div>}
+          />
         </div>
         {showComments && (
           <p className="label text-ink-faint mb-1">{plant.comments_count ?? 0} 评论</p>
@@ -498,11 +508,12 @@ function DraftsStrip({ drafts }: { drafts: PlantDraft[] }) {
 function TagsBrowser({
   tags,
   plants,
-  plantTags,
+  membership,
 }: {
   tags: TagWithCount[];
   plants: Plant[];
-  plantTags: { tag_id: string; plant_id: string }[];
+  /** 标签 → 挂着的条目/草稿。三源并集，见 lib/tags.ts `fetchTagMembership`。 */
+  membership: Map<string, TagMembership>;
 }) {
   const [open, setOpen] = useState<Record<string, boolean>>({});
   const plantById = useMemo(() => {
@@ -510,17 +521,21 @@ function TagsBrowser({
     for (const p of plants) m.set(p.id, p);
     return m;
   }, [plants]);
+  // 🔴 这里原来只数 `plant_tags` 关联表 —— 用户在识别卡上手动挂的标签写的是
+  // `plant_drafts.tags`，从不产生关联表的行，于是展开永远是空的、计数永远是 0。
   const byTag = useMemo(() => {
     const m = new Map<string, Plant[]>();
-    for (const pt of plantTags) {
-      const p = plantById.get(pt.plant_id);
-      if (!p) continue;
-      if (!m.has(pt.tag_id)) m.set(pt.tag_id, []);
-      m.get(pt.tag_id)!.push(p);
+    for (const [tagId, mem] of membership) {
+      const list: Plant[] = [];
+      for (const pid of mem.plantIds) {
+        const p = plantById.get(pid);
+        if (p) list.push(p);
+      }
+      list.sort((a, b) => a.title.localeCompare(b.title, "zh"));
+      m.set(tagId, list);
     }
-    for (const list of m.values()) list.sort((a, b) => a.title.localeCompare(b.title, "zh"));
     return m;
-  }, [plantTags, plantById]);
+  }, [membership, plantById]);
 
   if (tags.length === 0) {
     return (
@@ -546,6 +561,8 @@ function TagsBrowser({
               <h2 className="font-display text-xl font-semibold text-emerald-700">#{t.name}</h2>
               <span className="text-xs text-ink-faint">
                 · 已收录 {t.plant_count} / 共 {t.expected_count ?? t.plant_count}
+                {/* 待审草稿单列 —— 混进「已收录」会把没过审的算成成品。 */}
+                {t.draft_count > 0 && ` · 待审 ${t.draft_count}`}
               </span>
               {t.description && (
                 <span className="text-xs text-ink-faint truncate">· {t.description}</span>

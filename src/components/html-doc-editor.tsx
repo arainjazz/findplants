@@ -8,6 +8,7 @@ import {
   useState,
 } from "react";
 import { compressImage, extForMime } from "@/lib/image-compress";
+import { clearMissingOrganMarkers } from "@/lib/draft-enhance";
 import { createPortal } from "react-dom";
 import { FolderOpen, Clipboard, Link2, Globe, Pencil, ExternalLink, Trash2 } from "lucide-react";
 import { supabase } from "@/integrations/supabase/client";
@@ -201,6 +202,13 @@ export const HtmlDocEditor = forwardRef<HtmlDocEditorHandle, Props>(function Htm
         .lov-edit-mark{pointer-events:auto!important;}
         img,svg{cursor:context-menu;}
         body{caret-color:#c0392b;}
+        /* 图片按原图比例显示 —— 与预览态（draft-enhance 的 VIEWER_STYLE）保持一致。
+           以前编辑器少了这一条：图上的硬编码 height 属性 / 内联高度没人压得住，换了新配图
+           仍按旧的固定比例显示，非要点进预览才恢复正常（2026-07-22 用户实测反馈）。
+           编辑器和预览必须看到同一个渲染结果，否则编辑就是在盲改。
+           注意：本 style 块在保存时会被剔除（见 onSave 里对 lov-editor-runtime-style 的处理），
+           所以这些规则只作用于编辑视图，不会污染存进库的正文。 */
+        img{height:auto!important;max-width:100%!important;}
       `;
       (idoc.head ?? idoc.documentElement).appendChild(s);
     }
@@ -344,6 +352,17 @@ export const HtmlDocEditor = forwardRef<HtmlDocEditorHandle, Props>(function Htm
       el.style.width = "";
       el.style.height = "auto";
       el.style.maxWidth = "100%";
+      // 清掉宿主图槽的**失败态**。`.img-slot.broken` 带 aspect-ratio:4/3（premium-page.ts），
+      // 那是给「图挂了、空槽会塌成一条线」用的占位框。换上新图后若不摘掉这个类，新图就被
+      // 困在 4:3 里按固定比例显示 —— 这正是「编辑器里比例不跟着变、进预览才恢复」的原因
+      // （预览走 enhanceDraftHtmlForViewing，编辑器 srcDoc 用的是原始 HTML，没有那层中和 CSS）。
+      // 属性/内联样式清除对 CSS 类规则无效，必须显式摘类。
+      const slot = el.closest(".img-slot");
+      if (slot) slot.classList.remove("broken", "no-organ");
+      // 草稿模板的空槽（`<img class="sec-img" hidden src="">` + 一行「暂无该物种的…公开
+      // 照片」）：右键换图时是通过 figure 找到那个隐藏 img 的，换上真图后必须把缺图标记
+      // 和那句说明一起摘掉 —— 否则新配图下面还挂着「暂无照片」（2026-07-26 用户反馈）。
+      clearMissingOrganMarkers(el);
     }
     markDirty(el, "image");
     // Trigger a synthetic input event so caching effect picks it up.
@@ -463,6 +482,12 @@ export const HtmlDocEditor = forwardRef<HtmlDocEditorHandle, Props>(function Htm
       const docClone = idoc.cloneNode(true) as Document;
       const old = docClone.body.querySelector(`section.${COMMENTS_MARKER_CLASS}`);
       if (old) old.remove();
+      // 编辑器专用样式**绝不能存进正文**：它含 img{height:auto!important} 这类只该作用于
+      // 编辑视图的规则，写进库里会永久覆盖模板对图片的排版。cloneNode 会把它一起复制过来，
+      // 所以必须在序列化前显式摘掉。
+      // 用 querySelector 而非 getElementById：后者在 cloneNode 出来的 Document 上不保证
+      // 可靠（ID 缓存未必随克隆重建）。漏删一次，这段 CSS 就被永久写进正文。
+      docClone.querySelector("#lov-editor-runtime-style")?.remove();
       docClone.body.removeAttribute("contenteditable");
       const commentsBlock = buildCommentsSection(commentsHtml, docClone);
       docClone.body.appendChild(commentsBlock);

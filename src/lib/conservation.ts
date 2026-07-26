@@ -236,7 +236,25 @@ export function conservationBadges(
 // 「保护与名录收录」card and must keep excluding GRIIS (which owns a standalone warning
 // card). These chips are the at-a-glance row and DO include GRIIS.
 
-export type RegistryChipKind = "protected" | "cites" | "gts" | "griis" | "catalog" | "tag";
+export type RegistryChipKind =
+  // 重点保护名录按级别分两色（用户指定）：国家名录=粉，省级/地区名录=黄。
+  // 拆成两个 kind 而不是靠 label 前缀判色 —— 渲染端（网页/分享卡/服务端卡）只认 kind。
+  | "protected_national"
+  | "protected_regional"
+  | "cites"
+  | "gts"
+  | "griis"
+  | "catalog"
+  | "tag"
+  /**
+   * **人手动挂上的主题标签**（名字命中 `tags` 表的那些）。与 "tag" 分开是因为二者的
+   * 来源和分量完全不同：
+   *  - `tag`  = `plants.tags` / `plant_drafts.tags` 里的**特征词**，AI 自动填的，
+   *             只进搜索和这排卡签，不建专题；
+   *  - `tag_manual` = 有人在「手动添加 #tag 标签」里挑中的、`tags` 表里真实存在的主题标签，
+   *             它决定这条会出现在哪个专题页 —— 是一次**人的判断**，所以排在最前、绿框加重。
+   */
+  | "tag_manual";
 
 export type RegistryChip = {
   kind: RegistryChipKind;
@@ -244,7 +262,32 @@ export type RegistryChip = {
   label: string;
   /** Longer text for tooltips / the detail page. */
   title?: string;
+  /**
+   * 专题页 slug（只有 `tag_manual` 有）。**必须由调用方从 `tags` 表带过来，不能用
+   * slugifyTag(label) 现算** —— slug 是建标签那一刻算出来存进库的，规则日后一改，
+   * 现算的结果就和库里对不上，链接全部 404。有真值才渲染成链接。
+   */
+  slug?: string;
+  /** 绿色系第几号（只有 `tag_manual` 有）。见 {@link manualTagTone}。 */
+  tone?: number;
 };
+
+/**
+ * 手动主题标签的**绿色系**色板格数。手动标签一律是绿（区别于名录那几色），但不同标签取
+ * 不同的绿，这样「圣水草原的植被」和「城市行道树」并排时一眼看得出是两个专题。
+ *
+ * 取模式的哈希意味着标签多了会撞色 —— 这里可以接受：绿号只用来做视觉区分，不承载任何
+ * 语义（真正的身份是 slug 和文字）。反过来，哈希保证同一个标签名在**网页卡签、分享卡、
+ * 服务端简介卡**三处永远同色，不需要任何一处去查库或对表。
+ */
+export const MANUAL_TAG_TONES = 4;
+
+/** 标签名 → 绿号（0..MANUAL_TAG_TONES-1）。纯函数、跨端一致（djb2 变体，够散且短）。 */
+export function manualTagTone(name: string): number {
+  let h = 5381;
+  for (let i = 0; i < name.length; i++) h = ((h * 33) ^ name.charCodeAt(i)) >>> 0;
+  return h % MANUAL_TAG_TONES;
+}
 
 /** GRIIS degree → short chip label. Only the two harmful degrees read as a warning. */
 function griisChipLabel(degree: string): string {
@@ -271,10 +314,40 @@ function griisChipLabel(degree: string): string {
 export function registryChips(
   hit: ConservationHit,
   lists: ConservationList[],
-  extra?: { catalogNames?: string[]; tags?: string[] },
+  extra?: {
+    catalogNames?: string[];
+    tags?: string[];
+    /**
+     * `tags` 表里已建主题标签的 **名字 → slug** 映射。传了才分得出「人手动挂的主题标签」
+     * 和「AI 自动填的特征词」—— 两者都躺在同一个 `tags` text[] 里，光看数组区分不了。
+     * 不传（服务端出卡等拿不到该表的场合）则全部按特征词处理，行为与改动前一致。
+     */
+    knownTags?: Map<string, string>;
+  },
 ): RegistryChip[] {
   const listById = new Map(lists.map((l) => [l.id, l]));
   const chips: RegistryChip[] = [];
+
+  // 人手动挂的主题标签**排在最前面**（在保护名录、CITES 之前）。
+  // 理由：这排卡签里其余各项都是「按学名自动匹配名录」的机器判断，只有它是一次
+  // 明确的人的判断 —— 有人特意把这条归到了这个专题下。既然人特意做了，就该第一眼看到。
+  const manualTags: { name: string; slug: string }[] = [];
+  const autoTags: string[] = [];
+  for (const t of extra?.tags ?? []) {
+    if (!t) continue;
+    const slug = extra?.knownTags?.get(t);
+    if (slug) manualTags.push({ name: t, slug });
+    else autoTags.push(t);
+  }
+  for (const t of manualTags) {
+    chips.push({
+      kind: "tag_manual",
+      label: t.name,
+      slug: t.slug,
+      tone: manualTagTone(t.name),
+      title: `主题标签（手动添加）：${t.name} —— 这条会出现在该标签的专题页`,
+    });
+  }
 
   for (const [listId, status] of hit.protectedLists) {
     const l = listById.get(listId);
@@ -282,8 +355,10 @@ export function registryChips(
     // Real data shape: name =「国家（2021）」/「内蒙古（2009）」, province =「国家」/「内蒙古」,
     // status =「一级」/「二级」 → chip reads 「国家二级保护」/「内蒙古二级保护」.
     const short = [l?.province ?? "", status, "保护"].filter(Boolean).join("");
+    // 国家名录（province=「国家」）走粉，省级/地区名录走黄。province 为空时按地区处理
+    // —— 国家名录一定带「国家」，缺省更可能是某份地方名录漏填省份。
     chips.push({
-      kind: "protected",
+      kind: l?.province === "国家" ? "protected_national" : "protected_regional",
       label: short || nm,
       title: `重点保护野生植物名录 ${nm}${status ? " · " + status : ""}`,
     });
@@ -314,8 +389,8 @@ export function registryChips(
   for (const c of extra?.catalogNames ?? []) {
     chips.push({ kind: "catalog", label: c, title: `已收录于地区植物名录：${c}` });
   }
-  for (const t of extra?.tags ?? []) {
-    chips.push({ kind: "tag", label: t, title: `标签：${t}` });
+  for (const t of autoTags) {
+    chips.push({ kind: "tag", label: t, title: `特征词（自动识别）：${t}` });
   }
   return chips;
 }

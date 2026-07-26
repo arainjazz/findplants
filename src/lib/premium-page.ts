@@ -15,7 +15,13 @@
  * ⚠️ 刻意省略 v19 的 Section V「最新资讯」：它要求每张新闻卡都带**可点击 URL**，而本地
  * 模型无法联网核实 —— 强行生成只会逼模型编造链接，直接违反反虚构协议。取而代之的是
  * 由服务端真实名录数据程序化渲染的「名录与数据依据」引用区（renderReferences）。
+ *
+ * 📌 2026-07-20 起：上面这份"移植"只是**内置底版**。管理员可以在后台
+ * 「金叶详页创作指导」面板里粘贴一份新的 skill 正文（见 gold-skill.ts），它会被注入
+ * 三轮撰稿 prompt，并把版本号署在详页页尾。没粘贴时行为与从前逐字相同。
  */
+
+import { skillPromptBlock, skillSignature, type GoldSkill } from "./gold-skill";
 
 export type VerifiedFacts = {
   title: string;
@@ -36,6 +42,15 @@ export type VerifiedFacts = {
   capturePlace: string | null;
   /** 可点击的真实来源链接（程序化构造，非模型生成）。 */
   sources: { name: string; url: string }[];
+};
+
+/** 渲染层需要的一张图：URL + 署名串 + 可点回的原始页。 */
+export type RenderPhoto = {
+  url: string;
+  credit?: string;
+  sourceUrl?: string;
+  /** url 为空时写在空槽里的说明，如「暂无该物种的花期公开照片」。 */
+  missingNote?: string;
 };
 
 export type FeatureCard = {
@@ -146,13 +161,21 @@ function factsBlock(f: VerifiedFacts): string {
   return lines.map((l) => `- ${l}`).join("\n");
 }
 
+/**
+ * 三轮撰稿共用的前置块。`skill` = 管理员在后台粘贴的「金叶创作指导」，没配就是 null，
+ * 此时输出与本功能上线前逐字相同（零行为变化）。
+ *
+ * 顺序是刻意的：**已核实事实 → 创作指导 → 反虚构协议 → 写作规则**。
+ * 创作指导夹在中间，让反虚构协议拿到最后发言权 —— 详见 gold-skill.ts 的层级说明。
+ */
 const BASE = (
   f: VerifiedFacts,
+  skill?: GoldSkill | null,
 ) => `你是《鄂尔多斯植物精选百科》(Ordos Plantspedia) 的首席植物学家兼资深图鉴主编，正在撰写一份**精品级**中英双语物种详页。
 
 【已核实事实（ground truth，不得改写）】
 ${factsBlock(f)}
-
+${skillPromptBlock(skill ?? null) ? `\n${skillPromptBlock(skill ?? null)}\n` : ""}
 ${ANTI_FABRICATION}
 
 ${WRITING_RULES}`;
@@ -227,7 +250,7 @@ export const PREMIUM_SCHEMA_1 = {
   ],
 };
 
-export const premiumPrompt1 = (f: VerifiedFacts) => `${BASE(f)}
+export const premiumPrompt1 = (f: VerifiedFacts, skill?: GoldSkill | null) => `${BASE(f, skill)}
 
 【本次任务】只产出：题记、俗名条、开篇导语（中英）、株型总览（中英）、**恰好 6 张**关键特征卡、以及 1 个近似种对照。
 严格按给定 JSON 结构返回，不要 markdown 代码块。`;
@@ -299,7 +322,7 @@ export const PREMIUM_SCHEMA_2 = {
   required: ["habitat_chips", "habitat_zh", "habitat_en", "ethno_tabs", "literature"],
 };
 
-export const premiumPrompt2 = (f: VerifiedFacts) => `${BASE(f)}
+export const premiumPrompt2 = (f: VerifiedFacts, skill?: GoldSkill | null) => `${BASE(f, skill)}
 
 【本次任务】只产出：**恰好 7 条**生境速览、生境与分布正文（中英）、**恰好 5 张**人文卡、以及文学典籍记载。
 
@@ -363,7 +386,7 @@ export const PREMIUM_SCHEMA_3 = {
   ],
 };
 
-export const premiumPrompt3 = (f: VerifiedFacts) => `${BASE(f)}
+export const premiumPrompt3 = (f: VerifiedFacts, skill?: GoldSkill | null) => `${BASE(f, skill)}
 
 【本次任务】只产出：生态功能（中英）、全球分布与入侵（中英）、以及「博物趣闻」叙事区。
 
@@ -400,10 +423,32 @@ const escKeepStrong = (s: unknown): string =>
  *  the image fails to load at view time. The placeholder <span> is ALWAYS emitted
  *  (CSS hides it) — otherwise `onerror` would hide the <img> and leave a silent,
  *  unexplained empty box. */
-const slot = (url: string | undefined, label: string, alt: string): string =>
-  url
-    ? `<div class="img-slot" data-label="${esc(label)}"><img src="${esc(url)}" alt="${esc(alt)}" loading="lazy" onerror="this.parentElement.classList.add('broken')"/><span>图片待补 · image pending</span></div>`
-    : `<div class="img-slot broken" data-label="${esc(label)}"><span>图片待补 · image pending</span></div>`;
+const slot = (photo: RenderPhoto | undefined, label: string, alt: string): string => {
+  if (!photo?.url) {
+    // 该器官确实没有可用的公开照片时，**如实写明缺什么**，而不是塞一张随机图。
+    // 对科普站来说诚实比填满值钱：一张标着「花」的叶子特写比空位有害得多。
+    const note = (photo?.missingNote || "").trim();
+    // 两种空槽要区分：`no-organ` = 我们**确知**这个器官没有可用公开照片（瘦条 + 虚线，
+    // 说明写清楚）；无说明 = 图加载失败的兜底（保持 4:3 占位，提示补图）。
+    // 稀有种可能一次缺六个槽，若都按 4:3 撑开会得到六个 548px 的大空洞。
+    return note
+      ? `<div class="img-slot broken no-organ" data-label="${esc(label)}"><span>${esc(note)}</span></div>`
+      : `<div class="img-slot broken" data-label="${esc(label)}"><span>图片待补 · image pending</span></div>`;
+  }
+  // 署名条：摄影者 / 许可证 / 来源，能点回原始页面。**有图必有署名** ——
+  // 这些照片多为 CC BY-NC 等要求署名的许可，不署名就是侵权（见 species-photos.ts）。
+  const credit = (photo.credit || "").trim();
+  const creditHtml = credit
+    ? photo.sourceUrl
+      ? `<figcaption class="img-credit"><a href="${esc(photo.sourceUrl)}" target="_blank" rel="noreferrer nofollow">${esc(credit)}</a></figcaption>`
+      : `<figcaption class="img-credit">${esc(credit)}</figcaption>`
+    : "";
+  return (
+    `<figure class="img-slot" data-label="${esc(label)}">` +
+    `<img src="${esc(photo.url)}" alt="${esc(alt)}" loading="lazy" onerror="this.parentElement.classList.add('broken')"/>` +
+    `<span>图片待补 · image pending</span>${creditHtml}</figure>`
+  );
+};
 
 const CSS = `
 :root{--paper:#f5ede4;--paper-deep:#ecddd0;--ink:#1e1008;--ink-soft:#3a2010;--ink-faint:#6e4c28;
@@ -449,13 +494,24 @@ h2.sec .en{font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:va
 /* Image slots */
 /* 图片按原始比例完整显示、不裁剪（仅设最大高度防止超高竖图占满屏）；只有 .broken
    占位框才固定 4:3 尺寸，否则空图会塌成一条线。 */
-.img-slot{position:relative;width:100%;overflow:visible;border:1px solid var(--rule-soft);
+/* margin:0 是必须的：这个元素是 figure，浏览器 UA 样式给它 margin:1em 40px，
+   叠上 width:100% 会把整页撑出横向滚动条（实测 scrollWidth 786 > clientWidth 762）。
+   注意本块在 TS 模板字符串里，注释中禁止出现反引号。 */
+.img-slot{position:relative;width:100%;margin:0;overflow:visible;border:1px solid var(--rule-soft);
 background:var(--paper-deep);border-radius:2px}
 .img-slot img{width:100%;height:auto;max-height:80vh;object-fit:contain;display:block}
 .img-slot>span{display:none;font-size:12px;color:var(--rule-soft);letter-spacing:.08em}
 .img-slot.broken{display:flex;align-items:center;justify-content:center;aspect-ratio:4/3}
 .img-slot.broken img{display:none}
 .img-slot.broken>span{display:block}
+.img-slot.no-organ{aspect-ratio:auto;min-height:0;padding:22px 14px;border-style:dashed;
+background:transparent}
+.img-slot.no-organ>span{font-size:11px;line-height:1.6;letter-spacing:.02em}
+/* 署名条 —— 配图多为 CC BY-NC 等要求署名的许可，这一行是合规的一部分，不是装饰。 */
+.img-credit{margin:4px 2px 0;font-size:10px;line-height:1.5;color:var(--ink-faint,#8a988f);
+letter-spacing:.02em;word-break:break-word}
+.img-credit a{color:inherit;text-decoration:none;border-bottom:1px dotted currentColor}
+.img-slot.broken .img-credit{display:none}
 
 /* Intro */
 .intro{display:grid;grid-template-columns:1fr 1fr;gap:34px;align-items:start}
@@ -557,9 +613,15 @@ function renderReferences(f: VerifiedFacts): string {
 export function renderPremiumHtml(
   f: PremiumFields,
   facts: VerifiedFacts,
-  assets: { heroUrl: string; images: string[] },
+  assets: { heroUrl: string; images: RenderPhoto[] },
+  /** 生成时用的创作指导。传了才会在页尾署版本号；null/不传 = 走内置底版，页尾不署。 */
+  skill?: GoldSkill | null,
 ): string {
-  const img = (i: number): string | undefined => assets.images[i];
+  const img = (i: number): RenderPhoto | undefined => assets.images[i];
+  // 页尾署上本页所依据的创作指导版本 —— 换了 skill 之后哪些页是老版产出，看页尾就知道，
+  // 不必去翻数据库。没配 skill（走内置底版）时整行不渲染。
+  const sig = skillSignature(skill ?? null);
+  const skillLine = sig ? `创作指导 · ${esc(sig)}<br/>` : "";
   const cards = (f.feature_cards ?? []).slice(0, 6);
   const chips = (f.habitat_chips ?? []).slice(0, 7);
   const tabs = (f.ethno_tabs ?? []).slice(0, 5);
@@ -658,7 +720,7 @@ export function renderPremiumHtml(
 
 ${secTitle("I", "植物简介", "Introduction")}
 <div class="intro">
-  <div class="intro-img-col">${slot(assets.heroUrl, "intro-portrait", `${facts.title} 实拍`)}</div>
+  <div class="intro-img-col">${slot({ url: assets.heroUrl }, "intro-portrait", `${facts.title} 实拍`)}</div>
   <div><p>${escKeepStrong(f.intro_zh)}</p><p class="en-p">${escKeepStrong(f.intro_en)}</p></div>
 </div>
 <div class="form-panel" style="margin-top:28px">
@@ -706,7 +768,7 @@ ${renderReferences(facts)}
 <div class="colophon">
   ORDOS PLANTSPEDIA · 鄂尔多斯植物精选百科<br/>
   金叶编辑一键创建 · 内容由 AI 依据已核实名录数据撰写，建议编辑校对后收录<br/>
-  ${esc(facts.scientificName)}
+  ${skillLine}${esc(facts.scientificName)}
 </div>
 
 </div></body></html>`;

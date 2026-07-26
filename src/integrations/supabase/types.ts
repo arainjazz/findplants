@@ -691,6 +691,78 @@ export type Database = {
           },
         ]
       }
+      species_names: {
+        Row: {
+          name_code: string
+          name_key: string
+          accepted_code: string | null
+          accepted_key: string | null
+          is_accepted: boolean
+          status: string
+          scientific_name: string
+          author: string | null
+          chinese_name: string | null
+          genus_la: string | null
+          genus_zh: string | null
+          family_la: string | null
+          family_zh: string | null
+          order_zh: string | null
+          class_zh: string | null
+          phylum_zh: string | null
+          rank: string
+          common_names: string[] | null
+          distribution_zh: string | null
+          source: string
+          created_at: string
+        }
+        Insert: {
+          name_code: string
+          name_key: string
+          accepted_code?: string | null
+          accepted_key?: string | null
+          is_accepted?: boolean
+          status: string
+          scientific_name: string
+          author?: string | null
+          chinese_name?: string | null
+          genus_la?: string | null
+          genus_zh?: string | null
+          family_la?: string | null
+          family_zh?: string | null
+          order_zh?: string | null
+          class_zh?: string | null
+          phylum_zh?: string | null
+          rank?: string
+          common_names?: string[] | null
+          distribution_zh?: string | null
+          source?: string
+          created_at?: string
+        }
+        Update: {
+          name_code?: string
+          name_key?: string
+          accepted_code?: string | null
+          accepted_key?: string | null
+          is_accepted?: boolean
+          status?: string
+          scientific_name?: string
+          author?: string | null
+          chinese_name?: string | null
+          genus_la?: string | null
+          genus_zh?: string | null
+          family_la?: string | null
+          family_zh?: string | null
+          order_zh?: string | null
+          class_zh?: string | null
+          phylum_zh?: string | null
+          rank?: string
+          common_names?: string[] | null
+          distribution_zh?: string | null
+          source?: string
+          created_at?: string
+        }
+        Relationships: []
+      }
       plants: {
         Row: {
           author_id: string
@@ -710,6 +782,7 @@ export type Database = {
           id: string
           is_featured: boolean
           iucn_status: string | null
+          name_authority: Json | null
           parent_id: string | null
           rich_content: string | null
           scientific_name: string | null
@@ -738,6 +811,7 @@ export type Database = {
           id?: string
           is_featured?: boolean
           iucn_status?: string | null
+          name_authority?: Json | null
           parent_id?: string | null
           rich_content?: string | null
           scientific_name?: string | null
@@ -766,6 +840,7 @@ export type Database = {
           id?: string
           is_featured?: boolean
           iucn_status?: string | null
+          name_authority?: Json | null
           parent_id?: string | null
           rich_content?: string | null
           scientific_name?: string | null

@@ -147,11 +147,12 @@ function ProjectCard({ project: p }: { project: Project }) {
   const dateLabel = p.project_date ? new Date(p.project_date).toLocaleDateString("zh-CN") : "";
   return (
     <Link to="/projects/$id" params={{ id: p.id }} className="group block border border-rule hover:border-ink transition-colors">
-      <div className="aspect-[16/10] overflow-hidden bg-paper-deep border-b border-rule">
+      <div className="overflow-hidden bg-paper-deep border-b border-rule">
         {cover ? (
-          <img src={cover} alt="" className="w-full h-full object-cover group-hover:scale-[1.03] transition-transform duration-500" />
+          // 按海报原图比例自适应：竖图不再被 16:10 裁成半截，整张海报完整展示。
+          <img src={cover} alt="" className="w-full h-auto block group-hover:scale-[1.03] transition-transform duration-500" />
         ) : (
-          <div className="w-full h-full flex items-center justify-center text-leaf-deep/30 font-display text-5xl">❦</div>
+          <div className="aspect-[16/10] w-full flex items-center justify-center text-leaf-deep/30 font-display text-5xl">❦</div>
         )}
       </div>
       <div className="p-4">

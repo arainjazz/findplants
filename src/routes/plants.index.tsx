@@ -4,6 +4,7 @@ import { useMemo, useState, useEffect } from "react";
 import { zodValidator, fallback } from "@tanstack/zod-adapter";
 import { z } from "zod";
 import { SiteHeader, SiteFooter } from "@/components/site-header";
+import { ChecklistResults } from "@/components/checklist-results";
 import { fetchPaginatedPlants, fetchPlantsMetadata, type Plant } from "@/lib/plants";
 import { FilterDropdown } from "@/components/filter-dropdown";
 import {
@@ -26,7 +27,7 @@ import { fillChineseNames } from "@/lib/catalog-ai.functions";
 import { useServerFn } from "@tanstack/react-start";
 import { useAuth } from "@/hooks/use-auth";
 import { toast } from "sonner";
-import { fetchAllTags, fetchAllPlantTags, type TagWithCount } from "@/lib/tags";
+import { fetchAllTags, fetchTagMembership, type TagWithCount, type TagMembership } from "@/lib/tags";
 import { fetchAiPlantIds } from "@/lib/drafts";
 import {
   CITES_APPENDICES,
@@ -78,7 +79,14 @@ function PlantsList() {
   const { data: catalogs = [] } = useQuery({ queryKey: ["all-catalogs"], queryFn: fetchAllCatalogs });
   const { data: catalogEntries = [] } = useQuery({ queryKey: ["all-catalog-entries"], queryFn: fetchAllEntries });
   const { data: allTags = [] } = useQuery<TagWithCount[]>({ queryKey: ["all-tags"], queryFn: fetchAllTags });
-  const { data: allPlantTags = [] } = useQuery({ queryKey: ["all-plant-tags"], queryFn: fetchAllPlantTags });
+  // 标签归属：三源并集（关联表 + plants.tags + plant_drafts.tags），见 lib/tags.ts。
+  // 只用关联表的旧写法会让「识别卡上手动挂的标签」筛不出任何东西。
+  const { data: tagMembership = new Map<string, TagMembership>() } = useQuery({
+    queryKey: ["tag-membership"],
+    queryFn: () => fetchTagMembership(allTags),
+    enabled: allTags.length > 0,
+    staleTime: 60_000,
+  });
 
   // Conservation registries (国家/省级重点保护 + CITES/GTS/GRIIS). Matcher is rank-aware.
   const { data: conservationData } = useQuery({ queryKey: ["conservation-data"], queryFn: fetchConservationData });
@@ -157,13 +165,9 @@ function PlantsList() {
 
   const plantsByTag = useMemo(() => {
     const m = new Map<string, string[]>();
-    for (const pt of allPlantTags) {
-      const a = m.get(pt.tag_id);
-      if (a) a.push(pt.plant_id);
-      else m.set(pt.tag_id, [pt.plant_id]);
-    }
+    for (const [tagId, mem] of tagMembership) m.set(tagId, mem.plantIds);
     return m;
-  }, [allPlantTags]);
+  }, [tagMembership]);
 
   const plantsById = useMemo(() => new Map(plantsMetadata.map((p) => [p.id, p])), [plantsMetadata]);
 
@@ -288,7 +292,7 @@ function PlantsList() {
     if (selectedTagSlug) {
       const s = new Set<string>();
       const tagObj = allTags.find((t) => t.slug === selectedTagSlug);
-      if (tagObj) for (const pt of allPlantTags) if (pt.tag_id === tagObj.id) s.add(pt.plant_id);
+      if (tagObj) for (const pid of tagMembership.get(tagObj.id)?.plantIds ?? []) s.add(pid);
       sets.push(s);
     }
     // 地区名录（自建 regional_catalogs）membership.
@@ -308,7 +312,7 @@ function PlantsList() {
     return new Set(Array.from(sets[0]).filter((id) => sets.every((s) => s.has(id))));
   }, [
     selectedRegion, selectedTagSlug, selectedRcat, conservationMatcher,
-    catalogs, catalogEntries, plantsMetadata, allTags, allPlantTags,
+    catalogs, catalogEntries, plantsMetadata, allTags, tagMembership,
   ]);
 
   const filteredMetadataIds = useMemo(() => {
@@ -494,7 +498,7 @@ function PlantsList() {
         ) : (
           <>
             {allTags.length > 0 && (
-              <TagsBrowser tags={allTags} plants={plantsMetadata as any} plantTags={allPlantTags} />
+              <TagsBrowser tags={allTags} plants={plantsMetadata as any} membership={tagMembership} />
             )}
             {!selectedRcat && catalogs.length > 0 && (
               <section className="mb-6 border border-rule p-4 bg-paper-deep/20">
@@ -579,6 +583,9 @@ function PlantsList() {
                 )}
               </>
             )}
+            {/* 本站条目列完之后，再把国家名录搜一遍 —— 搜旧名也能中（名录含 7.2 万条
+                异名，服务端会折算到正名），并且一眼看出「名录有、本站还没做」的空白。 */}
+            <ChecklistResults q={searchVal} />
           </>
         )}
 
@@ -759,11 +766,12 @@ function PlantRow({ plant, isAi }: { plant: Plant; isAi?: boolean }) {
 function TagsBrowser({
   tags,
   plants,
-  plantTags,
+  membership,
 }: {
   tags: TagWithCount[];
   plants: Plant[];
-  plantTags: { tag_id: string; plant_id: string }[];
+  /** 标签 → 挂着的条目/草稿。三源并集，见 lib/tags.ts `fetchTagMembership`。 */
+  membership: Map<string, TagMembership>;
 }) {
   const [open, setOpen] = useState<Record<string, boolean>>({});
   const plantById = useMemo(() => {
@@ -771,17 +779,20 @@ function TagsBrowser({
     for (const p of plants) m.set(p.id, p);
     return m;
   }, [plants]);
+  // 见 index.tsx 里同名组件的注释：原来只数关联表，草稿上挂的标签一条都不算。
   const byTag = useMemo(() => {
     const m = new Map<string, Plant[]>();
-    for (const pt of plantTags) {
-      const p = plantById.get(pt.plant_id);
-      if (!p) continue;
-      if (!m.has(pt.tag_id)) m.set(pt.tag_id, []);
-      m.get(pt.tag_id)!.push(p);
+    for (const [tagId, mem] of membership) {
+      const list: Plant[] = [];
+      for (const pid of mem.plantIds) {
+        const p = plantById.get(pid);
+        if (p) list.push(p);
+      }
+      list.sort((a, b) => a.title.localeCompare(b.title, "zh"));
+      m.set(tagId, list);
     }
-    for (const list of m.values()) list.sort((a, b) => a.title.localeCompare(b.title, "zh"));
     return m;
-  }, [plantTags, plantById]);
+  }, [membership, plantById]);
   return (
     <section className="mb-6 border border-rule bg-paper-deep/20">
       <h2 className="font-display text-lg font-semibold px-4 pt-3">#tag 归类标签</h2>
@@ -799,6 +810,7 @@ function TagsBrowser({
                 <span className="font-display text-base font-semibold text-emerald-700">#{t.name}</span>
                 <span className="text-xs text-ink-faint">
                   · 已收录 {t.plant_count} / 共 {t.expected_count ?? t.plant_count}
+                  {t.draft_count > 0 && ` · 待审 ${t.draft_count}`}
                 </span>
                 {t.description && (
                   <span className="text-xs text-ink-faint truncate">· {t.description}</span>

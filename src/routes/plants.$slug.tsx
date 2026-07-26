@@ -19,6 +19,7 @@ import { ReplaceImageFlow } from "@/components/replace-image-flow";
 import { ShareButton } from "@/components/share-button";
 import { ShareCardButton } from "@/components/share-card-button";
 import { RegistryChips } from "@/components/registry-chips";
+import { NameAuthorityNote, readNameStamp } from "@/components/name-authority-badge";
 import { useRegistryChips } from "@/lib/use-registry-chips";
 import { supabase } from "@/integrations/supabase/client";
 import { FolderOpen, Link2, Image as ImageIcon, Globe } from "lucide-react";
@@ -27,14 +28,31 @@ export const Route = createFileRoute("/plants/$slug")({
   loader: async ({ params }) => {
     return fetchPlantBySlug(params.slug);
   },
-  head: ({ loaderData }) => ({
-    meta: [
-      { title: loaderData ? `${loaderData.title} (${loaderData.scientific_name || ""}) · Plantspedia` : "Plantspedia · 全民植物志" },
-      { name: "description", content: loaderData?.summary || "查看该植物的详细特征、分布与科普信息。" },
-      { property: "og:image", content: loaderData?.cover_url || "/default-og-image.jpg" },
-      { property: "og:type", content: "article" },
-    ],
-  }),
+  head: ({ loaderData }) => {
+    // 分享卡：标题「Plantspedia草木志·中文名」、简介用该植物的 summary、缩略图用它的封面照片。
+    // ⚠️ 必须**显式**写 og:title / og:description / twitter:* —— 只写 `title`/`description` 的话，
+    //    og:title、og:description 会**继承 __root.tsx 的站点默认**（"Plantspedia·全民植物志 /
+    //    由社区共同编纂…"），微信/Twitter 等抓的正是 og:*，于是分享出去永远是那句固定文案
+    //    （用户 2026-07-25 反馈）。
+    const name = loaderData?.title || "";
+    const shareTitle = name ? `Plantspedia草木志·${name}` : "Plantspedia · 全民植物志";
+    const desc = (loaderData?.summary || "查看该植物的详细特征、分布与科普信息。").slice(0, 180);
+    const img = loaderData?.cover_url || "/default-og-image.jpg";
+    return {
+      meta: [
+        { title: shareTitle },
+        { name: "description", content: desc },
+        { property: "og:title", content: shareTitle },
+        { property: "og:description", content: desc },
+        { property: "og:image", content: img },
+        { property: "og:type", content: "article" },
+        { name: "twitter:card", content: "summary_large_image" },
+        { name: "twitter:title", content: shareTitle },
+        { name: "twitter:description", content: desc },
+        { name: "twitter:image", content: img },
+      ],
+    };
+  },
   component: PlantDetail,
 });
 
@@ -90,6 +108,9 @@ function PlantDetail() {
     scientific_name: plant?.scientific_name,
     family: plant?.family,
     tags: plant?.tags,
+    // 已发布条目的主题标签在 `plant_tags` 关联表里（编辑器写的是那张表），
+    // 不在 `plants.tags` —— 不传 plantId 的话手动挂的标签一个都不会出现在卡签里。
+    plantId: plant?.id,
   });
 
   // 溯源表头：「AI 识别条目」显示「最早识别人/地点/时间」，从最早那条来源草稿回溯。
@@ -239,7 +260,13 @@ function PlantDetail() {
     // 跳过；等宽度恢复后 ResizeObserver 会再次触发、量到正确高度。
     if (iframe.clientWidth < 240) return;
     const h = Math.max(doc.documentElement?.scrollHeight ?? 0, doc.body?.scrollHeight ?? 0);
-    if (h > 0) iframe.style.height = `${h}px`;
+    if (h > 0) {
+      iframe.style.height = `${h}px`;
+      // ⚠️ 量到真高度就**必须拆掉 minHeight**。它原本写死 60vh 当加载占位，可 CSS 里
+      // min-height 永远压过 height —— 内容比 60vh 矮时（精简摘要卡草稿被采纳后的条目就是
+      // 这种），iframe 照样撑满 60vh，正文下面裂出一大片空白（2026-07-24 用户反馈）。
+      iframe.style.minHeight = "0px";
+    }
   };
 
   // 「注 N」= 正文里的 .lov-edit-mark 上标。iframe 出于安全无 allow-scripts（中和上传 HTML 里的脚本），
@@ -446,6 +473,9 @@ function PlantDetail() {
     />
   ) : null;
 
+  /** 正名核对留痕（服务端在金叶生成/编辑保存那一刻写下的，这里只读）。 */
+  const nameStamp = readNameStamp((plant as { name_authority?: unknown } | null)?.name_authority);
+
   const chipsNode = registryChipList.length ? (
     <RegistryChips chips={registryChipList} linkTags />
   ) : null;
@@ -569,6 +599,15 @@ function PlantDetail() {
         {chipsNode && (
           <div className="border-b border-rule bg-background">
             <div className="mx-auto max-w-6xl px-6 py-2.5">{chipsNode}</div>
+          </div>
+        )}
+        {/* 正名核对结论。放在正文 iframe **之前** —— 正文是上传的整页 HTML，
+            我们没法往里插东西；而「这个名字被自动改过」必须在读正文之前就看到。 */}
+        {nameStamp && (
+          <div className="border-b border-rule bg-background">
+            <div className="mx-auto max-w-6xl px-6 py-2.5">
+              <NameAuthorityNote stamp={nameStamp} />
+            </div>
           </div>
         )}
         <main className="flex-1">

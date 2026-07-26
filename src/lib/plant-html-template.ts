@@ -33,6 +33,12 @@ export type PlantDraftFields = {
    *  user's own photo_url). Any slot left empty falls back to photo_url and is
    *  marked as a replaceable default. */
   section_images?: string[];
+  /** 与 section_images 一一对应的署名串（摄影者 · 许可证 · 来源）。 */
+  section_credits?: string[];
+  /** 与 section_images 一一对应的原始页链接，署名可点回去。 */
+  section_sources?: string[];
+  /** 该槽位没有合适器官的照片时，如实写明缺什么（如「暂无该物种的花期公开照片」）。 */
+  section_missing?: string[];
   /** Populated only when GBIF/GRIIS confirms the species is an invasive alien
    *  species in China. Renders a red warning card just before Section I. */
   invasive?: {
@@ -99,7 +105,7 @@ const TEMPLATE = `<!DOCTYPE html>
 <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;0,500;0,600;1,400&family=EB+Garamond:ital,wght@0,400;1,400&family=Noto+Serif+SC:wght@300;400;500;600;700&display=swap" rel="stylesheet"/>
 <style>
 :root{--paper:#f5ede4;--paper-deep:#ecddd0;--ink:#1e1008;--ink-soft:#3a2010;--ink-faint:#6e4c28;--rule:#a06030;--rule-soft:#c89060;--accent:#4080b0;--gold:#7a5010;--chip-bg:rgba(64,128,176,0.07);--chip-border:rgba(64,128,176,0.24);}
-@media(prefers-color-scheme:dark){:root{--paper:#1c1917;--paper-deep:#292524;--ink:#f5f5f4;--ink-soft:#e7e5e4;--ink-faint:#a8a29e;--rule:#d97706;--rule-soft:#78350f;--accent:#38bdf8;--gold:#fbbf24;--chip-bg:rgba(56,189,248,0.07);--chip-border:rgba(56,189,248,0.24);}}
+
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
 body{font-family:'Noto Serif SC',serif;color:var(--ink-soft);background-color:var(--paper);background-image:radial-gradient(ellipse 68% 50% at 10% 8%,rgba(64,128,176,0.14) 0%,transparent 66%),radial-gradient(ellipse 54% 42% at 90% 85%,rgba(48,104,128,0.11) 0%,transparent 60%);line-height:1.72;min-height:100vh;}
 .page-wrap{max-width:1180px;margin:0 auto;padding:54px 56px 80px;}
@@ -141,10 +147,25 @@ strong{color:var(--ink);}
 i,em{color:var(--gold);}
 
 /* Section Images Layout */
-.sec-img{max-width:280px;width:100%;height:auto;border:1px solid var(--rule);box-shadow:0 0 0 3px var(--paper),0 0 0 4px var(--rule-soft);margin:16px auto;display:block;}
+/* 配图框与拍摄记录（.img-slot）**同一套裱框格式**（用户 2026-07-25 要求对齐）：
+   同样的 1px 边 + 双层纸裱（5px paper / 6px rule-soft）+ 同一道投影。之前 sec-img
+   用的是更薄的 3px/4px 裱边且没有投影，和 hero 那张实拍照片放在一页里明显不是一套。 */
+.sec-figure{max-width:320px;width:100%;margin:16px auto;}
+.sec-img{max-width:100%;width:100%;height:auto;border:1px solid var(--rule);box-shadow:0 0 0 5px var(--paper),0 0 0 6px var(--rule-soft),0 14px 30px -12px rgba(30,16,8,.26);margin:0;display:block;}
+/* 配图署名条 —— 外部图多为 CC BY-NC 等要求署名的许可，这一行属于合规要求。 */
+/* 选择器必须压过 .section-body p（0,1,1）—— 只写 .img-credit（0,1,0）会输掉，
+   实测被 16px 的正文规则盖住。注意：本块在 TS 模板字符串里，禁止出现反引号。 */
+.section-body p.img-credit,p.img-credit{max-width:100%;margin:8px 0 0;font-size:11px;line-height:1.5;text-align:center;color:var(--ink-faint,#8a988f);word-break:break-word;}
+.img-credit a{color:inherit;text-decoration:none;border-bottom:1px dotted currentColor;}
+/* 该器官确实没有公开照片时的空槽说明 —— 如实写明缺什么，不塞随机图充数。 */
+.section-body p.img-missing,p.img-missing{max-width:100%;margin:0;padding:28px 12px;font-size:11px;line-height:1.6;text-align:center;color:var(--ink-faint,#8a988f);border:1px dashed var(--rule);background:var(--paper);}
+img.sec-img[src=""]{display:none;}
 @media (min-width:768px){
-  .section-with-img{display:grid;grid-template-columns:1fr 280px;gap:32px;align-items:center;}
-  .sec-img{margin:0;}
+  /* align-items:start（不是 center）—— center 会把配图/「暂无」虚线框吊在正文的垂直
+     中央，正文一长，图上下就各裂出一大片说不清来由的空白（用户报的「莫名其妙的空挡」）。
+     顶对齐后图跟正文首行齐平，短的一侧只在下方留白，是正常的。 */
+  .section-with-img{display:grid;grid-template-columns:1fr 320px;gap:32px;align-items:start;}
+  .sec-figure{margin:0;}
 }
 
 /* Section V — care facts: summary CARDS shown ABOVE the rationale text. Each card =
@@ -174,6 +195,8 @@ i,em{color:var(--gold);}
   .sec-rule .en{display:none;}
   .section-body p{font-size:15px;}
   .name-origin{padding:16px 16px;}
+  /* 眉标改叫「名称和分类趣闻」后变长了，桌面版的 .32em 字距会让它在 375px 上折成两行。 */
+  .name-origin .no-title{letter-spacing:.12em;font-size:11px;}
   .care-facts{grid-template-columns:1fr;}
 }
 
@@ -196,15 +219,7 @@ i,em{color:var(--gold);}
 .invasive-card .ic-km.off{color:#7a5010;}
 .invasive-card .ic-cite{margin:16px 22px 20px;padding-top:12px;border-top:1px solid rgba(192,57,43,.22);font-family:'Cormorant Garamond',serif;font-size:12.5px;letter-spacing:.04em;color:#7a2a1c;}
 .invasive-card .ic-cite a{color:#7a2a1c;text-decoration:underline;}
-@media(prefers-color-scheme:dark){
-  .invasive-card{background:#2a1512;border-color:#e05a45;border-left-color:#e05a45;background-image:repeating-linear-gradient(135deg,rgba(224,90,69,0.06) 0,rgba(224,90,69,0.06) 12px,transparent 12px,transparent 24px);}
-  .invasive-card .ic-head{background:#8f2a1c;}
-  .invasive-card .ic-block .ic-label{color:#f0a595;border-bottom-color:rgba(224,90,69,.35);}
-  .invasive-card .ic-block p{color:#e9d9d4;}
-  .invasive-card .ic-national{background:rgba(224,90,69,.12);border-color:rgba(224,90,69,.32);color:#e9d9d4;}
-  .invasive-card .ic-national strong,.invasive-card .ic-km.on{color:#f0a595;}
-  .invasive-card .ic-km.off{color:#d9b57a;}
-}
+
 @media(max-width:640px){
   .invasive-card .ic-head{flex-wrap:wrap;gap:8px 12px;padding:14px 16px;}
   .invasive-card .ic-head h2{font-size:19px;}
@@ -241,20 +256,7 @@ i,em{color:var(--gold);}
 .conservation-card.cc-full .cc-chips{display:flex;flex-wrap:wrap;gap:10px;padding:0 22px 4px;}
 .conservation-card.cc-full .cc-cite{margin:14px 22px 20px;padding-top:12px;border-top:1px solid rgba(76,138,63,.26);font-family:'Cormorant Garamond',serif;font-size:12.5px;letter-spacing:.04em;color:#3f6f34;}
 .conservation-card.cc-full .cc-cite a{color:#3f6f34;text-decoration:underline;}
-@media(prefers-color-scheme:dark){
-  .conservation-card{background:linear-gradient(180deg,rgba(76,138,63,0.12),rgba(122,80,16,0.06));border-color:var(--rule-soft);border-left-color:#6fae5f;}
-  .conservation-card.cc-full{background:#12200f;border-color:#6fae5f;border-left-color:#6fae5f;background-image:repeating-linear-gradient(135deg,rgba(111,174,95,0.06) 0,rgba(111,174,95,0.06) 12px,transparent 12px,transparent 24px);}
-  .conservation-card.cc-full .cc-head{background:#345f2a;}
-  .conservation-card.cc-full .cc-block .cc-label{color:#bfe6b2;border-bottom-color:rgba(111,174,95,.35);}
-  .conservation-card.cc-full .cc-block p{color:#dbe9d4;}
-  .conservation-card.cc-full .cc-cite{color:#8fd07e;}
-  .conservation-card.cc-full .cc-cite a{color:#8fd07e;}
-  .conservation-card .cc-head h2{color:#8fd07e;}
-  .conservation-card .cc-protected{color:#bfe6b2;background:rgba(76,138,63,.2);border-color:rgba(111,174,95,.5);}
-  .conservation-card .cc-cites{color:#a8d8ea;background:rgba(56,189,248,.14);border-color:rgba(56,189,248,.45);}
-  .conservation-card .cc-gts{color:#f3cf8a;background:rgba(251,191,36,.14);border-color:rgba(251,191,36,.45);}
-  .conservation-card .cc-griis{color:#f0a595;background:rgba(224,90,69,.14);border-color:rgba(224,90,69,.45);}
-}
+
 </style>
 </head>
 <body>
@@ -295,34 +297,6 @@ i,em{color:var(--gold);}
 
   <div class="sec-rule">
     <span class="sec-num"><i>I</i></span>
-    <h2>形态特征</h2>
-    <span class="en">Morphological Characters</span>
-    <div class="sec-line"></div>
-  </div>
-  <div class="section-body section-with-img">
-    <div>
-      <p>{{morphology_zh}}</p>
-      <p class="en-p">{{morphology_en}}</p>
-    </div>
-    <img class="sec-img"{{sec_img_2_mark}} src="{{sec_img_2}}" alt="{{title}} 形态特征"/>
-  </div>
-
-  <div class="sec-rule">
-    <span class="sec-num"><i>II</i></span>
-    <h2>生境与分布</h2>
-    <span class="en">Habitat &amp; Distribution</span>
-    <div class="sec-line"></div>
-  </div>
-  <div class="section-body section-with-img">
-    <div>
-      <p>{{habitat_zh}}</p>
-      <p class="en-p">{{habitat_en}}</p>
-    </div>
-    <img class="sec-img"{{sec_img_3_mark}} src="{{sec_img_3}}" alt="{{title}} 生境与分布"/>
-  </div>
-
-  <div class="sec-rule">
-    <span class="sec-num"><i>III</i></span>
     <h2>植物人文</h2>
     <span class="en">Plants Humanities</span>
     <div class="sec-line"></div>
@@ -332,22 +306,50 @@ i,em{color:var(--gold);}
       <p>{{culture_zh}}</p>
       <p class="en-p">{{culture_en}}</p>
     </div>
-    <img class="sec-img"{{sec_img_4_mark}} src="{{sec_img_4}}" alt="{{title}} 植物人文"/>
+    <figure class="sec-figure"><img class="sec-img"{{sec_img_4_mark}} src="{{sec_img_4}}" alt="{{title}} 植物人文"/>{{sec_img_4_credit}}</figure>
+  </div>
+
+  <div class="sec-rule">
+    <span class="sec-num"><i>II</i></span>
+    <h2>形态特征</h2>
+    <span class="en">Morphological Characters</span>
+    <div class="sec-line"></div>
+  </div>
+  <div class="section-body section-with-img">
+    <div>
+      <p>{{morphology_zh}}</p>
+      <p class="en-p">{{morphology_en}}</p>
+    </div>
+    <figure class="sec-figure"><img class="sec-img"{{sec_img_2_mark}} src="{{sec_img_2}}" alt="{{title}} 形态特征"/>{{sec_img_2_credit}}</figure>
+  </div>
+
+  <div class="sec-rule">
+    <span class="sec-num"><i>III</i></span>
+    <h2>生境与分布</h2>
+    <span class="en">Habitat &amp; Distribution</span>
+    <div class="sec-line"></div>
+  </div>
+  <div class="section-body section-with-img">
+    <div>
+      <p>{{habitat_zh}}</p>
+      <p class="en-p">{{habitat_en}}</p>
+    </div>
+    <figure class="sec-figure"><img class="sec-img"{{sec_img_3_mark}} src="{{sec_img_3}}" alt="{{title}} 生境与分布"/>{{sec_img_3_credit}}</figure>
   </div>
 
   <div class="sec-rule">
     <span class="sec-num"><i>IV</i></span>
-    <h2>名称溯源</h2>
-    <span class="en">Name Origin</span>
+    <h2>名称和分类趣闻</h2>
+    <span class="en">Name &amp; Taxonomy Curiosities</span>
     <div class="sec-line"></div>
   </div>
   <div class="section-body section-with-img">
     <div class="name-origin">
-      <span class="no-title">NAME ORIGIN · 名 称 溯 源</span>
+      <span class="no-title">NAME &amp; TAXONOMY · 名 称 和 分 类 趣 闻</span>
       <p>{{name_origin_zh}}</p>
       <p class="en-p">{{name_origin_en}}</p>
     </div>
-    <img class="sec-img"{{sec_img_1_mark}} src="{{sec_img_1}}" alt="{{title}} 名称溯源"/>
+    <figure class="sec-figure"><img class="sec-img"{{sec_img_1_mark}} src="{{sec_img_1}}" alt="{{title}} 名称和分类趣闻"/>{{sec_img_1_credit}}</figure>
   </div>
 
   <div class="sec-rule">
@@ -363,7 +365,7 @@ i,em{color:var(--gold);}
       <p>{{care_tips_zh}}</p>
       <p class="en-p">{{care_tips_en}}</p>
     </div>
-    <img class="sec-img"{{sec_img_5_mark}} src="{{sec_img_5}}" alt="{{title}} 生长条件"/>
+    <figure class="sec-figure"><img class="sec-img"{{sec_img_5_mark}} src="{{sec_img_5}}" alt="{{title}} 生长条件"/>{{sec_img_5_credit}}</figure>
   </div>
 
   <div class="footer-rule">
@@ -516,12 +518,39 @@ export function renderDraftHtml(fields: PlantDraftFields): string {
   // missing slot falls back to the user's photo and keeps the "replaceable
   // default" marker so an editor is prompted to swap it.
   const secImgs = fields.section_images ?? [];
+  const secCredits = fields.section_credits ?? [];
+  const secSources = fields.section_sources ?? [];
+  const secMissing = fields.section_missing ?? [];
   const attrEsc = (u: string) => (u ?? "").replace(/"/g, "&quot;");
   const sectionDict: Record<string, string> = {};
   for (let i = 0; i < 5; i++) {
     const url = (secImgs[i] || "").trim();
-    sectionDict[`sec_img_${i + 1}`] = attrEsc(url || fields.photo_url);
-    sectionDict[`sec_img_${i + 1}_mark`] = url ? "" : ' data-default-img="1"';
+    const miss = (secMissing[i] || "").trim();
+    // 明确知道缺什么器官时，回落到用户自己的照片是**误导**——那张照片并不展示这个部位。
+    // 此时把 src 留空并由下面的 credit 位渲染说明；其余情况维持原有的「默认配图」行为。
+    sectionDict[`sec_img_${i + 1}`] = url ? attrEsc(url) : miss ? "" : attrEsc(fields.photo_url);
+    // 缺图时同时给 hidden：`src=""` 在部分浏览器会被解析成「重新请求当前页」，
+    // 靠 CSS 隐藏管不住那次请求。hidden 属性让它从一开始就不参与渲染。
+    sectionDict[`sec_img_${i + 1}_mark`] = url
+      ? ""
+      : miss
+        ? ' data-missing-organ="1" hidden'
+        : ' data-default-img="1"';
+    // 署名条。只有用了外部图才渲染 —— 回落到用户自己的照片时不该署第三方的名。
+    // 这些图多为 CC BY-NC 等要求署名的许可，这一行是合规的一部分，不是装饰。
+    const credit = url ? (secCredits[i] || "").trim() : "";
+    const src = url ? (secSources[i] || "").trim() : "";
+    if (!url && miss) {
+      sectionDict[`sec_img_${i + 1}_credit`] = `<p class="img-missing">${esc(miss)}</p>`;
+      continue;
+    }
+    sectionDict[`sec_img_${i + 1}_credit`] = credit
+      ? `<p class="img-credit">${
+          src
+            ? `<a href="${attrEsc(src)}" target="_blank" rel="noreferrer nofollow">${esc(credit)}</a>`
+            : esc(credit)
+        }</p>`
+      : "";
   }
   const dict: Record<string, string> = {
     ...sectionDict,

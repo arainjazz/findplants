@@ -12,6 +12,38 @@
     { "pattern": "plantspedia.club", "custom_domain": true },
     { "pattern": "www.plantspedia.club", "custom_domain": true }
   ],
+  // 开日志留存。默认只有 `wrangler tail` 的实时流，终端一关就什么都没了 ——
+  // 而一次生成要跑 3–10 分钟，指望全程挂着终端不现实。开了之后可以事后去
+  // Dashboard → Workers & Pages → 本 Worker → Observability 里按时间/关键字查。
+  // 免费版 20 万条/天、留存 3 天，对本站的量级绰绰有余。
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+
+  // 长任务队列。「进一步生成草稿」「金叶详页」冷启动要 3–10 分钟，而 waitUntil 只有
+  // 30 秒上限（生产探针实测 26 秒被掐）。Queues 消费者每次调用有 15 分钟挂钟，
+  // 且不要求 Workers Paid（官方 limits 页：限制对免费版同样适用，仅消息保留期不同）。
+  //
+  // ⚠️ 首次部署前必须先建队列，否则 deploy 会因绑定不存在而失败：
+  //     npx wrangler queues create plant-jobs
+  //     npx wrangler queues create plant-jobs-dlq
+  "queues": {
+    "producers": [{ "queue": "plant-jobs", "binding": "PLANT_JOBS" }],
+    "consumers": [
+      {
+        "queue": "plant-jobs",
+        // 一次只取一条：每个任务本身就要跑好几分钟，攒批毫无意义，
+        // 反而会让先到的任务干等后面的凑批。
+        "max_batch_size": 1,
+        "max_batch_timeout": 0,
+        // 生成失败已经写进任务行、也已经烧过 token 了，重投只会再烧一遍。
+        // 留 1 次是为了覆盖「消费者启动阶段就崩」这种没真正跑过的情况。
+        "max_retries": 1,
+        "dead_letter_queue": "plant-jobs-dlq"
+      }
+    ]
+  },
   "vars": {
     "SUPABASE_URL": "https://ianlasfsfuaibqldkfyb.supabase.co",
     "SUPABASE_PUBLISHABLE_KEY": "sb_publishable_uYxfH-YXkYmJqbcSupkDYA_3bVvoHHg",
