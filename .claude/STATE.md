@@ -4,8 +4,10 @@ _Last updated: 2026-07-26 — by Claude（本轮草稿页五修：① 换了配�
 照片」→ 新增 stripStaleMissingNotes，三条换图路径 + 视图 + 保存 + 收录发布全清；② 银叶草稿的
 简介卡不再顶「疑似」、不再压补拍框（showTentativeOnCard）；③ 正文下新增编辑专属绿框
 「草稿内容符合我的观察」=采纳+收录；④ 小P蛙讨论范围新增「快速识别简介卡」并能真改那几个字段；
-⑤ 编辑可手改简介卡（DraftCardEditor）。tsc/build/lint=0，**未部署**，编辑态 UI 未能本地实测
-（需编辑登录）。详见文件最下方本轮小节。）_
+⑤ 编辑可手改简介卡（DraftCardEditor）。tsc/build/lint=0。
+**✅ 已连同积压的另两轮一起上线：Version `0ae81b77`，18:41 CST；检查点提交 `fd4fae8`；
+两份待办迁移也已由用户在控制台跑完。** 编辑态 UI 仍需真人登录复看。详见文首「部署真相」
+与文件最下方本轮小节。）_
 _上一轮：2026-07-25（续二）— by Claude（本轮又三修：人文图槽加 plant/插画兜底（不加生境）；
 草稿三档判据改用 ai_payload._enriched（快速不再被错标银叶）；分享卡 og:* 改成「植物照片+
 Plantspedia草木志·名称+该植物简介」（plants.$slug 显式写全 og:*、drafts.$id 新增 loader/head）。
@@ -15,9 +17,15 @@ _Read this FIRST and update it LAST, every session._
 
 ## 🚨 部署真相（以 Cloudflare 为准，不以本文件的小节标签为准）
 
-**线上版本 = `adf3316b-687d-4f0d-9aea-d6b2929a206b`，2026-07-25 15:11 CST 部署。**
-（`./node_modules/.bin/wrangler deployments list | tail -30` 查得；07-25 那天还有一次
-`b9755785` 12:15 CST，两次都没记进本文件。）
+**线上版本 = `0ae81b77-11ce-455c-bfc7-2dd59d1cd82e`，2026-07-26 18:41 CST 部署。**
+本次把积压的三轮全部推上线，**至此工作树与线上一致，没有未部署的改动**。
+（上一版是 `adf3316b` 07-25 15:11；07-25 还有一次 `b9755785` 12:15，那两次都没记进本文件 ——
+本节就是为了以后不再出现这种「STATE 说没部署、其实早上线了」的错账。）
+
+⚠️ **部署踩坑（每次都会遇到，别当成故障）**：第一次 `wrangler deploy` 必定可能报
+`fetch failed / A fetch request failed`（本机双重代理，见 memory「Session ECONNRESET root cause」）。
+**代码和鉴权都没问题，直接原样重跑一次即可** —— 本次就是第二次成功的（上传阶段自己也
+retry 了 3 次）。
 
 **判据规则 —— 别再照抄小节标题里的「NOT deployed」：**
 `wrangler deploy` 打包的是**整个工作树**（含未提交改动），所以某一轮是否上线**只看时间**：
@@ -30,11 +38,17 @@ _Read this FIRST and update it LAST, every session._
 find src supabase *.ts *.jsonc -newermt "<那个时间>" -type f   # 晚于它的就是未上线的
 ```
 
-**截至 2026-07-26 17:57，未上线 = 13 个源文件、3 轮改动**：
+**2026-07-26 18:41 随 `0ae81b77` 上线的三轮**（此前一直积压）：
 ① 卡签配色分名录 + 项目页（conservation.ts / registry-chips.tsx / share-card.ts / projects.$id.tsx）
 ② 识别假失败自愈 + 闲聊消毒（tentative.ts / model-chatter.ts / explain-error.ts / camera-identify.tsx）
 ③ 草稿页五修（draft-enhance.ts / html-doc-editor.tsx / draft-card-fields.ts /
    identify-plant.functions.ts / drafts.$id.tsx）—— 详见文末小节。
+
+**上线核验（不需要登录就能做的部分，已做）**：`plantspedia.club` 200、`/drafts/<id>` SSR 200；
+直接拉线上 chunk 验证新代码确实在里面 ——
+`/assets/drafts._id-B4MBr15z.js` 含「草稿内容符合我的观察」「快速识别简介卡」「已采纳并收录为条目」，
+`/assets/html-doc-editor-DSoW4PYl.js` 含 `img-missing`（空槽清理逻辑）。
+⛔ **仍需真人复看**：②的断线自愈（要真手机断网）、③的编辑态四处（要编辑账号登录）。
 
 **✅ 两份迁移已于 2026-07-26 由用户在 Supabase 控制台执行**（均 Success, no rows returned）：
 - `20260720120000_species_dossiers.sql` —— 表建好了。**注意这一刻起线上行为就变了**：
@@ -44,7 +58,10 @@ find src supabase *.ts *.jsonc -newermt "<那个时间>" -type f   # 晚于它�
   「添加新项目内容报错 permission denied for function has_role」应已消失（待用户复看）。
 两份都可重复执行（if not exists / drop policy if exists），已生效、与部署无关。
 
-**git**：最后一次提交是 07-18（e7a61b4）。之后 8 天的改动全部未提交 —— 没有检查点。
+**git**：✅ 2026-07-26 已建检查点 `fd4fae8`（07-18 之后 8 天的积压：39 改 + 35 新，含 3 份迁移）。
+**未纳入该提交**（归属待定，仍是未跟踪状态）：`mcp/`、`.workbuddy/`、`.claude/MCP-PLAN.md`、
+`package-lock.json`（本仓用 bun.lock，多一份 npm 锁文件容易打架）。
+**未 push**：`main` 现在领先 `origin/main` 15 个提交（用户历来只在本地提交，不推 GitHub）。
 
 ## 🆕 2026-07-21（续16）两个线上报错的定位与修复
 - **① 「添加新项目内容报错：permission denied for function has_role」——已修（待控制台执行）。**
@@ -5179,6 +5196,12 @@ center 把配图/「暂无」虚线框吊在正文垂直中央，正文一长，
   （站内已无 mock 登录），且草稿列表对匿名用户不可见。请登录后在真草稿页上复看这四处。
 
 ### 下一步
-- 用编辑账号在一份银叶草稿上复看：① 配图下不再有「暂无…照片」；② 卡上无「疑似」、无补拍框；
-  ③ 正文下有绿框按钮、点了进已收录；④ 小P蛙范围里有「快速识别简介卡」，让它改学名/摘要后卡上真变。
-- 之后部署（本轮 + 之前多轮改动仍**未上线**）。
+- **✅ 已部署**：Version `0ae81b77-11ce-455c-bfc7-2dd59d1cd82e`，2026-07-26 18:41 CST
+  （连同积压的另两轮一起）。提交检查点 `fd4fae8`。
+- **⛔ 唯一剩下的事：用编辑账号在一份银叶草稿上线上复看四点** ——
+  ① 配图下不再有「暂无…照片」；② 卡上无「疑似」、无补拍框；③ 正文下有绿框按钮、点了进已收录；
+  ④ 小P蛙范围里有「快速识别简介卡」，让它改学名/摘要后卡上真的变。
+  （若手机上看到的还是旧界面 → 是 PWA service worker 缓存，不是部署没成功；见 memory
+  「PWA service worker caching」。）
+- 若 ④ 改完卡上没变：先看页面底部「修改记录」有没有那条「小P蛙改写（快速识别简介卡）」——
+  有记录说明写库成功、问题在缓存刷新；没记录说明服务端那条分支没走到。
