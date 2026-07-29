@@ -5631,3 +5631,5 @@ draft_id 为空的行不在管辖内，`onConflict` 无从落脚。所以这一�
 - `identify-plant.functions.ts` 的 97 条 lint 错误是**既有的**（stash 前后同数），
   非本轮引入；`task-feed.functions.ts` / `draft-agent-panel.tsx` lint 干净。
 - ⛔ 端到端仍要上线后真跑：绿条是否在识别期间出现、金叶超时文案是否自称「金叶详页模型」。
+
+### ✅ 已部署 — Version `d2153c0b-5200-4d37-8787-b32507f55cf3`，2026-07-29（提交 `1bea744`）
