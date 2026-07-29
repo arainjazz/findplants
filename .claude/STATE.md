@@ -5586,3 +5586,48 @@ React 报 `Maximum update depth exceeded`（栈顶 `forceStoreRerender`），
 提交 `6c2f918`，一次性上线 07-28 三批 + 07-29 三批（此前全部积压未上线）。
 线上实测：`plantspedia.club/identify` 有小P蛙、`/plants/$slug` 恰好 1 只、控制台无报错。
 仍未验证（要真登录 / 真跑一个失败任务）：对话往返、红圈亮起与消失。
+
+## ✅ 2026-07-29（续三）— 识别的绿色进度条 + 金叶超时报错认错了主人
+
+用户上线后实测反馈两件事。
+
+### 🔴 bug 1 — 快速识别全程在动态流里「不存在」，所以永远没有绿色进度条
+`upsertTaskFeed` 开头是 `if (!input.userId || !input.draftId) return;`，而**新建**识别的
+草稿是跑完才写出来的，入队时 `draftId` 是空串 → **整趟识别一条动态记录都没有**，
+进度条自然无从画起。上一轮把这行注释成「这是刻意的，不是漏」—— 是漏。
+相框里还写着「完成后小P蛙会亮起绿色角标」，等于承诺了一件做不到的事。
+
+修法（**不加迁移**）：迁移里的唯一索引是
+`(user_id, kind, draft_id) where draft_id is not null` —— **部分索引**，
+draft_id 为空的行不在管辖内，`onConflict` 无从落脚。所以这一路改成：
+- `upsertTaskFeed` 没有 draftId 时按 **jobId** 先查后写（多一次读，onPhase 一趟只 4 次）；
+- `startQuickIdentifyFn` 一入队就 `feedStart`，缩略图直接用刚传上去的原图，绿条立刻可见；
+- 草稿诞生时 `adoptFeedDraft` 把占位那条认领过去。
+  🔑 **不认领会留下一条永远 running 的孤儿**：feedFinish 按 draft_id 另写一条，
+  占位那条没人再更新，20 分钟后被判失联，用户看到一条永远转圈的幽灵。
+  认领撞上部分唯一索引时（补拍重识别，该草稿已有同类动态）直接删占位。
+
+### 🔴 bug 2 — 进度条排在名牌后面，被挤出屏幕
+浮标离底边只有 32px（`md:bottom-8`），三条进度条约 30px —— 三个任务一起跑时
+正好被挤出可视区。移到**图标正下方、名牌之上**，既符合用户说的「图标下面」，
+又不再受底边距约束。
+
+### 🔴 bug 3 — 金叶超时却报「小P 响应超时」，还让人去改小P的模型设置
+用户原话：「金叶模型是单独配置的，怎么会涉及到小P响应超时？」—— 问得对。
+`openaiCompatChat` 是**共享传输层**（小P/识别/银叶/金叶/器官识别全走它），
+两条报错文案把「小P」写死了，于是金叶失败把管理员指到完全无关的控制台去。
+同一个坑在 `runModelQueue` 那层已经修过（7382 行有注释），传输层这层漏了。
+修法：加 `opts.label`，`callSlot` 按 consoleId 传真名。
+
+顺带修掉一个真约束错配：单次请求超时写死 120 秒。金叶跑在队列里（15 分钟挂钟），
+而 kimi-k3 这类先写一大段思维链的推理模型一次调用常超 2 分钟 → 必然超时。
+新增 `opts.timeoutMs`，`BACKGROUND_CONSOLES = {gold, enrich}` 放宽到 300 秒。
+⚠️ **`card` / `second_opinion` 故意不放宽**：它们在 `runQuickIdentifyCore` 里，
+而那条核心**匿名用户仍走同步 HTTP** —— 放宽会先撞边缘 100 秒硬上限，
+用户看到「Load failed」而不是一句说得清的超时，反而更糟。
+
+### 验证证据
+- `tsc --noEmit` EXIT=0；`npm run build` EXIT=0；task-feed 单测 28 条全过。
+- `identify-plant.functions.ts` 的 97 条 lint 错误是**既有的**（stash 前后同数），
+  非本轮引入；`task-feed.functions.ts` / `draft-agent-panel.tsx` lint 干净。
+- ⛔ 端到端仍要上线后真跑：绿条是否在识别期间出现、金叶超时文案是否自称「金叶详页模型」。

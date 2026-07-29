@@ -30,6 +30,16 @@ async function admin() {
  * 重跑银叶不该在流里堆两条，而是把原来那条更新掉。
  *
  * 重跑时 `read_at` 被显式清回 null：内容变了，就该重新算作「未看过」。
+ *
+ * 🔑 **没有 draftId 时改用 jobId 认身份**。用户 2026-07-29 报的「快速识别跑着，
+ * 小P蛙下面却没有绿色进度条」就出在这：**新建**识别的草稿是跑完才写出来的，
+ * 入队时 draftId 还是空串，这里原先直接 return，于是整趟识别在动态流里**一条记录都没有** ——
+ * 进度条自然无从画起，用户只能盯着相框干等。
+ *
+ * 为什么这条路要「先查后写」而不是 upsert：迁移里的唯一索引是
+ * `(user_id, kind, draft_id) where draft_id is not null` —— **部分索引**，
+ * draft_id 为空的行根本不在它的管辖范围，`onConflict` 无从落脚。
+ * 多一次读换来不必加新迁移，而 onPhase 一趟只有 4 次，代价可接受。
  */
 export async function upsertTaskFeed(input: {
   userId: string | null | undefined;
@@ -47,7 +57,9 @@ export async function upsertTaskFeed(input: {
   markUnread?: boolean;
 }): Promise<void> {
   // 匿名识别不进动态流（表上 user_id not null）—— 用户 2026-07-29：重点照顾注册用户与编辑。
-  if (!input.userId || !input.draftId) return;
+  if (!input.userId) return;
+  // 草稿和任务两个身份**一个都没有**才是真写不了：认不出该更新哪一行，写进去就是垃圾行。
+  if (!input.draftId && !input.jobId) return;
   try {
     const db = await admin();
     const row: Record<string, unknown> = {
@@ -67,13 +79,75 @@ export async function upsertTaskFeed(input: {
     if (input.error !== undefined) row.error = input.error;
     if (input.markUnread) row.read_at = null;
 
-    const { error } = await db
+    if (input.draftId) {
+      const { error } = await db
+        .from("task_feed")
+        .upsert(row, { onConflict: "user_id,kind,draft_id" });
+      if (error) console.warn("[TaskFeed] upsert failed:", error.message);
+      return;
+    }
+
+    // ── 还没有草稿（新建识别）：按 job_id 先查后写 ──────────────────────────────
+    // 部分唯一索引管不到 draft_id 为空的行，只能自己保证「同一个任务只留一条」。
+    const { data: existing } = await db
       .from("task_feed")
-      .upsert(row, { onConflict: "user_id,kind,draft_id" });
-    if (error) console.warn("[TaskFeed] upsert failed:", error.message);
+      .select("id")
+      .eq("user_id", input.userId)
+      .eq("kind", input.kind)
+      .eq("job_id", input.jobId)
+      .is("draft_id", null)
+      .maybeSingle();
+
+    if (existing?.id) {
+      const { error } = await db.from("task_feed").update(row).eq("id", existing.id);
+      if (error) console.warn("[TaskFeed] update-by-job failed:", error.message);
+    } else {
+      const { error } = await db.from("task_feed").insert(row);
+      if (error) console.warn("[TaskFeed] insert-by-job failed:", error.message);
+    }
   } catch (e) {
     // 动态流写不进去只是少一条通知，绝不能让整趟生成翻车。
     console.warn("[TaskFeed] upsert threw:", e instanceof Error ? e.message : e);
+  }
+}
+
+/**
+ * 把「按 jobId 建的占位动态」认领给刚刚诞生的草稿。
+ *
+ * **不认领会留下一条永远 running 的孤儿**：新建识别跑完后 `feedFinish` 按 draft_id 写，
+ * 那是另一条记录；占位那条没人再更新，20 分钟后被 `isFeedStale` 判成失联，
+ * 用户在动态流里看到一条永远转圈的幽灵。
+ *
+ * 认领失败的唯一情形是「这份草稿已经有同类动态了」（补拍重识别）——
+ * 部分唯一索引会挡下来。那时占位那条已无价值，直接删掉。
+ */
+export async function adoptFeedDraft(
+  userId: string,
+  kind: TaskKind,
+  jobId: string,
+  draftId: string,
+): Promise<void> {
+  if (!userId || !jobId || !draftId) return;
+  try {
+    const db = await admin();
+    const { error } = await db
+      .from("task_feed")
+      .update({ draft_id: draftId })
+      .eq("user_id", userId)
+      .eq("kind", kind)
+      .eq("job_id", jobId)
+      .is("draft_id", null);
+    if (!error) return;
+    console.warn("[TaskFeed] adopt failed, dropping placeholder:", error.message);
+    await db
+      .from("task_feed")
+      .delete()
+      .eq("user_id", userId)
+      .eq("kind", kind)
+      .eq("job_id", jobId)
+      .is("draft_id", null);
+  } catch (e) {
+    console.warn("[TaskFeed] adopt threw:", e instanceof Error ? e.message : e);
   }
 }
 

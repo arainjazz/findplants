@@ -746,6 +746,21 @@ const CONSOLE_CONFIG_KEYS = {
 } as const;
 type ConsoleId = keyof typeof CONSOLE_CONFIG_KEYS;
 
+/**
+ * **只跑在 Cloudflare Queues 里**的控制台（消费者有 15 分钟挂钟）。
+ *
+ * 它们的单次请求超时可以给得比交互式链路宽得多 —— 小P对话挂在 HTTP 请求上，
+ * 边缘本身就只有 100 秒，等更久毫无意义；而金叶/银叶这种一跑几分钟的，
+ * 卡在 2 分钟只会把 kimi-k3 那类「先写一大段思维链」的推理模型全判成超时
+ * （用户 2026-07-29 配 kimi-k3 建金叶，正是这么超的）。
+ *
+ * ⚠️ **`card` / `second_opinion` 故意不在这里**：它们在 `runQuickIdentifyCore` 里，
+ * 而那条核心有两条入口 —— 登录用户走队列，**匿名用户仍走同步 HTTP**。
+ * 给它们放宽到 5 分钟，匿名识别会先撞上边缘 100 秒硬上限，
+ * 用户看到的是「Load failed」而不是一句说得清的超时，反而更糟。
+ */
+const BACKGROUND_CONSOLES = new Set<ConsoleId>(["gold", "enrich"]);
+
 const CONSOLE_LABELS: Record<ConsoleId, string> = {
   ai: "AI 模型",
   card: "出卡AI",
@@ -4343,10 +4358,18 @@ export const startQuickIdentifyFn = createServerFn({ method: "POST" })
       kind: "quick_identify",
       userId,
       // 新建识别还没有草稿；合并补拍才有。draftId 是 JobRecord 的必填字段，
-      // 空串表示「跑完才会有」——动态流那边靠 upsertTaskFeed 的空值保护跳过。
+      // 空串表示「跑完才会有」—— 动态流那一路改按 jobId 认身份（见 upsertTaskFeed）。
       draftId: data.merge_draft_id ?? "",
       phase: "已排队，正在启动…",
       payload: { identify: { ...data, photo_base64: "", extra_photos: [] }, photoUrl, extraUrls },
+    });
+
+    // 一入队就进动态流，绿色进度条立刻可见 —— 用户点完识别就会切走去拍下一株，
+    // 等第一个 onPhase 才落地会留一段「点了没反应」的空窗（冷启动可达几十秒）。
+    // 缩略图直接用刚传上去的那张原图，不必等草稿建好。
+    await feedStart(userId, "identify", data.merge_draft_id ?? null, job.id, {
+      title: "正在识别…",
+      thumbUrl: photoUrl,
     });
 
     if (!(await enqueueJob(job.id))) keepAlive(runQueuedJob(job.id));
@@ -5441,26 +5464,31 @@ export const startEnrichDraftFn = createServerFn({ method: "POST" })
  */
 async function feedStart(
   userId: string,
-  kind: "enrich_draft" | "gold_page",
-  draftId: string,
+  kind: TaskKind,
+  /** 新建识别这一路是 null —— 草稿要跑完才诞生，那时动态按 jobId 认身份。 */
+  draftId: string | null,
   jobId: string,
+  /** 没有草稿可读时（新建识别）由调用方直接给标题和缩略图。 */
+  fallback: { title?: string | null; thumbUrl?: string | null } = {},
 ): Promise<void> {
   const { upsertTaskFeed } = await import("./task-feed.functions");
-  let title: string | null = null;
-  let thumbUrl: string | null = null;
-  try {
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { data } = await (supabaseAdmin as any)
-      .from("plant_drafts")
-      .select("title, photo_url")
-      .eq("id", draftId)
-      .maybeSingle();
-    if (data) {
-      title = data.title ?? null;
-      thumbUrl = data.photo_url ?? null;
+  let title: string | null = fallback.title ?? null;
+  let thumbUrl: string | null = fallback.thumbUrl ?? null;
+  if (draftId) {
+    try {
+      const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+      const { data } = await (supabaseAdmin as any)
+        .from("plant_drafts")
+        .select("title, photo_url")
+        .eq("id", draftId)
+        .maybeSingle();
+      if (data) {
+        title = data.title ?? title;
+        thumbUrl = data.photo_url ?? thumbUrl;
+      }
+    } catch {
+      /* 读不到就先不显示名字，跑完 feedFinish 会补上 */
     }
-  } catch {
-    /* 读不到就先不显示名字，跑完 feedFinish 会补上 */
   }
   await upsertTaskFeed({
     userId,
@@ -5558,9 +5586,11 @@ export async function runQueuedJob(jobId: string): Promise<void> {
       : job.kind === "enrich_draft"
         ? ("enrich_draft" as const)
         : ("gold_page" as const);
-  // 快速识别**新建**时草稿是跑完才写出来的，入队时 draftId 还是空串。
-  // upsertTaskFeed 见到空 draftId 会直接跳过（那条 upsert 靠 draft_id 做唯一键），
-  // 所以这一路的动态在 feedFinish 里才第一次落地 —— 这是刻意的，不是漏。
+  // 快速识别**新建**时草稿是跑完才写出来的，入队时 draftId 还是空串 ——
+  // 这一路的动态因此按 **jobId** 认身份（upsertTaskFeed 里有专门的分支），
+  // 等草稿诞生再 adoptFeedDraft 认领过去。
+  // ⚠️ 曾经这里是「draftId 为空就整趟不写动态」，结果就是用户 2026-07-29 报的
+  // 「识别在跑，可小P蛙下面没有绿色进度条」—— 那时整趟识别在流里一条记录都没有。
   let feedDraftId = job.draftId || null;
   /** 归属三件事（谁的、哪类、哪份草稿）由 job 决定，调用方只管传变化的部分。 */
   type FeedPatch = Omit<Parameters<typeof upsertTaskFeed>[0], "userId" | "kind" | "draftId">;
@@ -5595,7 +5625,12 @@ export async function runQueuedJob(jobId: string): Promise<void> {
         extraUrls: qp.extraUrls ?? [],
       });
       // 草稿这时才存在 —— 补上 id，下面 feedFinish 才知道这条动态挂在哪份草稿上。
+      // 同时把之前按 jobId 建的那条占位动态认领过去，否则它会变成一条永远 running 的孤儿。
       feedDraftId = ident.draftId;
+      if (feedDraftId) {
+        const { adoptFeedDraft } = await import("./task-feed.functions");
+        await adoptFeedDraft(job.userId, feedKind, jobId, feedDraftId);
+      }
       result = ident;
     } else if (job.kind === "enrich_draft") {
       const pre = await enrichPreflight(job.draftId, job.userId, email);
@@ -7082,9 +7117,24 @@ async function openaiCompatChat(
      * 那是纯编造，而且 HTTP 200、日志无异常，谁也发现不了。
      */
     noBlindFallback?: boolean;
+    /**
+     * 报错文案里自称什么。**这是共享传输层** —— 小P对话、识别、银叶、金叶、
+     * 器官识别全走这一个函数。用户 2026-07-29 报的「金叶模型是单独配置的，
+     * 怎么会报小P响应超时？」就是因为这里的文案把「小P」写死了：
+     * 金叶超时却让人去改小P的模型设置，指到了完全无关的控制台。
+     */
+    label?: string;
+    /**
+     * 单次请求的超时。默认 120 秒是给**交互式**调用定的（小P对话挂在 HTTP 请求上，
+     * 边缘本身就只有 100 秒，等更久没有意义）。跑在队列里的后台任务有 15 分钟预算，
+     * 传更长的值 —— 否则像 kimi-k3 这类先写一大段思维链的推理模型必然卡在 120 秒。
+     */
+    timeoutMs?: number;
   } = {},
 ): Promise<AiTextResult> {
   const { thinking, noBlindFallback } = opts;
+  const who = opts.label ?? "小P";
+  const timeoutMs = opts.timeoutMs ?? 120_000;
   const apiBase = normalizeBaseUrl(baseUrl) || "https://api.openai.com/v1";
 
   // Build the OpenAI messages. `useImages` attaches the photo(s) to the last user
@@ -7140,7 +7190,7 @@ async function openaiCompatChat(
     let lastErr: unknown = null;
     for (let attempt = 0; attempt < 2; attempt++) {
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 120_000);
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
       try {
         const r = await fetch(`${apiBase}/chat/completions`, {
           method: "POST",
@@ -7162,13 +7212,13 @@ async function openaiCompatChat(
     }
     if ((lastErr as Error)?.name === "AbortError") {
       throw new Error(
-        "小P 响应超时（等了 2 分钟）：当前模型思考较慢，带图提问尤其耗时。可以重试一次；" +
-          "若连续超时，请在「模型设置」换更快的视觉模型，或确认所配模型支持看图。",
+        `${who} 响应超时（等了 ${Math.round(timeoutMs / 1000)} 秒）：当前模型思考较慢，带图提问尤其耗时。可以重试一次；` +
+          `若连续超时，请在**${who}**自己的控制台里换更快的视觉模型（或关掉它的思维链），并确认所配模型支持看图。`,
       );
     }
     throw new Error(
-      `小P 连接中转失败（${lastErr instanceof Error ? lastErr.message : "网络错误"}）：` +
-        `请检查中转地址/网络；整页改写体量较大时该中转可能超时，可在 /identify 把小P模型切回默认 Gemini 再试。`,
+      `${who} 连接中转失败（${lastErr instanceof Error ? lastErr.message : "网络错误"}）：` +
+        `请检查中转地址/网络；整页改写体量较大时该中转可能超时，可把**${who}**的模型切回默认 Gemini 再试。`,
     );
   };
 
@@ -7348,6 +7398,10 @@ async function xiaopTextCall(opts: {
         thinking: thinkingOf(slot, consoleId),
         // 「图就是任务」的链路（器官识别）必须禁掉盲退级，见 openaiCompatChat 的注释。
         noBlindFallback: !!opts.imagesEssential,
+        // 报错要自称**这条链路自己的**名字。金叶超时说成「小P 响应超时」，
+        // 会把人指到完全无关的控制台去（用户 2026-07-29 就是这么被绕懵的）。
+        label: consoleId === "xiaop" ? "小P" : CONSOLE_LABELS[consoleId],
+        timeoutMs: BACKGROUND_CONSOLES.has(consoleId) ? 300_000 : 120_000,
       },
     );
     return { ...r, provider: slot.provider, model: slot.model };
