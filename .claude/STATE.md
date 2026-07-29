@@ -5581,3 +5581,8 @@ React 报 `Maximum update depth exceeded`（栈顶 `forceStoreRerender`），
     npx wrangler tail --format pretty
 复现一次失败的识别，看抛出来的原话是 `Too many subrequests` 还是 `Exceeded CPU time limit` ——
 两者的修法完全不同（前者砍子请求数/升套餐，后者拆任务），**没拿到这行之前不要动手改**。
+
+### ✅ 已部署 — Version `d03bad76-4725-4bca-9708-9784943202d0`，2026-07-29
+提交 `6c2f918`，一次性上线 07-28 三批 + 07-29 三批（此前全部积压未上线）。
+线上实测：`plantspedia.club/identify` 有小P蛙、`/plants/$slug` 恰好 1 只、控制台无报错。
+仍未验证（要真登录 / 真跑一个失败任务）：对话往返、红圈亮起与消失。
