@@ -5738,3 +5738,7 @@ update 0 行 → insert 201 → 再 update 命中 1 行、值已生效、该草�
 - `tsc --noEmit` EXIT=0；`npm run build` EXIT=0；lint 干净；单测 41 条全过。
 - 真库往返实测（见上）。⛔ 端到端仍要用户真跑一轮：识别完应转绿色未读圆圈 + 出摘要卡，
   银叶应出蓝条、金叶应出橙条。
+
+### ✅ 已部署 — Version `d10fa611-7bdb-41d7-8e9c-8dbdad63826b`，2026-07-29（提交 `ed0b3ea`）
+（前 3 次 wrangler deploy 报 `fetch failed`，是本地代理抖动，第 4 次直接成功；见 memory
+`session-econnreset-root-cause`。）
