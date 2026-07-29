@@ -400,7 +400,7 @@ export function XiaoPAgentPanel({
           {/* 进度条紧贴图标下方、**在名牌之上**。原来排在名牌后面，而浮标离屏幕底边
               只有 32px（md:bottom-8）—— 三条一起跑时最后几条正好被挤出可视区，
               用户看到的就是「任务在跑，可小P蛙下面什么都没有」。 */}
-          <TaskProgressBars active={feed.active} />
+          <TaskProgressBars tasks={feed.running} />
           <span className="flex flex-col items-center text-center font-semibold text-leaf-deep bg-paper/90 border border-leaf/30 rounded-lg px-2 py-0.5 leading-tight whitespace-nowrap shadow-sm">
             <span className="text-[10px]">小P蛙</span>
             <span className="text-[9px] font-normal text-ink-soft">Plantspedia AI Agent</span>

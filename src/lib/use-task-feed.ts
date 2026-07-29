@@ -13,6 +13,7 @@ import { fetchTaskFeedFn, markFailedReadFn } from "./task-feed.functions";
 import { useAuth } from "@/hooks/use-auth";
 import {
   activeByKind,
+  runningTasks,
   unreadCounts,
   totalUnread,
   failedCounts,
@@ -28,8 +29,10 @@ const POLL_IDLE_MS = 60_000;
 
 export type TaskFeedState = {
   rows: TaskFeedRow[];
-  /** 每类当前在跑的那一条（画进度条用）。 */
+  /** 每类当前在跑的那一条（「每类要个代表」的场合用）。 */
   active: Partial<Record<TaskKind, TaskFeedRow>>;
+  /** 所有在跑的任务，**一个一根进度条**（浮标下面画的就是它）。 */
+  running: TaskFeedRow[];
   /** 每类「已完成但没看过」的条数（画圆圈用）。 */
   unread: Record<TaskKind, number>;
   unreadTotal: number;
@@ -93,6 +96,7 @@ export function useTaskFeed(): TaskFeedState {
   return {
     rows,
     active: signedIn ? activeByKind(rows) : {},
+    running: signedIn ? runningTasks(rows) : [],
     unread: signedIn ? unreadCounts(rows) : EMPTY,
     unreadTotal,
     failed: signedIn ? failedCounts(rows) : EMPTY,

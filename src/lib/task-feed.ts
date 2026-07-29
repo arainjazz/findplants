@@ -145,10 +145,28 @@ export function totalFailed(rows: TaskFeedRow[]): number {
 }
 
 /**
- * 每类任务当前**正在跑**的那一条（小P蛙图标下面的进度条画的就是它）。
+ * 当前所有**正在跑**的任务，一条一根进度条。
  *
- * 同类有多个在跑时取**最近更新**的那条 —— 用户连着点了三次「进一步生成草稿」时，
- * 进度条该跟着最新的那个走，而不是卡在第一个上。
+ * 用户 2026-07-29 定的口径：「两个识别 + 一个金叶在跑，应该出现三条进度条」——
+ * 所以这里**不再按 kind 合并**。原先 `activeByKind` 每类只留最近更新的那条，
+ * 同时跑两个识别就只看得到一根绿条，用户以为另一个没跑起来。
+ * 颜色仍按 kind 走（两个识别 = 两根绿条），这不冲突：颜色回答「这是什么任务」，
+ * 根数回答「有几个在跑」。
+ *
+ * 排序按 **createdAt 升序**（先起的在上）。用 updatedAt 排会让进度一动条目就换位，
+ * 盯着看的人会以为进度在乱跳。
+ */
+export function runningTasks(rows: TaskFeedRow[], now = Date.now()): TaskFeedRow[] {
+  return rows
+    .filter((r) => r.status === "running" && !isFeedStale(r, now))
+    .sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
+}
+
+/**
+ * 每类任务当前**正在跑**的那一条。
+ *
+ * 同类有多个在跑时取**最近更新**的那条。进度条已改用 `runningTasks`（每个任务一根），
+ * 这个函数留给「每类只要一个代表」的场合。
  */
 export function activeByKind(
   rows: TaskFeedRow[],

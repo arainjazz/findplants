@@ -7017,6 +7017,8 @@ async function geminiChat(
   schema?: unknown,
   maxRetry = 3,
   images?: InlineImage[],
+  /** 报错文案里自称什么。三条传输层都要，理由见 openaiCompatChat 的 `label`。 */
+  who = "小P",
 ): Promise<AiTextResult> {
   const generationConfig: Record<string, unknown> = schema
     ? { responseMimeType: "application/json", responseSchema: schema }
@@ -7039,7 +7041,7 @@ async function geminiChat(
     const res = await callGeminiWithRotation(splitGeminiKeys(apiKey), {
       model,
       timeoutMs: 120_000,
-      label: "小P",
+      label: who,
       body: {
         contents: gContents,
         systemInstruction: { parts: [{ text: system }] },
@@ -7047,7 +7049,7 @@ async function geminiChat(
       },
     });
     const txt = res.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (!txt) throw new Error("小P 未返回有效内容。");
+    if (!txt) throw new Error(`${who} 未返回有效内容。`);
     const u = res.usageMetadata ?? {};
     return {
       text: txt as string,
@@ -7060,7 +7062,7 @@ async function geminiChat(
   } catch (e) {
     if (e instanceof AiError && e.code === "GEMINI_NETWORK" && /abort/i.test(e.message)) {
       throw new Error(
-        "小P 响应超时（等了 2 分钟）：模型思考较慢，带图提问尤其耗时。请重试一次；连续超时可换更快的视觉模型。",
+        `${who} 响应超时（等了 2 分钟）：模型思考较慢，带图提问尤其耗时。请重试一次；连续超时可在「${who}」的控制台换更快的视觉模型。`,
       );
     }
     throw e;
@@ -7096,6 +7098,22 @@ function schemaInstruction(schema: unknown): string {
     `键名必须**逐字照抄**下面这份 JSON Schema（大小写、下划线、_zh / _en 后缀一个字符都不能改），` +
     `required 里列出的键一个都不能少，不要自行增加或包裹外层结构：\n${text}`
   );
+}
+
+/**
+ * 把「上游网关超时」这类**光看状态码根本读不懂**的失败翻译成人话。
+ *
+ * 用户 2026-07-29 收到的原文是「小P 调用失败 (HTTP 524)：error code: 524」——
+ * 524 是 Cloudflare 的**源站超时**：请求确实发出去了，是中转/厂商那头在规定时间内
+ * 没把响应写完。这跟本站的超时预算无关，重试或换个更快的模型才有用，
+ * 而原文既没说这些，还把责任指向了错误的控制台。
+ */
+function upstreamHint(status: number, who: string): string {
+  if (status === 524 || status === 504 || status === 522)
+    return `\n\n（HTTP ${status} 是**中转/厂商那一端**超时了，不是本站掐断的：请求发出去了，对方没能在它自己的时限内写完响应。多见于推理模型开着思维链又带图。可以重试一次；反复出现就在「${who}」的控制台里换更快的模型，或把它的思维链设成强制关闭。）`;
+  if (status === 502 || status === 503)
+    return `\n\n（HTTP ${status} 是中转/厂商暂时不可用，与所配模型和本站都无关。稍后重试，或在「${who}」的控制台里换一条中转。）`;
+  return "";
 }
 
 async function openaiCompatChat(
@@ -7255,11 +7273,13 @@ async function openaiCompatChat(
   }
   if (!resp.ok) {
     const t = await resp.text();
-    throw new Error(`小P 调用失败 (HTTP ${resp.status})：${t.slice(0, 200)}`);
+    throw new Error(
+      `${who} 调用失败 (HTTP ${resp.status})：${t.slice(0, 200)}${upstreamHint(resp.status, who)}`,
+    );
   }
   const res = await resp.json();
   const content = res.choices?.[0]?.message?.content;
-  if (!content) throw new Error("小P 未返回有效内容。");
+  if (!content) throw new Error(`${who} 未返回有效内容。`);
   const u = res.usage ?? {};
   return {
     text: content as string,
@@ -7280,6 +7300,8 @@ async function anthropicChat(
   system: string,
   schema?: unknown,
   images?: InlineImage[],
+  /** 报错文案里自称什么。三条传输层都要，理由见 openaiCompatChat 的 `label`。 */
+  who = "小P",
 ): Promise<AiTextResult> {
   const apiBase = normalizeBaseUrl(baseUrl) || "https://api.anthropic.com/v1";
   const idx = images?.length ? lastUserIndex(contents) : -1;
@@ -7314,11 +7336,13 @@ async function anthropicChat(
   });
   if (!resp.ok) {
     const t = await resp.text();
-    throw new Error(`小P 调用失败 (HTTP ${resp.status})：${t.slice(0, 200)}`);
+    throw new Error(
+      `${who} 调用失败 (HTTP ${resp.status})：${t.slice(0, 200)}${upstreamHint(resp.status, who)}`,
+    );
   }
   const res = await resp.json();
   const txt = res.content?.[0]?.text;
-  if (!txt) throw new Error("小P 未返回有效内容。");
+  if (!txt) throw new Error(`${who} 未返回有效内容。`);
   const u = res.usage ?? {};
   return {
     text: txt as string,
@@ -7357,6 +7381,9 @@ async function xiaopTextCall(opts: {
   imagesEssential?: boolean;
 }): Promise<AiTextResult & { provider: string; model: string }> {
   const consoleId = opts.consoleId ?? "xiaop";
+  // 报错要自称**这条链路自己的**名字。三条传输层里的每一句文案都要拿到它 ——
+  // 上一轮只改了超时那两句，结果金叶撞 HTTP 524 时照旧自称「小P 调用失败」。
+  const who = consoleId === "xiaop" ? "小P" : CONSOLE_LABELS[consoleId];
   // 每一项序列都是一套完整自洽的配置，所以「换一项重试」就是原样再跑一遍这段。
   const callSlot = async (
     slot: ModelSlot,
@@ -7370,6 +7397,7 @@ async function xiaopTextCall(opts: {
         opts.schema,
         opts.maxRetry ?? 3,
         opts.images,
+        who,
       );
       return { ...r, provider: "gemini", model: slot.model };
     }
@@ -7382,6 +7410,7 @@ async function xiaopTextCall(opts: {
         opts.system,
         opts.schema,
         opts.images,
+        who,
       );
       return { ...r, provider: "anthropic", model: slot.model };
     }
@@ -7398,9 +7427,7 @@ async function xiaopTextCall(opts: {
         thinking: thinkingOf(slot, consoleId),
         // 「图就是任务」的链路（器官识别）必须禁掉盲退级，见 openaiCompatChat 的注释。
         noBlindFallback: !!opts.imagesEssential,
-        // 报错要自称**这条链路自己的**名字。金叶超时说成「小P 响应超时」，
-        // 会把人指到完全无关的控制台去（用户 2026-07-29 就是这么被绕懵的）。
-        label: consoleId === "xiaop" ? "小P" : CONSOLE_LABELS[consoleId],
+        label: who,
         timeoutMs: BACKGROUND_CONSOLES.has(consoleId) ? 300_000 : 120_000,
       },
     );

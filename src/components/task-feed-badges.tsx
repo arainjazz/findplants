@@ -11,31 +11,48 @@ import { TASK_KIND_META, type TaskFeedRow, type TaskKind } from "@/lib/task-feed
 
 const ORDER: TaskKind[] = ["identify", "enrich_draft", "gold_page"];
 
+/** 最多同时画几根条。再多就只报数字 —— 一摞条子糊在浮标下面反而读不出信息。 */
+const MAX_BARS = 5;
+
 /**
- * 图标下面的进度条组。只显示**正在跑**的那几类，全都闲着时整块不渲染
- * （避免浮标下面常年挂着三条空槽）。
+ * 图标下面的进度条组：**一个在跑的任务一根条**，颜色按类走。
+ * 全都闲着时整块不渲染（避免浮标下面常年挂着空槽）。
+ *
+ * 自带不透明底板是刻意的：浮标下面紧挨着「小P蛙」白名牌，那块有 `shadow-sm`，
+ * 阴影糊到 6px 高的细条上，看起来就是被啃掉一半（用户 2026-07-29：「白色状态框
+ * 会对颜色进度条造成遮挡」）。给它自己的卡片 + `relative z-10`，谁也压不住谁。
  */
-export function TaskProgressBars({ active }: { active: Partial<Record<TaskKind, TaskFeedRow>> }) {
-  const running = ORDER.filter((k) => active[k]);
-  if (!running.length) return null;
+export function TaskProgressBars({ tasks }: { tasks: TaskFeedRow[] }) {
+  if (!tasks.length) return null;
+  const shown = tasks.slice(0, MAX_BARS);
+  const hidden = tasks.length - shown.length;
 
   return (
-    <div className="w-full flex flex-col gap-1 mt-1" aria-label="任务进度">
-      {running.map((kind) => {
-        const row = active[kind]!;
-        const meta = TASK_KIND_META[kind];
+    <div
+      className="relative z-10 w-full flex flex-col gap-[3px] bg-paper/95 border border-leaf/30 rounded-lg px-1.5 py-1 shadow-sm"
+      aria-label={`${tasks.length} 个任务进行中`}
+    >
+      {shown.map((row) => {
+        const meta = TASK_KIND_META[row.kind];
         return (
-          <div key={kind} className="w-full" title={`${meta.label}：${row.phase || "进行中"}`}>
-            <div className="h-1.5 w-full rounded-full bg-ink/10 overflow-hidden">
-              <div
-                className={`h-full rounded-full ${meta.bar} transition-[width] duration-700 ease-out`}
-                // 至少留 6% —— 进度 0 时一条完全看不见的进度条等于没有反馈。
-                style={{ width: `${Math.max(6, row.progress)}%` }}
-              />
-            </div>
+          <div
+            key={row.id}
+            className="h-2 w-full rounded-full bg-ink/10 overflow-hidden"
+            title={`${meta.label}${row.title ? ` · ${row.title}` : ""}：${row.phase || "进行中"}（${row.progress}%）`}
+          >
+            <div
+              className={`h-full rounded-full ${meta.bar} transition-[width] duration-700 ease-out`}
+              // 至少留 6% —— 进度 0 时一条完全看不见的进度条等于没有反馈。
+              style={{ width: `${Math.max(6, row.progress)}%` }}
+            />
           </div>
         );
       })}
+      {hidden > 0 && (
+        <span className="text-[9px] leading-none text-ink-soft text-center tabular-nums">
+          +{hidden} 个在跑
+        </span>
+      )}
     </div>
   );
 }
