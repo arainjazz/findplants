@@ -5776,3 +5776,5 @@ db.from("task_feed").eq("user_id", …)   // ❌ QueryBuilder 上根本没有 eq
 ### 验证证据
 - `tsc --noEmit` EXIT=0；`npm run build` EXIT=0；lint 干净。
 - 三套测试：纯函数 41 条、写入形状 10 条、真库往返 1 轮 —— 全过。
+
+### ✅ 已部署 — Version `57237c4e-f60f-4d10-b569-503631a075cf`，2026-07-29（提交 `0846ce6`）
