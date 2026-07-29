@@ -5699,3 +5699,42 @@ draft_id 为空的行不在管辖内，`onConflict` 无从落脚。所以这一�
   `data-y-position=top` / `data-x-position=center`，与浮标矩形 `overlapsFrog:false`，截图确认。
 
 ### ✅ 已部署 — Version `4d83e7ce-df11-4372-a5cf-3520c380650e`，2026-07-29（提交 `faec29c`）
+
+## ✅ 2026-07-29（续六）— 🔴 根因确诊：`ON CONFLICT` 匹配不上部分索引，动态流写入静默全废
+
+前三轮我一直在**症状层**打补丁（进度条排版、颜色、报错文案），根因在这一轮才挖到。
+
+### 真相
+`upsertTaskFeed` 走 draft_id 那条路用的是
+`.upsert(row, { onConflict: "user_id,kind,draft_id" })`，
+而迁移里那个唯一索引是**部分索引**（`where draft_id is not null`）。
+**Postgres 的 `ON CONFLICT (cols)` 匹配不上部分索引**（除非语句里带同样的谓词），
+而 PostgREST 的 `on_conflict` 只发列名、不发谓词 → 每一次写入都原地报
+`42P10 there is no unique or exclusion constraint matching the ON CONFLICT specification`。
+再加上本函数**把异常全吞了**（console.warn），这个失败**完全无声**。
+
+后果正好是用户连报三轮的全部症状：
+- 银叶 / 金叶的动态**一条都没写进去过** → 蓝条、橙条永远不出现；
+- 识别只有上一轮加的 job_id 分支写得进去，而收尾的 `feedFinish` 走 draft_id 路
+  → **识别永远停在 running**：绿条不消失、不转未读、点开也没有摘要卡。
+
+### 实测证据（`scratch/probe_task_feed_upsert.mjs`）
+- 全表只有 **4 行**，清一色 `identify / running`（银叶金叶零行 —— 从来没写进去过）；
+- upsert 复现 `HTTP 400 / 42P10`；
+- 同一张表普通 insert `HTTP 201` 正常 → 问题只在 ON CONFLICT 那一条路上。
+
+### 修法（不加迁移）
+两条路**都**改成「先 update（带 `.select("id")` 才分得清『更新了』和『没匹配到』）
+→ 没更到再 insert → insert 被拒就回头再 update 一次（并发兜底）」。
+`scratch/fix_task_feed_stuck_rows.mjs` 在真库上验过：
+update 0 行 → insert 201 → 再 update 命中 1 行、值已生效、该草稿下**仍只有 1 行**（没堆重复）。
+同一脚本清掉了 4 条僵尸 running 行（它们的草稿都已不存在 → 直接删）。
+
+⚠️ **别再改回 upsert**，除非先把索引换成非部分索引（那要一次迁移）。
+⚠️ 另一个教训：**吞异常必须吼**。写动态流不该拖垮生成没错，但 `console.warn` 等于没说话；
+现在失败一律 `console.error` 并写明是哪一步。
+
+### 验证证据
+- `tsc --noEmit` EXIT=0；`npm run build` EXIT=0；lint 干净；单测 41 条全过。
+- 真库往返实测（见上）。⛔ 端到端仍要用户真跑一轮：识别完应转绿色未读圆圈 + 出摘要卡，
+  银叶应出蓝条、金叶应出橙条。

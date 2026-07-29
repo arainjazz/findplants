@@ -26,20 +26,33 @@ async function admin() {
 }
 
 /**
- * 建/更新一条动态。**同一个人 + 同一类 + 同一份草稿只留一条**（迁移里有唯一索引）——
+ * 建/更新一条动态。**同一个人 + 同一类 + 同一份草稿只留一条** ——
  * 重跑银叶不该在流里堆两条，而是把原来那条更新掉。
  *
  * 重跑时 `read_at` 被显式清回 null：内容变了，就该重新算作「未看过」。
  *
- * 🔑 **没有 draftId 时改用 jobId 认身份**。用户 2026-07-29 报的「快速识别跑着，
- * 小P蛙下面却没有绿色进度条」就出在这：**新建**识别的草稿是跑完才写出来的，
- * 入队时 draftId 还是空串，这里原先直接 return，于是整趟识别在动态流里**一条记录都没有** ——
- * 进度条自然无从画起，用户只能盯着相框干等。
+ * ─────────────────────────────────────────────────────────────────────────────
+ * 🔴 **为什么整个函数都不能用 `.upsert({ onConflict })`**（2026-07-29 实测确诊）
  *
- * 为什么这条路要「先查后写」而不是 upsert：迁移里的唯一索引是
- * `(user_id, kind, draft_id) where draft_id is not null` —— **部分索引**，
- * draft_id 为空的行根本不在它的管辖范围，`onConflict` 无从落脚。
- * 多一次读换来不必加新迁移，而 onPhase 一趟只有 4 次，代价可接受。
+ * 迁移里的唯一索引是**部分索引**：
+ *     create unique index … on task_feed (user_id, kind, draft_id)
+ *       where draft_id is not null;
+ * 而 Postgres 的 `ON CONFLICT (cols)` **匹配不上部分索引**，除非语句里带上同样的
+ * 谓词；PostgREST 的 `on_conflict` 参数只会发列名、不发谓词。结果是每一次
+ * draft_id 路的写入都原地报
+ *     42P10 there is no unique or exclusion constraint matching the ON CONFLICT specification
+ * 而本函数把异常全吞了（写动态流不该拖垮生成）→ **这个失败完全无声**。
+ *
+ * 后果正是用户连报三轮的那些症状：银叶/金叶的动态**一条都没写进去过**（所以蓝条、
+ * 橙条永远不出现）；识别的动态只有我上一轮加的 job_id 分支写得进去，而收尾的
+ * `feedFinish` 又走 draft_id 路 → **识别永远停在 running**：绿条不消失、不转未读、
+ * 点开也没有摘要卡。探针脚本 `scratch/probe_task_feed_upsert.mjs` 复现了这一切：
+ * 全表只有 4 行、清一色 `identify/running`，upsert 报 42P10，普通 insert 正常。
+ *
+ * 所以两条路**都**改成「先更新，没更到再插入」。不加迁移就能立刻生效，
+ * 而 onPhase 一趟只有 4 次，多一次往返完全付得起。
+ * ⚠️ 别再改回 upsert —— 除非先把那个索引换成非部分索引（那需要一次迁移）。
+ * ─────────────────────────────────────────────────────────────────────────────
  */
 export async function upsertTaskFeed(input: {
   userId: string | null | undefined;
@@ -79,35 +92,35 @@ export async function upsertTaskFeed(input: {
     if (input.error !== undefined) row.error = input.error;
     if (input.markUnread) row.read_at = null;
 
-    if (input.draftId) {
-      const { error } = await db
-        .from("task_feed")
-        .upsert(row, { onConflict: "user_id,kind,draft_id" });
-      if (error) console.warn("[TaskFeed] upsert failed:", error.message);
+    // 认这一行的身份：有草稿就按草稿认，没有（新建识别，草稿跑完才诞生）就按任务认。
+    const matchRow = () => {
+      const q = db.from("task_feed").eq("user_id", input.userId).eq("kind", input.kind);
+      return input.draftId
+        ? q.eq("draft_id", input.draftId)
+        : q.eq("job_id", input.jobId).is("draft_id", null);
+    };
+
+    // ① 先更新。`.select("id")` 是关键 —— 没有它就分不清「更新成功」和「没有匹配行」。
+    const { data: updated, error: upErr } = await matchRow().update(row).select("id");
+    if (upErr) {
+      console.error("[TaskFeed] 更新失败:", upErr.message);
       return;
     }
+    if (updated?.length) return;
 
-    // ── 还没有草稿（新建识别）：按 job_id 先查后写 ──────────────────────────────
-    // 部分唯一索引管不到 draft_id 为空的行，只能自己保证「同一个任务只留一条」。
-    const { data: existing } = await db
-      .from("task_feed")
-      .select("id")
-      .eq("user_id", input.userId)
-      .eq("kind", input.kind)
-      .eq("job_id", input.jobId)
-      .is("draft_id", null)
-      .maybeSingle();
+    // ② 一行都没更到 = 这条动态还不存在，插一条。
+    const { error: insErr } = await db.from("task_feed").insert(row);
+    if (!insErr) return;
 
-    if (existing?.id) {
-      const { error } = await db.from("task_feed").update(row).eq("id", existing.id);
-      if (error) console.warn("[TaskFeed] update-by-job failed:", error.message);
-    } else {
-      const { error } = await db.from("task_feed").insert(row);
-      if (error) console.warn("[TaskFeed] insert-by-job failed:", error.message);
-    }
+    // ③ 插入被拒，几乎只剩一种可能：另一个并发写抢先插了同一条，撞上那个部分唯一索引。
+    //    那就说明行已经在了 —— 回到 ① 再更新一次，别把这次的进度丢掉。
+    console.warn("[TaskFeed] 插入被拒，改为重试更新:", insErr.message);
+    const { error: retryErr } = await matchRow().update(row);
+    if (retryErr) console.error("[TaskFeed] 重试更新仍失败:", retryErr.message);
   } catch (e) {
     // 动态流写不进去只是少一条通知，绝不能让整趟生成翻车。
-    console.warn("[TaskFeed] upsert threw:", e instanceof Error ? e.message : e);
+    // 但**必须吼出来**：正是「静悄悄地失败」让 42P10 藏过了三轮用户反馈。
+    console.error("[TaskFeed] 写入抛异常:", e instanceof Error ? e.message : e);
   }
 }
 
