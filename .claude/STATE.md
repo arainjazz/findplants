@@ -5205,3 +5205,304 @@ center 把配图/「暂无」虚线框吊在正文垂直中央，正文一长，
   「PWA service worker caching」。）
 - 若 ④ 改完卡上没变：先看页面底部「修改记录」有没有那条「小P蛙改写（快速识别简介卡）」——
   有记录说明写库成功、问题在缓存刷新；没记录说明服务端那条分支没走到。
+
+## ✅ 2026-07-28 — 序列能力顺位 + 推理开关 + 模型类型建议（tsc EXIT=0；**NOT deployed**）
+
+用户线上三处报错串成一条线：①二次复核 `qwen3.7-plus` **28 秒没返回** → 复核判「未运行」；
+②小P蛙序列 1 配了**纯文本**的 `qwen3.7-max`，带图调用 HTTP 400
+`InternalError.Algo.InvalidParameter: … [Unexpected item type in content.]`，
+且**整条序列停在第 1 项**（后面已验证读图的 gemini-3.5-flash 压根没试）；
+③银叶/金叶配图空缺 —— 而**配图的器官分类正是走小P蛙序列**，②直接把③也废了。
+
+### 1. ✅ 漏洞 B：能力型 400 要顺位（用户定夺：交给序列二顶上）
+[model-queue.ts](src/lib/model-queue.ts) `shouldFailOver` 原来只认「讲可用性的 400」
+（未开通/欠费/模型不存在）。新增 **`CAPABILITY_400`** —— 「**这个模型没这项能力**」
+（`unexpected item type` / `content must be a string` / `not support …image|vision` /
+`不支持图片` / `仅支持文本` …）。请求完全合法，只是这一项不会读图 → **必须顺位**。
+- ⚠️ 同时加 **`BAD_IMAGE_400` 一票否决**：话里在说**这张图本身**不行（format / 过大 /
+  解码 / 损坏）的，换谁都挂，不顺位、也不能把真错误埋掉。
+  现有断言 `"Invalid image format: webp not supported"` 正是靠它保持 false。
+- 反向语序模式**刻意限定**成 `image_input|image_url|vision|multimodal`，
+  不写宽泛的 `image .* not supported` —— 否则「webp 这种**格式**不支持」会被误判成能力问题。
+- `scratch/failover.test.mjs` 扩到 **25 条全过**（含用户那条 400 原文）。
+
+### 2. ✅ 推理（思维链）开关 —— 每个模型一个，三态
+`ModelSlot.thinking?: "on" | "off"`，**不设 = 跟随控制台默认**（三态而非布尔：
+以后调默认值时，老配置不会僵在旧默认上）。
+- **`THINKING_DEFAULTS`**：`enrich`=**on**（唯一真吃思维链的链路，且跑在 Queues
+  的 15 分钟挂钟里，不赶时间）；`card` / `second_opinion` / `xiaop` / `ai` 全 **off**
+  （都卡在用户等待的实时路径上，干的是机械活）。未知控制台保守 off。
+- `looksReasoningModel()` 是**启发式**，只用来在界面上提示 + 挑初始默认，**不替管理员决定**：
+  开关永远显示、永远可改。理由就是 `qwen3.7-max` —— 名字像旗舰推理模型，实际是纯文本模型。
+  `NON_THINKING_HINT`（turbo/flash/instruct/non-thinking）优先级高于推理特征。
+- 接线：`thinkingParams(cfg)` 替掉三处硬编码 `...THINKING_OFF`；
+  slot→cfg 处调 `thinkingOf(slot, consoleId)`；
+  **小P蛙那条原来一个关思考参数都不发**，现在也走同一套（`openaiCompatChat` 加第 8 个参数）。
+- 持久化：`readModelQueue` / `writeModelQueue` / `ModelSlotSchema`(zod) /
+  `saveModelQueueFn` handler **四处**都补了字段，否则会被静默丢弃。
+  ⚠️ 推理开关**不**跟着换模型清空（不同于 vision）：它是「这条链路要快还是要深」的判断，
+  换个模型 ID 照样成立；vision 才是对某个具体模型的实测结论。
+- `scratch/thinking-toggle.test.mjs` **30 条全过**（识别 / 默认值 / 覆盖 / 存取往返）。
+
+### 3. ✅ 模型类型建议（五个控制台各一份）
+[model-queue-console.tsx](src/components/model-queue-console.tsx) `CONSOLE_ADVICE`：
+每个控制台写明 **needs（该配什么）/ why / avoid（常见配错）/ thinkingWhy**。
+五个控制台界面长得一模一样、要求却天差地别 —— 尤其 **xiaop 兼着配图器官识别**，
+管理员从界面上完全看不出这里需要视觉模型（这就是③的成因）。
+
+### 验证证据
+- `tsc --noEmit` EXIT=0；`npm run build` EXIT=0；改动的两个文件 eslint 零非格式错误。
+- `scratch/failover.test.mjs` 25/25、`scratch/thinking-toggle.test.mjs` 30/30。
+- **浏览器实测**（dev 5203 → 草稿页 → 小P蛙 → 模型设置，走 localStorage 那条不需管理员）：
+  建议框与推理开关都渲染；下拉三档齐全；把模型改成 `qwen3.7-plus-2026-05-26` 并切「强制开启」
+  → 「⚠️ 看着像推理模型…」警告如期出现，徽标变「当前：开（不发关思考参数）」；控制台零报错。
+- 🐛 实测中发现并已修：建议文案里的 `**粗体**` markdown 会以**字面星号**渲染
+  （`<p>` 里是纯文本）→ `CONSOLE_ADVICE` 的 needs/why/avoid 改成 `React.ReactNode`，
+  两处改用真 `<b>`。重测已无字面星号。
+
+### ⚠️ 尚未修的（配图链路，已诊断未动手）
+1. **`classifyPhotoOrgans` 全有或全无**：`if (thumbs.length !== batch.length) return cands;`
+   —— 8 张里坏 1 张 → 整批退回空标签 → 一张也进不了槽。且 `fetchInlineImage` 是全文件
+   **唯一不带 User-Agent** 的 fetch（Wikimedia 对裸 UA 会 403）。
+2. **`loadXiaoPQueue` 没有 `?? loadAiQueue()` 兜底**（对比 loadCardQueue / loadEnrichQueue）。
+3. **`openaiCompatChat` 的盲退级**：中转拒收图片时会**去掉图重发** —— 对聊天合理，
+   对器官分类是灾难（没看见图却照编一串标签）。需要 `noBlindFallback` 开关。
+4. **`user_photos` 从没进过配图链路** —— 用户自己拍的花/叶特写是手上最贴题的图源，
+   目前只喂给小P蛙问答。
+
+### 下一步
+- 部署（本轮**均未上线**）。上线后：小P蛙序列 1 报 400 应自动顺位到 gemini-3.5-flash；
+  二次复核在控制台可见「推理模式」开关且默认关。
+- 再按上面 4 条修配图（建议顺序：先加可见性日志 → 再改逐张容错）。
+
+## ✅ 2026-07-28（续）— 金叶/器官识别拆出独立控制台 + 配图机制修复（tsc/build EXIT=0；已实测；**NOT deployed**）
+
+用户两条指令：①把金叶创建的模型从小P蛙里拆出来独立配置；②修银叶/金叶的配图机制。
+配图的两个决策点问过用户，均选推荐项：**器官识别给独立控制台**、**用户实拍进候选池**。
+
+### 1. ✅ 拆出两个新控制台（`xiaopTextCall` 原来被 5 类活共用）
+`xiaopTextCall` 新增 `consoleId` 参数，决定读哪个序列 + 用谁的推理默认值。
+- **`gold` 金叶详页模型**（`gold_model_config`），兜底链 **gold → enrich → ai**。
+  刻意**不回退小P蛙**：金叶写整份公开档案，与 enrich 同属长文诉求；小P蛙是为交互问答调的快模型。
+  推理默认 **on**（跑在队列 15 分钟挂钟里，不赶时间）。
+- **`organ` 配图器官识别模型**（`organ_model_config`），兜底链 **organ → card → ai**
+  （器官识别要「能读图 + 快 + 便宜」＝ 出卡AI 的画像）。推理默认 **off**（机械打标签）。
+  🔑 **这就是配图全空的真凶**：器官识别原来挂在小P蛙序列上，用户在小P蛙配了纯文本
+  `qwen3.7-max` → 带图调用一路 400 → 全站配图归零，而且不报错、名字上也想不到两者相连。
+- 报错文案跟着链路走：金叶失败不再说「给小P蛙换模型」。
+- 两块面板已挂上 `/identify`，`CONSOLE_ADVICE` 各写一份「该配什么/为什么/常见配错」。
+
+### 2. ✅ 配图：器官分类从「全批放弃」改成「逐张容错」
+- `classifyPhotoOrgans` 原来 `if (thumbs.length !== batch.length) return cands;` ——
+  **8 张里坏 1 张 → 整批退回空标签 → 一张也进不了槽**。改成只把取到的那些送去分类。
+- ⚠️ **最危险的一处**：模型看到的编号是「送出子集」的下标，不是 batch 下标。不映射就会把
+  器官**系统性错标到别的图上**（一张标着「花」的叶子特写比空槽有害得多）。
+  映射逻辑抽成纯函数 `applyOrganVerdicts`（[species-photos.ts](src/lib/species-photos.ts)），
+  `scratch/organ-verdicts.test.mjs` **16 条**专测错位场景。
+  prompt 里的数量/下标也一并改用 `sendable.length`（否则模型按 batch.length 编号，全对不上）。
+- `fetchInlineImagesIndexed`：保序、失败留 null（旧的 `fetchInlineImages` 会 filter 掉，
+  于是调用方根本对不上是哪几张 —— 这正是「全批放弃」写法的由来）。
+- **`fetchInlineImage` 补 User-Agent** —— 它曾是全文件唯一的裸 fetch 图片请求，
+  Wikimedia 对裸 UA 直接 403。顺手把三处 `"Plantspedia/1.0"` 收成 `PLANTSPEDIA_UA` 常量。
+
+### 3. ✅ 转存改「逐张回落」
+`rehostImages` → `rehostImagesIndexed`（保序，失败留 null）+ `rehostImagesAligned`（逐张回落）。
+旧写法 `rehosted.length === chosen.length ? rehosted : chosen` 只要一张失败就**整页退回外链**，
+而外链是 inat/gbif/wikimedia 域名、国内加载不出 ——
+日志里 `[PhotoSlots]` 显示 5/5 槽有图，用户看到的却是一排裂图。
+
+### 4. ✅ 用户实拍进配图候选池（此前完全没被用过）
+`userPhotoCandidates()`（纯函数）把 `photo_url` + `user_photos` 组装成候选，**排在池子最前**。
+- ⚠️ **刻意不直接塞进空槽**：和外部图一起过 `classifyPhotoOrgans` 现看现标，器官对不上
+  自然进不了槽。明确知道缺「花」时塞一张叶子照是误导，比空槽有害。
+- 署名走新增的 `SITE_LICENSE = "site-contributed"`（已加进 `REUSABLE_LICENSES`），
+  `licenseLabel` 对它返回**空串** —— 站内投稿没有标准许可徽标，语义由 sourceName
+  「本站用户实拍」承担，避免拼出「本站用户授权 · 本站用户实拍」这种同义反复。
+- 银叶（`buildDraftContent` 新增 `userPhotos`/`photographer` 入参）与金叶两条链路都接了。
+
+### 验证证据
+- `tsc --noEmit` EXIT=0；`npm run build` EXIT=0。
+- 新增/改动的 4 个文件 eslint **0 错**；`identify-plant.functions.ts` 的 `any` 计数
+  **93 → 93 未变**（那些是 site_config 查询的历史存量）。
+- 测试：failover 25 / thinking-toggle 32 / organ-verdicts 16 / photo-slots 14 / species-photos 19，全过。
+- 浏览器实测：草稿页 → 小P蛙 → 模型设置，建议框与推理开关正常渲染、无字面星号、控制台零报错。
+- ⚠️ `scratch/job-queue.test.mjs` 与 `species-dossier.test.mjs` 失败，是 **Node ESM 无扩展名
+  import 的既有问题**（`ERR_MODULE_NOT_FOUND: ./plants` / `./worker-ctx`），本轮未碰这些文件。
+- ⛔ **配图是否真的变多，只能上线后用一次真识别 + 真 enrich 验证** —— 要模型调用与外网抓图。
+
+### 尚未修的（配图，已诊断）
+1. **`openaiCompatChat` 的盲退级**：中转拒收图片时会**去掉图重发** —— 对聊天合理，
+   对器官分类是灾难（没看见图却照编标签）。需要 `noBlindFallback` 开关，分类链路传 true。
+2. **金叶 `premium-page.ts:625/630`**：`feature_cards.slice(0,6)` 决定渲染几张图，
+   模型只返回 4 张卡时第 5/6 张图已抓取/分类/转存，却**没有落点**被静默吞掉。
+3. **金叶「人文·科学绘图」槽结构性必空**：`specimen` 只在第 4/5 级图源产出，
+   而那两级被 `picked.length < n` 守着 —— 物种在 iNat 收录越好，越轮不到标本层。
+4. 上线后先看日志 `[PhotoOrgans]…候选 N 张 / 实际看图 M 张` 与 `[PhotoSlots]…x/5 槽有图`，
+   再决定要不要加量（子请求上限已非约束：07-21 起 Workers Paid，50→1000）。
+
+### 下一步
+- 部署（07-28 两批改动**均未上线**）。
+- 上线后到 `/identify` 配置**新的两个控制台**（留空也能跑，会自动借用 enrich / 出卡AI）。
+
+## ✅ 2026-07-28（续二）— 配图剩余三条（tsc/build EXIT=0；纯函数已实测；**NOT deployed**）
+
+### 1. ✅ 盲退级：加 `noBlindFallback` 闸门
+`openaiCompatChat` 第 8 个参数从裸 `thinking` 改成 options 对象
+（`{ thinking?, noBlindFallback? }`），并在「去掉图重发」那条降级路径上加闸门。
+- 🔑 **发现一个此前没注意到的交互**：盲退级发生在 `openaiCompatChat` **内部**，
+  它把能力型 400 吞成一个纯文本 200 —— 于是续一加的 `CAPABILITY_400` 顺位
+  **根本没机会触发**。修好它，「第一个不行第二个顶上」才真的成立。
+- `xiaopTextCall` 新增 `imagesEssential?: boolean`（默认 false）：
+  **器官识别**传 true（看不见图的器官判定是纯编造，且 HTTP 200 无从察觉，宁可 400 顺位）；
+  **视觉自检**也传 true（否则中转拒图 → 偷偷去掉图 → 模型答错颜色 → 判 blind，
+  结论碰巧对但**原因完全错**，真相是中转拒图、换个中转就好）。
+  小P蛙聊天保持默认 false —— 带图提问退化成纯文本回答仍然对用户有用。
+- 真降级时补了一行 `console.warn`，不再无声无息。
+
+### 2. ✅ 金叶落单配图不再被静默吞掉（[premium-page.ts](src/lib/premium-page.ts)）
+`featHtml` 原来 `cards.map(...)`，模型只写 4 张卡时下标 4、5 的图**已抓取/分类/转存/占了存储**，
+却因为循环只跑 4 轮而消失。
+- ⚠️ **刻意不把它们挪进前面几张卡** —— schema 要求「恰好 6 张，依次 根株/茎/叶/花/果/物候」，
+  所以 `images[i]` 与 `feature_cards[i]` 是**语义绑定**的；下标 4 是「果实」，塞进标题写着
+  「叶」的卡里就是错标，正是 `slot()` 注释反对的那种伤害。
+- 改法：新增「补充图像 · Additional images」带，图注**如实写出是哪个器官**
+  （根与株型/茎/叶/花/果实与种子/物候与繁殖）。正常 6 张卡的页面**完全不受影响**。
+- `scratch/gold-orphan-images.test.mjs` **14 条**（含「果实图绝不能混进前 4 张卡」）。
+  ⚠️ 该测试要先用 esbuild 打包（premium-page.ts 有无扩展名 import，node 直跑不了）：
+  `./node_modules/.bin/esbuild src/lib/premium-page.ts --bundle --format=esm --platform=neutral --outfile=<scratchpad>/premium-page.bundle.mjs`
+
+### 3. ✅ 「人文·科学绘图」不再结构性必空
+`fetchSpeciesPhotos` 新增 `opts.specimenFloor`，金叶传 **2**。
+- 病根：第 4/5 级（标本台纸、Commons 图版）都被 `picked.length < n` 守着，
+  **物种在 iNat 收录越好，前三级越早填满 n，这两级越轮不到跑**；而 `GOLD_SLOTS[7]`
+  的 want 是单元素 `["specimen"]`，零降级余地 → 越常见的物种那个槽越是恒空。
+- 改法：加 `specimenDeficit()` / `wantMore()` / `takeCount(forSpecimen)`；
+  **第 1、2 级的提前 `return finish()` 也一并改成 `!wantMore()`** —— 不改这两处，
+  常见种在第 1 级就返回了，配额形同虚设（这是最容易漏的一处，grep 逐个核对过）。
+  `commonsSearch` 加第 4 个参数 `take`，默认沿用旧行为，不影响第 3 级。
+- `finish()` 日志改成无条件打印 `采用 x/n 张（标本/图版 s/floor）`，上线后一眼可查。
+
+### 验证证据
+- `tsc --noEmit` EXIT=0；`npm run build` EXIT=0；premium-page.ts 非 prettier 错误 0 条；
+  `identify-plant.functions.ts` 的 `any` 计数仍是 **93**（未新增）。
+- 测试：failover 25 / thinking-toggle 32 / organ-verdicts 16 / gold-orphan-images 14 /
+  photo-slots 14 / species-photos 19 / quality-gate 16 / gold-skill 20，**全过**。
+- ⛔ 三条的**真实效果都只能上线后验**：盲退级要真中转拒图；标本配额要真抓 GBIF/Commons；
+  落单配图要模型真的少写卡。纯函数层面已尽可能覆盖。
+
+### 下一步
+- 部署（07-28 三批改动**均未上线**）。
+- 上线后重点看日志：
+  `[SpeciesPhotos]…采用 x/14 张（标本/图版 s/2）` → 「人文·科学绘图」槽是否还空；
+  `[PhotoOrgans]…候选 N 张 / 实际看图 M 张` → 逐张容错是否生效；
+  `[openaiCompatChat] … 拒收图片，已去掉图重发` → 若出现在非小P蛙链路即是漏网。
+- 到 `/identify` 配置新增的两个控制台（金叶详页模型 / 配图器官识别模型），留空也能跑。
+
+## ✅ 2026-07-29 — 配图全面降级 + AI 控制台职责说明 + 小P蛙通知中心（前两刀）
+（tsc/build EXIT=0；已浏览器实测；**NOT deployed**；迁移**已由用户在控制台执行**）
+
+### 1. ✅ 配图不再留空槽（用户明确推翻「诚实空槽」设计）
+- `DRAFT_SLOTS` / `GOLD_SLOTS` 的 `want` **全部列满 6 个器官**。金叶原来有
+  **5 个单器官刚性槽**（叶/花/果/科学绘图 + 根株），零降级余地 —— 那是金叶配图
+  常年大面积留空的直接原因。
+- `assignSlots` 从两轮扩到**四轮**：
+  ① want[0] 精确 → ② want[1..] 降级 → ③ **收 organ==="" 的图**（视觉分类失败时的
+  救命稻草，旧版这里直接整页零配图）→ ④ **复用已用过的图**（候选比槽少时，
+  优先复用「本站用户实拍」）。只有**候选池一张图都没有**才可能空。
+- ⚠️ **我保留了一条用户没要求但必须有的**：降级命中时图注**如实写明画面是什么**
+  （「图为植株 · 该物种的果实照片暂缺」）。不加这句，「果实卡里放植株照」就是
+  `slot()` 注释一直反对的那种误导。银叶走新增的 `section_notes` 通道、
+  金叶走 `RenderPhoto.note`，两处都**不进署名 `<a>`**（它是内容事实、不是版权信息）。
+- `scratch/photo-slots.test.mjs` **重写**：删掉三条编码旧设计的断言
+  （「绝不拿 want 之外的图填槽」「只有一张图就只能填一个槽」「空槽带说明」），
+  文件头写明删了哪三条、为什么。现 **18 条全过**。
+
+### 2. ✅ 每个 AI 控制台列出「负责哪些工作」
+`CONSOLE_ADVICE` 加 `jobs: string[]`，7 个控制台逐条列出影响面（如器官识别那条：
+「银叶草稿：判断每张候选配图展示的是花/叶/果/植株/生境/标本」「金叶详页：9 个图槽
+的分配全依赖这一步」）。理由：光说「该配能读图的模型」不够，管理员真正要知道的是
+**「我改这一项会影响站上哪些功能」**，而控制台名字传达不了这件事。
+浏览器实测（临时路由 `/advicetest`，验完已删）渲染正常。
+
+### 3. ✅ 小P蛙通知中心 —— 刀 1（数据层）+ 刀 2（浮标 UI）
+**用户 2026-07-29 两处拍板**：①已读判据 = **进过那份草稿的详情页**（不是在小P蛙里
+点卡片）；②**存库**（跨设备可见），重点照顾注册用户与编辑，匿名用户不进动态流。
+
+- **迁移 `20260729120000_task_feed.sql`（用户已在 Supabase 控制台执行并验证）**：
+  15 列、3 个索引 + 1 个唯一索引（user+kind+draft）、2 条 policy、1 个触发器。
+  🔑 触发器 `task_feed_guard_update_trg` 是关键：policy 允许本人 update（为了标已读），
+  但 RLS **表达不了「只能改 read_at 这一列」**，没有它前端可以伪造「任务已完成」。
+  service-role 显式放行。`types.ts` 手工补了这张表。
+- **分工**：`site_config` 的 job 行 = 执行状态（6h 后清），`task_feed` = 动态流 + 已读（长期）。
+  两边都写是刻意的 —— 动态流写挂了不影响任务本身（`upsertTaskFeed` 全程吞异常）。
+- **接入点**：`runQueuedJob` 是银叶/金叶的唯一公共出入口，钩一处覆盖两条链路。
+  `feedStart`（入队即落地，避免冷启动几十秒的「点了没反应」空窗）/ `onPhase` 镜像 /
+  `feedFinish`（补标题·封面·摘要 + 重标未读）/ 失败写 error。
+  ⚠️ **只在阶段推进时镜像，不跟心跳** —— 心跳 15 秒一次，跟着写会白白翻倍子请求。
+- **前端**：`use-task-feed.ts`（有任务在跑 5 秒轮询、全闲退到 60 秒）、
+  `task-feed-badges.tsx`（进度条在图标**下面**、未读圆圈在**右上角**，用户指定的位置）、
+  `task-feed-launcher.tsx`（全局浮标 + 摘要卡列表）。
+  🔑 **为什么要新做一个全局浮标**：原小P蛙（draft-agent-panel）**只挂在草稿页和条目页**，
+  而用户要的恰恰是「去识别下一株时也能看到进度」—— 那两页都不在路上。
+  用 `XiaoPAgentMountedContext` 让两者**同页只出现一只青蛙**：有对话面板的页面上
+  全局那只让位，由对话面板那只用**同一套组件**画角标。
+- 已读：`drafts.$id.tsx` 挂载时调 `markDraftReadFn`，真的清掉未读才 invalidate 动态流。
+
+### 验证证据
+- `tsc --noEmit` EXIT=0；`npm run build` EXIT=0；新文件非 prettier 错误 0 条。
+- `scratch/task-feed.test.mjs` **21 条**（未读计数 / 进度条选谁 / 失联判定 / 三色语义
+  «进度条与圆圈必须同色» / DB 行解析）；photo-slots **18 条**；总计 **9 套 217 条全过**。
+- 浏览器实测三色角标（临时路由 `/feedtest`，验完已删）：圆圈橙1/蓝12/绿3、
+  进度条绿20%/蓝55%/橙88%、128→「99+」、0% 时留可见小段、全闲时整块不渲染。
+
+### 下一步（刀 3、刀 4 未做）
+- **刀 3**：小P蛙**对话框内**逐条列摘要卡。现在列表在全局浮标的独立面板里，
+  草稿页/条目页那只青蛙点开的仍是纯对话 —— 两者尚未合并。
+- **刀 4（最重）**：识别搬上队列 = 绿色那条 + 相框里的详细进度。要拆
+  `quickIdentifyDraft` 那 600 行 handler、照片改走 Storage URL（**payload 绝不能塞
+  base64**，`pruneExpiredJobs` 会把所有 job 行全量拉回解析）、放开匿名轮询
+  （`pollJobFn` 现挂着 `requireSupabaseAuth`；`readJob(id, userId?)` 的 userId 本来就可选）。
+- ⛔ 动态流的**端到端**效果只能上线后验：要真登录 + 真跑一轮银叶/金叶。
+  纯函数与渲染层已尽可能覆盖。
+
+## ✅ 2026-07-29（续）— 刀 3 + 刀 4：识别搬上队列 + 小P蛙对话框列摘要卡
+
+### 刀 3 ✅ 摘要卡列表并进小P蛙对话框
+- 新 `task-feed-list.tsx`，全局浮标与草稿页那只青蛙**共用同一份**（同一份东西在两处
+  长得不一样是 bug 不是特性）。
+- 对话框加「对话 / 任务动态」切换条，**只在有动态可看时出现**。
+- 点开青蛙时：**有未读就直接落在动态流**上（用户点它的动机十有八九是「刚才那株出来了吗」），
+  没未读才回到对话。
+
+### 刀 4 ✅ 识别搬上 Cloudflare Queues（本轮最重、风险最高）
+根治 07-26 那个「等 101 秒报 Load failed、其实后台已成功」—— 整条识别挂在一个 HTTP
+请求上必然撞边缘 100 秒上限，锁屏/切后台更早断。
+
+- **把 `quickIdentifyDraft` 的 handler 体（4268–4926，658 行）原样抽成模块级
+  `runQuickIdentifyCore(data, onPhase, opts)`**，一行逻辑没改。同步入口保留成薄封装。
+- 新 `startQuickIdentifyFn`（登录用户走它）：照片**先传 Storage** → 建 job → 入队 → 立刻返回 jobId。
+  🔑 **payload 绝不能塞 base64**：`pruneExpiredJobs` 每次建任务都会把所有 job 行全量拉回解析，
+  塞一张 8MB 图会撑爆它。所以 payload 只带地址，消费者用地址把字节取回来。
+  `opts.photoUrl/extraUrls` 让核心跳过重复上传，避免同一张图存两份。
+- `JobRecord.kind` 加 `quick_identify`；`draftId` 允许空串（**新建识别的草稿是跑完才有的**，
+  补拍合并才一开始就有）。`runQueuedJob` 加识别分支，跑完把 `feedDraftId` 补上再 feedFinish。
+- 核心里插了 4 个 `onPhase`（读图 8% → 定种 25% → 出卡 72% → 写库 90%），
+  相框里显示**真实**阶段 + 绿色进度条，并写明「可以锁屏或去识别下一株」。
+- 客户端：登录走 `startIdentify` + `awaitJob` 轮询；匿名仍走同步老路。
+  **断线自愈逻辑原样保留** —— 轮询本身也会断，断了照样要回查一次。
+
+### 🔴 本轮踩到并修好的真 bug（只有 dev 抓得到）
+把 handler 体抽成模块级函数后，它调用的 `resolveCreator` 里那句
+`await import("@tanstack/react-start/server")` **泄进了客户端依赖图** ——
+以前它只从 handler 闭包里可达，而编译器会把 handler 体从客户端产物剥掉。
+症状极具迷惑性：**`npm run build` EXIT=0 照过，dev server 直接 500**。
+修法：按报错自己的建议新建 `src/lib/request-auth.server.ts`（`.server.ts` 是本仓库
+既有的服务端边界约定），**两处**都改走它。
+⚠️ 教训：抽取 handler 体时必须查一遍它的调用链里有没有服务端专用 import，
+且**光看 build 通过不足以确认**，一定要在 dev 里真打开页面。
+
+### 验证证据
+- `tsc --noEmit` EXIT=0；`npm run build` EXIT=0；服务端日志零错误；
+  `/identify` 在 dev 里真实渲染通过（修复前是 500）。
+- 10 套测试 **217 条全过**。
+- ⛔ 端到端只能上线后验：要真登录 + 真拍一张 + 真跑一轮。

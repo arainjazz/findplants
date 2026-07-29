@@ -51,6 +51,14 @@ export type RenderPhoto = {
   sourceUrl?: string;
   /** url 为空时写在空槽里的说明，如「暂无该物种的花期公开照片」。 */
   missingNote?: string;
+  /**
+   * 降级配图的**如实说明**，如「图为植株 · 该物种的果实照片暂缺」。
+   *
+   * 2026-07-29 起金叶不再留空槽（9 个槽的 want 已列全 6 个器官 + 四轮兜底），
+   * 于是「果实卡里放的其实是植株照」会成为常态。有图不等于可以不告诉读者图里是什么 ——
+   * 这一行就是那句交代，缺了它就变成了本文件 slot() 一直反对的那种误导。
+   */
+  note?: string;
 };
 
 export type FeatureCard = {
@@ -443,10 +451,13 @@ const slot = (photo: RenderPhoto | undefined, label: string, alt: string): strin
       ? `<figcaption class="img-credit"><a href="${esc(photo.sourceUrl)}" target="_blank" rel="noreferrer nofollow">${esc(credit)}</a></figcaption>`
       : `<figcaption class="img-credit">${esc(credit)}</figcaption>`
     : "";
+  // 降级说明排在署名之前，且**不进 <a>** —— 它是内容事实，不是版权信息。
+  const note = (photo.note || "").trim();
+  const noteHtml = note ? `<figcaption class="img-note">${esc(note)}</figcaption>` : "";
   return (
     `<figure class="img-slot" data-label="${esc(label)}">` +
     `<img src="${esc(photo.url)}" alt="${esc(alt)}" loading="lazy" onerror="this.parentElement.classList.add('broken')"/>` +
-    `<span>图片待补 · image pending</span>${creditHtml}</figure>`
+    `<span>图片待补 · image pending</span>${noteHtml}${creditHtml}</figure>`
   );
 };
 
@@ -512,6 +523,10 @@ background:transparent}
 letter-spacing:.02em;word-break:break-word}
 .img-credit a{color:inherit;text-decoration:none;border-bottom:1px dotted currentColor}
 .img-slot.broken .img-credit{display:none}
+/* 降级配图的如实说明。斜体 + 略深，读者应该先看到它再看署名。 */
+.img-note{margin:5px 2px 0;font-size:10px;line-height:1.5;color:var(--ink-soft,#5a6a5e);
+font-style:italic;word-break:break-word}
+.img-slot.broken .img-note{display:none}
 
 /* Intro */
 .intro{display:grid;grid-template-columns:1fr 1fr;gap:34px;align-items:start}
@@ -528,6 +543,14 @@ padding:5px 13px;font-size:12px;color:var(--ink-soft)}
 .feat-card{display:grid;grid-template-columns:1fr 1fr;gap:30px;align-items:center;margin-bottom:34px}
 .feat-card.rev .feat-img{order:2}
 .feat-num{font-family:"EB Garamond",Georgia,serif;font-style:italic;color:var(--rule);font-size:15px}
+/* 落单配图：特征卡少于 6 张时才出现（见 renderPremiumHtml 里的 orphans）。
+   刻意做得比正式特征卡朴素 —— 它是补充材料，不该抢正文的视觉分量。 */
+.feat-orphans{margin:8px 0 34px;padding-top:18px;border-top:1px dashed var(--rule)}
+.feat-orphans-note{font-size:13px;color:var(--ink-soft);margin:0 0 14px}
+.feat-orphans-note .en{display:block;font-size:11.5px;color:var(--rule);font-style:italic}
+.feat-orphan-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:18px}
+.feat-orphan-name{font-size:13px;font-weight:600;margin-bottom:6px}
+.feat-orphan-name .en{font-weight:400;color:var(--rule);font-style:italic;margin-left:6px}
 .feat-card h3{margin:.25em 0 .5em;font-size:20px}
 .feat-card h3 .en{display:block;font-size:11px;letter-spacing:.13em;text-transform:uppercase;
 color:var(--ink-faint);font-weight:400;font-style:normal}
@@ -626,6 +649,43 @@ export function renderPremiumHtml(
   const chips = (f.habitat_chips ?? []).slice(0, 7);
   const tabs = (f.ethno_tabs ?? []).slice(0, 5);
   const chapters = (f.curio?.chapters ?? []).slice(0, 5);
+
+  // ── 特征卡少于 6 张时的「落单配图」──────────────────────────────────────────
+  //
+  // schema 要求**恰好 6 张**，依次对应 根株/茎/叶/花/果实/物候，所以 assets.images[i]
+  // 与 feature_cards[i] 是**语义绑定**的。模型只写了 4 张时，下标 4、5 的图已经抓取、
+  // 分类、转存、占了 Supabase 存储，却因为 `cards.map` 只跑 4 轮而被**静默丢弃**。
+  //
+  // 为什么不把它们挪到前面几张卡里：那就是错标 —— 下标 4 是「果实」，塞进标题写着「叶」
+  // 的卡里，正是本文件 slot() 注释里反对的那种伤害。
+  // 所以单独给一条「补充图像」带，图注**如实写出它是哪个器官**。正常的 6 张卡页面
+  // 完全不受影响（下面 orphans 为空，整段不渲染）。
+  const FEATURE_SLOT_NAMES: [string, string][] = [
+    ["根与株型", "Habit"],
+    ["茎", "Stem"],
+    ["叶", "Leaf"],
+    ["花", "Flower"],
+    ["果实与种子", "Fruit & Seed"],
+    ["物候与繁殖", "Phenology"],
+  ];
+  const orphans = FEATURE_SLOT_NAMES.slice(cards.length, 6)
+    .map((name, k) => ({ name, photo: img(cards.length + k) }))
+    .filter((x) => x.photo?.url);
+  const orphanHtml = orphans.length
+    ? `<div class="feat-orphans">` +
+      `<p class="feat-orphans-note">补充图像 · Additional images` +
+      `<span class="en">本页特征卡少于 6 张，以下配图已检索到但没有对应的正文卡片。</span></p>` +
+      `<div class="feat-orphan-grid">` +
+      orphans
+        .map(
+          (x) =>
+            `<div class="feat-orphan"><div class="feat-orphan-name">${esc(x.name[0])}` +
+            `<span class="en">${esc(x.name[1])}</span></div>` +
+            `${slot(x.photo, `feat-extra-${esc(x.name[1])}`, `${facts.title} ${x.name[0]}`)}</div>`,
+        )
+        .join("") +
+      `</div></div>`
+    : "";
 
   const featHtml = cards
     .map((c, i) => {
@@ -731,6 +791,7 @@ ${secTitle("I", "植物简介", "Introduction")}
 
 ${secTitle("II", "关键特征", "Key Features")}
 ${featHtml}
+${orphanHtml}
 ${simHtml}
 
 ${secTitle("III", "典型生境", "Habitat")}

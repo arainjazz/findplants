@@ -49,6 +49,7 @@ import { TagPicker } from "@/components/tag-picker";
 import { fetchAllTags } from "@/lib/tags";
 import { NameAuthorityNote, readNameStamp } from "@/components/name-authority-badge";
 import { renderShareCard, shareOrSaveImage } from "@/lib/share-card";
+import { markDraftReadFn } from "@/lib/task-feed.functions";
 import { lookupSpeciesExisting, type SpeciesExisting } from "@/lib/species-existing.functions";
 import { computeIdentifyConfidence, traceSteps, type IdentifyTrace } from "@/lib/identify-trace";
 import { JobProgressPanel } from "@/components/job-progress";
@@ -130,6 +131,27 @@ function DraftPage() {
   const revertDraftEdit = useServerFn(revertDraftEditFn);
   const startEnrich = useServerFn(startEnrichDraftFn);
   const lookupExisting = useServerFn(lookupSpeciesExisting);
+  const markRead = useServerFn(markDraftReadFn);
+
+  // ── 「进过详情页就算已读」（用户 2026-07-29 拍板的判据）───────────────────────
+  // 判据刻意**不是**「在小P蛙里点了那张卡片」：用户真正想知道的是「这份东西我看过没有」，
+  // 而看过的标志就是进过这一页 —— 从小P蛙点进来、从草稿列表点进来、直接贴 URL 进来，
+  // 三条路都该算数。
+  //
+  // 只在 id 变化时跑一次。失败完全静默：标不上已读只是角标多显示一个数字，
+  // 绝不能因此打扰用户或挡住页面。
+  useEffect(() => {
+    if (!user?.id || !id) return;
+    void markRead({ data: { draftId: id } })
+      .then((r) => {
+        // 真的清掉了未读才去刷新动态流 —— 否则每进一次草稿页都白发一次请求。
+        if (r?.marked) qc.invalidateQueries({ queryKey: ["task-feed"] });
+      })
+      .catch(() => {
+        /* 动态流是锦上添花，标不上就算了 */
+      });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id, user?.id]);
   // 非空 = 金叶详页刚生成完，弹「立即查看 / 稍后查看」确认框。
   const [goldDone, setGoldDone] = useState<{ slug: string; goldRemaining: number | null } | null>(
     null,
@@ -318,14 +340,11 @@ function DraftPage() {
   const followEnrichJob = async (jobId: string, tId: string | number) => {
     rememberJob(enrichScope, jobId);
     setEnrichProg({ phase: "正在启动生成任务…", progress: 0, startedAt: Date.now() });
-    const out = await awaitJob<{ silverRemaining?: number | null }>(
-      jobId,
-      (phase, progress) => {
-        // 常驻面板是主反馈；toast 保留作为「已经滚走到别处」时的兜底提示。
-        setEnrichProg((p) => ({ phase, progress, startedAt: p?.startedAt ?? Date.now() }));
-        toast.loading(phase, { id: tId, duration: Infinity });
-      },
-    );
+    const out = await awaitJob<{ silverRemaining?: number | null }>(jobId, (phase, progress) => {
+      // 常驻面板是主反馈；toast 保留作为「已经滚走到别处」时的兜底提示。
+      setEnrichProg((p) => ({ phase, progress, startedAt: p?.startedAt ?? Date.now() }));
+      toast.loading(phase, { id: tId, duration: Infinity });
+    });
     setEnrichProg(null);
     // 只有服务端给了明确结论（成功 / 明确失败）才丢掉 jobId。轮询侧自己放弃时
     // （超时、疑似卡死）**必须留着** —— 任务多半还在服务端跑，留着才能刷新接回。
@@ -1772,10 +1791,11 @@ function DraftPage() {
                       data: {
                         draftId: id,
                         kind: "draft_text",
-                        summary: `小P蛙改写（${DRAFT_CARD_SCOPE}）：${res.card.changes.join("；")}`.slice(
-                          0,
-                          500,
-                        ),
+                        summary:
+                          `小P蛙改写（${DRAFT_CARD_SCOPE}）：${res.card.changes.join("；")}`.slice(
+                            0,
+                            500,
+                          ),
                         source: "xiaop_agent",
                       },
                     }).catch(() => {});
@@ -1987,12 +2007,11 @@ function DraftPage() {
             className="bg-background border border-ink shadow-xl w-full max-w-sm p-5"
             onClick={(e) => e.stopPropagation()}
           >
-            <p className="font-display text-xl font-bold text-amber-700 mb-1">
-              🏅 金叶详页已创建
-            </p>
+            <p className="font-display text-xl font-bold text-amber-700 mb-1">🏅 金叶详页已创建</p>
             <p className="text-[12px] text-ink-soft leading-relaxed mb-4">
               「{draft?.title || draft?.scientific_name}」的物种详细科普页已生成并收录。剩余金叶{" "}
-              {goldDone.goldRemaining === null ? "∞（管理员无限）" : `${goldDone.goldRemaining} 枚`}。
+              {goldDone.goldRemaining === null ? "∞（管理员无限）" : `${goldDone.goldRemaining} 枚`}
+              。
             </p>
             <div className="flex flex-col gap-2">
               <button

@@ -1,0 +1,138 @@
+// ─── 任务动态流的服务端读写 ───────────────────────────────────────────────────
+//
+// 纯逻辑（未读计数、进度条选谁、三色语义）在 task-feed.ts，那边能脱离网络直接测。
+// 这里只管跟数据库打交道：写入一律走 service-role，读取按登录身份。
+//
+// **写入为什么必须走 service-role**：`task_feed` 上有一条 policy 允许本人 update 自己的行
+// （为了「标已读」），但 Postgres 的 RLS 表达不了「只能改 read_at 这一列」。
+// 迁移里因此加了 `task_feed_guard_update_trg` 触发器，把普通用户的其余列改动**静默还原**。
+// service-role 绕过 RLS，也被触发器显式放行 —— 所以进度/状态只可能由服务端写进去，
+// 前端伪造不了「任务已完成」。
+//
+// **写入全部吞异常**：动态流是给用户看的锦上添花，它写不进去绝不能让整趟生成翻车。
+// 任务能不能跑完的权威始终是 site_config 里的 job 行，不是这张表。
+
+import { createServerFn } from "@tanstack/react-start";
+import { z } from "zod";
+import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
+import { readFeedRow, FEED_LIMIT, type TaskFeedRow, type TaskKind } from "./task-feed";
+
+async function admin() {
+  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+  // task_feed 是 2026-07-29 手工迁移建的表；查询构建器的类型来自 types.ts 的手写补丁，
+  // 与本仓库其它手工建表处（site_config 等）的做法一致。
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return supabaseAdmin as any;
+}
+
+/**
+ * 建/更新一条动态。**同一个人 + 同一类 + 同一份草稿只留一条**（迁移里有唯一索引）——
+ * 重跑银叶不该在流里堆两条，而是把原来那条更新掉。
+ *
+ * 重跑时 `read_at` 被显式清回 null：内容变了，就该重新算作「未看过」。
+ */
+export async function upsertTaskFeed(input: {
+  userId: string | null | undefined;
+  kind: TaskKind;
+  draftId: string | null;
+  jobId?: string | null;
+  status?: "running" | "done" | "error";
+  phase?: string;
+  progress?: number;
+  title?: string | null;
+  thumbUrl?: string | null;
+  summary?: string | null;
+  error?: string | null;
+  /** true = 这次更新要把它重新标成未读（重跑、或刚刚完成）。 */
+  markUnread?: boolean;
+}): Promise<void> {
+  // 匿名识别不进动态流（表上 user_id not null）—— 用户 2026-07-29：重点照顾注册用户与编辑。
+  if (!input.userId || !input.draftId) return;
+  try {
+    const db = await admin();
+    const row: Record<string, unknown> = {
+      user_id: input.userId,
+      kind: input.kind,
+      draft_id: input.draftId,
+      updated_at: new Date().toISOString(),
+    };
+    if (input.jobId !== undefined) row.job_id = input.jobId;
+    if (input.status !== undefined) row.status = input.status;
+    if (input.phase !== undefined) row.phase = input.phase;
+    if (input.progress !== undefined)
+      row.progress = Math.max(0, Math.min(100, Math.round(input.progress)));
+    if (input.title !== undefined) row.title = input.title;
+    if (input.thumbUrl !== undefined) row.thumb_url = input.thumbUrl;
+    if (input.summary !== undefined) row.summary = input.summary;
+    if (input.error !== undefined) row.error = input.error;
+    if (input.markUnread) row.read_at = null;
+
+    const { error } = await db
+      .from("task_feed")
+      .upsert(row, { onConflict: "user_id,kind,draft_id" });
+    if (error) console.warn("[TaskFeed] upsert failed:", error.message);
+  } catch (e) {
+    // 动态流写不进去只是少一条通知，绝不能让整趟生成翻车。
+    console.warn("[TaskFeed] upsert threw:", e instanceof Error ? e.message : e);
+  }
+}
+
+/** 拉本人的动态流。前端每几秒问一次，用来画进度条和未读圆圈。 */
+export const fetchTaskFeedFn = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .handler(async ({ context }): Promise<{ rows: TaskFeedRow[] }> => {
+    const { userId } = context as { userId: string };
+    try {
+      const db = await admin();
+      const { data, error } = await db
+        .from("task_feed")
+        .select("*")
+        .eq("user_id", userId)
+        .order("created_at", { ascending: false })
+        .limit(FEED_LIMIT);
+      if (error) {
+        console.warn("[TaskFeed] fetch failed:", error.message);
+        return { rows: [] };
+      }
+      return { rows: (data ?? []).map(readFeedRow).filter(Boolean) as TaskFeedRow[] };
+    } catch (e) {
+      // 拉不到就当没有 —— 小P蛙上少个角标，不该把页面搞崩。
+      console.warn("[TaskFeed] fetch threw:", e instanceof Error ? e.message : e);
+      return { rows: [] };
+    }
+  });
+
+/**
+ * 把某份草稿的动态标为已读。
+ *
+ * 已读判据是用户 2026-07-29 拍板的：**进过那份草稿的详情页就算已读**，
+ * 而不是「在小P蛙里点了那张卡片」。所以调用点在 /drafts/$id 的挂载处，
+ * 不在小P蛙的列表里。
+ *
+ * 一份草稿可能同时有银叶和金叶两条动态（kind 不同），这里**一并标掉** ——
+ * 用户看的是那一页，不是某一类任务。
+ */
+export const markDraftReadFn = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input: unknown) => z.object({ draftId: z.string().uuid() }).parse(input))
+  .handler(async ({ data, context }): Promise<{ marked: number }> => {
+    const { userId } = context as { userId: string };
+    try {
+      const db = await admin();
+      const { data: rows, error } = await db
+        .from("task_feed")
+        .update({ read_at: new Date().toISOString() })
+        .eq("user_id", userId)
+        .eq("draft_id", data.draftId)
+        .is("read_at", null)
+        .select("id");
+      if (error) {
+        console.warn("[TaskFeed] markRead failed:", error.message);
+        return { marked: 0 };
+      }
+      return { marked: (rows ?? []).length };
+    } catch (e) {
+      console.warn("[TaskFeed] markRead threw:", e instanceof Error ? e.message : e);
+      return { marked: 0 };
+    }
+  });

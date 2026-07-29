@@ -2,7 +2,8 @@ import { useEffect, useRef, useState } from "react";
 import { useServerFn } from "@tanstack/react-start";
 import { useNavigate } from "@tanstack/react-router";
 import { useQueryClient } from "@tanstack/react-query";
-import { quickIdentifyDraft } from "@/lib/identify-plant.functions";
+import { quickIdentifyDraft, startQuickIdentifyFn } from "@/lib/identify-plant.functions";
+import { awaitJob, rememberJob, forgetJob } from "@/lib/poll-job";
 import { findDraftByPhotoHash } from "@/lib/species-existing.functions";
 import { keepVisualAdvice } from "@/lib/retake-advice";
 import { explainError, isNetworkError } from "@/lib/explain-error";
@@ -16,7 +17,7 @@ const LOADING_STEPS = [
   "🧠 正在提取花叶边缘与色彩形态特征...",
   "📖 正在对比 Plantspedia 植物志库...",
   "✍️ 正在整理并自动排版中英科普资料...",
-  "💾 正在写入云端，即将生成草稿..."
+  "💾 正在写入云端，即将生成草稿...",
 ];
 
 /** 补拍复核上下文：从草稿页「去补拍」带来，count=本次是第几次补拍（≥3 服务端强制出结论）。
@@ -44,7 +45,9 @@ function retakeOrdinal(count: number): string {
   return count === 1 ? "第一次补拍" : count === 2 ? "第二次补拍" : `第 ${count} 次补拍`;
 }
 
-export function CameraIdentify({ retake: retakeCtx = null }: { retake?: RetakeContext | null } = {}) {
+export function CameraIdentify({
+  retake: retakeCtx = null,
+}: { retake?: RetakeContext | null } = {}) {
   const retakeMode = !!retakeCtx;
   // 上一轮的补拍建议，滤掉「摸一摸 / 闻一闻」这类拍不出来的条目：库里的旧草稿存的还是
   // prompt 加禁令之前的文案，照搬出来只会让用户白跑一趟（他们只能回传照片）。
@@ -60,7 +63,9 @@ export function CameraIdentify({ retake: retakeCtx = null }: { retake?: RetakeCo
   // Coarse location-permission status, surfaced on the review screen so a wrong
   // "deny" tap doesn't silently persist. "denied" → we show a re-acquire button
   // + settings guide instead of failing quietly.
-  const [geoStatus, setGeoStatus] = useState<"idle" | "loading" | "granted" | "denied" | "unavailable" | "timeout">("idle");
+  const [geoStatus, setGeoStatus] = useState<
+    "idle" | "loading" | "granted" | "denied" | "unavailable" | "timeout"
+  >("idle");
   const [stepIndex, setStepIndex] = useState(0);
   // Last identify failure, kept on screen (a toast vanishes before the user can read
   // the cause). Server errors already carry「原因 + 怎么办」in their message.
@@ -90,11 +95,16 @@ export function CameraIdentify({ retake: retakeCtx = null }: { retake?: RetakeCo
   const navigate = useNavigate();
   const qc = useQueryClient();
   const submit = useServerFn(quickIdentifyDraft);
+  const startIdentify = useServerFn(startQuickIdentifyFn);
+  // 走队列时的**真实**阶段文案（取代那串固定轮播的 LOADING_STEPS）。
+  const [jobPhase, setJobPhase] = useState<{ text: string; pct: number } | null>(null);
   const findDuplicate = useServerFn(findDraftByPhotoHash);
   // 非空 = 这张照片以前识别过，弹「去看看 / 再识别一次」确认框。
-  const [dupHit, setDupHit] = useState<{ draftId: string; title: string | null; hash: string } | null>(
-    null,
-  );
+  const [dupHit, setDupHit] = useState<{
+    draftId: string;
+    title: string | null;
+    hash: string;
+  } | null>(null);
   // The user's ORIGINAL (uncompressed) file — kept so "保存原图到相册" saves the good
   // copy. A web-camera capture is NOT auto-saved to the iPhone album, so this button
   // is the user's escape hatch to keep the shot (re-identify later from good signal).
@@ -192,12 +202,17 @@ export function CameraIdentify({ retake: retakeCtx = null }: { retake?: RetakeCo
           toast.success("✓ 已使用照片自带位置", { id: "geo-exif" });
           return;
         }
-        console.warn("[Geolocation] hard timeout — no callback fired (likely iOS Location Services off for Chrome)");
+        console.warn(
+          "[Geolocation] hard timeout — no callback fired (likely iOS Location Services off for Chrome)",
+        );
         setGeoStatus("timeout");
-        toast.error("定位无响应：请检查 iOS 设置 → 隐私与安全性 → 定位服务，确认已开启且 Chrome 设为「使用 App 期间」", {
-          id: "geo-timeout",
-          duration: 9000,
-        });
+        toast.error(
+          "定位无响应：请检查 iOS 设置 → 隐私与安全性 → 定位服务，确认已开启且 Chrome 设为「使用 App 期间」",
+          {
+            id: "geo-timeout",
+            duration: 9000,
+          },
+        );
       });
     }, 13_000);
 
@@ -223,10 +238,13 @@ export function CameraIdentify({ retake: retakeCtx = null }: { retake?: RetakeCo
           } else {
             // POSITION_UNAVAILABLE / TIMEOUT — usually iOS Location Services off.
             setGeoStatus("timeout");
-            toast.error("暂时拿不到定位：请检查 iOS 设置 → 隐私与安全性 → 定位服务 是否已为 Chrome 开启，再点「开启定位」重试", {
-              id: "geo-failed",
-              duration: 9000,
-            });
+            toast.error(
+              "暂时拿不到定位：请检查 iOS 设置 → 隐私与安全性 → 定位服务 是否已为 Chrome 开启，再点「开启定位」重试",
+              {
+                id: "geo-failed",
+                duration: 9000,
+              },
+            );
           }
         });
       },
@@ -557,23 +575,48 @@ export function CameraIdentify({ retake: retakeCtx = null }: { retake?: RetakeCo
           mime: s.blob.type || "image/jpeg",
         })),
       );
-      const res = await submit({
-        data: {
-          photo_base64: base64,
-          photo_mime: blob.type || "image/jpeg",
-          ...(extras.length ? { extra_photos: extras } : {}),
-          lat: finalCoords?.lat ?? null,
-          lng: finalCoords?.lng ?? null,
-          logged_in_user_id: user?.id, // 传递登录用户 ID
-          retake_count: retakeCtx?.count ?? 0,
-          species_hint_title: retakeCtx?.title,
-          species_hint_sci: retakeCtx?.sci,
-          merge_draft_id: retakeCtx?.mergeDraftId,
-          photo_sha256: photoSha256 ?? undefined,
-        },
-      });
+      const payload = {
+        photo_base64: base64,
+        photo_mime: blob.type || "image/jpeg",
+        ...(extras.length ? { extra_photos: extras } : {}),
+        lat: finalCoords?.lat ?? null,
+        lng: finalCoords?.lng ?? null,
+        logged_in_user_id: user?.id, // 传递登录用户 ID
+        retake_count: retakeCtx?.count ?? 0,
+        species_hint_title: retakeCtx?.title,
+        species_hint_sci: retakeCtx?.sci,
+        merge_draft_id: retakeCtx?.mergeDraftId,
+        photo_sha256: photoSha256 ?? undefined,
+      };
+
+      // ── 登录用户走队列 ──────────────────────────────────────────────────────
+      // 照片先上云，识别在服务端后台跑，这里只轮询。这是 07-26「等了 101 秒报
+      // Load failed、其实后台已经成功」的**根治**：整条识别挂在一个 HTTP 请求上
+      // 必然撞 Cloudflare 边缘 100 秒上限，而锁屏 / 切后台会让手机更早掐断连接。
+      // 走队列后消费者有 15 分钟，用户可以锁屏、切走、去识别下一株。
+      //
+      // 下面那段「断线自愈」**依然保留**：轮询本身也会断（切网、代理掉线），
+      // 断了照样要回查一次「是不是其实已经写进去了」。两层防护不冲突。
+      //
+      // 匿名用户仍走同步老路 —— 他们没有动态流，也没有跨设备接回任务的需求。
+      let draftId: string;
+      if (user?.id) {
+        const { jobId } = await startIdentify({ data: payload });
+        rememberJob("identify", jobId);
+        setJobPhase({ text: "已排队，正在启动…", pct: 3 });
+        const outcome = await awaitJob<{ draftId: string }>(jobId, (phase, pct) =>
+          setJobPhase({ text: phase, pct }),
+        );
+        forgetJob("identify");
+        if (!outcome.ok) throw new Error(outcome.error);
+        draftId = outcome.result.draftId;
+        // 刚落一条绿色动态，让小P蛙上的角标立刻更新，不等下一轮轮询。
+        qc.invalidateQueries({ queryKey: ["task-feed"] });
+      } else {
+        draftId = ((await submit({ data: payload })) as { draftId: string }).draftId;
+      }
       toast.success("已生成简介摘要卡，正在跳转…");
-      goToDraft((res as { draftId: string }).draftId);
+      goToDraft(draftId);
     } catch (e) {
       // ── 断线自愈 ────────────────────────────────────────────────────────────
       // 识别是个**有副作用的写操作**：服务端跑完就把草稿写进库了。而网络层失败只说明
@@ -595,6 +638,7 @@ export function CameraIdentify({ retake: retakeCtx = null }: { retake?: RetakeCo
       }
       setRecoverNote(null);
       setPhase("captured");
+      setJobPhase(null);
       setErrorKind(checked === true ? "no-result" : checked === false ? "unknown" : "failed");
       const msg = explainError(e, {
         elapsedMs: Date.now() - startedAt,
@@ -652,7 +696,6 @@ export function CameraIdentify({ retake: retakeCtx = null }: { retake?: RetakeCo
 
   return (
     <div className="max-w-md mx-auto w-full bg-paper-deep/35 border border-rule/70 p-4 md:p-5 rounded-3xl shadow-lg mb-12 select-none animate-in fade-in slide-in-from-bottom-4 duration-500">
-
       {/* 「这张照片已经识别过」——省掉一次完全重复的识别（也省一次模型调用）。
           刻意做成必须选一个的弹窗而不是 toast：默认行为选错了代价不对称——误跳走只是多点一下，
           误重复识别则是白等一轮 + 库里多一条重复草稿。 */}
@@ -708,12 +751,15 @@ export function CameraIdentify({ retake: retakeCtx = null }: { retake?: RetakeCo
       {retakeMode && phase === "idle" && (
         <div className="mb-3 rounded-2xl border border-amber-500/40 bg-amber-500/10 px-3 py-3 text-center space-y-2">
           <p className="text-sm font-semibold text-amber-700 leading-snug">
-            正在补拍复核{retakeCtx?.title ? `「${retakeCtx.title}」` : ""}（{retakeOrdinal(retakeCtx?.count ?? 1)}）
+            正在补拍复核{retakeCtx?.title ? `「${retakeCtx.title}」` : ""}（
+            {retakeOrdinal(retakeCtx?.count ?? 1)}）
           </p>
           {visualAdvice && (
             <div className="text-left mx-auto max-w-[300px] rounded-lg bg-background/60 border border-amber-500/25 px-2.5 py-2">
               <p className="text-[11px] font-semibold text-amber-700 mb-0.5">上次识别建议补拍：</p>
-              <p className="text-[11px] text-ink-soft leading-relaxed whitespace-pre-line">{visualAdvice}</p>
+              <p className="text-[11px] text-ink-soft leading-relaxed whitespace-pre-line">
+                {visualAdvice}
+              </p>
             </div>
           )}
           <p className="text-[11px] text-ink-faint leading-relaxed">
@@ -742,89 +788,111 @@ export function CameraIdentify({ retake: retakeCtx = null }: { retake?: RetakeCo
               上传相册补拍
             </button>
           </div>
-          <p className="text-[10px] text-ink-faint">两种方式都记作一次补拍（{retakeOrdinal(retakeCtx?.count ?? 1)}）</p>
+          <p className="text-[10px] text-ink-faint">
+            两种方式都记作一次补拍（{retakeOrdinal(retakeCtx?.count ?? 1)}）
+          </p>
         </div>
       )}
 
       {/* 1. Viewfinder area — outer centers the frame so a portrait shot stays
           centred; the inner frame's border hugs the real image 画幅. */}
       <div className={`w-full flex justify-center ${hideViewfinder ? "hidden" : ""}`}>
-      <div
-        className="scanner-view rounded-2xl relative overflow-hidden bg-background border border-rule/35 shadow-inner"
-        style={frameStyle(phase, imgAspect)}
-      >
-        {/* L-Corners */}
-        <div className="scan-corner scan-corner-tl" />
-        <div className="scan-corner scan-corner-tr" />
-        <div className="scan-corner scan-corner-bl" />
-        <div className="scan-corner scan-corner-br" />
+        <div
+          className="scanner-view rounded-2xl relative overflow-hidden bg-background border border-rule/35 shadow-inner"
+          style={frameStyle(phase, imgAspect)}
+        >
+          {/* L-Corners */}
+          <div className="scan-corner scan-corner-tl" />
+          <div className="scan-corner scan-corner-tr" />
+          <div className="scan-corner scan-corner-bl" />
+          <div className="scan-corner scan-corner-br" />
 
-        {phase === "idle" ? (
-          <>
-            {/* Grid background & crosshair */}
-            <div className="scanner-grid scanner-grid-animated" />
-            <div className="scanner-focus-target" />
+          {phase === "idle" ? (
+            <>
+              {/* Grid background & crosshair */}
+              <div className="scanner-grid scanner-grid-animated" />
+              <div className="scanner-focus-target" />
 
-            {/* Prompt information */}
-            <div className="absolute inset-0 flex flex-col items-center justify-center p-6 text-center z-10 pointer-events-none">
-              <div className="w-14 h-14 rounded-full bg-ink/5 flex items-center justify-center border border-rule/15 text-ink-soft mb-3 animate-pulse">
-                <CameraIcon className="w-7 h-7" />
+              {/* Prompt information */}
+              <div className="absolute inset-0 flex flex-col items-center justify-center p-6 text-center z-10 pointer-events-none">
+                <div className="w-14 h-14 rounded-full bg-ink/5 flex items-center justify-center border border-rule/15 text-ink-soft mb-3 animate-pulse">
+                  <CameraIcon className="w-7 h-7" />
+                </div>
+                <p className="text-sm font-bold text-ink-soft leading-snug">
+                  点击下方快门调用相机拍摄，或上传已有照片
+                </p>
+                <p className="text-xs text-ink-faint leading-normal mt-2 max-w-[220px]">
+                  建议尽量使照片清晰且主体突出。拍摄时会请求定位，用于记录分布地图。
+                </p>
               </div>
-              <p className="text-sm font-bold text-ink-soft leading-snug">点击下方快门调用相机拍摄，或上传已有照片</p>
-              <p className="text-xs text-ink-faint leading-normal mt-2 max-w-[220px]">
-                建议尽量使照片清晰且主体突出。拍摄时会请求定位，用于记录分布地图。
-              </p>
-            </div>
-          </>
-        ) : (
-          <>
-            {/* Image display — the frame now matches the photo's真实画幅, so
+            </>
+          ) : (
+            <>
+              {/* Image display — the frame now matches the photo's真实画幅, so
                 object-cover fills it edge-to-edge with no crop and no letterbox. */}
-            <img
-              src={previewUrl!}
-              alt="captured plant"
-              className="w-full h-full object-cover transition-opacity duration-300"
-            />
+              <img
+                src={previewUrl!}
+                alt="captured plant"
+                className="w-full h-full object-cover transition-opacity duration-300"
+              />
 
-            {/* GPS Overlay Badge */}
-            {coords && (
-              <div className="absolute top-4 right-4 bg-background/85 backdrop-blur-md border border-rule/55 px-2.5 py-1 rounded-full text-[10px] font-semibold tracking-wider text-ink-soft inline-flex items-center gap-1 shadow-sm z-10 animate-in fade-in slide-in-from-top-2 duration-300">
-                <MapPinIcon className="w-3.5 h-3.5 text-vermilion" />
-                <span>{coords.lat.toFixed(4)}, {coords.lng.toFixed(4)}</span>
-              </div>
-            )}
+              {/* GPS Overlay Badge */}
+              {coords && (
+                <div className="absolute top-4 right-4 bg-background/85 backdrop-blur-md border border-rule/55 px-2.5 py-1 rounded-full text-[10px] font-semibold tracking-wider text-ink-soft inline-flex items-center gap-1 shadow-sm z-10 animate-in fade-in slide-in-from-top-2 duration-300">
+                  <MapPinIcon className="w-3.5 h-3.5 text-vermilion" />
+                  <span>
+                    {coords.lat.toFixed(4)}, {coords.lng.toFixed(4)}
+                  </span>
+                </div>
+              )}
 
-            {/* Laser scanning line */}
-            {phase === "submitting" && <div className="scan-laser-line" />}
+              {/* Laser scanning line */}
+              {phase === "submitting" && <div className="scan-laser-line" />}
 
-            {/* Progressive Loader Card Overlay */}
-            {phase === "submitting" && (
-              <div className="absolute inset-0 bg-background/45 backdrop-blur-xs flex items-center justify-center p-4 z-20 animate-in fade-in duration-300">
-                <div className="bg-background/95 border border-rule/80 p-5 rounded-2xl shadow-xl max-w-[280px] w-full text-center flex flex-col items-center gap-4 animate-in fade-in zoom-in-95 duration-200">
-                  <div className="relative w-10 h-10">
-                    <div className="w-10 h-10 rounded-full border-[3px] border-rule/20 border-t-vermilion animate-spin" />
-                  </div>
-                  <div className="space-y-1 w-full">
-                    {/* 连接断了但正在回查时，换一套文案 —— 这时候再滚「AI 深度分析中」是撒谎，
+              {/* Progressive Loader Card Overlay */}
+              {phase === "submitting" && (
+                <div className="absolute inset-0 bg-background/45 backdrop-blur-xs flex items-center justify-center p-4 z-20 animate-in fade-in duration-300">
+                  <div className="bg-background/95 border border-rule/80 p-5 rounded-2xl shadow-xl max-w-[280px] w-full text-center flex flex-col items-center gap-4 animate-in fade-in zoom-in-95 duration-200">
+                    <div className="relative w-10 h-10">
+                      <div className="w-10 h-10 rounded-full border-[3px] border-rule/20 border-t-vermilion animate-spin" />
+                    </div>
+                    <div className="space-y-1 w-full">
+                      {/* 连接断了但正在回查时，换一套文案 —— 这时候再滚「AI 深度分析中」是撒谎，
                         而直接报「识别失败」又往往是误报（服务端多半已经写完库了）。 */}
-                    <p className="text-xs font-bold text-vermilion tracking-widest uppercase">
-                      {recoverNote ? "正在确认结果" : "AI 深度分析中"}
-                    </p>
-                    <p className="text-xs text-ink-soft font-medium min-h-[36px] flex items-center justify-center px-2">
-                      {recoverNote ?? LOADING_STEPS[stepIndex]}
-                    </p>
-                    {recoverNote && (
-                      <p className="text-[10px] text-ink-faint leading-relaxed px-1 pt-0.5">
-                        请稍候，先别重新识别 —— 后台可能已经跑完了
+                      <p className="text-xs font-bold text-vermilion tracking-widest uppercase">
+                        {recoverNote ? "正在确认结果" : "AI 深度分析中"}
                       </p>
-                    )}
+                      {/* 有 jobPhase = 走队列，显示服务端**真实**跑到哪一步了；
+                        没有 = 匿名同步路径，只能继续滚那串固定文案。 */}
+                      <p className="text-xs text-ink-soft font-medium min-h-[36px] flex items-center justify-center px-2">
+                        {recoverNote ?? jobPhase?.text ?? LOADING_STEPS[stepIndex]}
+                      </p>
+                      {!recoverNote && jobPhase && (
+                        <>
+                          <div className="h-1.5 w-full rounded-full bg-ink/10 overflow-hidden">
+                            <div
+                              className="h-full rounded-full bg-emerald-500 transition-[width] duration-700 ease-out"
+                              style={{ width: `${Math.max(3, jobPhase.pct)}%` }}
+                            />
+                          </div>
+                          {/* 这句是这次改造的**全部意义**：告诉用户可以走开了。 */}
+                          <p className="text-[10px] text-ink-faint leading-relaxed px-1 pt-1">
+                            任务已在云端运行，可以锁屏或去识别下一株 —— 完成后小P蛙会亮起绿色角标。
+                          </p>
+                        </>
+                      )}
+                      {recoverNote && (
+                        <p className="text-[10px] text-ink-faint leading-relaxed px-1 pt-0.5">
+                          请稍候，先别重新识别 —— 后台可能已经跑完了
+                        </p>
+                      )}
+                    </div>
                   </div>
                 </div>
-              </div>
-            )}
-          </>
-        )}
-      </div>
+              )}
+            </>
+          )}
+        </div>
       </div>
 
       {/* 补拍多角度：主图选好后，最多再加 2 张同一株植物的其它角度，同一次请求一起识别。
@@ -906,8 +974,9 @@ export function CameraIdentify({ retake: retakeCtx = null }: { retake?: RetakeCo
                 本站的定位权限已被拒绝
               </p>
               <p className="text-[11px] text-ink-faint leading-relaxed">
-                浏览器不允许网页再次弹出授权框，需手动开启：Chrome 右下角 ⋯ → 设置 → 内容设置 → 位置信息 →
-                允许 plantspedia.club；并确认 iOS 设置 → 隐私与安全性 → 定位服务 → Chrome 为「使用 App 期间」。
+                浏览器不允许网页再次弹出授权框，需手动开启：Chrome 右下角 ⋯ → 设置 → 内容设置 →
+                位置信息 → 允许 plantspedia.club；并确认 iOS 设置 → 隐私与安全性 → 定位服务 → Chrome
+                为「使用 App 期间」。
               </p>
             </div>
           ) : (
@@ -917,11 +986,17 @@ export function CameraIdentify({ retake: retakeCtx = null }: { retake?: RetakeCo
                 className="w-full flex items-center justify-center gap-1.5 text-xs text-ink-soft bg-paper-deep/40 hover:bg-paper-deep/70 border border-rule/50 rounded-xl px-3 py-2 transition-colors cursor-pointer"
               >
                 <MapPinIcon className="w-3.5 h-3.5 text-vermilion shrink-0" />
-                {geoStatus === "loading" ? "正在获取位置…" : geoStatus === "timeout" ? "定位无响应，点此重试" : "开启定位（记录这株植物的位置）"}
+                {geoStatus === "loading"
+                  ? "正在获取位置…"
+                  : geoStatus === "timeout"
+                    ? "定位无响应，点此重试"
+                    : "开启定位（记录这株植物的位置）"}
               </button>
               {geoStatus === "timeout" && (
                 <p className="mt-1.5 text-[11px] text-amber-700 leading-relaxed">
-                  一直转圈通常是 iOS 关掉了定位：请打开 iOS 设置 → 隐私与安全性 → 定位服务，确认总开关已开、且 Chrome 设为「使用 App 期间」并开启「精确位置」，再点上方按钮重试。
+                  一直转圈通常是 iOS 关掉了定位：请打开 iOS 设置 → 隐私与安全性 →
+                  定位服务，确认总开关已开、且 Chrome 设为「使用 App
+                  期间」并开启「精确位置」，再点上方按钮重试。
                 </p>
               )}
             </>
@@ -934,8 +1009,20 @@ export function CameraIdentify({ retake: retakeCtx = null }: { retake?: RetakeCo
       {phase === "captured" && errorMsg && (
         <div className="mt-3 rounded-xl border border-destructive/40 bg-destructive/5 px-3 py-2.5">
           <p className="flex items-center gap-1.5 text-xs font-semibold text-destructive">
-            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-              <circle cx="12" cy="12" r="10" /><path d="M12 8v4" /><path d="M12 16h.01" />
+            <svg
+              viewBox="0 0 24 24"
+              width="14"
+              height="14"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden="true"
+            >
+              <circle cx="12" cy="12" r="10" />
+              <path d="M12 8v4" />
+              <path d="M12 16h.01" />
             </svg>
             {errorKind === "failed"
               ? "识别失败"
@@ -944,7 +1031,9 @@ export function CameraIdentify({ retake: retakeCtx = null }: { retake?: RetakeCo
                 : "未收到结果（可能已完成）"}
           </p>
           {/* whitespace-pre-line：网络类报错是「原因 ①②③」多行文案，不换行会挤成一团 */}
-          <p className="mt-1 text-xs text-ink-soft leading-relaxed whitespace-pre-line">{errorMsg}</p>
+          <p className="mt-1 text-xs text-ink-soft leading-relaxed whitespace-pre-line">
+            {errorMsg}
+          </p>
           <button
             onClick={() => setErrorMsg(null)}
             className="mt-1.5 text-[11px] text-ink-faint hover:text-vermilion underline underline-offset-2 cursor-pointer"
@@ -967,7 +1056,9 @@ export function CameraIdentify({ retake: retakeCtx = null }: { retake?: RetakeCo
           ) : coords ? (
             <div className="flex items-center gap-2 text-xs text-leaf-deep bg-leaf/10 border border-leaf/30 rounded-xl px-3 py-2">
               <MapPinIcon className="w-3.5 h-3.5 text-leaf-deep shrink-0" />
-              <span className="tabular-nums">已获取位置 {coords.lat.toFixed(4)}, {coords.lng.toFixed(4)}</span>
+              <span className="tabular-nums">
+                已获取位置 {coords.lat.toFixed(4)}, {coords.lng.toFixed(4)}
+              </span>
               <button
                 onClick={requestGeo}
                 className="ml-auto text-[11px] text-ink-faint hover:text-vermilion underline underline-offset-2 cursor-pointer"
@@ -1006,7 +1097,17 @@ export function CameraIdentify({ retake: retakeCtx = null }: { retake?: RetakeCo
             onClick={saveToAlbum}
             className="mt-2 w-full flex items-center justify-center gap-1.5 text-xs text-ink-soft bg-paper-deep/40 hover:bg-paper-deep/70 border border-rule/50 rounded-xl px-3 py-2 transition-colors cursor-pointer"
           >
-            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <svg
+              viewBox="0 0 24 24"
+              width="14"
+              height="14"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.8"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden="true"
+            >
               <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
               <polyline points="7 10 12 15 17 10" />
               <line x1="12" y1="15" x2="12" y2="3" />
@@ -1041,7 +1142,11 @@ export function CameraIdentify({ retake: retakeCtx = null }: { retake?: RetakeCo
 
             {/* Info / Tips Button */}
             <button
-              onClick={() => toast.info("💡 拍照提示：对焦清晰、光线充足并尽量使单种植物居中，能显著提高 AI 识别准确率。")}
+              onClick={() =>
+                toast.info(
+                  "💡 拍照提示：对焦清晰、光线充足并尽量使单种植物居中，能显著提高 AI 识别准确率。",
+                )
+              }
               title="使用小贴士"
               className="w-12 h-12 rounded-full border border-rule bg-background flex items-center justify-center text-ink-soft hover:bg-ink hover:text-background transition-all cursor-pointer shadow-sm active:scale-90"
             >
@@ -1079,7 +1184,11 @@ export function CameraIdentify({ retake: retakeCtx = null }: { retake?: RetakeCo
 
             {/* Info Button */}
             <button
-              onClick={() => toast.info("💡 提示：照片已选择。点击中间的“AI识别”按钮即可触发大语言模型生成精美双语科普文案。")}
+              onClick={() =>
+                toast.info(
+                  "💡 提示：照片已选择。点击中间的“AI识别”按钮即可触发大语言模型生成精美双语科普文案。",
+                )
+              }
               title="说明"
               className="w-12 h-12 rounded-full border border-rule bg-background flex items-center justify-center text-ink-soft hover:bg-ink hover:text-background transition-all cursor-pointer shadow-sm active:scale-90"
             >
@@ -1153,61 +1262,109 @@ function blobToBase64(blob: Blob): Promise<string> {
 // Flat SVG icons
 function CameraIcon({ className }: { className?: string }) {
   return (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"
-      strokeLinecap="round" strokeLinejoin="round" className={className} aria-hidden="true">
-      <path d="M3 8.5A2.5 2.5 0 0 1 5.5 6h2l1.2-2h6.6L16.5 6h2A2.5 2.5 0 0 1 21 8.5v9A2.5 2.5 0 0 1 18.5 20h-13A2.5 2.5 0 0 1 3 17.5v-9Z"/>
-      <circle cx="12" cy="13" r="3.6"/>
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden="true"
+    >
+      <path d="M3 8.5A2.5 2.5 0 0 1 5.5 6h2l1.2-2h6.6L16.5 6h2A2.5 2.5 0 0 1 21 8.5v9A2.5 2.5 0 0 1 18.5 20h-13A2.5 2.5 0 0 1 3 17.5v-9Z" />
+      <circle cx="12" cy="13" r="3.6" />
     </svg>
   );
 }
 
 function GalleryIcon({ className }: { className?: string }) {
   return (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"
-      strokeLinecap="round" strokeLinejoin="round" className={className} aria-hidden="true">
-      <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
-      <circle cx="9.5" cy="9.5" r="1.5"/>
-      <path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/>
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden="true"
+    >
+      <rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
+      <circle cx="9.5" cy="9.5" r="1.5" />
+      <path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21" />
     </svg>
   );
 }
 
 function MapPinIcon({ className }: { className?: string }) {
   return (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"
-      strokeLinecap="round" strokeLinejoin="round" className={className} aria-hidden="true">
-      <path d="M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0Z"/>
-      <circle cx="12" cy="10" r="3"/>
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden="true"
+    >
+      <path d="M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0Z" />
+      <circle cx="12" cy="10" r="3" />
     </svg>
   );
 }
 
 function SparkleIcon({ className }: { className?: string }) {
   return (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"
-      strokeLinecap="round" strokeLinejoin="round" className={className} aria-hidden="true">
-      <path d="m12 3-1.912 5.813a2 2 0 0 1-1.275 1.275L3 12l5.813 1.912a2 2 0 0 1 1.275 1.275L12 21l1.912-5.813a2 2 0 0 1 1.275-1.275L21 12l-5.813-1.912a2 2 0 0 1-1.275-1.275Z"/>
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden="true"
+    >
+      <path d="m12 3-1.912 5.813a2 2 0 0 1-1.275 1.275L3 12l5.813 1.912a2 2 0 0 1 1.275 1.275L12 21l1.912-5.813a2 2 0 0 1 1.275-1.275L21 12l-5.813-1.912a2 2 0 0 1-1.275-1.275Z" />
     </svg>
   );
 }
 
 function RotateCcwIcon({ className }: { className?: string }) {
   return (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"
-      strokeLinecap="round" strokeLinejoin="round" className={className} aria-hidden="true">
-      <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/>
-      <path d="M3 3v5h5"/>
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden="true"
+    >
+      <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
+      <path d="M3 3v5h5" />
     </svg>
   );
 }
 
 function InfoIcon({ className }: { className?: string }) {
   return (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"
-      strokeLinecap="round" strokeLinejoin="round" className={className} aria-hidden="true">
-      <circle cx="12" cy="12" r="10"/>
-      <path d="M12 16v-4"/>
-      <path d="M12 8h.01"/>
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden="true"
+    >
+      <circle cx="12" cy="12" r="10" />
+      <path d="M12 16v-4" />
+      <path d="M12 8h.01" />
     </svg>
   );
 }

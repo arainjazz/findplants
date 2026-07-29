@@ -18,7 +18,7 @@ export type JobStatus = "running" | "done" | "error";
 export type JobRecord = {
   id: string;
   /** 哪种任务，决定前端怎么呈现结果。 */
-  kind: "enrich_draft" | "gold_page";
+  kind: "enrich_draft" | "gold_page" | "quick_identify";
   status: JobStatus;
   /** 给用户看的阶段文案，例如「正在联网调研…」。 */
   phase: string;
@@ -26,6 +26,12 @@ export type JobRecord = {
   progress: number;
   /** 发起人 —— 轮询时校验，别人的任务读不到。 */
   userId: string;
+  /**
+   * 关联的草稿。
+   *
+   * ⚠️ 快速识别**新建**时为空串 —— 草稿是任务跑完才写出来的，入队时还不存在。
+   * 只有补拍合并（merge_draft_id）才一开始就有值。读它的地方都要挡住空串。
+   */
   draftId: string;
   /** status === "done" 时的返回值（原来 server fn 直接 return 的那个对象）。 */
   result?: unknown;
@@ -181,13 +187,26 @@ export function bindJobUpdates(initial: JobRecord) {
 
   const finish = (result: unknown): Promise<void> => {
     terminal = true;
-    rec = { ...rec, status: "done", phase: "已完成", progress: 100, result, updatedAt: new Date().toISOString() };
+    rec = {
+      ...rec,
+      status: "done",
+      phase: "已完成",
+      progress: 100,
+      result,
+      updatedAt: new Date().toISOString(),
+    };
     return flush();
   };
 
   const fail = (message: string): Promise<void> => {
     terminal = true;
-    rec = { ...rec, status: "error", phase: "已失败", error: message, updatedAt: new Date().toISOString() };
+    rec = {
+      ...rec,
+      status: "error",
+      phase: "已失败",
+      error: message,
+      updatedAt: new Date().toISOString(),
+    };
     return flush();
   };
 

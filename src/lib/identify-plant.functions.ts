@@ -33,6 +33,8 @@ import {
   filterLicensed,
   creditLine,
   stripHtml,
+  applyOrganVerdicts,
+  userPhotoCandidates,
   type PhotoCandidate,
   type Organ,
 } from "./species-photos";
@@ -64,11 +66,7 @@ import {
   pickDraftCardFields,
 } from "./draft-card-fields";
 import { stripModelChatter } from "./model-chatter";
-import {
-  type IdentifyTrace,
-  computeIdentifyConfidence,
-  confZh,
-} from "./identify-trace";
+import { type IdentifyTrace, computeIdentifyConfidence, confZh } from "./identify-trace";
 import { normalizeBaseUrl } from "./ai-base-url";
 import {
   bearerFetchRotating,
@@ -84,9 +82,11 @@ import {
   shouldFailOver,
   slotLabel,
   isKnownBlind,
+  thinkingOf,
   type ModelSlot,
   type ModelQueue,
   type SlotVision,
+  type ThinkingMode,
 } from "./model-queue";
 import {
   VISION_PROBE_PNG_B64,
@@ -98,6 +98,7 @@ import {
   speedNote,
 } from "./vision-probe";
 import { slugify, speciesKey, visibleBodyText, textShingles, jaccardSimilarity } from "./plants";
+import type { TaskKind } from "./task-feed";
 
 const AI_MODEL = "google/gemini-2.5-pro";
 const AI_GATEWAY = "https://ai.gateway.lovable.dev/v1/chat/completions";
@@ -697,7 +698,23 @@ type AiProviderConfig = {
   apiKey: string;
   model: string;
   baseUrl?: string; // for openai-compatible, anthropic or custom endpoints
+  /**
+   * 这次调用开不开思维链。**已经是解析过的最终值**（`thinkingOf(slot, consoleId)` 的输出），
+   * 下游只管照着发参数，不用再知道是哪个控制台、管理员有没有显式选过。
+   */
+  thinking?: ThinkingMode;
 };
+
+/**
+ * 按配置决定要不要发那组「别思考，直接答」的参数。
+ *
+ * 展开进请求体即可：`...thinkingParams(cfg)`。开思考时返回空对象 —— **什么都不发**，
+ * 让模型按自己的默认来，而不是反过来发一组「请思考」的参数（那种参数各家写法更乱，
+ * 且对本来就不推理的模型纯属白发一个会被 400 的键）。
+ */
+function thinkingParams(cfg: Pick<AiProviderConfig, "thinking">): Record<string, unknown> {
+  return cfg.thinking === "on" ? {} : { ...THINKING_OFF };
+}
 
 // ─── 优先调用序列：读写（三个控制台共用一套）──────────────────────────────────
 // 每个控制台在 site_config 里占一个 key，存的都是同一个 ModelQueue 形态。
@@ -715,6 +732,17 @@ const CONSOLE_CONFIG_KEYS = {
   enrich: "enrich_model_config",
   second_opinion: "second_opinion_config",
   xiaop: "xiaop_model_config",
+  // 「金叶详页」单独一套 —— 它以前借用小P蛙的序列，可两者的诉求正好相反：
+  // 小P蛙是**交互式问答/改稿**（要跟手、要便宜、常带图），金叶是**一次性写整份公开档案**
+  // （全站最复杂的一次生成，三轮撰稿，跑在队列的 15 分钟挂钟里，慢一点无所谓）。
+  // 共用一套的后果是必然互相将就：为小P蛙调快，金叶正文就变薄；为金叶调强，问答就变慢变贵。
+  gold: "gold_model_config",
+  // 「配图器官识别」单独一套 —— 它以前挂在小P蛙序列上，而这两件事毫无关系：
+  // 小P蛙是**交互式问答/改稿**，器官识别是**机械的视觉打标签**（判断一张图是花/叶/果/植株）。
+  // 后果 2026-07-26 线上验证过：小P蛙序列 1 配了纯文本的 qwen3.7-max，带图调用一路 400，
+  // **配图分类跟着一起废**，银叶/金叶全成空槽 —— 而管理员从「小P蛙」这个名字上
+  // 根本想不到它还管着配图。
+  organ: "organ_model_config",
 } as const;
 type ConsoleId = keyof typeof CONSOLE_CONFIG_KEYS;
 
@@ -724,6 +752,8 @@ const CONSOLE_LABELS: Record<ConsoleId, string> = {
   enrich: "草稿生成模型",
   second_opinion: "疑似复核模型",
   xiaop: "小P蛙模型",
+  gold: "金叶详页模型",
+  organ: "配图器官识别模型",
 };
 
 async function loadModelQueue(consoleId: ConsoleId): Promise<ModelQueue> {
@@ -765,6 +795,29 @@ async function loadEnrichQueue(): Promise<ModelQueue> {
   return own.sequence.length ? own : await loadAiQueue();
 }
 const loadSecondOpinionQueue = () => loadModelQueue("second_opinion");
+/**
+ * 「金叶详页」的序列。
+ *
+ * **兜底链是 gold → enrich → ai**，而不是回到小P蛙：金叶干的活（写整份公开档案）跟
+ * 「进一步生成草稿」是同一类诉求 —— 要长文能力、能容忍慢 —— 所以没单独配时借草稿生成的
+ * 配置远比借小P蛙（为交互问答调的快模型）合理。
+ * 这条回退同样保证「部署即生效」：新 key 上线时必然是空的，不会让金叶当场失灵。
+ */
+async function loadGoldQueue(): Promise<ModelQueue> {
+  const own = await loadModelQueue("gold");
+  return own.sequence.length ? own : await loadEnrichQueue();
+}
+/**
+ * 「配图器官识别」的序列。
+ *
+ * **兜底链是 organ → card → ai**：器官识别要的是「能读图 + 快 + 便宜」，这正是
+ * 出卡AI 的画像，比回到小P蛙（为交互问答调的）合理得多。
+ * 同样保证「部署即生效」—— 新 key 上线时是空的，不会让配图当场失灵。
+ */
+async function loadOrganQueue(): Promise<ModelQueue> {
+  const own = await loadModelQueue("organ");
+  return own.sequence.length ? own : await loadCardQueue();
+}
 
 /** 「金叶详页创作指导 Skill」在 site_config 里的 key。 */
 const GOLD_SKILL_CONFIG_KEY = "gold_skill_config";
@@ -1162,7 +1215,13 @@ async function plantNetIdentify(
 //   · OpenAI          https://api.openai.com/v1                        模型 gpt-4o 等
 // 因此换厂商只需在管理面板改 apiKey + baseUrl + model，无需改代码。
 // 注意各家 Key 都要用**推理（数据面）Key**，不是控制台的 AK/SK。
-type SecondOpinionConfig = { apiKey: string; model: string; baseUrl: string };
+type SecondOpinionConfig = {
+  apiKey: string;
+  model: string;
+  baseUrl: string;
+  /** 已解析的推理开关（默认 off —— 复核就是被推理模型拖超时的重灾区）。 */
+  thinking?: ThinkingMode;
+};
 
 const SECOND_OPINION_DEFAULT_BASE = "https://ark.cn-beijing.volces.com/api/v3";
 
@@ -1292,6 +1351,7 @@ async function withSecondOpinionSlots<T>(
         apiKey: s.apiKey,
         model: s.model,
         baseUrl: s.baseUrl || SECOND_OPINION_DEFAULT_BASE,
+        thinking: thinkingOf(s, "second_opinion"),
       }))
     : sequence.length
       ? [] // 配了、但全是 blind → 直接放弃，别再拿同一个瞎模型试一次
@@ -1310,7 +1370,10 @@ async function withSecondOpinionSlots<T>(
     if (secondOpinionSlotTimeout() === 0) {
       noteFailure(
         `复核总预算 ${Math.round(SECOND_OPINION_TOTAL_BUDGET_MS / 1000)} 秒已用完，` +
-          `剩余 ${slots.length - i} 个序列项（${slots.slice(i).map((s) => s.model).join("、")}）未再尝试`,
+          `剩余 ${slots.length - i} 个序列项（${slots
+            .slice(i)
+            .map((s) => s.model)
+            .join("、")}）未再尝试`,
       );
       break;
     }
@@ -1389,7 +1452,7 @@ async function secondOpinionIdentify(
           // 关思考。复核模型常是推理模型，默认先写一大段思维链 —— 对「再看一眼图报个物种」
           // 这件事几乎没有增益，却能把 8 秒的调用拖到 40 秒以上，必然撞超时。
           // 三种写法一起发，不认的那个会被 postOpenAICompat 从 400 报错里认出来并摘掉。
-          ...THINKING_OFF,
+          ...thinkingParams(cfg),
           // ⚠️ **刻意不发 `response_format: {type:"json_object"}`**。
           // 复核链路配的基本都是第三方中转（能列出两百多个模型的那种聚合站），而中转对这个
           // 参数的支持五花八门：不认的直接 400，认一半的返回空字符串。callAiIdentify
@@ -1418,7 +1481,7 @@ async function secondOpinionIdentify(
               { role: "system", content: system },
               { role: "user", content },
             ],
-            ...THINKING_OFF,
+            ...thinkingParams(cfg),
             max_tokens: 1200,
             temperature: 0,
           },
@@ -1428,7 +1491,9 @@ async function secondOpinionIdentify(
       if (!resp.ok) {
         const body = (await resp.text().catch(() => "")).slice(0, 300);
         console.warn("[SecondOpinion] HTTP", resp.status, body);
-        noteFailure(`${cfg.model} 返回 HTTP ${resp.status}${body ? "：" + body.slice(0, 120) : ""}`);
+        noteFailure(
+          `${cfg.model} 返回 HTTP ${resp.status}${body ? "：" + body.slice(0, 120) : ""}`,
+        );
         return null;
       }
       const data = await resp.json();
@@ -1463,11 +1528,11 @@ async function secondOpinionIdentify(
             // 补拍照）+ 要一段 150–260 字的导语 —— 两者的耗时根本不是一个量级。
             // 自检回答的是「这个 key 能用吗 / 这个模型看得见图吗」，从来不回答「它够不够快」。
             `${cfg.model} 在 ${Math.round(budgetMs / 1000)} 秒内没返回（实际等了 ${spent} 秒）。` +
-            `注意：后台「连通体检 / 视觉自检」发的是一张几百字节的小图、只要四个词的回答，` +
-            `全绿只说明 key 可用、模型能读图，**测不出它答一次真实复核要多久** —— ` +
-            `推理模型（qwen3 / glm / deepseek 的 thinking 版等）常常要 40 秒以上。` +
-            `建议在「二次复核」控制台换成非推理的视觉模型（或该模型的 non-thinking / turbo 版本），` +
-            `并把慢的那个排到序列后面。`
+              `注意：后台「连通体检 / 视觉自检」发的是一张几百字节的小图、只要四个词的回答，` +
+              `全绿只说明 key 可用、模型能读图，**测不出它答一次真实复核要多久** —— ` +
+              `推理模型（qwen3 / glm / deepseek 的 thinking 版等）常常要 40 秒以上。` +
+              `建议在「二次复核」控制台换成非推理的视觉模型（或该模型的 non-thinking / turbo 版本），` +
+              `并把慢的那个排到序列后面。`
           : `${cfg.model} 调用出错（第 ${spent} 秒）：${msg.slice(0, 140)}`,
       );
       return null;
@@ -1508,7 +1573,10 @@ async function secondOpinionPrimaryVerdict(
     const controller = new AbortController();
     // 与复核共用同一份总预算（都走 withSecondOpinionSlots）。这条路只要几个字段、
     // 不写导语，本来就快得多，所以给 20 秒封顶就够。
-    const timer = setTimeout(() => controller.abort(), Math.min(secondOpinionSlotTimeout() || 1, 20_000));
+    const timer = setTimeout(
+      () => controller.abort(),
+      Math.min(secondOpinionSlotTimeout() || 1, 20_000),
+    );
     try {
       const resp = await postOpenAICompat(
         `${cfg.baseUrl}/chat/completions`,
@@ -1520,7 +1588,7 @@ async function secondOpinionPrimaryVerdict(
             { role: "user", content },
           ],
           // 同复核：顶替定种只要一个学名和一个分数，思维链纯属拖时间。
-          ...THINKING_OFF,
+          ...thinkingParams(cfg),
           response_format: { type: "json_object" },
           max_tokens: 600,
           temperature: 0,
@@ -1710,7 +1778,13 @@ async function callAiIdentify(
     sequence,
     (slot) =>
       callAiIdentifyWithConfig(
-        { provider: slot.provider, apiKey: slot.apiKey, model: slot.model, baseUrl: slot.baseUrl },
+        {
+          provider: slot.provider,
+          apiKey: slot.apiKey,
+          model: slot.model,
+          baseUrl: slot.baseUrl,
+          thinking: thinkingOf(slot, queueKind),
+        },
         photoDataUrl,
         hintPlace,
         speciesHint,
@@ -2512,7 +2586,22 @@ async function reverseGeocode(lat: number, lng: number): Promise<string> {
  * 四级数据源，按「对读者的价值」排序：iNat 实拍 → GBIF 观测 → Commons → 腊叶标本/图版。
  * 每一级都先过许可闸门再进多样性挑选。
  */
-async function fetchSpeciesPhotos(term: string, n: number): Promise<PhotoCandidate[]> {
+async function fetchSpeciesPhotos(
+  term: string,
+  n: number,
+  opts: {
+    /**
+     * **至少**要凑够几张标本台纸 / 科学图版（organ = specimen）。
+     *
+     * 为什么需要这个下限：第 4/5 级（标本、图版）都被 `picked.length < n` 守着，
+     * 于是**物种在 iNat 收录得越好，这两级越轮不到跑** —— 前三级早就把 n 填满了。
+     * 而金叶的「人文·科学绘图」槽 want 是单元素 `["specimen"]`，没有任何降级余地，
+     * 结果就是：**越常见的物种，那个槽越是恒空**（结构性必空，跟这个物种有没有图版无关）。
+     * 给它一个独立于 n 的小额配额，这条链路才真正有机会填上。
+     */
+    specimenFloor?: number;
+  } = {},
+): Promise<PhotoCandidate[]> {
   const q = (term || "").trim();
   if (!q) return [];
   const timeoutFetch = async (url: string) => {
@@ -2521,7 +2610,7 @@ async function fetchSpeciesPhotos(term: string, n: number): Promise<PhotoCandida
     try {
       const r = await fetch(url, {
         signal: controller.signal,
-        headers: { "User-Agent": "Plantspedia/1.0" },
+        headers: { "User-Agent": PLANTSPEDIA_UA },
       });
       return r.ok ? await r.json() : null;
     } catch {
@@ -2604,6 +2693,16 @@ async function fetchSpeciesPhotos(term: string, n: number): Promise<PhotoCandida
     droppedTotal += dropped;
     return kept;
   };
+
+  // ── 标本/图版的独立配额（见 opts.specimenFloor）────────────────────────────
+  const specimenFloor = opts.specimenFloor ?? 0;
+  const specimenDeficit = () =>
+    Math.max(0, specimenFloor - picked.filter((c) => c.organ === "specimen").length);
+  /** 还要不要继续抓：总数没够 **或** 标本配额没凑齐。 */
+  const wantMore = () => picked.length < n || specimenDeficit() > 0;
+  /** 这一级该取几张。标本级要在「补总数」和「补配额」里取大的那个。 */
+  const takeCount = (forSpecimen = false) =>
+    forSpecimen ? Math.max(n - picked.length, specimenDeficit()) : Math.max(0, n - picked.length);
 
   // 1) iNaturalist — best for real, vetted species field photos. Pull a general
   //    votes-sorted pool PLUS organ-annotated pools so the draft's section images span
@@ -2702,7 +2801,9 @@ async function fetchSpeciesPhotos(term: string, n: number): Promise<PhotoCandida
       for (let i = 0; i < maxLen; i++) for (const p of pools) if (p[i]) cands.push(p[i]);
       for (const c of pickDiverse(cands, n - picked.length)) picked.push(c);
     }
-    if (picked.length >= n) return finish();
+    // ⚠️ 不是 `picked.length >= n` —— 那样常见种在这里就返回了，下面的标本/图版级
+    // 永远轮不到跑，金叶「人文·科学绘图」槽因此结构性必空（见 opts.specimenFloor）。
+    if (!wantMore()) return finish();
   } catch {
     /* fall through to next source */
   }
@@ -2735,7 +2836,7 @@ async function fetchSpeciesPhotos(term: string, n: number): Promise<PhotoCandida
         });
       }
       for (const c of pickDiverse(licensed(cands), n - picked.length)) picked.push(c);
-      if (picked.length >= n) return finish();
+      if (!wantMore()) return finish();
     } catch {
       /* fall through */
     }
@@ -2743,7 +2844,13 @@ async function fetchSpeciesPhotos(term: string, n: number): Promise<PhotoCandida
 
   // 3) Wikimedia Commons live photos.
   //    extmetadata 才带 License / Artist —— 没有它就无从判断能不能用，必须请求。
-  const commonsSearch = async (search: string, limit: string, organ: Organ = "") => {
+  const commonsSearch = async (
+    search: string,
+    limit: string,
+    organ: Organ = "",
+    /** 这一级取几张。默认按「还差多少凑够 n」，标本/图版级会传标本配额。 */
+    take = takeCount(),
+  ) => {
     const j = await timeoutFetch(
       "https://commons.wikimedia.org/w/api.php?" +
         new URLSearchParams({
@@ -2781,12 +2888,13 @@ async function fetchSpeciesPhotos(term: string, n: number): Promise<PhotoCandida
         sourceName: "Wikimedia Commons",
       });
     }
-    for (const c of pickDiverse(licensed(cands), n - picked.length)) picked.push(c);
-    return picked.length >= n;
+    for (const c of pickDiverse(licensed(cands), take)) picked.push(c);
+    return !wantMore();
   };
 
   if (picked.length < n) {
     try {
+      // commonsSearch 现在返回 !wantMore()，所以标本配额没凑齐时不会在这里提前收工。
       if (await commonsSearch(q + " filetype:bitmap", "30")) return finish();
     } catch {
       /* fall through */
@@ -2798,7 +2906,9 @@ async function fetchSpeciesPhotos(term: string, n: number): Promise<PhotoCandida
   //    about a living plant than a field photo, so these only fill slots that real
   //    photos could not. Rare species (few/no iNat observations) are exactly the case
   //    where this tier saves a draft from shipping with blank image slots.
-  if (picked.length < n) {
+  // ⚠️ 守卫是 wantMore() 而不是 `picked.length < n`：常见种前三级就把 n 填满了，
+  // 用旧守卫这一级永远不跑，金叶「人文·科学绘图」槽也就永远是空的。
+  if (wantMore()) {
     try {
       const params = new URLSearchParams({
         mediaType: "StillImage",
@@ -2824,19 +2934,20 @@ async function fetchSpeciesPhotos(term: string, n: number): Promise<PhotoCandida
           sourceName: occ?.institutionCode ? `标本 · ${occ.institutionCode}` : "腊叶标本",
         });
       }
-      for (const c of pickDiverse(licensed(cands), n - picked.length)) picked.push(c);
-      if (picked.length >= n) return finish();
+      for (const c of pickDiverse(licensed(cands), takeCount(true))) picked.push(c);
+      if (!wantMore()) return finish();
     } catch {
       /* fall through */
     }
   }
 
-  if (picked.length < n) {
+  if (wantMore()) {
     try {
       // Commons hosts the classic plates (Flora of China / Curtis's / BHL scans) and
       // line drawings under these terms.
       for (const term of ["illustration", "botanical illustration", "line drawing"]) {
-        if (await commonsSearch(`${q} ${term} filetype:bitmap`, "15", "specimen")) return finish();
+        if (await commonsSearch(`${q} ${term} filetype:bitmap`, "15", "specimen", takeCount(true)))
+          return finish();
       }
     } catch {
       /* give up gracefully */
@@ -2846,10 +2957,12 @@ async function fetchSpeciesPhotos(term: string, n: number): Promise<PhotoCandida
   return finish();
 
   function finish(): PhotoCandidate[] {
-    if (droppedTotal)
-      console.log(
-        `[SpeciesPhotos] 「${q}」：采用 ${picked.length} 张，因许可不明/保留所有权利丢弃 ${droppedTotal} 张`,
-      );
+    const spec = picked.filter((c) => c.organ === "specimen").length;
+    console.log(
+      `[SpeciesPhotos]「${q}」：采用 ${picked.length}/${n} 张` +
+        (specimenFloor ? `（标本/图版 ${spec}/${specimenFloor}）` : "") +
+        (droppedTotal ? `，因许可不明/保留所有权利丢弃 ${droppedTotal} 张` : ""),
+    );
     return picked;
   }
 }
@@ -2879,18 +2992,37 @@ async function classifyPhotoOrgans(
   const batch = cands.slice(0, 14);
   try {
     // iNat 的 /large. 换成 /medium.（≈500px）够判器官了，省一半以上流量。
-    const thumbs = await fetchInlineImages(
+    const fetched = await fetchInlineImagesIndexed(
       batch.map((c) => c.url.replace(/\/large\./, "/medium.")),
     );
-    if (thumbs.length !== batch.length) {
+    // **逐张容错，不再全批放弃。** 旧写法是 `thumbs.length !== batch.length → return cands`，
+    // 于是 8 张里坏 1 张就整批退回空标签；而空标签命不中任何槽的 want，页面就一张配图都没有
+    // （这正是用户报的「银叶/金叶没有新增配图」的主因之一）。现在只把**取到的那些**送去看，
+    // 缺的那张保留它自己的数据源标注 —— 少一张图，远好过一份草稿全空。
+    const sendable = fetched
+      .map((img, batchIndex) => ({ img, batchIndex }))
+      .filter((x): x is { img: InlineImage; batchIndex: number } => x.img != null);
+
+    if (!sendable.length) {
       console.warn(
-        `[PhotoOrgans] 只取到 ${thumbs.length}/${batch.length} 张缩略图，跳过分类（保留数据源标注）`,
+        `[PhotoOrgans]「${speciesName}」：${batch.length} 张缩略图**一张都没取到**，` +
+          `跳过分类（保留数据源标注）。多为图源 403/超时 —— 检查 User-Agent 与网络出口。`,
       );
       return cands;
     }
+    if (sendable.length < batch.length) {
+      console.warn(
+        `[PhotoOrgans]「${speciesName}」：只取到 ${sendable.length}/${batch.length} 张缩略图，` +
+          `**仅对这些分类**，其余保留数据源标注（旧版会整批放弃）。`,
+      );
+    }
+    const thumbs = sendable.map((x) => x.img);
 
+    // ⚠️ prompt 里的数量与下标**必须按实际送出的子集**（sendable），不能再用 batch.length ——
+    // 送 7 张却说「这里有 8 张、i 从 0 到 7」，模型会照着编号，返回的 i 与图对不上，
+    // 器官就会被系统性地错标到别的图上。下面解析时再把 i 映射回原 batch 下标。
     const system =
-      `你在为一份植物科普页面挑配图。用户会依次给你 ${batch.length} 张照片，` +
+      `你在为一份植物科普页面挑配图。用户会依次给你 ${sendable.length} 张照片，` +
       `它们**据称**都是「${speciesName}」。请**只描述你实际看到的画面**，不要依赖对该物种的既有知识。\n` +
       `对每张图判断它主要展示什么，只返回一个 JSON 数组，不要 markdown、不要多余文字：\n` +
       `[{"i":0,"organ":"leaf","usable":true,"caption_zh":"一句话说明画面内容，20字以内"}, …]\n` +
@@ -2905,48 +3037,34 @@ async function classifyPhotoOrgans(
       `usable=false 的情形：画面主体是人、动物、建筑、文字标签、截图、水印严重、` +
       `严重模糊或过曝、或根本看不出是植物。\n` +
       `**判不准就给 other，不要猜**——一张标错器官的图比一个空位有害得多。` +
-      `数组必须恰好 ${batch.length} 项，i 从 0 到 ${batch.length - 1}。`;
+      `数组必须恰好 ${sendable.length} 项，i 从 0 到 ${sendable.length - 1}。`;
 
     const { text } = await xiaopTextCall({
       contents: [
         {
           role: "user",
-          parts: [{ text: `请依次判断这 ${batch.length} 张照片各自展示的部位。` }],
+          parts: [{ text: `请依次判断这 ${sendable.length} 张照片各自展示的部位。` }],
         },
       ],
       system,
       images: thumbs,
+      consoleId: "organ",
+      // 看不见图的「器官判定」是纯编造，且 HTTP 200 无从察觉 —— 宁可 400 顺位给序列 2。
+      imagesEssential: true,
     });
 
     const parsed = JSON.parse(cleanJson(text));
     if (!Array.isArray(parsed)) throw new Error("返回的不是数组");
 
-    const byIndex = new Map<number, { organ: Organ; usable: boolean; caption: string }>();
-    for (const row of parsed) {
-      const i = Number(row?.i);
-      if (!Number.isInteger(i) || i < 0 || i >= batch.length) continue;
-      byIndex.set(i, {
-        organ: normalizeOrgan(row?.organ),
-        // 只有**显式** false 才算弃用；字段缺失按可用处理，免得模型漏写就把图全毙了。
-        usable: row?.usable !== false,
-        caption: String(row?.caption_zh ?? "").slice(0, 40),
-      });
-    }
-
-    const out: PhotoCandidate[] = [];
-    let dropped = 0;
-    batch.forEach((c, i) => {
-      const v = byIndex.get(i);
-      if (!v) {
-        out.push(c); // 模型漏了这一张 → 保留数据源标注
-        return;
-      }
-      if (!v.usable) {
-        dropped++;
-        return;
-      }
-      out.push({ ...c, organ: v.organ });
-    });
+    // 映射逻辑收在 species-photos.ts 的纯函数里 —— 「模型给的序号是**送出子集**的下标、
+    // 不是 batch 下标」是这条链路最容易错且后果最严重的一处（错标 = 一张标着「花」的
+    // 叶子特写进了花槽），必须能脱离网络和模型直接测。见 scratch/organ-verdicts.test.mjs。
+    const { out, dropped } = applyOrganVerdicts(
+      batch,
+      sendable.map((x) => x.batchIndex),
+      parsed,
+      normalizeOrgan,
+    );
     // 超出 batch 的候选原样带上，别白扔。
     out.push(...cands.slice(14));
 
@@ -2956,7 +3074,8 @@ async function classifyPhotoOrgans(
       return a;
     }, {});
     console.log(
-      `[PhotoOrgans]「${speciesName}」看图 ${batch.length} 张，弃用 ${dropped} 张，器官分布：${JSON.stringify(tally)}`,
+      `[PhotoOrgans]「${speciesName}」候选 ${batch.length} 张 / 实际看图 ${sendable.length} 张，` +
+        `弃用 ${dropped} 张，器官分布：${JSON.stringify(tally)}`,
     );
     return out;
   } catch (e) {
@@ -2988,10 +3107,14 @@ async function classifyPhotoOrgans(
  *     MAX_STORE_BYTES. Workers has no sharp/canvas, so anything still oversized after
  *     (1)+(2) is skipped rather than stored.
  */
-async function rehostImages(cands: PhotoCandidate[], prefix: string): Promise<PhotoCandidate[]> {
+/** 保序版转存：失败的位置留 `null`，长度恒等于入参。 */
+async function rehostImagesIndexed(
+  cands: PhotoCandidate[],
+  prefix: string,
+): Promise<(PhotoCandidate | null)[]> {
   // 返回**候选对象**而不是裸 URL：署名/许可必须跟着图一路走到渲染层。转存只换 url，
   // 其余字段原样保留 —— 图存进了我们自己的 bucket，并不改变它的著作权归属。
-  const out: PhotoCandidate[] = [];
+  const out: (PhotoCandidate | null)[] = [];
   const MAX_STORE_BYTES = 5 * 1024 * 1024; // never persist more than 5 MB per image
   const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
 
@@ -3009,7 +3132,7 @@ async function rehostImages(cands: PhotoCandidate[], prefix: string): Promise<Ph
     try {
       const init = {
         signal: controller.signal,
-        headers: { "User-Agent": "Plantspedia/1.0" },
+        headers: { "User-Agent": PLANTSPEDIA_UA },
         ...(useResize
           ? { cf: { image: { width: 1280, quality: 78, fit: "scale-down", format: "webp" } } }
           : {}),
@@ -3052,6 +3175,7 @@ async function rehostImages(cands: PhotoCandidate[], prefix: string): Promise<Ph
         .upload(path, Buffer.from(ab), { contentType: ct, upsert: false });
       if (error) {
         console.warn(`[RehostImages] upload failed for ${src}:`, error.message);
+        out.push(null);
         continue;
       }
       out.push({
@@ -3060,9 +3184,26 @@ async function rehostImages(cands: PhotoCandidate[], prefix: string): Promise<Ph
       });
     } catch (e) {
       console.warn(`[RehostImages] failed for ${src}:`, e instanceof Error ? e.message : e);
+      out.push(null);
     }
   }
   return out;
+}
+
+/**
+ * 转存一批图，**逐张回落**：这一张没转成就用它自己的原始外链，而不是整批退回去。
+ *
+ * 旧写法是 `rehosted.length === chosen.length ? rehosted : chosen` —— 只要有一张失败，
+ * **整页的图全部退回外链**。而外链是 inaturalist / gbif / wikimedia 的域名，国内基本加载
+ * 不出来：日志里 `[PhotoSlots]` 会显示 5/5 槽有图，用户看到的却是一排裂图。
+ * 逐张回落之后，失败的只影响它自己。
+ */
+async function rehostImagesAligned(
+  cands: PhotoCandidate[],
+  prefix: string,
+): Promise<PhotoCandidate[]> {
+  const rehosted = await rehostImagesIndexed(cands, prefix);
+  return cands.map((c, i) => rehosted[i] ?? c);
 }
 
 // ── GBIF / GRIIS invasive-species check ──────────────────────────────────────
@@ -3087,7 +3228,7 @@ async function timeoutJson(url: string, ms = 8000): Promise<any> {
   try {
     const r = await fetch(url, {
       signal: controller.signal,
-      headers: { "User-Agent": "Plantspedia/1.0" },
+      headers: { "User-Agent": PLANTSPEDIA_UA },
     });
     return r.ok ? await r.json() : null;
   } catch {
@@ -3411,6 +3552,10 @@ async function buildDraftContent(opts: {
   webResearch?: { digest: string; sources: { title: string; uri: string }[] };
   /** 走哪套模型序列：拍照出卡用「出卡AI」控制台，enrichDraft 的重活用「草稿生成模型」。 */
   queueKind?: "card" | "enrich";
+  /** 这份草稿累积的用户实拍（补拍会追加）。进配图候选池，与公开图同等参与器官识别。 */
+  userPhotos?: unknown;
+  /** 用户实拍的署名（草稿的 creator_label / 昵称）。拿不到就不写摄影者，绝不编造。 */
+  photographer?: string | null;
 }): Promise<{
   meta: AiMeta;
   usedModel: string;
@@ -3459,6 +3604,8 @@ async function buildDraftContent(opts: {
   // hotlink foreign hosts (broken/slow from China). Non-fatal.
   let sectionPhotos: (PhotoCandidate | null)[] = [];
   let sectionMissing: string[] = [];
+  /** 降级配图的如实说明，与 sectionPhotos 同下标对齐。 */
+  let sectionNotes: string[] = [];
   try {
     const sci = (meta.scientific_name || "").trim().split(/\s+/).slice(0, 2).join(" ");
     const term = sci || meta.common_name_en || meta.title || "";
@@ -3468,18 +3615,30 @@ async function buildDraftContent(opts: {
       // 会把每个候选都抓一张缩略图（12 张≈12 个子请求）。8 张对 5 个槽够挑，且更容易全数抓到、
       // 让分类真正生效（thumbs 差一张就整批跳过分类，见 classifyPhotoOrgans）。
       const external = await fetchSpeciesPhotos(term, 8);
+      // 用户自己拍的照片**排在候选池最前面** —— 拍的就是这一株、这个季节、这个地点，
+      // 是最贴题的图源。但它们**不享受特权**：和外部图一起过 classifyPhotoOrgans 现看现标，
+      // 器官对不上照样进不了槽（见 userPhotoCandidates 的注释）。
+      const mine = userPhotoCandidates({
+        photoUrl: opts.photoUrl,
+        userPhotos: opts.userPhotos,
+        who: opts.photographer,
+        place: opts.place,
+      });
       // 现看现标器官 → 按标签入槽。**分类在转存之前**，只有中选的图才进 bucket。
-      const labelled = await classifyPhotoOrgans(external, term);
+      const labelled = await classifyPhotoOrgans([...mine, ...external], term);
       const assigned = assignSlots(labelled, DRAFT_SLOTS);
-      console.log(`[PhotoSlots] 草稿「${term}」：${describeAssignment(assigned)}`);
+      console.log(
+        `[PhotoSlots] 草稿「${term}」：${describeAssignment(assigned)}` +
+          `（候选 ${mine.length} 张用户实拍 + ${external.length} 张公开图）`,
+      );
       const chosen = assigned.map((a) => a.photo).filter(Boolean) as PhotoCandidate[];
-      const rehosted = await rehostImages(chosen, "drafts/species/section");
-      // 转存失败就退回原始外链（署名字段一样在），总比没有图好。
-      const finalPhotos = rehosted.length === chosen.length ? rehosted : chosen;
+      // 逐张回落：这一张没转成就用它自己的外链，不再整批退回去（见 rehostImagesAligned）。
+      const finalPhotos = await rehostImagesAligned(chosen, "drafts/species/section");
       // 回填到槽位顺序上，空槽保持 null —— 模板据此渲染「暂无……公开照片」而不是塞图。
       let k = 0;
       sectionPhotos = assigned.map((a) => (a.photo ? (finalPhotos[k++] ?? null) : null));
       sectionMissing = assigned.map((a) => (a.photo ? "" : a.spec.missingNote));
+      sectionNotes = assigned.map((a) => (a.photo ? a.mismatchNote : ""));
     }
   } catch (e) {
     console.warn("[buildDraftContent] species photo search failed:", e);
@@ -3604,6 +3763,7 @@ async function buildDraftContent(opts: {
     section_credits: sectionPhotos.map((c) => (c ? creditLine(c) : "")),
     section_sources: sectionPhotos.map((c) => c?.sourceUrl ?? ""),
     section_missing: sectionMissing,
+    section_notes: sectionNotes,
     invasive: invasiveCard,
     conservation: conservationBadgesList,
     conservation_card: conservationCardObj,
@@ -3658,7 +3818,8 @@ function normalizeIdentification(meta: AiMeta): void {
     // 消毒后整段没了（模型这一趟基本只吐了闲聊）→ 给一句诚实的占位，别留白卡。
     // 疑似分支不需要这条：它上面已有「疑似（依据现有照片暂无法确诊到种）」兜底。
     if (!(meta.summary_zh || "").toString().trim()) {
-      meta.summary_zh = "本次未能生成简介文案（模型返回内容异常）。物种判定见上方名称，可点「进一步生成草稿」重新撰写。";
+      meta.summary_zh =
+        "本次未能生成简介文案（模型返回内容异常）。物种判定见上方名称，可点「进一步生成草稿」重新撰写。";
     }
   }
 }
@@ -3893,8 +4054,10 @@ export const submitPlantDraft = createServerFn({ method: "POST" })
     let createdBy: string | null = null;
     let creatorLabel = data.creator_label?.trim() || "访客";
     try {
-      const { getRequestHeader } = await import("@tanstack/react-start/server");
-      const authHeader = getRequestHeader("Authorization");
+      // 经 `.server.ts` 边界拿 —— 直接 import 会把服务端专用模块泄进客户端依赖图
+      // （2026-07-29 抽 runQuickIdentifyCore 时踩过：dev 500 而 build 照过，极具迷惑性）。
+      const { getAuthorizationHeader } = await import("./request-auth.server");
+      const authHeader = await getAuthorizationHeader();
       if (authHeader?.startsWith("Bearer ")) {
         const token = authHeader.slice(7);
         const { data: u } = await supabaseAdmin.auth.getUser(token);
@@ -4067,8 +4230,10 @@ async function resolveCreator(
   // 兜底：尝试从 Authorization header 读（服务端渲染或其他调用路径）
   if (!createdBy) {
     try {
-      const { getRequestHeader } = await import("@tanstack/react-start/server");
-      const authHeader = getRequestHeader("Authorization");
+      // 经 `.server.ts` 边界拿 —— 直接 import 会把服务端专用模块泄进客户端依赖图
+      // （2026-07-29 抽 runQuickIdentifyCore 时踩过：dev 500 而 build 照过，极具迷惑性）。
+      const { getAuthorizationHeader } = await import("./request-auth.server");
+      const authHeader = await getAuthorizationHeader();
       if (authHeader?.startsWith("Bearer ")) {
         const token = authHeader.slice(7);
         const { data: u } = await supabaseAdmin.auth.getUser(token);
@@ -4103,556 +4268,723 @@ const htmlEsc = (s: string) =>
 // sees a card immediately. The heavy multi-image draft is generated later, on
 // demand, by enrichDraft. If the fast path is unavailable it falls back to the
 // full pipeline so this never hard-fails.
+/**
+ * 同步识别的入口 —— **保留它**，因为两种情形仍然需要：
+ * ① 队列绑定不可用时（本地 vite dev 没有 workerd）的退路；
+ * ② 匿名用户（不进动态流，也就没有轮询的必要）。
+ * 登录用户的正路是 `startQuickIdentifyFn`（走队列，可切后台）。
+ */
 export const quickIdentifyDraft = createServerFn({ method: "POST" })
   .inputValidator((input) => SubmitInput.parse(input))
-  .handler(async ({ data }) => {
+  .handler(async ({ data }) => runQuickIdentifyCore(data));
+
+/**
+ * 识别的**正路**：先把照片传上云端，再把任务交给队列，立刻返回 jobId。
+ *
+ * 为什么必须这样（用户 2026-07-29 的需求，也是 07-26 那个「假失败」的根治）：
+ * 整条识别串着 Pl@ntNet + 一线视觉模型 + 疑似复核 + 出卡，挂在一个 HTTP 请求上
+ * 必然撞 Cloudflare 边缘 **100 秒**上限 —— 用户实测等到 101 秒报「Load failed」，
+ * 而服务端其实已经把草稿写完了。搬进队列后消费者有 15 分钟，用户可以锁屏、
+ * 切后台、去识别下一株。
+ *
+ * ⚠️ **payload 里绝不能塞 base64**：`pruneExpiredJobs` 每次建任务都会把所有 job 行的
+ * value 全量拉回来解析，塞进一张 8MB 的图会把它撑爆。所以照片**先传存储**，
+ * payload 只带地址；消费者用地址把字节取回来。
+ *
+ * 仅限登录用户。匿名识别继续走同步的 `quickIdentifyDraft` —— 他们没有动态流、
+ * 也没有跨设备接回任务的需求（用户明确表示重点照顾注册用户与编辑）。
+ */
+export const startQuickIdentifyFn = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input) => SubmitInput.parse(input))
+  .handler(async ({ data, context }) => {
+    const { userId } = context as { userId: string };
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { dbCreatedBy, creatorLabel } = await resolveCreator(
-      data.creator_label,
-      data.logged_in_user_id,
-    );
+    const { createJob, pruneExpiredJobs } = await import("./background-jobs");
+    const { keepAlive } = await import("./worker-ctx");
+    const { enqueueJob } = await import("./job-queue");
 
-    const lat = data.lat ?? null;
-    const lng = data.lng ?? null;
-    const dataUrl = `data:${data.photo_mime};base64,${data.photo_base64}`;
+    const extOf = (mime: string) =>
+      mime.includes("png") ? "png" : mime.includes("webp") ? "webp" : "jpg";
+    const rnd = () => Math.random().toString(36).slice(2, 8);
 
-    // ── 出卡速度：地名反查 + 原图上传 都不该串在识别前面 ────────────────────────
-    // 识别只吃 base64（dataUrl），既不需要 photoUrl 也不真的需要地名。以前这三步是串行的
-    // （geocode → upload → identify），用户就得连等三个网络往返。现在前两步**并行启动**，
-    // 识别期间它们在后台跑完，关键路径只剩识别本身。
-    const geoP: Promise<string> =
-      lat != null && lng != null
-        ? reverseGeocode(lat, lng).catch((e) => {
-            console.warn("[QuickIdentify] reverseGeocode failed:", e);
-            return "";
-          })
-        : Promise.resolve("");
-
-    const buffer = Buffer.from(data.photo_base64, "base64");
-    const ext = data.photo_mime.includes("png")
-      ? "png"
-      : data.photo_mime.includes("webp")
-        ? "webp"
-        : "jpg";
-    const path = `drafts/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
-    // `.then(ok, err)` 就地接住 rejection —— 这个 promise 要等到识别之后才 await，
-    // 中途若失败又没有 handler，Node 会报 unhandled rejection 把整个请求带崩。
-    const uploadP = supabaseAdmin.storage
+    // 主图：传不上去就没法往下走（消费者要靠地址取字节），当场报错而不是排队后再失败。
+    const mainPath = `drafts/${Date.now()}-${rnd()}.${extOf(data.photo_mime)}`;
+    const { error: upErr } = await supabaseAdmin.storage
       .from("plant-images")
-      .upload(path, buffer, { contentType: data.photo_mime, upsert: false })
-      .then(
-        (r) => r as { error: { message?: string } | null },
-        (e) => ({ error: { message: e instanceof Error ? e.message : String(e) } }),
-      );
-
-    // ── 本轮同时上传的额外角度照（补拍最多 2 张）────────────────────────────────
-    // 与主图**并行**上传，理由同上：识别只吃 base64，不必等任何一张传完。
-    // 与主图的关键差别是**失败不致命** —— 主图传不上去整次识别就没有封面、必须报错；
-    // 额外角度照只是多一个视角，传失败就当这一张没有（识别仍照常用它的 base64，因为模型
-    // 吃的是内存里的字节、根本不经过存储）。绝不能让第 2 张的存储抖动毁掉整次识别。
-    const extras = (data.extra_photos ?? []).slice(0, 2);
-    const extraDataUrls = extras.map((ph) => `data:${ph.mime};base64,${ph.base64}`);
-    const extraUploads = extras.map((ph) => {
-      const ex = ph.mime.includes("png") ? "png" : ph.mime.includes("webp") ? "webp" : "jpg";
-      const p = `drafts/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ex}`;
-      return {
-        path: p,
-        p: supabaseAdmin.storage
-          .from("plant-images")
-          .upload(p, Buffer.from(ph.base64, "base64"), { contentType: ph.mime, upsert: false })
-          .then(
-            (r) => r as { error: { message?: string } | null },
-            (e) => ({ error: { message: e instanceof Error ? e.message : String(e) } }),
-          ),
-      };
-    });
-
-    let meta: AiMeta;
-    let usedModel: string;
-    let usedProvider: string;
-    let usage: AiTokenUsage;
-    let html: string;
-    let enriched: boolean;
-    let isInvasive = false;
-    let gbifTaxonKey: number | null = null;
-    // 二次复核的留痕（仅当复核真的改变了结论时非 null），写进 ai_payload 供复盘。
-    let secondOpinion: {
-      by: string;
-      model: string;
-      action: string;
-      from: string;
-      to: string;
-      plantnet: string;
-    } | null = null;
-
-    // ── 全链路识别痕迹 ────────────────────────────────────────────────────────
-    // 与 secondOpinion 的区别：那个只在「复核改变了结论」时才有，这个**每次识别都记**，
-    // 包括复核压根没跑（限流/超时/没配模型）的情况。
-    // 起因：用户发现「出现疑似时用量表只有 plantnet+gemini-quick，补拍后才出现 review-adopted」，
-    // 追下来是 secondOpinionIdentify 在 429 限流/30s 超时时**静默返回 null**，用户被直接推去补拍，
-    // 完全无从知道「说好的自动复核」到底跑没跑。痕迹渲染进简介卡后，这件事永久透明。
-    const trace: {
-      primaryEngine: string;
-      primaryLabel: string;
-      primaryPct: number | null;
-      phase1Model: string;
-      phase1Confidence: string;
-      review:
-        | { ran: false; reason: string }
-        | { ran: true; model: string; confidence: string; action: string; adopted: boolean };
-      retakeCount: number;
-    } = {
-      primaryEngine: "none",
-      primaryLabel: "",
-      primaryPct: null,
-      phase1Model: "",
-      phase1Confidence: "",
-      review: { ran: false, reason: "未触发（结果不是疑似）" },
-      retakeCount: 0,
-    };
-
-    const retakeCount = data.retake_count ?? 0;
-    const speciesHint =
-      data.species_hint_title || data.species_hint_sci
-        ? { title: data.species_hint_title, sci: data.species_hint_sci }
-        : null;
-
-    // Merge mode (补拍): load the existing draft's prior user photos so the new shot
-    // appends to the gallery, and so the share card can use the resolving shot as its
-    // cover. The NEW photo goes FIRST (it's the clearest / most recent, and the one
-    // that resolved the identification when we finally 升出 low).
-    let priorPhotos: string[] = [];
-    if (data.merge_draft_id) {
-      try {
-        const { data: prev } = await (supabaseAdmin as any)
-          .from("plant_drafts")
-          .select("user_photos, photo_url")
-          .eq("id", data.merge_draft_id)
-          .maybeSingle();
-        if (prev) {
-          const up = Array.isArray(prev.user_photos)
-            ? (prev.user_photos as string[]).filter(Boolean)
-            : [];
-          priorPhotos = up.length ? up : prev.photo_url ? [prev.photo_url as string] : [];
-        }
-      } catch (e) {
-        console.warn("[QuickIdentify] prior user_photos load failed (migration pending?):", e);
-      }
-    }
-    // 地名只是识别的辅助提示，最多等它 4s —— Nominatim 偶发很慢/无响应，不该拖住出卡。
-    // 写库前会再取一次完整结果（那时通常早已 resolve），所以 capture_place 不会因此丢。
-    let place = await Promise.race([
-      geoP,
-      new Promise<string>((r) => setTimeout(() => r(""), 4000)),
-    ]);
-
-    // On 补拍, load the earlier shots as inline images so the model can judge from
-    // ALL angles at once. Best-effort: a fetch failure just falls back to single-image.
-    let priorInline: InlineImage[] = [];
-    if (priorPhotos.length > 0) {
-      try {
-        priorInline = await fetchInlineImages(priorPhotos.slice(0, 4));
-      } catch (e) {
-        console.warn(
-          "[QuickIdentify] prior photo inline fetch failed:",
-          e instanceof Error ? e.message : e,
-        );
-      }
-    }
-    // 本轮同时拍的额外角度照**排在历史补拍照前面**：下游一律 slice 取前几张，谁排前面谁
-    // 真正进模型。这一轮的照片是用户刚刚按提示补拍的同一株植物，比几轮以前的旧照片更该被看见。
-    // 它们的字节已经在内存里（就是请求体），不必像历史照片那样再从存储 fetch 回来。
-    if (extras.length) {
-      priorInline = [
-        ...extras.map((ph) => ({ mimeType: ph.mime, base64: ph.base64 })),
-        ...priorInline,
-      ];
-    }
-
-    // ── Stage 0（phase-1）：专业识别引擎作为一线信号 ────────────────────────────
-    // 先做一次专业定种，判定作为「定种基准」提示喂给 Gemini —— Gemini 的置信度因此吸收了
-    // 这个信号（低分或与照片明显不符 → 倾向标「疑似」→ 触发下方二次复核），无需再单独维护
-    // 一个脆弱的分数阈值门。此前这条链路只在 callAiIdentify（重路径）里跑，而拍照走的是本
-    // 快路径，等于专业识别一直没参与常规识别 —— 这里把它接回一线。
-    //
-    // 一线引擎降级链：
-    //   Pl@ntNet（免费额度 500 次/天）
-    //     → 额度用尽 / 未配 key / 请求失败 → 二次复核模型视觉顶替
-    //       → 二次复核模型也不可用 → 退回纯 Gemini（旧行为）
-    // 额度耗尽（HTTP 429）会被持久标记进 site_config.plantnet_quota_state，之后的请求直接
-    // 跳过 Pl@ntNet，不用每次都撞一发必定 429 的往返；1 小时后自动重试，额度一重置就切回。
-    let plantNetHint: string | undefined;
-    // Pl@ntNet 的判定留一份：两条出卡链路都失败时用它兜底出摘要卡，避免「待鉴定植物」。
-    let primaryFallback: { sci: string; family: string; genus: string; pct: number } | null = null;
-    let primaryLabel = "none";
-    let primaryEngine: "plantnet" | "vision" | "none" = "none";
-    let secondPrimary: { usage: AiTokenUsage; model: string } | null = null;
-    const plantNetKey = await loadPlantNetKey();
-    const quotaKnownExhausted = plantNetKey ? await isPlantNetQuotaExhausted() : false;
-
-    if (plantNetKey && !quotaKnownExhausted) {
-      const pnRes = await plantNetIdentify(dataUrl, plantNetKey, extraDataUrls).catch((e) => {
-        console.warn("[Pl@ntNet] quick-path identify failed; falling back:", e);
-        return { verdict: null, quotaExhausted: false, status: 0, body: "" };
+      .upload(mainPath, Buffer.from(data.photo_base64, "base64"), {
+        contentType: data.photo_mime,
+        upsert: false,
       });
-      if (pnRes.quotaExhausted) await markPlantNetQuotaExhausted();
-      const pn = pnRes.verdict;
-      if (pn && pn.scientific_name) {
-        const pct = Math.round((pn.score ?? 0) * 100);
-        primaryEngine = "plantnet";
-        primaryLabel = `${pn.scientific_name}@${pct}%`;
-        // 痕迹：Pl@ntNet 的 score 是引擎给的真实置信分，是整条链路上唯一「非模型自评」的
-        // 客观数字，最终可信度%就以它为锚（见 computeIdentifyConfidence）。
-        trace.primaryEngine = "plantnet";
-        trace.primaryLabel = pn.scientific_name;
-        trace.primaryPct = pct;
-        // 出卡链路全挂时用它兜底出摘要卡（见下方 else 分支）——有 Pl@ntNet 的学名，
-        // 就绝不该把草稿命名成「待鉴定植物」。
-        primaryFallback = {
-          sci: pn.scientific_name,
-          family: (pn.family || "").toString(),
-          genus: (pn.genus || "").toString(),
-          pct,
-        };
-        plantNetHint =
-          `【专业识别引擎 Pl@ntNet 判定】最可能物种：${pn.scientific_name}` +
-          `${pn.family ? `（科 ${pn.family}${pn.genus ? ` / 属 ${pn.genus}` : ""}）` : ""}` +
-          `，置信度 ${pct}%。备选：${pn.candidates.join("、")}。` +
-          `请以此专业判定为基准核对照片；若置信度偏低（低于 30%）或与照片明显不符，` +
-          `请在 summary_zh 开头标注「疑似」并简述分歧依据。`;
-      }
-    }
-
-    // Pl@ntNet 没能给出判定（额度用尽 / 未配 key / 请求失败）→ 二次复核模型顶上一线专业定种。
-    if (!plantNetHint) {
-      const dv = await secondOpinionPrimaryVerdict(dataUrl, priorInline);
-      if (dv) {
-        primaryEngine = "vision";
-        primaryLabel = `${dv.label}（二次复核模型顶替）`;
-        plantNetHint = dv.hint;
-        secondPrimary = { usage: dv.usage, model: dv.model };
-        // 顶替模式没有 Pl@ntNet 那种客观分数，只有模型自评 → primaryPct 保持 null，
-        // 可信度%改由 phase-1/复核的置信档决定，卡片上也会如实写「Pl@ntNet 未参与」。
-        trace.primaryEngine = "vision";
-        trace.primaryLabel = dv.label;
-      }
-    }
-    console.log(
-      `[Phase1] 一线引擎=${primaryEngine}（${primaryLabel}）` +
-        (quotaKnownExhausted ? " · Pl@ntNet 额度已标记用尽，本次跳过" : ""),
-    );
-
-    let quick = await identifyQuick(dataUrl, place, {
-      speciesHint,
-      retakeCount,
-      forceResult: retakeCount >= 3, // 补拍满 3 次必须出结论（哪怕疑似）
-      priorPhotos: priorInline,
-      plantNetHint,
-    });
-
-    // identifyQuick 是 **Gemini 专用**链路，「出卡AI」序列里没有 Gemini 项时它返回 null
-    // （管理员配的是 Kimi / 自建 custom 就属于这种）。这时改用序列本身再识别一次 ——
-    // 关键是**仍然只出摘要卡**。
-    //
-    // 这里以前是直接掉进下面的 `else` 跑完整 buildDraftContent 并把草稿标成
-    // enriched=true，于是换成非 Gemini 模型后，用户根本没点「进一步生成草稿」，
-    // 草稿却已经被完整生成了 —— 既莫名其妙，也白烧一次长文的钱。
-    if (!quick) {
-      quick = await callAiIdentify(
-        dataUrl,
-        place,
-        speciesHint ? { title: speciesHint.title, scientificName: speciesHint.sci } : null,
-        undefined,
-        "card",
-      ).catch((e) => {
-        // 失败不在这里报错：下面的 `else` 还有一条完整流水线兜底。
-        console.warn("[Phase1] 出卡AI 序列识别失败，回退完整流水线：", e);
-        return null;
-      });
-    }
-
-    // 识别已出结果 —— 到这一步才真正需要 photoUrl（建卡 / 写库）。上传是和地名反查、
-    // Pl@ntNet、识别**并行**跑的，此刻通常早已完成，这个 await 基本不耗时。
-    const { error: upErr } = await uploadP;
     if (upErr)
       throw new AiError(
         "STORAGE_UPLOAD_FAILED",
         `照片上传失败（STORAGE_UPLOAD_FAILED）：无法把照片存入云端存储。原因：${upErr.message}。请检查网络后重试。`,
       );
-    const photoUrl = supabaseAdmin.storage.from("plant-images").getPublicUrl(path).data.publicUrl;
-    // 本轮同时上传的额外角度照：**传成功的才进相册**。失败的那张识别照样用过（模型吃的是内存里
-    // 的字节），只是存储里没有它——把一个不存在的 URL 写进 user_photos 只会在草稿页显示裂图。
+    const photoUrl = supabaseAdmin.storage.from("plant-images").getPublicUrl(mainPath)
+      .data.publicUrl;
+
+    // 额外角度照：失败**不致命**（同 runQuickIdentifyCore 的口径），少一个视角而已。
     const extraUrls: string[] = [];
-    for (const u of extraUploads) {
-      const { error } = await u.p;
+    for (const ph of (data.extra_photos ?? []).slice(0, 2)) {
+      const p2 = `drafts/${Date.now()}-${rnd()}.${extOf(ph.mime)}`;
+      const { error } = await supabaseAdmin.storage
+        .from("plant-images")
+        .upload(p2, Buffer.from(ph.base64, "base64"), { contentType: ph.mime, upsert: false });
       if (error) {
-        console.warn("[QuickIdentify] 额外角度照上传失败（忽略，不影响本次识别）:", error.message);
+        console.warn("[StartIdentify] 额外角度照上传失败（忽略）:", error.message);
         continue;
       }
-      extraUrls.push(
-        supabaseAdmin.storage.from("plant-images").getPublicUrl(u.path).data.publicUrl,
+      extraUrls.push(supabaseAdmin.storage.from("plant-images").getPublicUrl(p2).data.publicUrl);
+    }
+
+    void pruneExpiredJobs();
+    const job = await createJob({
+      kind: "quick_identify",
+      userId,
+      // 新建识别还没有草稿；合并补拍才有。draftId 是 JobRecord 的必填字段，
+      // 空串表示「跑完才会有」——动态流那边靠 upsertTaskFeed 的空值保护跳过。
+      draftId: data.merge_draft_id ?? "",
+      phase: "已排队，正在启动…",
+      payload: { identify: { ...data, photo_base64: "", extra_photos: [] }, photoUrl, extraUrls },
+    });
+
+    if (!(await enqueueJob(job.id))) keepAlive(runQueuedJob(job.id));
+
+    return { jobId: job.id, photoUrl };
+  });
+
+/** quickIdentify 的入参形状。队列消费者重放时要按同一形状把 data 拼回来。 */
+type QuickIdentifyData = z.infer<typeof SubmitInput>;
+
+/** 阶段回调。同步调用时是空函数，走队列时把文案写进 job 行与动态流。 */
+type PhaseFn = (phase: string, progress: number) => void;
+
+/**
+ * 一次快速识别的**全部实际工作**。
+ *
+ * 2026-07-29 从 `quickIdentifyDraft` 的 handler 里原样抽出来，一行逻辑没改 ——
+ * 目的是让它既能被同步 server fn 直接调用，也能被队列消费者重放。
+ *
+ * **为什么必须能重放**：整条识别串着 Pl@ntNet + 一线视觉模型 + 疑似复核 + 出卡，
+ * 挂在一个 HTTP 请求上就必然撞 Cloudflare 边缘 100 秒上限（用户实测等到 101 秒
+ * 报 Load failed，而服务端其实已经把草稿写进库了）。搬进队列后消费者有 15 分钟，
+ * 用户也可以切后台、去识别下一株。
+ *
+ * `opts.photoUrl` 是**已经传好的主图地址**：走队列时图片在入队前就传上去了
+ * （payload 里绝不能塞 base64，见 background-jobs 的 pruneExpiredJobs），
+ * 传了就跳过内部那次上传，避免同一张图存两份。
+ */
+async function runQuickIdentifyCore(
+  data: QuickIdentifyData,
+  onPhase: PhaseFn = () => {},
+  opts: { photoUrl?: string; extraUrls?: string[] } = {},
+) {
+  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+  const { dbCreatedBy, creatorLabel } = await resolveCreator(
+    data.creator_label,
+    data.logged_in_user_id,
+  );
+
+  const lat = data.lat ?? null;
+  const lng = data.lng ?? null;
+  const dataUrl = `data:${data.photo_mime};base64,${data.photo_base64}`;
+
+  // 阶段文案：同步路径下 onPhase 是空函数，走队列时它会写进 job 行 + 动态流，
+  // 让相框里的进度、以及小P蛙上的绿色进度条都有东西可显示。
+  onPhase("正在读取照片与拍摄位置…", 8);
+
+  // ── 出卡速度：地名反查 + 原图上传 都不该串在识别前面 ────────────────────────
+  // 识别只吃 base64（dataUrl），既不需要 photoUrl 也不真的需要地名。以前这三步是串行的
+  // （geocode → upload → identify），用户就得连等三个网络往返。现在前两步**并行启动**，
+  // 识别期间它们在后台跑完，关键路径只剩识别本身。
+  const geoP: Promise<string> =
+    lat != null && lng != null
+      ? reverseGeocode(lat, lng).catch((e) => {
+          console.warn("[QuickIdentify] reverseGeocode failed:", e);
+          return "";
+        })
+      : Promise.resolve("");
+
+  const buffer = Buffer.from(data.photo_base64, "base64");
+  const ext = data.photo_mime.includes("png")
+    ? "png"
+    : data.photo_mime.includes("webp")
+      ? "webp"
+      : "jpg";
+  const path = `drafts/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
+  // 走队列时主图在**入队前**就传好了（payload 只带地址、绝不带 base64），
+  // 这里直接跳过，免得同一张图在存储里躺两份。
+  const preUploaded = !!opts.photoUrl;
+  // `.then(ok, err)` 就地接住 rejection —— 这个 promise 要等到识别之后才 await，
+  // 中途若失败又没有 handler，Node 会报 unhandled rejection 把整个请求带崩。
+  const uploadP = preUploaded
+    ? Promise.resolve({ error: null as { message?: string } | null })
+    : supabaseAdmin.storage
+        .from("plant-images")
+        .upload(path, buffer, { contentType: data.photo_mime, upsert: false })
+        .then(
+          (r) => r as { error: { message?: string } | null },
+          (e) => ({ error: { message: e instanceof Error ? e.message : String(e) } }),
+        );
+
+  onPhase("正在比对专业定种引擎与视觉模型…", 25);
+
+  // ── 本轮同时上传的额外角度照（补拍最多 2 张）────────────────────────────────
+  // 与主图**并行**上传，理由同上：识别只吃 base64，不必等任何一张传完。
+  // 与主图的关键差别是**失败不致命** —— 主图传不上去整次识别就没有封面、必须报错；
+  // 额外角度照只是多一个视角，传失败就当这一张没有（识别仍照常用它的 base64，因为模型
+  // 吃的是内存里的字节、根本不经过存储）。绝不能让第 2 张的存储抖动毁掉整次识别。
+  const extras = (data.extra_photos ?? []).slice(0, 2);
+  const extraDataUrls = extras.map((ph) => `data:${ph.mime};base64,${ph.base64}`);
+  // 走队列时这些图也已经传好了（地址在 opts.extraUrls 里），只喂模型、不再重传。
+  const extraUploads = (preUploaded ? [] : extras).map((ph) => {
+    const ex = ph.mime.includes("png") ? "png" : ph.mime.includes("webp") ? "webp" : "jpg";
+    const p = `drafts/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ex}`;
+    return {
+      path: p,
+      p: supabaseAdmin.storage
+        .from("plant-images")
+        .upload(p, Buffer.from(ph.base64, "base64"), { contentType: ph.mime, upsert: false })
+        .then(
+          (r) => r as { error: { message?: string } | null },
+          (e) => ({ error: { message: e instanceof Error ? e.message : String(e) } }),
+        ),
+    };
+  });
+
+  let meta: AiMeta;
+  let usedModel: string;
+  let usedProvider: string;
+  let usage: AiTokenUsage;
+  let html: string;
+  let enriched: boolean;
+  const isInvasive = false;
+  const gbifTaxonKey: number | null = null;
+  // 二次复核的留痕（仅当复核真的改变了结论时非 null），写进 ai_payload 供复盘。
+  let secondOpinion: {
+    by: string;
+    model: string;
+    action: string;
+    from: string;
+    to: string;
+    plantnet: string;
+  } | null = null;
+
+  // ── 全链路识别痕迹 ────────────────────────────────────────────────────────
+  // 与 secondOpinion 的区别：那个只在「复核改变了结论」时才有，这个**每次识别都记**，
+  // 包括复核压根没跑（限流/超时/没配模型）的情况。
+  // 起因：用户发现「出现疑似时用量表只有 plantnet+gemini-quick，补拍后才出现 review-adopted」，
+  // 追下来是 secondOpinionIdentify 在 429 限流/30s 超时时**静默返回 null**，用户被直接推去补拍，
+  // 完全无从知道「说好的自动复核」到底跑没跑。痕迹渲染进简介卡后，这件事永久透明。
+  const trace: {
+    primaryEngine: string;
+    primaryLabel: string;
+    primaryPct: number | null;
+    phase1Model: string;
+    phase1Confidence: string;
+    review:
+      | { ran: false; reason: string }
+      | { ran: true; model: string; confidence: string; action: string; adopted: boolean };
+    retakeCount: number;
+  } = {
+    primaryEngine: "none",
+    primaryLabel: "",
+    primaryPct: null,
+    phase1Model: "",
+    phase1Confidence: "",
+    review: { ran: false, reason: "未触发（结果不是疑似）" },
+    retakeCount: 0,
+  };
+
+  const retakeCount = data.retake_count ?? 0;
+  const speciesHint =
+    data.species_hint_title || data.species_hint_sci
+      ? { title: data.species_hint_title, sci: data.species_hint_sci }
+      : null;
+
+  // Merge mode (补拍): load the existing draft's prior user photos so the new shot
+  // appends to the gallery, and so the share card can use the resolving shot as its
+  // cover. The NEW photo goes FIRST (it's the clearest / most recent, and the one
+  // that resolved the identification when we finally 升出 low).
+  let priorPhotos: string[] = [];
+  if (data.merge_draft_id) {
+    try {
+      const { data: prev } = await (supabaseAdmin as any)
+        .from("plant_drafts")
+        .select("user_photos, photo_url")
+        .eq("id", data.merge_draft_id)
+        .maybeSingle();
+      if (prev) {
+        const up = Array.isArray(prev.user_photos)
+          ? (prev.user_photos as string[]).filter(Boolean)
+          : [];
+        priorPhotos = up.length ? up : prev.photo_url ? [prev.photo_url as string] : [];
+      }
+    } catch (e) {
+      console.warn("[QuickIdentify] prior user_photos load failed (migration pending?):", e);
+    }
+  }
+  // 地名只是识别的辅助提示，最多等它 4s —— Nominatim 偶发很慢/无响应，不该拖住出卡。
+  // 写库前会再取一次完整结果（那时通常早已 resolve），所以 capture_place 不会因此丢。
+  let place = await Promise.race([geoP, new Promise<string>((r) => setTimeout(() => r(""), 4000))]);
+
+  // On 补拍, load the earlier shots as inline images so the model can judge from
+  // ALL angles at once. Best-effort: a fetch failure just falls back to single-image.
+  let priorInline: InlineImage[] = [];
+  if (priorPhotos.length > 0) {
+    try {
+      priorInline = await fetchInlineImages(priorPhotos.slice(0, 4));
+    } catch (e) {
+      console.warn(
+        "[QuickIdentify] prior photo inline fetch failed:",
+        e instanceof Error ? e.message : e,
       );
     }
-    const allPhotos = [photoUrl, ...extraUrls, ...priorPhotos].filter(Boolean).slice(0, 12);
-    // 补回完整地名（上面为了不拖慢识别只等了 4s；此刻反查早已结束）。
-    place = (await geoP) || place;
+  }
+  // 本轮同时拍的额外角度照**排在历史补拍照前面**：下游一律 slice 取前几张，谁排前面谁
+  // 真正进模型。这一轮的照片是用户刚刚按提示补拍的同一株植物，比几轮以前的旧照片更该被看见。
+  // 它们的字节已经在内存里（就是请求体），不必像历史照片那样再从存储 fetch 回来。
+  if (extras.length) {
+    priorInline = [
+      ...extras.map((ph) => ({ mimeType: ph.mime, base64: ph.base64 })),
+      ...priorInline,
+    ];
+  }
 
-    if (quick) {
-      meta = quick.meta;
-      // 模型有时**什么名字都不给**（title 与 scientific_name 双空）。以前这种情况会一路走到
-      // draftTitleFor 的最后一档，草稿被命名成「待鉴定植物」——用户明确不接受这个结果。
-      // 手上既然有 Pl@ntNet 的学名，就用它回填：宁可写「疑似 X」，也不要一个没有信息量的名字。
-      if (
-        primaryFallback &&
-        !(meta.title || "").toString().trim() &&
-        !(meta.scientific_name || "").toString().trim()
-      ) {
+  // ── Stage 0（phase-1）：专业识别引擎作为一线信号 ────────────────────────────
+  // 先做一次专业定种，判定作为「定种基准」提示喂给 Gemini —— Gemini 的置信度因此吸收了
+  // 这个信号（低分或与照片明显不符 → 倾向标「疑似」→ 触发下方二次复核），无需再单独维护
+  // 一个脆弱的分数阈值门。此前这条链路只在 callAiIdentify（重路径）里跑，而拍照走的是本
+  // 快路径，等于专业识别一直没参与常规识别 —— 这里把它接回一线。
+  //
+  // 一线引擎降级链：
+  //   Pl@ntNet（免费额度 500 次/天）
+  //     → 额度用尽 / 未配 key / 请求失败 → 二次复核模型视觉顶替
+  //       → 二次复核模型也不可用 → 退回纯 Gemini（旧行为）
+  // 额度耗尽（HTTP 429）会被持久标记进 site_config.plantnet_quota_state，之后的请求直接
+  // 跳过 Pl@ntNet，不用每次都撞一发必定 429 的往返；1 小时后自动重试，额度一重置就切回。
+  let plantNetHint: string | undefined;
+  // Pl@ntNet 的判定留一份：两条出卡链路都失败时用它兜底出摘要卡，避免「待鉴定植物」。
+  let primaryFallback: { sci: string; family: string; genus: string; pct: number } | null = null;
+  let primaryLabel = "none";
+  let primaryEngine: "plantnet" | "vision" | "none" = "none";
+  let secondPrimary: { usage: AiTokenUsage; model: string } | null = null;
+  const plantNetKey = await loadPlantNetKey();
+  const quotaKnownExhausted = plantNetKey ? await isPlantNetQuotaExhausted() : false;
+
+  if (plantNetKey && !quotaKnownExhausted) {
+    const pnRes = await plantNetIdentify(dataUrl, plantNetKey, extraDataUrls).catch((e) => {
+      console.warn("[Pl@ntNet] quick-path identify failed; falling back:", e);
+      return { verdict: null, quotaExhausted: false, status: 0, body: "" };
+    });
+    if (pnRes.quotaExhausted) await markPlantNetQuotaExhausted();
+    const pn = pnRes.verdict;
+    if (pn && pn.scientific_name) {
+      const pct = Math.round((pn.score ?? 0) * 100);
+      primaryEngine = "plantnet";
+      primaryLabel = `${pn.scientific_name}@${pct}%`;
+      // 痕迹：Pl@ntNet 的 score 是引擎给的真实置信分，是整条链路上唯一「非模型自评」的
+      // 客观数字，最终可信度%就以它为锚（见 computeIdentifyConfidence）。
+      trace.primaryEngine = "plantnet";
+      trace.primaryLabel = pn.scientific_name;
+      trace.primaryPct = pct;
+      // 出卡链路全挂时用它兜底出摘要卡（见下方 else 分支）——有 Pl@ntNet 的学名，
+      // 就绝不该把草稿命名成「待鉴定植物」。
+      primaryFallback = {
+        sci: pn.scientific_name,
+        family: (pn.family || "").toString(),
+        genus: (pn.genus || "").toString(),
+        pct,
+      };
+      plantNetHint =
+        `【专业识别引擎 Pl@ntNet 判定】最可能物种：${pn.scientific_name}` +
+        `${pn.family ? `（科 ${pn.family}${pn.genus ? ` / 属 ${pn.genus}` : ""}）` : ""}` +
+        `，置信度 ${pct}%。备选：${pn.candidates.join("、")}。` +
+        `请以此专业判定为基准核对照片；若置信度偏低（低于 30%）或与照片明显不符，` +
+        `请在 summary_zh 开头标注「疑似」并简述分歧依据。`;
+    }
+  }
+
+  // Pl@ntNet 没能给出判定（额度用尽 / 未配 key / 请求失败）→ 二次复核模型顶上一线专业定种。
+  if (!plantNetHint) {
+    const dv = await secondOpinionPrimaryVerdict(dataUrl, priorInline);
+    if (dv) {
+      primaryEngine = "vision";
+      primaryLabel = `${dv.label}（二次复核模型顶替）`;
+      plantNetHint = dv.hint;
+      secondPrimary = { usage: dv.usage, model: dv.model };
+      // 顶替模式没有 Pl@ntNet 那种客观分数，只有模型自评 → primaryPct 保持 null，
+      // 可信度%改由 phase-1/复核的置信档决定，卡片上也会如实写「Pl@ntNet 未参与」。
+      trace.primaryEngine = "vision";
+      trace.primaryLabel = dv.label;
+    }
+  }
+  console.log(
+    `[Phase1] 一线引擎=${primaryEngine}（${primaryLabel}）` +
+      (quotaKnownExhausted ? " · Pl@ntNet 额度已标记用尽，本次跳过" : ""),
+  );
+
+  let quick = await identifyQuick(dataUrl, place, {
+    speciesHint,
+    retakeCount,
+    forceResult: retakeCount >= 3, // 补拍满 3 次必须出结论（哪怕疑似）
+    priorPhotos: priorInline,
+    plantNetHint,
+  });
+
+  // identifyQuick 是 **Gemini 专用**链路，「出卡AI」序列里没有 Gemini 项时它返回 null
+  // （管理员配的是 Kimi / 自建 custom 就属于这种）。这时改用序列本身再识别一次 ——
+  // 关键是**仍然只出摘要卡**。
+  //
+  // 这里以前是直接掉进下面的 `else` 跑完整 buildDraftContent 并把草稿标成
+  // enriched=true，于是换成非 Gemini 模型后，用户根本没点「进一步生成草稿」，
+  // 草稿却已经被完整生成了 —— 既莫名其妙，也白烧一次长文的钱。
+  if (!quick) {
+    quick = await callAiIdentify(
+      dataUrl,
+      place,
+      speciesHint ? { title: speciesHint.title, scientificName: speciesHint.sci } : null,
+      undefined,
+      "card",
+    ).catch((e) => {
+      // 失败不在这里报错：下面的 `else` 还有一条完整流水线兜底。
+      console.warn("[Phase1] 出卡AI 序列识别失败，回退完整流水线：", e);
+      return null;
+    });
+  }
+
+  // 识别已出结果 —— 到这一步才真正需要 photoUrl（建卡 / 写库）。上传是和地名反查、
+  // Pl@ntNet、识别**并行**跑的，此刻通常早已完成，这个 await 基本不耗时。
+  onPhase("正在整理识别结果并生成简介卡…", 72);
+
+  const { error: upErr } = await uploadP;
+  if (upErr)
+    throw new AiError(
+      "STORAGE_UPLOAD_FAILED",
+      `照片上传失败（STORAGE_UPLOAD_FAILED）：无法把照片存入云端存储。原因：${upErr.message}。请检查网络后重试。`,
+    );
+  // 走队列时地址在入队前就定好了；同步路径才现拼。
+  const photoUrl =
+    opts.photoUrl || supabaseAdmin.storage.from("plant-images").getPublicUrl(path).data.publicUrl;
+  // 本轮同时上传的额外角度照：**传成功的才进相册**。失败的那张识别照样用过（模型吃的是内存里
+  // 的字节），只是存储里没有它——把一个不存在的 URL 写进 user_photos 只会在草稿页显示裂图。
+  const extraUrls: string[] = [...(opts.extraUrls ?? [])];
+  for (const u of extraUploads) {
+    const { error } = await u.p;
+    if (error) {
+      console.warn("[QuickIdentify] 额外角度照上传失败（忽略，不影响本次识别）:", error.message);
+      continue;
+    }
+    extraUrls.push(supabaseAdmin.storage.from("plant-images").getPublicUrl(u.path).data.publicUrl);
+  }
+  const allPhotos = [photoUrl, ...extraUrls, ...priorPhotos].filter(Boolean).slice(0, 12);
+  // 补回完整地名（上面为了不拖慢识别只等了 4s；此刻反查早已结束）。
+  place = (await geoP) || place;
+
+  if (quick) {
+    meta = quick.meta;
+    // 模型有时**什么名字都不给**（title 与 scientific_name 双空）。以前这种情况会一路走到
+    // draftTitleFor 的最后一档，草稿被命名成「待鉴定植物」——用户明确不接受这个结果。
+    // 手上既然有 Pl@ntNet 的学名，就用它回填：宁可写「疑似 X」，也不要一个没有信息量的名字。
+    if (
+      primaryFallback &&
+      !(meta.title || "").toString().trim() &&
+      !(meta.scientific_name || "").toString().trim()
+    ) {
+      console.warn(`[Phase1] 出卡模型未给出任何名称，用 Pl@ntNet 学名回填：${primaryFallback.sci}`);
+      meta.title = primaryFallback.sci;
+      meta.scientific_name = primaryFallback.sci;
+      if (!(meta.family || "").toString().trim()) meta.family = primaryFallback.family;
+      if (!(meta.genus || "").toString().trim()) meta.genus = primaryFallback.genus;
+      // 模型自己都没定出名字 → 一律按疑似，交给补拍/复核去坐实。
+      meta.identification_confidence = "low";
+    }
+    usedModel = quick.model;
+    usedProvider = quick.provider;
+    usage = quick.usage;
+    enriched = false;
+    // 一线引擎必须体现在 provider 里 —— 否则用量表永远只显示 "gemini-quick"，管理员
+    // 根本无从判断专业识别到底参与了没有（这正是上线后第一时间被问到的问题）。
+    // 注意：Pl@ntNet 不消耗 token，所以它只体现在 provider 名里、不会有独立的 token
+    // 记录，这是正常现象，不代表它没工作。
+    if (primaryEngine === "plantnet") {
+      usedProvider = `plantnet+${usedProvider}`;
+    } else if (secondPrimary) {
+      usage = addUsage(usage, secondPrimary.usage);
+      usedProvider = `vision-primary+${usedProvider}`;
+      usedModel = `${secondPrimary.model}+${usedModel}`;
+    }
+    // 统一疑似信号：名称/正文/补拍横幅三者一致（详见 normalizeIdentification）。
+    normalizeIdentification(meta);
+    // 痕迹要记 normalize **之后**的档位：模型常不写 confidence 而把「疑似」写进正文，
+    // normalize 会把这种情况回填成 low，复核闸门读的也是这个回填后的值。
+    trace.phase1Model = usedModel;
+    trace.phase1Confidence = (meta.identification_confidence || "").toString();
+    trace.retakeCount = retakeCount;
+
+    // ── 二次复核视觉模型 ──────────────────────────────────
+    // 仅在 phase-1 判为「疑似」且仍有补拍名额时，才咨询第二个视觉模型：它有把握 → 整卡
+    // 采纳（确认或纠正物种）→ 直接出确诊卡、跳过补拍；它同样没把握 → 维持疑似 → 照常进
+    // 补拍。补拍满 3 次不再复核（那已是强制出终局结论的关卡）。未配置二次复核模型 / 请求失败 →
+    // secondOpinionIdentify 返回 null → 行为与改动前完全一致。
+    // primaryEngine==="vision" 时跳过：一线已经是二次复核模型看过这张图了，同一个模型再看一遍
+    // 基本不会得出不同结论，白花一次调用 —— 直接照常进补拍。
+    if (meta.identification_confidence === "low" && retakeCount < 3 && primaryEngine !== "vision") {
+      const candidate = [meta.title, meta.scientific_name]
+        .map((s) => (s || "").toString().trim())
+        .filter(Boolean)
+        .join(" ");
+      const second = await secondOpinionIdentify(dataUrl, priorInline, place, {
+        candidate,
+        plantNetHint,
+      });
+      if (!second) {
+        // **这就是用户那个疑问的真凶**：复核该跑、也确实被调用了，但 429 限流 / 30s 超时 /
+        // 没配二次复核模型都会让 secondOpinionIdentify 静默返回 null，于是用量表上只有
+        // plantnet+gemini-quick、用户被直接推去补拍，看不出「说好的自动复核」跑没跑。
+        // 现在如实记进痕迹并渲染到简介卡上（具体是哪种失败在服务端日志 [SecondOpinion] 里）。
         console.warn(
-          `[Phase1] 出卡模型未给出任何名称，用 Pl@ntNet 学名回填：${primaryFallback.sci}`,
+          `[SecondOpinion] 复核未能完成（限流/超时/未配置），维持疑似 → 进补拍。primary=${primaryEngine}(${primaryLabel})`,
         );
-        meta.title = primaryFallback.sci;
-        meta.scientific_name = primaryFallback.sci;
-        if (!(meta.family || "").toString().trim()) meta.family = primaryFallback.family;
-        if (!(meta.genus || "").toString().trim()) meta.genus = primaryFallback.genus;
-        // 模型自己都没定出名字 → 一律按疑似，交给补拍/复核去坐实。
-        meta.identification_confidence = "low";
-      }
-      usedModel = quick.model;
-      usedProvider = quick.provider;
-      usage = quick.usage;
-      enriched = false;
-      // 一线引擎必须体现在 provider 里 —— 否则用量表永远只显示 "gemini-quick"，管理员
-      // 根本无从判断专业识别到底参与了没有（这正是上线后第一时间被问到的问题）。
-      // 注意：Pl@ntNet 不消耗 token，所以它只体现在 provider 名里、不会有独立的 token
-      // 记录，这是正常现象，不代表它没工作。
-      if (primaryEngine === "plantnet") {
-        usedProvider = `plantnet+${usedProvider}`;
-      } else if (secondPrimary) {
-        usage = addUsage(usage, secondPrimary.usage);
-        usedProvider = `vision-primary+${usedProvider}`;
-        usedModel = `${secondPrimary.model}+${usedModel}`;
-      }
-      // 统一疑似信号：名称/正文/补拍横幅三者一致（详见 normalizeIdentification）。
-      normalizeIdentification(meta);
-      // 痕迹要记 normalize **之后**的档位：模型常不写 confidence 而把「疑似」写进正文，
-      // normalize 会把这种情况回填成 low，复核闸门读的也是这个回填后的值。
-      trace.phase1Model = usedModel;
-      trace.phase1Confidence = (meta.identification_confidence || "").toString();
-      trace.retakeCount = retakeCount;
-
-      // ── 二次复核视觉模型 ──────────────────────────────────
-      // 仅在 phase-1 判为「疑似」且仍有补拍名额时，才咨询第二个视觉模型：它有把握 → 整卡
-      // 采纳（确认或纠正物种）→ 直接出确诊卡、跳过补拍；它同样没把握 → 维持疑似 → 照常进
-      // 补拍。补拍满 3 次不再复核（那已是强制出终局结论的关卡）。未配置二次复核模型 / 请求失败 →
-      // secondOpinionIdentify 返回 null → 行为与改动前完全一致。
-      // primaryEngine==="vision" 时跳过：一线已经是二次复核模型看过这张图了，同一个模型再看一遍
-      // 基本不会得出不同结论，白花一次调用 —— 直接照常进补拍。
-      if (
-        meta.identification_confidence === "low" &&
-        retakeCount < 3 &&
-        primaryEngine !== "vision"
-      ) {
-        const candidate = [meta.title, meta.scientific_name]
-          .map((s) => (s || "").toString().trim())
-          .filter(Boolean)
-          .join(" ");
-        const second = await secondOpinionIdentify(dataUrl, priorInline, place, {
-          candidate,
-          plantNetHint,
-        });
-        if (!second) {
-          // **这就是用户那个疑问的真凶**：复核该跑、也确实被调用了，但 429 限流 / 30s 超时 /
-          // 没配二次复核模型都会让 secondOpinionIdentify 静默返回 null，于是用量表上只有
-          // plantnet+gemini-quick、用户被直接推去补拍，看不出「说好的自动复核」跑没跑。
-          // 现在如实记进痕迹并渲染到简介卡上（具体是哪种失败在服务端日志 [SecondOpinion] 里）。
-          console.warn(
-            `[SecondOpinion] 复核未能完成（限流/超时/未配置），维持疑似 → 进补拍。primary=${primaryEngine}(${primaryLabel})`,
-          );
-          // 报**真实**原因，不再拿「限流/超时/未配置」三选一去猜（见 noteFailure 注释）。
-          const why = takeSecondOpinionFailures();
-          trace.review = {
-            ran: false,
-            reason: why || "复核未能完成（未拿到具体原因）",
-          };
-        } else {
-          // 无论结论是否被采纳，这次复核的 token 都已经花掉了 —— 必须计入用量，
-          // 否则被否决的复核会变成一笔查不到的隐形开销。
-          usage = addUsage(usage, second.usage);
-          normalizeIdentification(second.meta);
-          const resolved = second.meta.identification_confidence !== "low";
-          const beforeKey = speciesKey((meta.scientific_name || "").toString());
-          const afterKey = speciesKey((second.meta.scientific_name || "").toString());
-          const action = beforeKey && afterKey && beforeKey === afterKey ? "confirm" : "override";
-          // 决策日志：线上调参用（谁给了什么、最终怎么裁定）。只进服务端日志，不入库。
-          console.log(
-            `[SecondOpinion] primary=${primaryEngine}(${primaryLabel}) gemini=low(${candidate || "?"}) ` +
-              `review=${second.meta.identification_confidence}(${(second.meta.title || "").toString().trim()} / ${(second.meta.scientific_name || "").toString().trim()}) ` +
-              `→ ${resolved ? `RESOLVED(${action})，跳过补拍` : "仍疑似 → 照常补拍"}`,
-          );
-          if (resolved) {
-            // 透明留痕：写进 ai_payload._second_opinion（不渲染进卡片，避免污染 150–260 字
-            // 导语），配合 ai_usage_logs 里的 provider/model 供管理员复盘与调参。
-            secondOpinion = {
-              by: "second-opinion",
-              model: second.model,
-              action,
-              from: (meta.scientific_name || "").toString().trim(),
-              to: (second.meta.scientific_name || "").toString().trim(),
-              plantnet: `${primaryEngine}:${primaryLabel}`,
-            };
-            meta = second.meta;
-            usedProvider = `${usedProvider}+review-adopted`;
-            usedModel = `${usedModel}+${second.model}`;
-          } else {
-            // 复核跑了但维持疑似 —— 同样要留痕，否则用量表上这笔开销没有出处。
-            usedProvider = `${usedProvider}+review-declined`;
-            usedModel = `${usedModel}+${second.model}`;
-          }
-          trace.review = {
-            ran: true,
-            model: second.model,
-            confidence: (second.meta.identification_confidence || "").toString(),
-            action,
-            adopted: resolved,
-          };
-        }
-      } else if (meta.identification_confidence === "low") {
-        // 确实是疑似，但被闸门另外两个条件挡下了 —— 同样要说清为什么没复核，
-        // 否则用户又会遇到「疑似了却没见复核」的同一个困惑。
+        // 报**真实**原因，不再拿「限流/超时/未配置」三选一去猜（见 noteFailure 注释）。
+        const why = takeSecondOpinionFailures();
         trace.review = {
           ran: false,
-          reason:
-            retakeCount >= 3
-              ? "已补拍 3 次，进入终局裁定，不再复核"
-              : "一线定种已由复核模型顶替，同一模型不重复复核",
+          reason: why || "复核未能完成（未拿到具体原因）",
+        };
+      } else {
+        // 无论结论是否被采纳，这次复核的 token 都已经花掉了 —— 必须计入用量，
+        // 否则被否决的复核会变成一笔查不到的隐形开销。
+        usage = addUsage(usage, second.usage);
+        normalizeIdentification(second.meta);
+        const resolved = second.meta.identification_confidence !== "low";
+        const beforeKey = speciesKey((meta.scientific_name || "").toString());
+        const afterKey = speciesKey((second.meta.scientific_name || "").toString());
+        const action = beforeKey && afterKey && beforeKey === afterKey ? "confirm" : "override";
+        // 决策日志：线上调参用（谁给了什么、最终怎么裁定）。只进服务端日志，不入库。
+        console.log(
+          `[SecondOpinion] primary=${primaryEngine}(${primaryLabel}) gemini=low(${candidate || "?"}) ` +
+            `review=${second.meta.identification_confidence}(${(second.meta.title || "").toString().trim()} / ${(second.meta.scientific_name || "").toString().trim()}) ` +
+            `→ ${resolved ? `RESOLVED(${action})，跳过补拍` : "仍疑似 → 照常补拍"}`,
+        );
+        if (resolved) {
+          // 透明留痕：写进 ai_payload._second_opinion（不渲染进卡片，避免污染 150–260 字
+          // 导语），配合 ai_usage_logs 里的 provider/model 供管理员复盘与调参。
+          secondOpinion = {
+            by: "second-opinion",
+            model: second.model,
+            action,
+            from: (meta.scientific_name || "").toString().trim(),
+            to: (second.meta.scientific_name || "").toString().trim(),
+            plantnet: `${primaryEngine}:${primaryLabel}`,
+          };
+          meta = second.meta;
+          usedProvider = `${usedProvider}+review-adopted`;
+          usedModel = `${usedModel}+${second.model}`;
+        } else {
+          // 复核跑了但维持疑似 —— 同样要留痕，否则用量表上这笔开销没有出处。
+          usedProvider = `${usedProvider}+review-declined`;
+          usedModel = `${usedModel}+${second.model}`;
+        }
+        trace.review = {
+          ran: true,
+          model: second.model,
+          confidence: (second.meta.identification_confidence || "").toString(),
+          action,
+          adopted: resolved,
         };
       }
-
-      // 补拍满 3 次必须收口 —— 代码层硬保证，不依赖模型听话。
-      // Gemini 链路本来是靠 prompt 里那段「最终裁定（硬性）」做到的，但那有两个漏洞：
-      // ① 模型可以不照做；② 非 Gemini 的兜底链路（callAiIdentify）根本没有那段 prompt。
-      // 补拍建议一旦非空，草稿页的补拍关卡就会继续拦人，用户会被困在补拍循环里出不来。
-      if (retakeCount >= 3) {
-        meta.needs_more_photos_zh = "";
-        meta.needs_more_photos_en = "";
-      }
-
-      // Summary-card HTML with the full gallery of the user's own shots (newest first).
-      html = buildSummaryCardHtml({
-        photos: allPhotos,
-        title: meta.title || "",
-        sci: meta.scientific_name || "",
-        summaryZh: meta.summary_zh || "",
-        family: meta.family,
-        genus: meta.genus,
-        tentative: isTentative(meta), // 与标题、正文用同一套判据
-        chips: await lookupRegistryChips(meta.scientific_name, meta.family),
-        // 识别过程写进简介卡（分享卡不含 —— 分享出去只要结论，不要过程）。
-        trace,
-        finalConfidence: (meta.identification_confidence || "").toString(),
-      });
-    } else {
-      // ── 两条出卡链路都失败的兜底 ────────────────────────────────────────────
-      // **绝不再自动跑完整流水线（buildDraftContent）**。以前这里那么干，一次性造成三个
-      // 线上问题（2026-07-21 实测同时出现）：
-      //   ① 标 enriched=true → 用户根本没点「生成进一步介绍草稿」，整篇草稿却已经生成，
-      //      白烧一次长文的钱，也让「银叶换草稿」这层设计形同虚设；
-      //   ② 不走 buildSummaryCardHtml → 简介卡上没有识别过程 / 综合可信度；
-      //   ③ 配图走 section photos，抓不到时页面上是一堆重复的用户原图。
-      // 改为：用 Pl@ntNet 的专业判定兜底出一张**摘要卡**，enriched=false —— 生成正文这件事
-      // 永远由用户自己按按钮决定。
-      if (!primaryFallback) {
-        // 连 Pl@ntNet 都没有判定 → 手上真的什么都没有。此时**宁可如实报错**，也不要造一张
-        // 叫「待鉴定植物」的空卡骗用户（那正是用户明确不接受的那种结果）。
-        throw new AiError(
-          "IDENTIFY_FAILED",
-          "识别失败（IDENTIFY_FAILED）：出卡模型序列与专业识别引擎都没能给出结果。请稍后重试；若反复出现，请在管理后台检查「出卡AI」序列与 Pl@ntNet 额度。",
-        );
-      }
-      console.warn(
-        `[Phase1] 出卡链路全部失败，用 Pl@ntNet 判定兜底出摘要卡：${primaryFallback.sci}（${primaryFallback.pct}%）`,
-      );
-      meta = {
-        title: primaryFallback.sci,
-        scientific_name: primaryFallback.sci,
-        family: primaryFallback.family,
-        genus: primaryFallback.genus,
-        // 只有专业引擎的判定、没有模型复核过 → 一律按疑似处理，让用户走补拍把它坐实。
-        identification_confidence: "low",
-        summary_zh: `由专业识别引擎 Pl@ntNet 判定为 ${primaryFallback.sci}（置信度 ${primaryFallback.pct}%）。本次出卡模型未能返回结果，因此暂不做进一步描述——建议补拍关键部位以确认到种。`,
-      } as AiMeta;
-      normalizeIdentification(meta);
-      // Pl@ntNet 不消耗 token，所以这一趟的用量是 0 —— 用量表上出现 provider=plantnet-fallback
-      // 且 token 为 0 的记录，就代表「出卡模型全挂、靠专业引擎兜底出的卡」。
-      usedProvider = "plantnet-fallback";
-      usedModel = `plantnet(${primaryFallback.sci})`;
-      usage = ZERO_USAGE;
-      trace.phase1Model = "（出卡模型未返回，Pl@ntNet 兜底）";
-      trace.phase1Confidence = "low";
-      trace.review = { ran: false, reason: "出卡模型未返回结果，无可复核的候选" };
-      html = buildSummaryCardHtml({
-        photos: allPhotos,
-        title: meta.title || "",
-        sci: meta.scientific_name || "",
-        summaryZh: meta.summary_zh || "",
-        family: meta.family,
-        genus: meta.genus,
-        tentative: true,
-        chips: await lookupRegistryChips(meta.scientific_name, meta.family),
-        trace,
-        finalConfidence: "low",
-      });
-      enriched = false;
+    } else if (meta.identification_confidence === "low") {
+      // 确实是疑似，但被闸门另外两个条件挡下了 —— 同样要说清为什么没复核，
+      // 否则用户又会遇到「疑似了却没见复核」的同一个困惑。
+      trace.review = {
+        ran: false,
+        reason:
+          retakeCount >= 3
+            ? "已补拍 3 次，进入终局裁定，不再复核"
+            : "一线定种已由复核模型顶替，同一模型不重复复核",
+      };
     }
 
-    const safeTitle = draftTitleFor(meta);
-    const aiPayload = JSON.parse(
-      JSON.stringify({
-        ...meta,
-        _enriched: enriched,
-        ...(secondOpinion ? { _second_opinion: secondOpinion } : {}),
-        // 全链路痕迹：简介卡渲染它，管理员复盘也读它（复核到底跑没跑、为什么没跑）。
-        _identify_trace: trace,
-        // 照片指纹：下次同一张图再传上来，识别前就能提示「这张已经识别过」。
-        ...(data.photo_sha256 ? { _photo_sha256: data.photo_sha256 } : {}),
-      }),
-    );
+    // 补拍满 3 次必须收口 —— 代码层硬保证，不依赖模型听话。
+    // Gemini 链路本来是靠 prompt 里那段「最终裁定（硬性）」做到的，但那有两个漏洞：
+    // ① 模型可以不照做；② 非 Gemini 的兜底链路（callAiIdentify）根本没有那段 prompt。
+    // 补拍建议一旦非空，草稿页的补拍关卡就会继续拦人，用户会被困在补拍循环里出不来。
+    if (retakeCount >= 3) {
+      meta.needs_more_photos_zh = "";
+      meta.needs_more_photos_en = "";
+    }
 
-    let draftId: string;
-    if (data.merge_draft_id) {
-      // ── 补拍合并：更新既有草稿，不新建。照片追加进 user_photos（新图在首、作封面）、
-      //    覆盖摘要卡、刷新置信度与补拍建议。合并后 submitted_for_review 保持不变
-      //    （用户之前提交过就还在队列/地图上；没提交就仍是私有草稿）。 ──
-      const { error: mergeErr } = await (supabaseAdmin as any)
+    // Summary-card HTML with the full gallery of the user's own shots (newest first).
+    html = buildSummaryCardHtml({
+      photos: allPhotos,
+      title: meta.title || "",
+      sci: meta.scientific_name || "",
+      summaryZh: meta.summary_zh || "",
+      family: meta.family,
+      genus: meta.genus,
+      tentative: isTentative(meta), // 与标题、正文用同一套判据
+      chips: await lookupRegistryChips(meta.scientific_name, meta.family),
+      // 识别过程写进简介卡（分享卡不含 —— 分享出去只要结论，不要过程）。
+      trace,
+      finalConfidence: (meta.identification_confidence || "").toString(),
+    });
+  } else {
+    // ── 两条出卡链路都失败的兜底 ────────────────────────────────────────────
+    // **绝不再自动跑完整流水线（buildDraftContent）**。以前这里那么干，一次性造成三个
+    // 线上问题（2026-07-21 实测同时出现）：
+    //   ① 标 enriched=true → 用户根本没点「生成进一步介绍草稿」，整篇草稿却已经生成，
+    //      白烧一次长文的钱，也让「银叶换草稿」这层设计形同虚设；
+    //   ② 不走 buildSummaryCardHtml → 简介卡上没有识别过程 / 综合可信度；
+    //   ③ 配图走 section photos，抓不到时页面上是一堆重复的用户原图。
+    // 改为：用 Pl@ntNet 的专业判定兜底出一张**摘要卡**，enriched=false —— 生成正文这件事
+    // 永远由用户自己按按钮决定。
+    if (!primaryFallback) {
+      // 连 Pl@ntNet 都没有判定 → 手上真的什么都没有。此时**宁可如实报错**，也不要造一张
+      // 叫「待鉴定植物」的空卡骗用户（那正是用户明确不接受的那种结果）。
+      throw new AiError(
+        "IDENTIFY_FAILED",
+        "识别失败（IDENTIFY_FAILED）：出卡模型序列与专业识别引擎都没能给出结果。请稍后重试；若反复出现，请在管理后台检查「出卡AI」序列与 Pl@ntNet 额度。",
+      );
+    }
+    console.warn(
+      `[Phase1] 出卡链路全部失败，用 Pl@ntNet 判定兜底出摘要卡：${primaryFallback.sci}（${primaryFallback.pct}%）`,
+    );
+    meta = {
+      title: primaryFallback.sci,
+      scientific_name: primaryFallback.sci,
+      family: primaryFallback.family,
+      genus: primaryFallback.genus,
+      // 只有专业引擎的判定、没有模型复核过 → 一律按疑似处理，让用户走补拍把它坐实。
+      identification_confidence: "low",
+      summary_zh: `由专业识别引擎 Pl@ntNet 判定为 ${primaryFallback.sci}（置信度 ${primaryFallback.pct}%）。本次出卡模型未能返回结果，因此暂不做进一步描述——建议补拍关键部位以确认到种。`,
+    } as AiMeta;
+    normalizeIdentification(meta);
+    // Pl@ntNet 不消耗 token，所以这一趟的用量是 0 —— 用量表上出现 provider=plantnet-fallback
+    // 且 token 为 0 的记录，就代表「出卡模型全挂、靠专业引擎兜底出的卡」。
+    usedProvider = "plantnet-fallback";
+    usedModel = `plantnet(${primaryFallback.sci})`;
+    usage = ZERO_USAGE;
+    trace.phase1Model = "（出卡模型未返回，Pl@ntNet 兜底）";
+    trace.phase1Confidence = "low";
+    trace.review = { ran: false, reason: "出卡模型未返回结果，无可复核的候选" };
+    html = buildSummaryCardHtml({
+      photos: allPhotos,
+      title: meta.title || "",
+      sci: meta.scientific_name || "",
+      summaryZh: meta.summary_zh || "",
+      family: meta.family,
+      genus: meta.genus,
+      tentative: true,
+      chips: await lookupRegistryChips(meta.scientific_name, meta.family),
+      trace,
+      finalConfidence: "low",
+    });
+    enriched = false;
+  }
+
+  const safeTitle = draftTitleFor(meta);
+  const aiPayload = JSON.parse(
+    JSON.stringify({
+      ...meta,
+      _enriched: enriched,
+      ...(secondOpinion ? { _second_opinion: secondOpinion } : {}),
+      // 全链路痕迹：简介卡渲染它，管理员复盘也读它（复核到底跑没跑、为什么没跑）。
+      _identify_trace: trace,
+      // 照片指纹：下次同一张图再传上来，识别前就能提示「这张已经识别过」。
+      ...(data.photo_sha256 ? { _photo_sha256: data.photo_sha256 } : {}),
+    }),
+  );
+
+  let draftId: string;
+  if (data.merge_draft_id) {
+    // ── 补拍合并：更新既有草稿，不新建。照片追加进 user_photos（新图在首、作封面）、
+    //    覆盖摘要卡、刷新置信度与补拍建议。合并后 submitted_for_review 保持不变
+    //    （用户之前提交过就还在队列/地图上；没提交就仍是私有草稿）。 ──
+    const { error: mergeErr } = await (supabaseAdmin as any)
+      .from("plant_drafts")
+      .update({
+        photo_url: photoUrl, // cover = the resolving shot
+        capture_lat: lat,
+        capture_lng: lng,
+        capture_place: place,
+        ai_model: usedModel,
+        ai_payload: aiPayload,
+        title: safeTitle,
+        scientific_name: meta.scientific_name || null,
+        common_name_en: meta.common_name_en || null,
+        common_names_zh: meta.common_names_zh || null,
+        family: meta.family || null,
+        genus: meta.genus || null,
+        summary: (meta.summary_zh || meta.summary_en || "").toString().slice(0, 600),
+        tags: meta.tags ?? [],
+        iucn_status: meta.iucn_status || null,
+        html_content: html,
+      })
+      .eq("id", data.merge_draft_id)
+      .neq("status", "approved"); // never rewrite an already-published draft
+    if (mergeErr)
+      throw new AiError(
+        "DRAFT_UPDATE_FAILED",
+        `合并补拍失败（DRAFT_UPDATE_FAILED）：识别已完成，但更新草稿时出错。原因：${mergeErr.message}。`,
+      );
+    draftId = data.merge_draft_id;
+    // Best-effort: persist retake_count + the accumulated photo gallery (graceful if
+    // the migration hasn't been applied — these two updates just no-op then).
+    try {
+      await (supabaseAdmin as any)
         .from("plant_drafts")
-        .update({
-          photo_url: photoUrl, // cover = the resolving shot
-          capture_lat: lat,
-          capture_lng: lng,
-          capture_place: place,
-          ai_model: usedModel,
-          ai_payload: aiPayload,
-          title: safeTitle,
-          scientific_name: meta.scientific_name || null,
-          common_name_en: meta.common_name_en || null,
-          common_names_zh: meta.common_names_zh || null,
-          family: meta.family || null,
-          genus: meta.genus || null,
-          summary: (meta.summary_zh || meta.summary_en || "").toString().slice(0, 600),
-          tags: meta.tags ?? [],
-          iucn_status: meta.iucn_status || null,
-          html_content: html,
-        })
-        .eq("id", data.merge_draft_id)
-        .neq("status", "approved"); // never rewrite an already-published draft
-      if (mergeErr)
-        throw new AiError(
-          "DRAFT_UPDATE_FAILED",
-          `合并补拍失败（DRAFT_UPDATE_FAILED）：识别已完成，但更新草稿时出错。原因：${mergeErr.message}。`,
-        );
-      draftId = data.merge_draft_id;
-      // Best-effort: persist retake_count + the accumulated photo gallery (graceful if
-      // the migration hasn't been applied — these two updates just no-op then).
+        .update({ retake_count: retakeCount })
+        .eq("id", draftId);
+    } catch (e) {
+      console.warn("[QuickIdentify] retake_count update failed (migration pending?):", e);
+    }
+    try {
+      await (supabaseAdmin as any)
+        .from("plant_drafts")
+        .update({ user_photos: allPhotos })
+        .eq("id", draftId);
+    } catch (e) {
+      console.warn("[QuickIdentify] user_photos update failed (migration pending?):", e);
+    }
+  } else {
+    onPhase("正在写入云端…", 90);
+    const { data: row, error: insErr } = await supabaseAdmin
+      .from("plant_drafts")
+      .insert({
+        created_by: dbCreatedBy,
+        creator_label: creatorLabel,
+        photo_url: photoUrl,
+        capture_lat: lat,
+        capture_lng: lng,
+        capture_place: place,
+        ai_model: usedModel,
+        ai_payload: aiPayload,
+        title: safeTitle,
+        scientific_name: meta.scientific_name || null,
+        common_name_en: meta.common_name_en || null,
+        common_names_zh: meta.common_names_zh || null,
+        family: meta.family || null,
+        genus: meta.genus || null,
+        summary: (meta.summary_zh || meta.summary_en || "").toString().slice(0, 600),
+        tags: meta.tags ?? [],
+        iucn_status: meta.iucn_status || null,
+        html_content: html,
+      })
+      .select("id")
+      .single();
+    if (insErr)
+      throw new AiError(
+        "DRAFT_INSERT_FAILED",
+        `保存草稿失败（DRAFT_INSERT_FAILED）：识别已完成，但写入数据库时出错。原因：${insErr.message}。`,
+      );
+    draftId = row.id as string;
+
+    // Store retake_count + the initial user_photos in SEPARATE best-effort updates so
+    // the INSERT stays safe if this deploy landed before the migration (an unknown
+    // column would 400 the insert and break identification).
+    if (retakeCount > 0) {
       try {
         await (supabaseAdmin as any)
           .from("plant_drafts")
@@ -4661,109 +4993,57 @@ export const quickIdentifyDraft = createServerFn({ method: "POST" })
       } catch (e) {
         console.warn("[QuickIdentify] retake_count update failed (migration pending?):", e);
       }
-      try {
-        await (supabaseAdmin as any)
-          .from("plant_drafts")
-          .update({ user_photos: allPhotos })
-          .eq("id", draftId);
-      } catch (e) {
-        console.warn("[QuickIdentify] user_photos update failed (migration pending?):", e);
-      }
-    } else {
-      const { data: row, error: insErr } = await supabaseAdmin
-        .from("plant_drafts")
-        .insert({
-          created_by: dbCreatedBy,
-          creator_label: creatorLabel,
-          photo_url: photoUrl,
-          capture_lat: lat,
-          capture_lng: lng,
-          capture_place: place,
-          ai_model: usedModel,
-          ai_payload: aiPayload,
-          title: safeTitle,
-          scientific_name: meta.scientific_name || null,
-          common_name_en: meta.common_name_en || null,
-          common_names_zh: meta.common_names_zh || null,
-          family: meta.family || null,
-          genus: meta.genus || null,
-          summary: (meta.summary_zh || meta.summary_en || "").toString().slice(0, 600),
-          tags: meta.tags ?? [],
-          iucn_status: meta.iucn_status || null,
-          html_content: html,
-        })
-        .select("id")
-        .single();
-      if (insErr)
-        throw new AiError(
-          "DRAFT_INSERT_FAILED",
-          `保存草稿失败（DRAFT_INSERT_FAILED）：识别已完成，但写入数据库时出错。原因：${insErr.message}。`,
-        );
-      draftId = row.id as string;
-
-      // Store retake_count + the initial user_photos in SEPARATE best-effort updates so
-      // the INSERT stays safe if this deploy landed before the migration (an unknown
-      // column would 400 the insert and break identification).
-      if (retakeCount > 0) {
-        try {
-          await (supabaseAdmin as any)
-            .from("plant_drafts")
-            .update({ retake_count: retakeCount })
-            .eq("id", draftId);
-        } catch (e) {
-          console.warn("[QuickIdentify] retake_count update failed (migration pending?):", e);
-        }
-      }
-      try {
-        await (supabaseAdmin as any)
-          .from("plant_drafts")
-          .update({ user_photos: allPhotos })
-          .eq("id", draftId);
-      } catch (e) {
-        console.warn("[QuickIdentify] user_photos update failed (migration pending?):", e);
-      }
     }
-
     try {
-      await (supabaseAdmin as any).from("ai_usage_logs").insert({
-        user_id: dbCreatedBy,
-        user_label: creatorLabel,
-        provider: usedProvider,
-        model: usedModel,
-        prompt_tokens: usage.prompt_tokens,
-        completion_tokens: usage.completion_tokens,
-        total_tokens: usage.total_tokens,
-        capture_place: place || null,
-        capture_lat: lat,
-        capture_lng: lng,
-        draft_id: draftId,
-        draft_title: safeTitle,
-        task_type: "quick_identify", // Quick summary card generation
-      });
+      await (supabaseAdmin as any)
+        .from("plant_drafts")
+        .update({ user_photos: allPhotos })
+        .eq("id", draftId);
     } catch (e) {
-      console.warn("[QuickIdentify] usage log failed:", e);
+      console.warn("[QuickIdentify] user_photos update failed (migration pending?):", e);
     }
+  }
 
-    if (enriched && (gbifTaxonKey != null || isInvasive)) {
-      try {
-        await (supabaseAdmin as any)
-          .from("plant_drafts")
-          .update({ is_invasive: isInvasive, gbif_taxon_key: gbifTaxonKey })
-          .eq("id", draftId);
-      } catch (e) {
-        console.warn("[QuickIdentify] invasive flag update failed:", e);
-      }
+  try {
+    await (supabaseAdmin as any).from("ai_usage_logs").insert({
+      user_id: dbCreatedBy,
+      user_label: creatorLabel,
+      provider: usedProvider,
+      model: usedModel,
+      prompt_tokens: usage.prompt_tokens,
+      completion_tokens: usage.completion_tokens,
+      total_tokens: usage.total_tokens,
+      capture_place: place || null,
+      capture_lat: lat,
+      capture_lng: lng,
+      draft_id: draftId,
+      draft_title: safeTitle,
+      task_type: "quick_identify", // Quick summary card generation
+    });
+  } catch (e) {
+    console.warn("[QuickIdentify] usage log failed:", e);
+  }
+
+  if (enriched && (gbifTaxonKey != null || isInvasive)) {
+    try {
+      await (supabaseAdmin as any)
+        .from("plant_drafts")
+        .update({ is_invasive: isInvasive, gbif_taxon_key: gbifTaxonKey })
+        .eq("id", draftId);
+    } catch (e) {
+      console.warn("[QuickIdentify] invasive flag update failed:", e);
     }
+  }
 
-    return {
-      draftId,
-      enriched,
-      place,
-      identification_confidence: (meta.identification_confidence as string) ?? null,
-      needs_more_photos_zh: (meta.needs_more_photos_zh as string) ?? "",
-      title: safeTitle,
-    };
-  });
+  return {
+    draftId,
+    enriched,
+    place,
+    identification_confidence: (meta.identification_confidence as string) ?? null,
+    needs_more_photos_zh: (meta.needs_more_photos_zh as string) ?? "",
+    title: safeTitle,
+  };
+}
 
 // ── Submit a draft into the review queue ──────────────────────────────────────
 // A freshly-identified draft is PRIVATE (submitted_for_review=false): it doesn't
@@ -4928,6 +5208,9 @@ async function runEnrichCore(
       },
       webResearch: webResearch || undefined, // 传递联网调研结果给内容生成函数
       queueKind: "enrich", // 「进一步生成草稿」走它自己的模型序列
+      // 用户实拍进配图候选池（补拍累积的额外角度照往往正是外部图缺的那个器官特写）。
+      userPhotos: (draft as { user_photos?: unknown }).user_photos,
+      photographer: (draft as { creator_label?: string | null }).creator_label ?? null,
     });
 
   // Identity is LOCKED to phase-1 (with meta as fallback for anything phase-1 left
@@ -5129,6 +5412,10 @@ export const startEnrichDraftFn = createServerFn({ method: "POST" })
       payload: { email },
     });
 
+    // 一入队就进动态流 —— 用户点完就可以切走，小P蛙上立刻能看到这条在跑。
+    // 等第一个 onPhase 才落地会留一段「点了没反应」的空窗（冷启动可达几十秒）。
+    await feedStart(userId, "enrich_draft", data.draft_id, job.id);
+
     // 正路：交给 Queues（消费者有 15 分钟）。绑定不可用时（本地 dev / 队列没建）
     // 才退回 waitUntil —— 那条路只有约 26 秒，冷启动多半跑不完，但总比什么都不做强。
     if (!(await enqueueJob(job.id))) keepAlive(runQueuedJob(job.id));
@@ -5146,6 +5433,98 @@ export const startEnrichDraftFn = createServerFn({ method: "POST" })
  * **幂等**：Queues 允许重复投递（重试、至少一次语义）。任务已经不是 running 就直接
  * 返回，绝不重跑 —— 否则一次重投会让用户被扣两次叶子、库里多出一个重复页面。
  */
+/**
+ * 任务一入队就在动态流里立一条「排队中」。
+ *
+ * 顺手把草稿的标题/封面读进来 —— 卡片在**跑的过程中**就该能认出是哪一株，
+ * 而不是等跑完才显示名字。
+ */
+async function feedStart(
+  userId: string,
+  kind: "enrich_draft" | "gold_page",
+  draftId: string,
+  jobId: string,
+): Promise<void> {
+  const { upsertTaskFeed } = await import("./task-feed.functions");
+  let title: string | null = null;
+  let thumbUrl: string | null = null;
+  try {
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data } = await (supabaseAdmin as any)
+      .from("plant_drafts")
+      .select("title, photo_url")
+      .eq("id", draftId)
+      .maybeSingle();
+    if (data) {
+      title = data.title ?? null;
+      thumbUrl = data.photo_url ?? null;
+    }
+  } catch {
+    /* 读不到就先不显示名字，跑完 feedFinish 会补上 */
+  }
+  await upsertTaskFeed({
+    userId,
+    kind,
+    draftId,
+    jobId,
+    status: "running",
+    phase: "已排队，正在启动…",
+    progress: 1,
+    title,
+    thumbUrl,
+    error: null,
+    // 重跑时把上一轮的「已读」清掉：内容要变了，就该重新算作没看过。
+    markUnread: true,
+  });
+}
+
+/**
+ * 任务跑完后，把摘要卡要显示的字段补进动态流，并重新标为未读。
+ *
+ * 从 `plant_drafts` 读而不是从任务的返回值里翻：enrich / gold 两条链路的 result 形状
+ * 完全不同（一个是 {draftId}、一个还带 slug/html 路径），而草稿行里这三个字段的口径
+ * 是统一的。多一次读换来一处逻辑，值。
+ */
+async function feedFinish(
+  draftId: string,
+  userId: string,
+  kind: TaskKind,
+  jobId: string,
+): Promise<void> {
+  const { upsertTaskFeed } = await import("./task-feed.functions");
+  let title: string | null = null;
+  let thumbUrl: string | null = null;
+  let summary: string | null = null;
+  try {
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data } = await (supabaseAdmin as any)
+      .from("plant_drafts")
+      .select("title, photo_url, summary_zh")
+      .eq("id", draftId)
+      .maybeSingle();
+    if (data) {
+      title = data.title ?? null;
+      thumbUrl = data.photo_url ?? null;
+      summary = (data.summary_zh ?? "").toString().slice(0, 200) || null;
+    }
+  } catch {
+    // 读不到就只更状态 —— 卡片少几个字，总好过整条动态不落地。
+  }
+  await upsertTaskFeed({
+    userId,
+    kind,
+    draftId,
+    jobId,
+    status: "done",
+    phase: "已完成",
+    progress: 100,
+    title,
+    thumbUrl,
+    summary,
+    markUnread: true,
+  });
+}
+
 export async function runQueuedJob(jobId: string): Promise<void> {
   const { readJob, bindJobUpdates } = await import("./background-jobs");
 
@@ -5166,9 +5545,32 @@ export async function runQueuedJob(jobId: string): Promise<void> {
 
   const payload = (job.payload ?? {}) as { email?: string | null; userModel?: unknown };
   const email = payload.email ?? null;
+
+  // ── 动态流镜像（小P蛙通知中心）──────────────────────────────────────────────
+  // job 行是执行状态的权威（6 小时后被清），task_feed 是长期动态流 + 已读状态。
+  // 两边都写是刻意的：动态流写挂了不影响任务本身（upsertTaskFeed 全程吞异常）。
+  // **只在阶段推进时镜像，不跟心跳** —— 心跳 15 秒一次，跟着写会白白翻倍子请求，
+  // 而进度条根本不需要那个精度。
+  const { upsertTaskFeed } = await import("./task-feed.functions");
+  const feedKind =
+    job.kind === "quick_identify"
+      ? ("identify" as const)
+      : job.kind === "enrich_draft"
+        ? ("enrich_draft" as const)
+        : ("gold_page" as const);
+  // 快速识别**新建**时草稿是跑完才写出来的，入队时 draftId 还是空串。
+  // upsertTaskFeed 见到空 draftId 会直接跳过（那条 upsert 靠 draft_id 做唯一键），
+  // 所以这一路的动态在 feedFinish 里才第一次落地 —— 这是刻意的，不是漏。
+  let feedDraftId = job.draftId || null;
+  /** 归属三件事（谁的、哪类、哪份草稿）由 job 决定，调用方只管传变化的部分。 */
+  type FeedPatch = Omit<Parameters<typeof upsertTaskFeed>[0], "userId" | "kind" | "draftId">;
+  const feed = (patch: FeedPatch) =>
+    void upsertTaskFeed({ userId: job.userId, kind: feedKind, draftId: feedDraftId, ...patch });
+
   const onPhase = (phase: string, progress: number) => {
     // 不 await：进度写库不该拖慢生成，写失败也已在 flush 里吞掉。
     void jobs.phase(phase, progress);
+    feed({ jobId, status: "running", phase, progress });
   };
 
   // 心跳独立于阶段推进：撰稿是一整个 await，慢模型能跑五分钟以上，
@@ -5176,7 +5578,26 @@ export async function runQueuedJob(jobId: string): Promise<void> {
   const stopHeartbeat = jobs.startHeartbeat();
   try {
     let result: unknown;
-    if (job.kind === "enrich_draft") {
+    if (job.kind === "quick_identify") {
+      // 照片在入队前就传上云了，payload 里只有地址。把字节取回来重建 base64 ——
+      // runQuickIdentifyCore 的入参形状与同步路径**完全一致**，一行逻辑都不用分叉。
+      const qp = (job.payload ?? {}) as {
+        identify?: QuickIdentifyData;
+        photoUrl?: string;
+        extraUrls?: string[];
+      };
+      if (!qp.identify || !qp.photoUrl) throw new Error("识别任务的入参已丢失，请重新识别。");
+      const r = await fetch(qp.photoUrl);
+      if (!r.ok) throw new Error(`取回照片失败（HTTP ${r.status}），请重新识别。`);
+      const b64 = Buffer.from(await r.arrayBuffer()).toString("base64");
+      const ident = await runQuickIdentifyCore({ ...qp.identify, photo_base64: b64 }, onPhase, {
+        photoUrl: qp.photoUrl,
+        extraUrls: qp.extraUrls ?? [],
+      });
+      // 草稿这时才存在 —— 补上 id，下面 feedFinish 才知道这条动态挂在哪份草稿上。
+      feedDraftId = ident.draftId;
+      result = ident;
+    } else if (job.kind === "enrich_draft") {
       const pre = await enrichPreflight(job.draftId, job.userId, email);
       result = pre.alreadyEnriched
         ? { alreadyEnriched: true as const, draftId: job.draftId }
@@ -5190,12 +5611,22 @@ export async function runQueuedJob(jobId: string): Promise<void> {
     }
     stopHeartbeat();
     await jobs.finish(result);
+    // 完成时补齐摘要卡要显示的字段，并**重新标为未读** —— 内容刚变，就该重新算作没看过。
+    // 读草稿本体（而不是从 result 里翻）：三条链路的返回形状各不相同，从库里读一次最稳。
+    if (feedDraftId) await feedFinish(feedDraftId, job.userId, feedKind, jobId);
   } catch (e) {
     stopHeartbeat();
     const msg =
       e instanceof Error && e.message ? e.message : "生成失败（UNKNOWN）：发生了未知错误，请重试。";
     console.error(`[job-runner] 任务 ${jobId}（${job.kind}）失败：`, e);
     await jobs.fail(msg);
+    feed({
+      jobId,
+      status: "error",
+      phase: "已失败",
+      error: msg.slice(0, 500),
+      markUnread: true,
+    });
   } finally {
     // 上面两条路都已经停过表；这里兜住「stopHeartbeat 之前就抛了」的漏网情况。
     stopHeartbeat();
@@ -5221,6 +5652,7 @@ export const pollJobFn = createServerFn({ method: "POST" })
       phase: rec.phase,
       progress: rec.progress,
       kind: rec.kind,
+      draftId: rec.draftId || null,
       result: rec.result ?? null,
       error: rec.error ?? null,
       stale: isJobStale(rec),
@@ -5581,20 +6013,35 @@ async function runGoldCore(
   onPhase("正在检索并转存配图…", 12);
   let photos: (PhotoCandidate | null)[] = [];
   let photoMissing: string[] = GOLD_SLOTS.map((s) => s.missingNote);
+  /** 降级配图的如实说明，与 photos 同下标对齐。 */
+  let photoNotes: string[] = GOLD_SLOTS.map(() => "");
   try {
     const term =
       facts.scientificName.split(/\s+/).slice(0, 2).join(" ") || facts.commonNameEn || facts.title;
     // 9 个槽要覆盖 根株/茎/叶/花/果/物候/生境/标本/人文，候选必须给够挑选余地。
-    const external = await fetchSpeciesPhotos(term, 14);
-    const labelled = await classifyPhotoOrgans(external, term);
+    // specimenFloor: 2 —— 金叶的「人文·科学绘图」槽 want 是单元素 ["specimen"]，零降级余地。
+    // 不给独立配额，常见种前三级就把 14 张填满，标本/图版级永远不跑，那个槽结构性必空。
+    // 多出的 1–2 个子请求在 Workers Paid（上限 1000）下可以忽略。
+    const external = await fetchSpeciesPhotos(term, 14, { specimenFloor: 2 });
+    // 同银叶：用户实拍排最前，但一样要过器官识别才进得了槽。
+    const mine = userPhotoCandidates({
+      photoUrl: draft.photo_url,
+      userPhotos: (draft as { user_photos?: unknown }).user_photos,
+      who: (draft as { creator_label?: string | null }).creator_label,
+      place: (draft as { capture_place?: string | null }).capture_place,
+    });
+    const labelled = await classifyPhotoOrgans([...mine, ...external], term);
     const assigned = assignSlots(labelled, GOLD_SLOTS);
-    console.log(`[PhotoSlots] 金叶「${term}」：${describeAssignment(assigned)}`);
+    console.log(
+      `[PhotoSlots] 金叶「${term}」：${describeAssignment(assigned)}` +
+        `（候选 ${mine.length} 张用户实拍 + ${external.length} 张公开图）`,
+    );
     const chosen = assigned.map((a) => a.photo).filter(Boolean) as PhotoCandidate[];
-    const rehosted = await rehostImages(chosen, `plants/gold/${draft.id}`);
-    const finalPhotos = rehosted.length === chosen.length ? rehosted : chosen;
+    const finalPhotos = await rehostImagesAligned(chosen, `plants/gold/${draft.id}`);
     let k = 0;
     photos = assigned.map((a) => (a.photo ? (finalPhotos[k++] ?? null) : null));
     photoMissing = assigned.map((a) => (a.photo ? "" : a.spec.missingNote));
+    photoNotes = assigned.map((a) => (a.photo ? a.mismatchNote : ""));
   } catch (e) {
     console.warn("[GoldPage] image fetch failed; slots will render as .broken:", e);
   }
@@ -5686,6 +6133,7 @@ async function runGoldCore(
       system,
       schema,
       overrideSequence,
+      consoleId: "gold",
     });
     goldUsage = addUsage(goldUsage, usage);
     goldProvider = provider;
@@ -5695,7 +6143,7 @@ async function runGoldCore(
     } catch {
       throw new AiError(
         `GOLD_BAD_JSON_${label}`,
-        `创建失败（GOLD_BAD_JSON_${label}）：模型返回的内容不是完整 JSON，通常是生成被截断。请重试；反复出现可在管理后台给小P蛙换一个更强的模型。`,
+        `创建失败（GOLD_BAD_JSON_${label}）：模型返回的内容不是完整 JSON，通常是生成被截断。请重试；反复出现可在管理后台的「金叶详页模型」控制台换一个更强的模型。`,
       );
     }
   };
@@ -5769,8 +6217,14 @@ async function runGoldCore(
       // 署名跟着图走：每张图注渲染「摄影：X · CC BY-NC · iNaturalist」，可点回原始页。
       images: photos.map((c, i) =>
         c
-          ? { url: c.url, credit: creditLine(c), sourceUrl: c.sourceUrl }
-          : // 没有这个器官的公开照片 → 槽位如实写明缺什么，**不拿随机图糊过去**。
+          ? {
+              url: c.url,
+              credit: creditLine(c),
+              sourceUrl: c.sourceUrl,
+              // 降级命中时如实交代画面里是什么（见 photo-slots 的 mismatchNote）。
+              note: photoNotes[i] || undefined,
+            }
+          : // 候选池一张图都没有（2026-07-29 起极罕见）→ 如实写明。
             { url: "", missingNote: photoMissing[i] ?? "" },
       ),
     },
@@ -5920,6 +6374,9 @@ export const startGoldDetailPageFn = createServerFn({ method: "POST" })
       // **不进队列消息**（队列消息在 CF 侧最长留存 24 小时）。
       payload: { email, userModel: data.userModel },
     });
+
+    // 同 enrich：一入队就进动态流，用户点完立刻能切走。
+    await feedStart(userId, "gold_page", data.draft_id, job.id);
 
     if (!(await enqueueJob(job.id))) keepAlive(runQueuedJob(job.id));
 
@@ -6385,11 +6842,27 @@ function lastUserIndex(contents: ChatContents): number {
 
 /** Download an image URL and return it as inline base64 (so the model can SEE it).
  *  Returns null on any failure or if it's too large (caller proceeds text-only). */
+/**
+ * 对外抓图/抓页时统一署名的 User-Agent。
+ *
+ * Wikimedia / Commons 等站点的 API 礼仪要求请求带可识别的 UA，**裸请求会被 403**。
+ * 收成一个常量是为了别再出现「有的地方带、有的地方不带」——那种不一致的代价不是
+ * 少一张图，而是整条配图链路悄无声息地空掉。
+ */
+const PLANTSPEDIA_UA = "Plantspedia/1.0 (+https://plantspedia.club)";
+
 async function fetchInlineImage(url: string): Promise<InlineImage | null> {
   try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 15_000);
-    const r = await fetch(url, { signal: controller.signal });
+    // ⚠️ **必须带 User-Agent**。这曾是全文件唯一一个裸 fetch 的图片请求，而
+    // Wikimedia / Commons 对没有 UA 的请求直接回 403（它们的 API 礼仪明文要求署名 UA）。
+    // 后果不是「少一张图」而是「整份草稿零配图」—— 见下面 fetchInlineImagesIndexed 的注释。
+    // 同文件的 timeoutFetch 与转存下载早就带了 UA，这里是漏网的一处。
+    const r = await fetch(url, {
+      signal: controller.signal,
+      headers: { "User-Agent": PLANTSPEDIA_UA },
+    });
     clearTimeout(timer);
     if (!r.ok) return null;
     const ct = (r.headers.get("content-type") || "image/jpeg").split(";")[0];
@@ -6484,6 +6957,20 @@ function xiaopVisionUrls(opts: {
 async function fetchInlineImages(urls: string[]): Promise<InlineImage[]> {
   const imgs = await Promise.all(urls.map((u) => fetchInlineImage(u)));
   return imgs.filter((x): x is InlineImage => x != null);
+}
+
+/**
+ * 同 fetchInlineImages，但**保序**：抓不到的那一张留 `null` 占位，不塌缩。
+ *
+ * 为什么要多这一个：`fetchInlineImages` 把失败项直接 filter 掉，于是调用方只能看到
+ * 「拿到几张」，**对不上是哪几张**。器官分类正是因此写成了「差一张就整批放弃」——
+ * 而 fetchInlineImage 有四条静默失败分支（非 2xx / 非 image 类型 / >6MB / 15 秒超时），
+ * 8 张里坏 1 张的概率一点都不低。结果就是用户看到的「配图全空」。
+ *
+ * 保序之后，调用方可以只把拿到的那些送去分类，再把结果映射回原下标。
+ */
+async function fetchInlineImagesIndexed(urls: string[]): Promise<(InlineImage | null)[]> {
+  return await Promise.all(urls.map((u) => fetchInlineImage(u)));
 }
 
 /** Gemini chat call (structured output via responseSchema; optional vision). */
@@ -6584,7 +7071,20 @@ async function openaiCompatChat(
   system: string,
   schema?: unknown,
   images?: InlineImage[],
+  opts: {
+    /** 已解析的推理开关；"on" = 不发关思考参数，让模型按自己的默认来。 */
+    thinking?: ThinkingMode;
+    /**
+     * `true` = **禁止**「去掉图重发」那条降级路径（见下方 blind fallback）。
+     *
+     * 给「图本身就是任务」的链路用：配图器官识别、视觉自检。对它们来说，
+     * 一次看不见图的成功调用**比失败更糟** —— 模型会照样返回一串器官标签，
+     * 那是纯编造，而且 HTTP 200、日志无异常，谁也发现不了。
+     */
+    noBlindFallback?: boolean;
+  } = {},
 ): Promise<AiTextResult> {
+  const { thinking, noBlindFallback } = opts;
   const apiBase = normalizeBaseUrl(baseUrl) || "https://api.openai.com/v1";
 
   // Build the OpenAI messages. `useImages` attaches the photo(s) to the last user
@@ -6633,6 +7133,9 @@ async function openaiCompatChat(
       model,
       messages: buildMessages(useImages),
       max_tokens: 16000,
+      // 小P蛙默认关思考：它要么在跟用户对话（要跟手），要么在做配图器官打标签
+      // （机械活）。两种都不吃思维链，却都会被它拖到 2 分钟超时那条分支上。
+      ...thinkingParams({ thinking }),
     };
     let lastErr: unknown = null;
     for (let attempt = 0; attempt < 2; attempt++) {
@@ -6681,13 +7184,22 @@ async function openaiCompatChat(
   // Text-only models (e.g. DeepSeek deepseek-chat) reject the vision `image_url`
   // part with a 400. Rather than fail the whole chat, retry once WITHOUT images so
   // text conversation still works — the user just can't get image-based answers.
-  if (!resp.ok && images?.length) {
+  //
+  // ⚠️ **两个前提缺一不可**：①调用方没禁用它；②这条链路里「看不看得见图」不是关键。
+  // 对器官识别 / 视觉自检这类**图就是任务**的调用必须禁用 —— 否则模型没看见图却照样
+  // 编一串器官标签回来（HTTP 200、日志干净），比直接失败有害得多。
+  // 禁用之后 400 会原样抛出，交给 shouldFailOver 的 CAPABILITY_400 顺位给序列 2 ——
+  // 这也是「第一个不行第二个顶上」真正生效的前提：盲退级会把 400 吞成 200，顺位就永远不触发。
+  if (!resp.ok && images?.length && !noBlindFallback) {
     const t = await resp.clone().text();
     if (
       /image_url|unknown variant|expected\s+`?text`?|does ?n['’]?t support image|not support.*image|multimodal|vision/i.test(
         t,
       )
     ) {
+      console.warn(
+        `[openaiCompatChat] ${model} 拒收图片，已**去掉图**重发一次 —— 本次回答没有看到任何图片。`,
+      );
       resp = await send(false, usedKey);
     }
   }
@@ -6780,7 +7292,21 @@ async function xiaopTextCall(opts: {
   /** Per-user model config (sent from the client) takes priority over the
    *  admin site config; falls back to env Gemini when neither is set. */
   overrideSequence?: ModelSlot[] | null;
+  /**
+   * 读哪个控制台的序列、以及按谁的推理默认值走。默认 `"xiaop"`（这个函数本来就是
+   * 为小P蛙写的）。金叶详页传 `"gold"` —— 它跟交互问答的诉求正相反，不该共用一套配置。
+   */
+  consoleId?: ConsoleId;
+  /**
+   * `true` = **图就是任务本身**，看不见图的回答一文不值（器官识别就是这种）。
+   *
+   * 效果是禁掉「中转拒收图片就去掉图重发」那条降级路径：宁可这一项报 400 被顺位给
+   * 序列 2，也不要一个没看过图、却编得有模有样的 200。默认 false —— 小P蛙聊天带图
+   * 提问时，退化成纯文本回答仍然对用户有用。
+   */
+  imagesEssential?: boolean;
 }): Promise<AiTextResult & { provider: string; model: string }> {
+  const consoleId = opts.consoleId ?? "xiaop";
   // 每一项序列都是一套完整自洽的配置，所以「换一项重试」就是原样再跑一遍这段。
   const callSlot = async (
     slot: ModelSlot,
@@ -6818,6 +7344,11 @@ async function xiaopTextCall(opts: {
       opts.system,
       opts.schema,
       opts.images,
+      {
+        thinking: thinkingOf(slot, consoleId),
+        // 「图就是任务」的链路（器官识别）必须禁掉盲退级，见 openaiCompatChat 的注释。
+        noBlindFallback: !!opts.imagesEssential,
+      },
     );
     return { ...r, provider: slot.provider, model: slot.model };
   };
@@ -6826,7 +7357,13 @@ async function xiaopTextCall(opts: {
   // 用户自带序列优先（整条都用，能自己降级）；否则走管理员配的序列。
   let sequence: ModelSlot[] = opts.overrideSequence?.length
     ? opts.overrideSequence
-    : (await loadXiaoPQueue()).sequence;
+    : (
+        await (consoleId === "gold"
+          ? loadGoldQueue()
+          : consoleId === "organ"
+            ? loadOrganQueue()
+            : loadXiaoPQueue())
+      ).sequence;
 
   if (!sequence.length) {
     const envKey = process.env.GEMINI_API_KEY;
@@ -6842,9 +7379,16 @@ async function xiaopTextCall(opts: {
   }
   // 小P蛙**有时**带图（问某张配图 / 复核详页插图），有时纯问答。只在真带了图这一次
   // 要求视觉 —— 纯文本提问没必要把一个只会写字的好模型排除掉。
-  return runModelQueue(sequence, callSlot, "小P", {
-    requireVision: !!opts.images?.length,
-  });
+  // 报错文案里带的是**这条链路自己的**控制台名 —— 金叶失败时说「给小P蛙换模型」
+  // 会把管理员指到完全无关的那个控制台去。
+  return runModelQueue(
+    sequence,
+    callSlot,
+    consoleId === "xiaop" ? "小P" : CONSOLE_LABELS[consoleId],
+    {
+      requireVision: !!opts.images?.length,
+    },
+  );
 }
 
 // ── 小P蛙 联网检索（Google 搜索 grounding，仅 Gemini）───────────────────────────
@@ -7154,9 +7698,7 @@ export const askDraftAgentFn = createServerFn({ method: "POST" })
               `【待审草稿：${draft.title}${draft.scientific_name ? "（" + draft.scientific_name + "）" : ""}】\n` +
               // 简介卡快照始终附上：即使范围是整页，编辑也常问「卡上的学名对不对」。
               `以下是${DRAFT_CARD_SCOPE}（草稿字段，不在正文 HTML 里）：\n${draftCardToText(cardFields)}\n\n` +
-              (cardScope
-                ? "本轮讨论范围就是上面这张卡；下面的正文仅供参考。\n"
-                : "") +
+              (cardScope ? "本轮讨论范围就是上面这张卡；下面的正文仅供参考。\n" : "") +
               `以下是草稿正文纯文本：\n${docText}`,
           },
         ],
@@ -7307,8 +7849,7 @@ export const applyDraftAgentEditFn = createServerFn({ method: "POST" })
       const after = pickDraftCardFields({ ...before, ...provided });
       // 形状闸门：名称字段有过「模型把一整段元话语塞进 title」的先例（见 tentative.ts），
       // 这里按名称/摘要各自的合理量级封顶，清成空则退回原值。
-      const capName = (v: string, fallback: string) =>
-        sanitizeSpeciesName(v) || fallback;
+      const capName = (v: string, fallback: string) => sanitizeSpeciesName(v) || fallback;
       after.title = capName(after.title, before.title);
       after.scientific_name = capName(after.scientific_name, before.scientific_name);
       after.common_names_zh = after.common_names_zh.slice(0, 200);
@@ -8505,13 +9046,23 @@ export const getAiConfigFn = createServerFn({ method: "GET" })
 // 以前每个控制台一套 get/save/clear，三份几乎一样的代码各自漂移。现在只按
 // consoleId 分发到不同的 site_config key。
 
-const ConsoleIdSchema = z.enum(["ai", "card", "enrich", "second_opinion", "xiaop"]);
+const ConsoleIdSchema = z.enum([
+  "ai",
+  "card",
+  "enrich",
+  "second_opinion",
+  "xiaop",
+  "gold",
+  "organ",
+]);
 
 const ModelSlotSchema = z.object({
   provider: z.enum(["gemini", "openai", "anthropic", "custom"]),
   apiKey: z.string().min(1).max(2000),
   baseUrl: z.string().max(300).optional().or(z.literal("")),
   model: z.string().min(1).max(200),
+  /** 不传 = 跟随该控制台默认（见 model-queue.ts 的 THINKING_DEFAULTS）。 */
+  thinking: z.enum(["on", "off"]).optional(),
 });
 
 const SaveQueueInput = z.object({
@@ -8545,6 +9096,7 @@ export const saveModelQueueFn = createServerFn({ method: "POST" })
         apiKey: normalizeApiKey(s.provider, s.apiKey),
         baseUrl: s.baseUrl ?? "",
         model: s.model,
+        ...(s.thinking ? { thinking: s.thinking } : {}),
       })),
       userId,
     );
@@ -8605,6 +9157,10 @@ async function callSlotForProbe(
       system,
       undefined,
       images,
+      // 视觉自检的**全部意义**就是「这个模型看不看得见图」。若中转拒图后偷偷去掉图重发，
+      // 模型会答错颜色 → 被判 blind，结论**碰巧**是对的，但原因完全错了（真相是中转拒图，
+      // 换个中转就好）。禁掉它，让 400 原样呈现成「调用未成功」。
+      { noBlindFallback: true },
     );
   }
   return { text: r.text, promptTokens: r.usage?.prompt_tokens ?? 0 };

@@ -10,7 +10,16 @@ import {
   getQueueBalancesFn,
   probeSlotVisionFn,
 } from "@/lib/identify-plant.functions";
-import { normalizeBaseUrl, visionOf, type ModelProvider, type ModelSlot } from "@/lib/model-queue";
+import {
+  normalizeBaseUrl,
+  visionOf,
+  looksReasoningModel,
+  defaultThinking,
+  thinkingOf,
+  type ModelProvider,
+  type ModelSlot,
+  type ThinkingMode,
+} from "@/lib/model-queue";
 import { visionBadge } from "@/lib/vision-probe";
 import { checkKeyHealthFn, type KeyHealth } from "@/lib/key-health.functions";
 
@@ -80,7 +89,8 @@ function VisionProbeRow({
       if (r.ok) toast.success(`序列 ${index + 1}：${r.detail}`);
       else toast.error(`序列 ${index + 1}：${r.detail}`, { duration: 9000 });
     },
-    onError: (e: Error) => setHealthMsg({ ok: false, detail: e.message, remaining: null, limit: null }),
+    onError: (e: Error) =>
+      setHealthMsg({ ok: false, detail: e.message, remaining: null, limit: null }),
   });
 
   const tone =
@@ -204,7 +214,146 @@ const emptySlot = (): ModelSlot => ({
 });
 
 // 与 identify-plant.functions.ts 的 CONSOLE_CONFIG_KEYS / ConsoleIdSchema 保持一致。
-export type ConsoleId = "ai" | "card" | "enrich" | "second_opinion" | "xiaop";
+export type ConsoleId = "ai" | "card" | "enrich" | "second_opinion" | "xiaop" | "gold" | "organ";
+
+/**
+ * 每个控制台**该配什么样的模型**。
+ *
+ * 为什么必须写在界面上：这几个控制台长得一模一样，可它们对模型的要求天差地别 ——
+ * 有的必须能读图，有的只要快，有的要能写长文。2026-07-26 线上就吃过亏：小P蛙序列 1
+ * 配了纯文本的 `qwen3.7-max`，而当时小P蛙**还兼着配图器官识别**（要看图），于是带图调用
+ * 一路 400，全站配图跟着归零；管理员从界面上完全看不出这里需要视觉模型。
+ * （器官识别已于 2026-07-28 拆成独立控制台，但「界面要说清这里该配什么」这条教训通用。）
+ *
+ * `needs` 是硬要求，`jobs` 逐条列出**这个模型到底干哪些活**，`why` 说明为什么，
+ * `avoid` 是常见的配错。
+ *
+ * `jobs` 是 2026-07-29 新增的：光说「该配能读图的模型」还不够 —— 管理员真正需要知道的是
+ * 「我改这一项，会影响站上的哪些功能」。控制台名字（「出卡AI」「小P蛙」）根本传达不了
+ * 这件事，而配错的代价是整条功能静默失效。
+ */
+const CONSOLE_ADVICE: Record<
+  ConsoleId,
+  {
+    needs: React.ReactNode;
+    /** 这个模型负责的**每一件**具体工作。改这里之前先看它影响什么。 */
+    jobs: string[];
+    why: React.ReactNode;
+    avoid: React.ReactNode;
+    thinkingWhy: string;
+  }
+> = {
+  ai: {
+    needs: "快速响应的纯文本模型",
+    jobs: [
+      "管理后台「批量添加条目」：从粘贴的 HTML 里提取物种元数据",
+      "任何其它控制台**留空时**的最终兜底",
+    ],
+    why: "只做两件机械活：批量导入时从 HTML 里抠元数据、以及其它控制台没配时的兜底。不看图。",
+    avoid: "不必用贵的多模态大模型；推理模型在这里纯属拖时间。",
+    thinkingWhy: "机械提取，思维链无增益 → 默认关。",
+  },
+  card: {
+    needs: "能读图的多模态模型，且要快",
+    jobs: [
+      "拍照识别：看图定种，写出物种名、学名、置信度",
+      "写「快速识别简介」摘要卡的全部文字",
+      "写分享卡上的文案",
+      "补拍复核时重新看图给结论",
+      "「配图器官识别」留空时顶上（两者画像一致：能读图 + 要快）",
+    ],
+    why: "拍照后当场看图写简介摘要卡 / 分享卡。整条识别卡在 Cloudflare 边缘 100 秒上限里。",
+    avoid: "纯文本模型会直接失效（看不见图还会凭空编一个物种，且返回 200，顺位机制救不了）。",
+    thinkingWhy: "实时路径、预算紧 → 默认关。",
+  },
+  enrich: {
+    needs: "能读图、擅长长文的多模态模型",
+    jobs: [
+      "点「进一步生成草稿」后：写整份中英双语科普正文（银叶草稿）",
+      "生成前的联网调研",
+      "「金叶详页模型」留空时顶上",
+    ],
+    why: "写整份中英双语科普草稿，是全站最复杂的一次生成。跑在队列消费者的 15 分钟挂钟里，慢一点没关系。",
+    avoid: "小快模型写出来的正文会明显偏薄。",
+    thinkingWhy: "唯一真正吃思维链的链路，且不赶时间 → 默认开。",
+  },
+  second_opinion: {
+    jobs: [
+      "识别判「疑似」时：独立再看一眼图，给出物种与置信档位",
+      "Pl@ntNet 拿不到结果 / 额度用尽时：直接顶替它做一线定种",
+      "识别页「引擎自检」里被测的三条链路之一",
+    ],
+    needs: (
+      <>
+        能读图的多模态模型，<b>必须快</b>
+      </>
+    ),
+    why: "识别判「疑似」时再看一眼图给个物种和档位；同时在 Pl@ntNet 拿不到结果时顶一线。整条只有几十秒预算。",
+    avoid:
+      "推理模型是这里的头号杀手：2026-07-26 线上 qwen3.7-plus 28 秒没返回，复核直接判为「未运行」。要用就选它的 non-thinking / turbo 版本。",
+    thinkingWhy: "超时重灾区，思维链对「报个物种」几乎无增益 → 默认关。",
+  },
+  gold: {
+    needs: "能写长文的强模型（能读图更好）",
+    jobs: [
+      "金叶详页：三轮联网调研（形态生境 / 人文民俗 / 生态科研）",
+      "金叶详页：三轮长文撰稿（正文主体 / 人文应用 / 生态延伸）",
+      "按「金叶详页创作指导」的章法组织全篇",
+    ],
+    why: (
+      <>
+        写整份<b>公开档案页</b>——三轮联网调研 + 三段长文，全站最重的一次生成。跑在队列消费者的 15
+        分钟挂钟里，慢一点没关系。
+      </>
+    ),
+    avoid:
+      "别配为「跟手」调的快模型：金叶正文会明显偏薄，而且容易在三轮撰稿中途被截断（报 GOLD_BAD_JSON）。留空则自动借用「草稿生成模型」的配置。",
+    thinkingWhy: "复杂长文正是思维链加分的地方，且不赶时间 → 默认开。",
+  },
+  organ: {
+    needs: "能读图的多模态模型，要快要便宜",
+    jobs: [
+      "银叶草稿：判断每张候选配图展示的是花/叶/果/植株/生境/标本",
+      "金叶详页：同上（9 个图槽的分配全依赖这一步）",
+      "顺带判断每张图「可不可用」（滤掉人、建筑、水印、糊片）",
+    ],
+    why: (
+      <>
+        判断每张候选配图<b>展示的是花/叶/果/植株/生境</b>——银叶和金叶的分区能不能配上图，
+        全看这一步。它只需要吐一个 JSON 数组，是纯机械活。
+      </>
+    ),
+    avoid: (
+      <>
+        <b>纯文本模型会让全站配图直接归零</b>：认不出器官 = 标签为空 = 一张也进不了槽，
+        而且它不报错、只在日志里留一行。这正是 2026-07-26 那次「银叶/金叶没有新增配图」的成因
+        （当时它还挂在小P蛙序列上，配了纯文本的 qwen3.7-max）。留空则自动借用「出卡AI」。
+      </>
+    ),
+    thinkingWhy: "机械打标签，思维链纯拖时间 → 默认关。",
+  },
+  xiaop: {
+    needs: "能读图的多模态模型",
+    jobs: [
+      "小P蛙对话框里的所有问答",
+      "按用户要求改写草稿 / 条目正文",
+      "带图提问（「这张配图对不对」「图里是什么部位」）",
+    ],
+    why: (
+      <>
+        只管<b>交互式问答与改稿</b>。原先挂在这里的两件事已经拆走：金叶详页归「金叶详页模型」、
+        配图器官识别归「配图器官识别模型」—— 它们和问答的诉求完全不同，共用必然互相拖累。
+      </>
+    ),
+    avoid: (
+      <>
+        配纯文本模型会让<b>带图提问</b>失效（问某张配图、复核详页插图）。另外：中转若拒收图片， 可能
+        <b>悄悄去掉图重发</b> —— 模型一张图没看见，却照样答得头头是道。
+      </>
+    ),
+    thinkingWhy: "交互问答要跟手，等模型想半分钟没人受得了 → 默认关。",
+  },
+};
 
 /**
  * 存储适配器。管理员的三个控制台存 site_config（走 server fn）；用户自己的
@@ -216,6 +365,66 @@ export type QueueStorage = {
   save: (sequence: ModelSlot[]) => void;
   clear: () => void;
 };
+
+/**
+ * 一项的推理（思维链）开关。
+ *
+ * 三态而不是勾选框：「跟随默认」必须和「管理员明确选了和默认一样的值」区分开 ——
+ * 否则以后调整某个控制台的默认值，所有老配置都会僵在旧默认上。
+ *
+ * ⚠️ 开关**永远显示**，不是只在「检测到推理模型」时才出现。因为 looksReasoningModel()
+ * 只是按名字猜的启发式，而模型名从来不是能力契约（`qwen3.7-max` 听着像旗舰推理模型，
+ * 实际是个纯文本模型）。猜中了就多给一句提示，猜不中也不挡管理员自己选。
+ */
+function ThinkingRow({
+  consoleId,
+  slot,
+  onChange,
+}: {
+  consoleId: ConsoleId;
+  slot: ModelSlot;
+  onChange: (t: ThinkingMode | undefined) => void;
+}) {
+  const fallback = defaultThinking(consoleId);
+  const effective = thinkingOf(slot, consoleId);
+  const suspected = looksReasoningModel(slot.model);
+
+  return (
+    <div className="rounded-sm border border-rule/60 bg-paper/40 px-2 py-1.5 space-y-1">
+      <div className="flex items-center gap-2 flex-wrap">
+        <span className="text-[11px] font-semibold">推理模式（思维链）</span>
+        <select
+          value={slot.thinking ?? ""}
+          onChange={(e) => onChange((e.target.value || undefined) as ThinkingMode | undefined)}
+          className="border border-rule rounded-sm px-1.5 py-1 text-[11px] bg-background cursor-pointer"
+        >
+          <option value="">跟随本控制台默认（{fallback === "on" ? "开" : "关"}）</option>
+          <option value="off">强制关闭 —— 直接作答，最快</option>
+          <option value="on">强制开启 —— 先想再答，更慢</option>
+        </select>
+        <span
+          className={`text-[10px] px-1.5 py-0.5 rounded-full ${
+            effective === "on" ? "bg-amber-500/15 text-amber-700" : "bg-leaf/15 text-leaf-deep"
+          }`}
+        >
+          当前：{effective === "on" ? "开（不发关思考参数）" : "关"}
+        </span>
+      </div>
+      {suspected && effective === "on" && (
+        <p className="text-[10px] text-amber-700 leading-relaxed">
+          ⚠️「{slot.model}」看着像<b>推理模型</b>。它会先写一大段思维链再作答，一次调用常要 40
+          秒以上 —— 若这条链路有超时预算，建议改成「强制关闭」，或换成该模型的 non-thinking / turbo
+          版本。
+        </p>
+      )}
+      <p className="text-[10px] text-ink-faint leading-relaxed">
+        「关」会发一组<b>厂商无关</b>的关思考参数（enable_thinking / reasoning_effort / thinking
+        三种写法一起发，不认的那个会被自动摘掉）；「开」则一个都不发，让模型按自己的默认来。
+        <b>部分模型（如 qwen3.8-max）思考不可关闭</b>，这时开关不起作用，只能换模型。
+      </p>
+    </div>
+  );
+}
 
 export function ModelQueueConsole({
   consoleId,
@@ -458,9 +667,44 @@ export function ModelQueueConsole({
           {intro}
           <p className="text-[11px] text-ink-faint leading-relaxed border-l-2 border-leaf-deep/40 pl-2">
             按 <b>序列 1 → 2 → 3…</b> 依次调用：排在前面的失败（额度用尽、限流、key
-            失效、模型不存在、服务端故障）会自动顺位交给下一个。每个序列项都是一套
+            失效、模型不存在、服务端故障、<b>这个模型不会读图</b>
+            ）会自动顺位交给下一个。每个序列项都是一套
             <b>独立完整</b>的配置，各自带自己的 key —— 不同厂商可以混排。
           </p>
+
+          {/* 这个控制台该配什么样的模型。五个控制台界面完全一样、要求却天差地别，
+              不写出来只能靠记（而记错的代价见 CONSOLE_ADVICE 的注释）。 */}
+          {(() => {
+            const a = CONSOLE_ADVICE[consoleId ?? "xiaop"];
+            return (
+              <div className="rounded-md border border-leaf-deep/30 bg-leaf/5 px-3 py-2.5 space-y-1">
+                <p className="text-[11px] font-semibold text-leaf-deep">这里该配：{a.needs}</p>
+                {/* 「这个模型干哪些活」放在最前面 —— 管理员改配置前真正要知道的是
+                    「我动了它会影响什么」，而控制台名字传达不了这件事。 */}
+                <div className="rounded bg-background/60 border border-leaf-deep/20 px-2 py-1.5">
+                  <p className="text-[10px] font-semibold text-leaf-deep mb-1">
+                    这个模型负责站上这些工作：
+                  </p>
+                  <ul className="space-y-0.5">
+                    {a.jobs.map((j) => (
+                      <li
+                        key={j}
+                        className="text-[11px] text-ink-soft leading-relaxed flex gap-1.5"
+                      >
+                        <span className="text-leaf-deep shrink-0">·</span>
+                        <span>{j}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+                <p className="text-[11px] text-ink-soft leading-relaxed">{a.why}</p>
+                <p className="text-[11px] text-amber-700 leading-relaxed">⚠️ {a.avoid}</p>
+                <p className="text-[10px] text-ink-faint leading-relaxed">
+                  推理开关：{a.thinkingWhy}
+                </p>
+              </div>
+            );
+          })()}
 
           {sequence.map((slot, i) => {
             const m = metaOf(slot.provider);
@@ -579,6 +823,12 @@ export function ModelQueueConsole({
                     className="w-full border border-rule rounded-sm px-2 py-1.5 text-[12px] font-mono bg-background"
                   />
                 </div>
+
+                <ThinkingRow
+                  consoleId={consoleId ?? "xiaop"}
+                  slot={slot}
+                  onChange={(thinking) => patch(i, { thinking })}
+                />
 
                 <p className="text-[10px] text-ink-faint font-mono">
                   {i + 1}. {m.label} | {slot.model || "（未填）"}

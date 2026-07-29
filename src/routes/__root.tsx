@@ -9,6 +9,7 @@ import {
   Scripts,
 } from "@tanstack/react-router";
 import { Toaster } from "@/components/ui/sonner";
+import { TaskFeedLauncher } from "@/components/task-feed-launcher";
 import { AuthProvider } from "@/hooks/use-auth";
 import { OfflineStatus } from "@/components/offline-status";
 import appCss from "../styles.css?url";
@@ -20,7 +21,12 @@ function NotFoundComponent() {
         <p className="label mb-2">404 · Specimen not found</p>
         <h1 className="text-5xl font-display font-bold mb-4">未收录此条目</h1>
         <p className="text-ink-faint mb-6">这页可能尚未编纂，或已被移除。</p>
-        <Link to="/" className="inline-block border border-ink px-4 py-2 hover:bg-ink hover:text-background transition-colors">回到首页</Link>
+        <Link
+          to="/"
+          className="inline-block border border-ink px-4 py-2 hover:bg-ink hover:text-background transition-colors"
+        >
+          回到首页
+        </Link>
       </div>
     </div>
   );
@@ -37,10 +43,20 @@ function ErrorComponent({ error, reset }: { error: Error; reset: () => void }) {
         <p className="text-ink-faint text-sm mb-5">{error.message}</p>
         <div className="flex justify-center gap-3">
           <button
-            onClick={() => { router.invalidate(); reset(); }}
+            onClick={() => {
+              router.invalidate();
+              reset();
+            }}
             className="border border-ink px-4 py-2 hover:bg-ink hover:text-background transition-colors"
-          >重试</button>
-          <a href="/" className="border border-ink/40 px-4 py-2 hover:bg-paper-deep transition-colors">回首页</a>
+          >
+            重试
+          </button>
+          <a
+            href="/"
+            className="border border-ink/40 px-4 py-2 hover:bg-paper-deep transition-colors"
+          >
+            回首页
+          </a>
         </div>
       </div>
     </div>
@@ -54,14 +70,31 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
       { name: "viewport", content: "width=device-width, initial-scale=1" },
       { title: "Plantspedia · 全民植物志" },
       { name: "theme-color", content: "#2e7d32" },
-      { name: "description", content: "Plantspedia 是一个由社区共同编纂的植物科普网站，收录每一种值得记住的草木。" },
+      {
+        name: "description",
+        content: "Plantspedia 是一个由社区共同编纂的植物科普网站，收录每一种值得记住的草木。",
+      },
       { property: "og:title", content: "Plantspedia · 全民植物志" },
-      { property: "og:description", content: "Plantspedia 是一个由社区共同编纂的植物科普网站，收录每一种值得记住的草木。" },
+      {
+        property: "og:description",
+        content: "Plantspedia 是一个由社区共同编纂的植物科普网站，收录每一种值得记住的草木。",
+      },
       { property: "og:type", content: "website" },
       { name: "twitter:title", content: "Plantspedia · 全民植物志" },
-      { name: "twitter:description", content: "Plantspedia 是一个由社区共同编纂的植物科普网站，收录每一种值得记住的草木。" },
-      { property: "og:image", content: "https://storage.googleapis.com/gpt-engineer-file-uploads/GK5tu8pqzVgtJ3MTnznluTif3u13/social-images/social-1780563206704-ChatGPT_Image_2026年6月1日_22_32_38.webp" },
-      { name: "twitter:image", content: "https://storage.googleapis.com/gpt-engineer-file-uploads/GK5tu8pqzVgtJ3MTnznluTif3u13/social-images/social-1780563206704-ChatGPT_Image_2026年6月1日_22_32_38.webp" },
+      {
+        name: "twitter:description",
+        content: "Plantspedia 是一个由社区共同编纂的植物科普网站，收录每一种值得记住的草木。",
+      },
+      {
+        property: "og:image",
+        content:
+          "https://storage.googleapis.com/gpt-engineer-file-uploads/GK5tu8pqzVgtJ3MTnznluTif3u13/social-images/social-1780563206704-ChatGPT_Image_2026年6月1日_22_32_38.webp",
+      },
+      {
+        name: "twitter:image",
+        content:
+          "https://storage.googleapis.com/gpt-engineer-file-uploads/GK5tu8pqzVgtJ3MTnznluTif3u13/social-images/social-1780563206704-ChatGPT_Image_2026年6月1日_22_32_38.webp",
+      },
       { name: "twitter:card", content: "summary_large_image" },
     ],
     links: [
@@ -69,7 +102,10 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
       { rel: "stylesheet", href: appCss },
       { rel: "preconnect", href: "https://fonts.googleapis.com" },
       { rel: "preconnect", href: "https://fonts.gstatic.com", crossOrigin: "" },
-      { rel: "stylesheet", href: "https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@400;500;600;700&family=EB+Garamond:wght@400;500;600&family=Noto+Serif+SC:wght@400;500;600;700&family=Cormorant+SC:wght@500;600;700&display=swap" },
+      {
+        rel: "stylesheet",
+        href: "https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@400;500;600;700&family=EB+Garamond:wght@400;500;600&family=Noto+Serif+SC:wght@400;500;600;700&family=Cormorant+SC:wght@500;600;700&display=swap",
+      },
     ],
   }),
   shellComponent: RootShell,
@@ -118,7 +154,8 @@ function RootComponent() {
       })
       .catch((err) => console.error("Service Worker registration failed:", err));
 
-    return () => navigator.serviceWorker.removeEventListener("controllerchange", onControllerChange);
+    return () =>
+      navigator.serviceWorker.removeEventListener("controllerchange", onControllerChange);
   }, []);
 
   return (
@@ -127,6 +164,11 @@ function RootComponent() {
         <Outlet />
         <Toaster />
         <OfflineStatus />
+        {/* 全局通知浮标：识别 / 银叶 / 金叶三类任务的进度与未读。
+            挂在根上是刻意的 —— 用户点完「生成」就会切走去识别下一株，
+            而原来的小P蛙只在草稿页和条目页出现，那两页恰恰都不在路上。
+            有完整对话面板的页面上它会自动让位（见 XiaoPAgentMountedContext）。 */}
+        <TaskFeedLauncher />
       </AuthProvider>
     </QueryClientProvider>
   );

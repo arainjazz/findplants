@@ -601,12 +601,13 @@ function IdentifyTrioSection() {
         <div className="px-3 pb-3 animate-in fade-in slide-in-from-top-1 duration-200">
           <p className="text-[11px] text-ink-faint leading-relaxed mb-3">
             <b>这三块决定「拍照 → 出简介摘要卡 / 分享卡」的全部速度与准确度</b>，请只在这里调它们：
-            ①<b>Pl@ntNet</b> 专业定种打头阵 → ②<b>疑似复核视觉模型</b>（Pl@ntNet 拿不到结果时顶一线，
-            识别判「疑似」时二次判定）→ ③<b>出卡AI</b> 写卡。
+            ①<b>Pl@ntNet</b> 专业定种打头阵 → ②<b>疑似复核视觉模型</b>（Pl@ntNet
+            拿不到结果时顶一线， 识别判「疑似」时二次判定）→ ③<b>出卡AI</b> 写卡。
             <br />
-            ⚠️ 快速出卡那条链路<b>只会调用序列里的 Gemini 项</b>，其它厂商（Kimi 等）在这条链路上会被
-            跳过；把它们放进来只会在 Gemini 全部失效时才顶上，那一次必然又慢又贵。想用 Kimi 写长文，
-            请配到下面的<b>「草稿生成模型控制台」</b>。
+            ⚠️ 快速出卡那条链路<b>只会调用序列里的 Gemini 项</b>，其它厂商（Kimi
+            等）在这条链路上会被 跳过；把它们放进来只会在 Gemini
+            全部失效时才顶上，那一次必然又慢又贵。想用 Kimi 写长文， 请配到下面的
+            <b>「草稿生成模型控制台」</b>。
           </p>
           <PlantNetPanel />
           <SecondOpinionPanel />
@@ -634,9 +635,9 @@ function AdminModelHub() {
         <div className="mt-3 border border-rule rounded-md p-4 bg-paper/40 space-y-2 animate-in fade-in slide-in-from-top-1 duration-200">
           <p className="text-[11px] text-ink-faint leading-relaxed mb-2">
             最上面的<b>三重奏</b>负责「拍照 → 出卡」这条一线链路；下面几块管的是出卡之后、
-            或与出卡无关的事：<b>草稿生成</b>写整份科普草稿、<b>小P蛙</b>负责对话与改写、
-            <b>AI 模型控制台</b>只兜底剩下的杂项。
-            每套都可配「优先调用序列」，前一个失败自动顺位。
+            或与出卡无关的事：<b>草稿生成</b>写整份科普草稿（银叶）、<b>小P蛙</b>负责对话与改写、
+            <b>金叶详页模型</b>写公开档案页、<b>配图器官识别</b>决定分区能不能配上图、
+            <b>AI 模型控制台</b>只兜底剩下的杂项。 每套都可配「优先调用序列」，前一个失败自动顺位。
             <br />
             最后一块<b>金叶详页 · 创作指导 Skill</b> 管的不是「用哪个模型」而是「按什么章法写」——
             粘一份 skill 进去，金叶详页就按它写，版本号会署在详页页尾。
@@ -645,11 +646,73 @@ function AdminModelHub() {
           <AdminModelPanel />
           <EnrichModelPanel />
           <XiaoPModelPanel />
-          {/* 金叶详页只有「怎么写」可配，模型走小P蛙序列，所以它排在模型控制台之后。 */}
+          <OrganModelPanel />
+          {/* 金叶两块相邻：先「用哪个模型」再「按什么章法写」。 */}
+          <GoldModelPanel />
           <GoldSkillPanel />
         </div>
       )}
     </div>
+  );
+}
+
+/**
+ * 配图器官识别的模型 —— 2026-07-28 从小P蛙序列里拆出来。
+ *
+ * 拆的理由和金叶一样，但后果更隐蔽：器官识别是**机械的视觉打标签**，跟交互问答毫无关系，
+ * 可它原来挂在小P蛙序列上。于是管理员在「小P蛙」里配了个纯文本模型，**全站配图当场归零**
+ * ——而且不报错，只在日志里留一行，从控制台名字上完全想不到这两件事是连着的。
+ */
+function OrganModelPanel() {
+  return (
+    <ModelQueueConsole
+      consoleId="organ"
+      visionProbe
+      title="管理员 · 配图器官识别模型"
+      titleIcon={<WrenchIcon className="w-3.5 h-3.5" />}
+      openLabel="配置配图器官识别模型"
+      intro={
+        <p className="text-[11px] text-ink-faint leading-relaxed">
+          给每张候选配图<b>现看现标</b>它展示的是花 / 叶 / 果 / 植株 / 生境 —— 银叶草稿和金叶详页的
+          分区<b>能不能配上图，全看这一步</b>。图源自带的器官标注覆盖率低到没法用，所以必须现看。
+          <br />
+          <b>必须是能读图的模型</b>：配成纯文本模型会让全站配图归零（认不出器官 = 一张也进不了槽），
+          而且它不报错。建议配完点一下「视觉自检」。
+          <br />
+          <b>留空则自动沿用「出卡AI」的序列</b>（同样是「能读图 + 要快」的画像），不配也不会坏。
+        </p>
+      }
+    />
+  );
+}
+
+/**
+ * 金叶详页的模型 —— 2026-07-28 从小P蛙序列里拆出来。
+ *
+ * 拆的理由：两者诉求正相反。小P蛙是**交互式问答/改稿**（要跟手、要便宜、常带图），
+ * 金叶是**一次性写整份公开档案**（三轮调研 + 三轮撰稿，跑在队列的 15 分钟挂钟里）。
+ * 共用一套必然互相将就：为小P蛙调快，金叶正文就变薄、还容易中途截断（GOLD_BAD_JSON）；
+ * 为金叶调强，问答就变慢变贵。
+ */
+function GoldModelPanel() {
+  return (
+    <ModelQueueConsole
+      consoleId="gold"
+      visionProbe
+      title="管理员 · 金叶详页模型"
+      titleIcon={<WrenchIcon className="w-3.5 h-3.5" />}
+      openLabel="配置金叶详页模型"
+      intro={
+        <p className="text-[11px] text-ink-faint leading-relaxed">
+          点「金叶 skill 一键创建」时写整份<b>公开档案页</b>的模型 —— 三轮联网调研 + 三段长文，
+          全站最重的一条链路。它<b>原来借用小P蛙的序列</b>，而小P蛙是为交互问答调的快模型，
+          两边必然互相将就，所以现在拆开单独配。
+          <br />
+          <b>留空则自动沿用「草稿生成模型」的序列</b>（同属长文诉求，比借小P蛙合理），
+          再留空才回退到「AI 模型控制台」，所以不配也不会坏。
+        </p>
+      }
+    />
   );
 }
 

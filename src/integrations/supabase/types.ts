@@ -966,6 +966,60 @@ export type Database = {
         }
         Relationships: []
       }
+      task_feed: {
+        Row: {
+          created_at: string
+          draft_id: string | null
+          error: string | null
+          id: string
+          job_id: string | null
+          kind: string
+          phase: string
+          progress: number
+          read_at: string | null
+          status: string
+          summary: string | null
+          thumb_url: string | null
+          title: string | null
+          updated_at: string
+          user_id: string
+        }
+        Insert: {
+          created_at?: string
+          draft_id?: string | null
+          error?: string | null
+          id?: string
+          job_id?: string | null
+          kind: string
+          phase?: string
+          progress?: number
+          read_at?: string | null
+          status?: string
+          summary?: string | null
+          thumb_url?: string | null
+          title?: string | null
+          updated_at?: string
+          user_id: string
+        }
+        Update: {
+          created_at?: string
+          draft_id?: string | null
+          error?: string | null
+          id?: string
+          job_id?: string | null
+          kind?: string
+          phase?: string
+          progress?: number
+          read_at?: string | null
+          status?: string
+          summary?: string | null
+          thumb_url?: string | null
+          title?: string | null
+          updated_at?: string
+          user_id?: string
+        }
+        Relationships: []
+      }
       user_roles: {
         Row: {
           created_at: string

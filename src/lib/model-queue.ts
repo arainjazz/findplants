@@ -26,6 +26,18 @@ export type SlotVision = {
   model: string;
 };
 
+/**
+ * 推理（思维链）开关。
+ *
+ * `"off"` = 调用时发一组厂商无关的「别思考，直接答」参数（见 ai-key-pool.ts 的
+ * `THINKING_OFF`）；`"on"` = 一个都不发，让模型按自己的默认来；
+ * **不设** = 沿用该控制台的默认（见 `THINKING_DEFAULTS`）。
+ *
+ * 三态而不是布尔：要能区分「管理员明确要求开」和「还没表态、跟着默认走」——
+ * 否则以后调整默认值时，所有老配置都会被当成「明确选了旧默认」而僵在那里。
+ */
+export type ThinkingMode = "on" | "off";
+
 /** 序列里的一项：能独立发起一次调用所需的全部信息。 */
 export type ModelSlot = {
   provider: ModelProvider;
@@ -34,6 +46,8 @@ export type ModelSlot = {
   model: string;
   /** 视觉准入检测结果；没测过就没有这个字段。 */
   vision?: SlotVision;
+  /** 推理开关；不设 = 跟随控制台默认。 */
+  thinking?: ThinkingMode;
 };
 
 const VERDICTS = ["pass", "blind", "unknown"] as const;
@@ -49,6 +63,11 @@ function readVision(raw: unknown): SlotVision | undefined {
     imageTokenDelta: typeof v.imageTokenDelta === "number" ? v.imageTokenDelta : null,
     model: String(v.model ?? ""),
   };
+}
+
+/** 只认 "on" / "off"；其余（含 undefined）一律回 undefined = 跟随控制台默认。 */
+function readThinking(raw: unknown): ThinkingMode | undefined {
+  return raw === "on" || raw === "off" ? raw : undefined;
 }
 
 /**
@@ -68,6 +87,78 @@ export function visionOf(slot: ModelSlot): SlotVision | undefined {
 /** 这一项是否**已知**看不见图。只有明确测出 blind 才为 true；没测过一律 false。 */
 export function isKnownBlind(slot: ModelSlot): boolean {
   return visionOf(slot)?.verdict === "blind";
+}
+
+// ─── 推理开关：识别、默认值、判定 ────────────────────────────────────────────
+
+/** 一眼能看出「这是关了思考的版本」的后缀 —— 命中就直接判定不是推理模型。 */
+const NON_THINKING_HINT = /non[-_]?think|no[-_]?think|instruct\b|turbo\b|flash\b|-fast\b/i;
+
+/** 会先写一大段思维链的模型的常见命名特征。 */
+const REASONING_HINT = new RegExp(
+  [
+    "think", // qwen3-thinking / glm-thinking / gemini-*-thinking
+    "reason", // deepseek-reasoner / *-reasoning
+    "^o\\d", // OpenAI o1 / o3 / o4-mini
+    "\\bo\\d-", //  …以及带前缀的写法
+    "-r\\d", // deepseek-r1 / -r2
+    "qwen[\\d.]*-(?:plus|max)", // 阿里 Qwen3 plus/max 默认开思考
+    "deepseek-(?:v[\\d.]+)?r", //
+    "glm-[\\d.]+v?-?(?:plus|air|thinking)",
+    "kimi-k[\\d.]+(?!.*turbo)",
+  ].join("|"),
+  "i",
+);
+
+/**
+ * 模型 ID **看起来**像不像推理模型。
+ *
+ * ⚠️ 这是个**启发式，不是事实** —— 模型名从来不是能力契约，厂商随时能给同一个名字
+ * 换掉底层行为（`qwen3.7-max` 这次就是个纯文本模型，名字上完全看不出来）。所以它只
+ * 用来在界面上给一句「看着像推理模型」的提示 + 挑一个初始默认值，**绝不**用来替管理员
+ * 做决定：开关永远显示、永远可手动改，最终以人选的为准。
+ */
+export function looksReasoningModel(model: string): boolean {
+  const m = String(model ?? "").trim();
+  if (!m) return false;
+  if (NON_THINKING_HINT.test(m)) return false;
+  return REASONING_HINT.test(m);
+}
+
+/**
+ * 每个控制台的推理默认值 —— 取决于**这条链路要的是「快」还是「想得深」**。
+ *
+ * 关（off）的四个都卡在用户等待的实时路径上，且干的是机械活：
+ *  - `second_opinion` 二次复核：2026-07-26 线上 `qwen3.7-plus` **28 秒没返回**，
+ *    整条复核判为「未运行」。它的活是「再看一眼图，报个物种和档位」，思维链几乎无增益。
+ *  - `card` 出卡：整条 phase-1 卡在 Cloudflare 边缘 100 秒上限里，没有思考的余量。
+ *  - `xiaop` 小P蛙：交互问答要跟手；它还兼着**配图器官分类**（机械打标签）。
+ *  - `ai` 兜底：批量导入时从 HTML 里抠字段，纯提取。
+ *
+ * 开（on）的只有 `enrich` 撰写长文 —— 它跑在 Queues 消费者的 **15 分钟**挂钟里
+ * （见 job-queue.ts），慢一点无所谓，而中英双语科普长文正是思维链真能加分的地方。
+ */
+export const THINKING_DEFAULTS: Record<string, ThinkingMode> = {
+  ai: "off",
+  card: "off",
+  enrich: "on",
+  second_opinion: "off",
+  xiaop: "off",
+  // 金叶与 enrich 同类：写整份公开档案，跑在队列的 15 分钟挂钟里，不赶时间。
+  gold: "on",
+  // 器官识别是**机械的视觉打标签**（这张图是花还是叶），思维链毫无增益，
+  // 却会把一次配图从几秒拖到几十秒；而它在 enrich/金叶 里都是串在长流程中间的一步。
+  organ: "off",
+};
+
+/** 该控制台没有明确配置时的默认值。未知控制台一律保守关掉。 */
+export function defaultThinking(consoleId: string): ThinkingMode {
+  return THINKING_DEFAULTS[consoleId] ?? "off";
+}
+
+/** 这一项这次调用**到底**开不开思考。管理员显式选过就以他为准，否则跟随控制台默认。 */
+export function thinkingOf(slot: Pick<ModelSlot, "thinking">, consoleId: string): ThinkingMode {
+  return slot.thinking ?? defaultThinking(consoleId);
 }
 
 /** 一个控制台的完整配置。sequence[0] 即「优先调用序列 1」。 */
@@ -115,12 +206,14 @@ export function readModelQueue(value: unknown): ModelQueue {
       .map((s) => {
         const slot = (s ?? {}) as Record<string, unknown>;
         const vision = readVision(slot.vision);
+        const thinking = readThinking(slot.thinking);
         return {
           provider: asProvider(slot.provider),
           apiKey: String(slot.apiKey ?? "").trim(),
           baseUrl: normalizeBaseUrl(slot.baseUrl),
           model: String(slot.model ?? "").trim(),
           ...(vision ? { vision } : {}),
+          ...(thinking ? { thinking } : {}),
         };
       })
       .filter((s) => s.apiKey && s.model);
@@ -158,12 +251,16 @@ export function writeModelQueue(sequence: ModelSlot[], updatedBy: string): Model
     sequence: sequence.map((s) => {
       const model = String(s.model ?? "").trim();
       const vision = s.vision && s.vision.model === model ? s.vision : undefined;
+      const thinking = readThinking(s.thinking);
       return {
         provider: asProvider(s.provider),
         apiKey: String(s.apiKey ?? "").trim(),
         baseUrl: normalizeBaseUrl(s.baseUrl),
         model,
         ...(vision ? { vision } : {}),
+        // 推理开关**不**跟着换模型清空（不同于 vision）：它是管理员对「这条链路要快还是要深」
+        // 的判断，换个模型 ID 这个判断照样成立；而 vision 是对某个具体模型的实测结论。
+        ...(thinking ? { thinking } : {}),
       };
     }),
     updatedAt: new Date().toISOString(),
@@ -196,17 +293,71 @@ const SLOT_SPECIFIC_400 =
   /not activated|not enabled|not authorized|no permission|unauthorized|insufficient|balance|quota|arrears|expired|model not found|does not exist|unsupported model|未开通|未激活|未授权|无权限|欠费|余额|不存在|已过期/i;
 
 /**
+ * 第二类「换一项就好」的 400：**这个模型没有这项能力**，而不是请求写错了。
+ *
+ * 真实案例（2026-07-26 线上）：小P蛙序列 1 配了阿里云百炼的 `qwen3.7-max` —— 一个
+ * **纯文本模型**。带图调用时它回 HTTP 400：
+ *   `InternalError.Algo.InvalidParameter: The provided messages input is invalid.
+ *    The error info is [Unexpected item type in content.]`
+ * 意思是「content 数组里出现了我不认识的项」，指的就是那张图。
+ *
+ * 旧规则把它归进「请求本身有毛病，换厂商也没用」，于是整条序列**停在第 1 项**，
+ * 后面那个已验证读图的 gemini-3.5-flash 压根没被试过 —— 用户看到的就是
+ * 「已依次尝试 1/3 个序列（末项的错误无法靠换模型解决，已停止顺位）」。
+ * 事实恰恰相反：**请求完全合法，只是这一项不会读图**，顺位给下一项正是序列机制的意义。
+ *
+ * ⚠️ 必须和「图片本身有问题」划清界限（那种确实换谁都挂，不该顺位、也不该把真错误埋掉）：
+ * 这里只认「**模型/接口不支持这类内容**」的说法，不认「图太大 / 解码失败 / 格式不对」。
+ * 所以下面每一条都要求把话说到「不支持」或「要的是纯文本」，而不是笼统的 invalid。
+ */
+const CAPABILITY_400 = new RegExp(
+  [
+    // 阿里百炼 / DashScope：content 数组里有它不认的项（= 那张图）
+    "unexpected item type",
+    // 纯文本接口：要求 content 是字符串，给了数组就拒
+    "content must be a string",
+    "unsupported content",
+    "invalid content type",
+    // 「(does) not support … image/vision/多模态」——限定宾语，避免误伤参数类报错
+    "(?:not|n[o']?t) support\\w*[^.]{0,24}(?:image|vision|multi-?modal|picture)",
+    // 反过来的语序：「image input is not supported」。**必须**限定成
+    // image_input / image_url / vision / multimodal 这类「输入模态」的说法 ——
+    // 光写 `image .* not supported` 会把「webp 这种**格式**不支持」也吃进来，
+    // 而那是图本身的问题，换厂商一样挂（见下面的 BAD_IMAGE_400）。
+    "(?:image[_ ]?(?:input|url)|vision|multi-?modal)[^.]{0,20}(?:not|un)\\s?supported",
+    "only supports? text",
+    "text[- ]only model",
+    "不支持(?:图片|图像|多模态|视觉)",
+    "(?:仅|只)支持文本",
+  ].join("|"),
+  "i",
+);
+
+/**
+ * 否决闸门：话里在说**这张图本身**不行（格式、体积、解码、损坏）。
+ *
+ * 这类换哪家都一样挂，顺位只是白等一轮，还会把「你的图有什么毛病」这条真正有用的
+ * 报错埋在最后一项的错误信息底下。所以即使措辞碰巧撞上 CAPABILITY_400，也一律不顺位。
+ */
+const BAD_IMAGE_400 =
+  /\bformats?\b|invalid image|decode|corrupt|too large|exceeds|file size|图片格式|解码|损坏|过大/i;
+
+/**
  * 判断一次失败要不要顺位给下一个序列项。
  *
  * 会顺位：401/403（key 无效或不属于这家）、404（模型 ID 在这家不存在）、
  * 429（限流 / 额度用尽，正是「Gemini 用完换 Kimi」的场景）、5xx（服务端故障）、
- * 网络错误 / 超时（status 传 0），以及**讲可用性的 400**（见 SLOT_SPECIFIC_400）。
+ * 网络错误 / 超时（status 传 0），以及两类 400 —— **讲可用性的**（SLOT_SPECIFIC_400）
+ * 和**讲能力的**（CAPABILITY_400，例如把图发给了纯文本模型）。
  *
- * 不顺位：其余 400 —— 请求本身有问题（图片格式、参数不合法），换个厂商同样会挂，
- * 白等一轮还会把真正的错误信息埋掉。
+ * 不顺位：其余 400 —— 请求本身有问题（图片损坏、参数不合法），换个厂商同样会挂，
+ * 白等一轮还会把真正的错误信息埋掉。BAD_IMAGE_400 命中时**一票否决**能力顺位。
  */
 export function shouldFailOver(status: number, message = ""): boolean {
-  if (status === 400) return SLOT_SPECIFIC_400.test(message);
+  if (status === 400) {
+    if (SLOT_SPECIFIC_400.test(message)) return true;
+    return CAPABILITY_400.test(message) && !BAD_IMAGE_400.test(message);
+  }
   if (status === 0) return true; // 网络错误 / 超时
   return status === 401 || status === 403 || status === 404 || status === 429 || status >= 500;
 }

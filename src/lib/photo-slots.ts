@@ -19,53 +19,136 @@ export type SlotSpec = {
   /** 模板里的槽位名，仅用于日志。 */
   key: string;
   /**
-   * 想要的器官，**按优先级排列**。第一个拿不到就退而求其次。
-   * 空数组 = 什么都行（兜底槽）。
+   * 想要的器官，**按优先级排列**。第一个拿不到就顺着往下退。
+   *
+   * 📌 2026-07-29 起**每个槽都必须列全 6 个器官**（用户决定：不再允许空槽）。
+   * 从前这里只写 1–3 个，`want` 之外一律拒收，于是金叶的「果实」「科学绘图」等
+   * 单器官刚性槽常年空着。现在 `want` 是**完整的降级链**，链末仍拿不到时还有
+   * 第三、四轮兜底（见 assignSlots），只有候选池**一张图都没有**才会真的空。
    */
   want: Organ[];
-  /** 缺图时写在页面上的中文说明，如「暂无该物种的花期公开照片」。 */
+  /** 连一张候选都没有时（极罕见）写在页面上的说明。 */
   missingNote: string;
 };
 
-/** 草稿页 5 个分区图槽（对应 plant-html-template 的 sec_img_1..5）。 */
+/** 器官的中文短名 —— 图注要如实说出画面里实际是什么。 */
+const ORGAN_ZH: Record<Organ, string> = {
+  leaf: "叶",
+  flower: "花",
+  fruit: "果实",
+  plant: "植株",
+  habitat: "生境",
+  specimen: "标本或图版",
+  "": "",
+};
+
+/**
+ * 草稿页 5 个分区图槽（对应 plant-html-template 的 sec_img_1..5）。
+ *
+ * 每条 `want` 都列全 6 个器官 —— 前几位是这一栏**真正想要**的，后面纯属兜底。
+ * 顺序不是随手排的：它决定了「实在没有花的时候，这一栏宁可要什么」。
+ */
 export const DRAFT_SLOTS: SlotSpec[] = [
-  { key: "名称和分类趣闻", want: ["plant", "habitat"], missingNote: "暂无该物种的植株公开照片" },
-  { key: "形态特征", want: ["leaf", "flower", "plant"], missingNote: "暂无该物种的叶部公开照片" },
-  { key: "生境与分布", want: ["habitat", "plant"], missingNote: "暂无该物种的生境公开照片" },
   {
-    // 人文栏现在是 Section I（首栏），别老空着。允许回落到植株、插画/标本（specimen），
-    // 但**刻意不收 habitat**（用户 2026-07-25：生境图不该配在人文这里兜底）——
-    // 生境图有它自己的「生境与分布」栏，挪来人文栏既跑题又会把那栏抽空。
-    key: "植物人文",
-    want: ["flower", "fruit", "specimen", "plant"],
+    key: "名称和分类趣闻",
+    want: ["plant", "habitat", "specimen", "leaf", "flower", "fruit"],
     missingNote: "暂无该物种的公开配图",
   },
-  { key: "生长条件", want: ["plant", "habitat", "leaf"], missingNote: "暂无该物种的植株公开照片" },
+  {
+    key: "形态特征",
+    want: ["leaf", "flower", "fruit", "plant", "specimen", "habitat"],
+    missingNote: "暂无该物种的公开配图",
+  },
+  {
+    key: "生境与分布",
+    want: ["habitat", "plant", "leaf", "flower", "fruit", "specimen"],
+    missingNote: "暂无该物种的公开配图",
+  },
+  {
+    // 人文栏是 Section I（首栏）。花/果/图版最贴题，生境排最后 ——
+    // 它有自己的「生境与分布」栏，太早挪过来会把那栏抽空。
+    key: "植物人文",
+    want: ["flower", "fruit", "specimen", "plant", "leaf", "habitat"],
+    missingNote: "暂无该物种的公开配图",
+  },
+  {
+    key: "生长条件",
+    want: ["plant", "habitat", "leaf", "flower", "fruit", "specimen"],
+    missingNote: "暂无该物种的公开配图",
+  },
 ];
 
-/** 金叶详页 9 个图槽：6 张特征卡（根株/茎/叶/花/果/物候）+ 生境全景 + 2 张人文配图。 */
+/**
+ * 金叶详页 9 个图槽：6 张特征卡（根株/茎/叶/花/果/物候）+ 生境全景 + 2 张人文配图。
+ *
+ * ⚠️ 这里从前有 **5 个单器官刚性槽**（叶/花/果/科学绘图各只认一种器官，零降级余地），
+ * 是金叶配图常年大面积留空的直接原因 —— 尤其「果实与种子」和「人文·科学绘图」。
+ * 现已全部改成完整降级链。
+ */
 export const GOLD_SLOTS: SlotSpec[] = [
-  { key: "特征卡·根与株型", want: ["plant"], missingNote: "暂无该物种的株型公开照片" },
-  { key: "特征卡·茎", want: ["plant", "leaf"], missingNote: "暂无该物种的茎部公开照片" },
-  { key: "特征卡·叶", want: ["leaf"], missingNote: "暂无该物种的叶部公开照片" },
-  { key: "特征卡·花", want: ["flower"], missingNote: "暂无该物种的花期公开照片" },
-  { key: "特征卡·果实与种子", want: ["fruit"], missingNote: "暂无该物种的果实公开照片" },
+  {
+    key: "特征卡·根与株型",
+    want: ["plant", "habitat", "leaf", "specimen", "flower", "fruit"],
+    missingNote: "暂无该物种的公开配图",
+  },
+  {
+    key: "特征卡·茎",
+    want: ["plant", "leaf", "specimen", "habitat", "flower", "fruit"],
+    missingNote: "暂无该物种的公开配图",
+  },
+  {
+    key: "特征卡·叶",
+    want: ["leaf", "plant", "specimen", "flower", "fruit", "habitat"],
+    missingNote: "暂无该物种的公开配图",
+  },
+  {
+    key: "特征卡·花",
+    want: ["flower", "fruit", "plant", "specimen", "leaf", "habitat"],
+    missingNote: "暂无该物种的公开配图",
+  },
+  {
+    key: "特征卡·果实与种子",
+    want: ["fruit", "flower", "plant", "specimen", "leaf", "habitat"],
+    missingNote: "暂无该物种的公开配图",
+  },
   {
     key: "特征卡·物候与繁殖",
-    want: ["flower", "fruit"],
-    missingNote: "暂无该物种的花果期公开照片",
+    want: ["flower", "fruit", "plant", "leaf", "specimen", "habitat"],
+    missingNote: "暂无该物种的公开配图",
   },
-  { key: "生境全景", want: ["habitat", "plant"], missingNote: "暂无该物种的生境公开照片" },
-  { key: "人文·科学绘图", want: ["specimen"], missingNote: "暂无该物种的标本或图版" },
-  { key: "人文·图像", want: ["flower", "plant", "fruit"], missingNote: "暂无可用的人文配图" },
+  {
+    key: "生境全景",
+    want: ["habitat", "plant", "leaf", "flower", "fruit", "specimen"],
+    missingNote: "暂无该物种的公开配图",
+  },
+  {
+    key: "人文·科学绘图",
+    want: ["specimen", "plant", "flower", "leaf", "fruit", "habitat"],
+    missingNote: "暂无该物种的公开配图",
+  },
+  {
+    key: "人文·图像",
+    want: ["flower", "plant", "fruit", "leaf", "habitat", "specimen"],
+    missingNote: "暂无该物种的公开配图",
+  },
 ];
 
 export type SlotAssignment = {
   spec: SlotSpec;
-  /** 命中的图；null = 这个器官确实没有可用的公开照片。 */
+  /** 命中的图；null 只在**候选池一张图都没有**时出现。 */
   photo: PhotoCandidate | null;
   /** 是否降级命中（拿到的不是 want[0]）。仅用于日志与统计。 */
   fallback: boolean;
+  /**
+   * 降级命中时的**如实说明**，如「图为植株 · 该物种的果实照片暂缺」。
+   *
+   * 不留空槽是用户 2026-07-29 的决定，但「这张图画的是什么」不能跟着一起含糊 ——
+   * 一张标着「果实」的植株照会误导读者，而一句图注就能同时满足「有图」和「不骗人」。
+   * `want[0]` 命中时为空串（图就是这一栏要的东西，无需解释）。
+   */
+  mismatchNote: string;
+  /** 这张图是不是重复使用了（候选比槽少时的最后兜底）。 */
+  reused: boolean;
 };
 
 /**
@@ -82,7 +165,13 @@ export type SlotAssignment = {
  */
 export function assignSlots(cands: PhotoCandidate[], specs: SlotSpec[]): SlotAssignment[] {
   const used = new Set<string>();
-  const out: SlotAssignment[] = specs.map((spec) => ({ spec, photo: null, fallback: false }));
+  const out: SlotAssignment[] = specs.map((spec) => ({
+    spec,
+    photo: null,
+    fallback: false,
+    mismatchNote: "",
+    reused: false,
+  }));
 
   const take = (want: Organ, avoidPlaces: Set<string>): PhotoCandidate | null => {
     // 同一拍摄地/同一摄影者的图先跳过一轮，避免整页都是同一个人同一天拍的。
@@ -98,9 +187,18 @@ export function assignSlots(cands: PhotoCandidate[], specs: SlotSpec[]): SlotAss
     return null;
   };
 
+  /** 降级命中时的如实图注。拿不到器官名（未知标签）就只说「暂缺」，不编。 */
+  const noteFor = (spec: SlotSpec, got: PhotoCandidate): string => {
+    const wantedZh = ORGAN_ZH[spec.want[0] ?? ""] || "";
+    const gotZh = ORGAN_ZH[got.organ] || "";
+    if (!wantedZh) return "";
+    if (!gotZh) return `该物种的${wantedZh}照片暂缺，此处为其它公开配图`;
+    return `图为${gotZh} · 该物种的${wantedZh}照片暂缺`;
+  };
+
   const places = new Set<string>();
 
-  // 第一轮：只发首选器官。
+  // 第一轮：只发首选器官。先保证「叶槽拿到叶、花槽拿到花」。
   out.forEach((a) => {
     const first = a.spec.want[0];
     if (!first) return;
@@ -108,7 +206,8 @@ export function assignSlots(cands: PhotoCandidate[], specs: SlotSpec[]): SlotAss
     if (hit) a.photo = hit;
   });
 
-  // 第二轮：还空着的槽按优先级降级。
+  // 第二轮：还空着的槽按 want 顺序降级。want 现在列全了 6 个器官，所以只要池子里
+  // 还有**任何已识别器官**的余图，这一轮基本都能填上。
   out.forEach((a) => {
     if (a.photo) return;
     for (const w of a.spec.want.slice(1)) {
@@ -116,20 +215,46 @@ export function assignSlots(cands: PhotoCandidate[], specs: SlotSpec[]): SlotAss
       if (hit) {
         a.photo = hit;
         a.fallback = true;
-        return;
-      }
-    }
-    // want 为空 = 兜底槽，什么都能要。
-    if (a.spec.want.length === 0) {
-      for (const c of cands) {
-        if (used.has(c.url)) continue;
-        used.add(c.url);
-        a.photo = c;
-        a.fallback = true;
+        a.mismatchNote = noteFor(a.spec, hit);
         return;
       }
     }
   });
+
+  // 第三轮：**器官未知**（organ === ""）的余图也收。
+  // 视觉分类失败、或模型判 other 的图会落在这里 —— 从前它们命不中任何 want，
+  // 于是「分类一失败 → 整页零配图」。现在它们是最后一批真正的候选。
+  out.forEach((a) => {
+    if (a.photo) return;
+    for (const c of cands) {
+      if (used.has(c.url)) continue;
+      used.add(c.url);
+      a.photo = c;
+      a.fallback = true;
+      a.mismatchNote = noteFor(a.spec, c);
+      return;
+    }
+  });
+
+  // 第四轮：候选**比槽还少**时复用已用过的图，保证不留空（用户 2026-07-29 的要求）。
+  // 优先复用「本站用户实拍」—— 那是拍的这一株、这个季节、这个地点，比任何外部图都贴题；
+  // 其次按顺序复用。整页可能出现同一张图两次，这是「不留空」的必然代价，已知并接受。
+  const pool = cands.filter((c) => used.has(c.url));
+  if (pool.length) {
+    const ordered = [
+      ...pool.filter((c) => c.sourceName === "本站用户实拍"),
+      ...pool.filter((c) => c.sourceName !== "本站用户实拍"),
+    ];
+    let k = 0;
+    out.forEach((a) => {
+      if (a.photo) return;
+      const c = ordered[k++ % ordered.length];
+      a.photo = c;
+      a.fallback = true;
+      a.reused = true;
+      a.mismatchNote = noteFor(a.spec, c);
+    });
+  }
 
   return out;
 }
@@ -138,10 +263,12 @@ export function assignSlots(cands: PhotoCandidate[], specs: SlotSpec[]): SlotAss
 export function describeAssignment(out: SlotAssignment[]): string {
   const filled = out.filter((a) => a.photo).length;
   const fallbacks = out.filter((a) => a.fallback).length;
+  const reused = out.filter((a) => a.reused).length;
   const missing = out.filter((a) => !a.photo).map((a) => a.spec.key);
   return (
-    `${filled}/${out.length} 槽有图（其中 ${fallbacks} 个降级命中）` +
-    (missing.length ? `；缺：${missing.join("、")}` : "")
+    `${filled}/${out.length} 槽有图（降级 ${fallbacks} 个，其中复用 ${reused} 张）` +
+    // 走到这一步还缺，说明候选池**一张图都没有** —— 是检索/许可闸门的问题，不是分配的问题。
+    (missing.length ? `；仍缺（候选池为空）：${missing.join("、")}` : "")
   );
 }
 

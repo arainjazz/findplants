@@ -39,6 +39,14 @@ export type PlantDraftFields = {
   section_sources?: string[];
   /** 该槽位没有合适器官的照片时，如实写明缺什么（如「暂无该物种的花期公开照片」）。 */
   section_missing?: string[];
+  /**
+   * 降级配图的**如实说明**，如「图为植株 · 该物种的果实照片暂缺」。
+   *
+   * 与 `section_missing` 的分工：那个是「这一栏一张图都没有」（现已极罕见），
+   * 这个是「有图，但画的不是这一栏本来想要的东西」。2026-07-29 起不再留空槽，
+   * 所以日常出现的几乎都是后者 —— 有图不等于可以不告诉读者图里是什么。
+   */
+  section_notes?: string[];
   /** Populated only when GBIF/GRIIS confirms the species is an invasive alien
    *  species in China. Renders a red warning card just before Section I. */
   invasive?: {
@@ -157,7 +165,10 @@ i,em{color:var(--gold);}
    实测被 16px 的正文规则盖住。注意：本块在 TS 模板字符串里，禁止出现反引号。 */
 .section-body p.img-credit,p.img-credit{max-width:100%;margin:8px 0 0;font-size:11px;line-height:1.5;text-align:center;color:var(--ink-faint,#8a988f);word-break:break-word;}
 .img-credit a{color:inherit;text-decoration:none;border-bottom:1px dotted currentColor;}
-/* 该器官确实没有公开照片时的空槽说明 —— 如实写明缺什么，不塞随机图充数。 */
+/* 降级配图的如实说明（「图为植株 · 该物种的果实照片暂缺」）。比署名略深一点，
+   因为它是内容事实、不是版权信息，读者应该先看到它。 */
+.section-body p.img-note,p.img-note{max-width:100%;margin:8px 0 0;font-size:11px;line-height:1.5;text-align:center;color:var(--ink-faint,#8a988f);font-style:italic;}
+/* 候选池一张图都没有时的空槽说明。2026-07-29 起已极罕见（见 photo-slots 的四轮兜底）。 */
 .section-body p.img-missing,p.img-missing{max-width:100%;margin:0;padding:28px 12px;font-size:11px;line-height:1.6;text-align:center;color:var(--ink-faint,#8a988f);border:1px dashed var(--rule);background:var(--paper);}
 img.sec-img[src=""]{display:none;}
 @media (min-width:768px){
@@ -521,6 +532,7 @@ export function renderDraftHtml(fields: PlantDraftFields): string {
   const secCredits = fields.section_credits ?? [];
   const secSources = fields.section_sources ?? [];
   const secMissing = fields.section_missing ?? [];
+  const secNotes = fields.section_notes ?? [];
   const attrEsc = (u: string) => (u ?? "").replace(/"/g, "&quot;");
   const sectionDict: Record<string, string> = {};
   for (let i = 0; i < 5; i++) {
@@ -544,13 +556,19 @@ export function renderDraftHtml(fields: PlantDraftFields): string {
       sectionDict[`sec_img_${i + 1}_credit`] = `<p class="img-missing">${esc(miss)}</p>`;
       continue;
     }
-    sectionDict[`sec_img_${i + 1}_credit`] = credit
-      ? `<p class="img-credit">${
-          src
-            ? `<a href="${attrEsc(src)}" target="_blank" rel="noreferrer nofollow">${esc(credit)}</a>`
-            : esc(credit)
-        }</p>`
-      : "";
+    // 降级说明排在署名**之前**、且**不进 <a>** —— 它是给读者的事实交代，
+    // 不是署名的一部分，混进链接文字里既难读也不合适。
+    const note = url ? (secNotes[i] || "").trim() : "";
+    const noteHtml = note ? `<p class="img-note">${esc(note)}</p>` : "";
+    sectionDict[`sec_img_${i + 1}_credit`] =
+      noteHtml +
+      (credit
+        ? `<p class="img-credit">${
+            src
+              ? `<a href="${attrEsc(src)}" target="_blank" rel="noreferrer nofollow">${esc(credit)}</a>`
+              : esc(credit)
+          }</p>`
+        : "");
   }
   const dict: Record<string, string> = {
     ...sectionDict,
