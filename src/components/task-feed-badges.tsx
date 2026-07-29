@@ -44,13 +44,34 @@ export function TaskProgressBars({ active }: { active: Partial<Record<TaskKind, 
  * 图标右上角的未读圆圈。三类各一个，只在该类有未读时出现。
  *
  * 横排而不是叠在一起：三个数字要能同时看清，叠起来就只剩最上面那个可读。
+ *
+ * **红圈 = 失败**，排在三色之外单独一个：失败若也按类着色，用户就分不出
+ * 「绿3」是三条识别好了还是三条识别炸了 —— 这两件事的处理方式完全相反。
  */
-export function TaskUnreadRings({ unread }: { unread: Record<TaskKind, number> }) {
+export function TaskUnreadRings({
+  unread,
+  failed,
+}: {
+  unread: Record<TaskKind, number>;
+  /** 每类「失败且没看过」的条数。缺省视作没有失败。 */
+  failed?: Record<TaskKind, number>;
+}) {
   const shown = ORDER.filter((k) => unread[k] > 0);
-  if (!shown.length) return null;
+  const failedTotal = failed ? ORDER.reduce((n, k) => n + (failed[k] || 0), 0) : 0;
+  if (!shown.length && !failedTotal) return null;
 
   return (
     <span className="absolute -top-1.5 -right-1.5 flex flex-row-reverse gap-0.5" aria-live="polite">
+      {failedTotal > 0 && (
+        <span
+          title={`失败：${ORDER.filter((k) => failed![k] > 0)
+            .map((k) => `${TASK_KIND_META[k].label} ${failed![k]}`)
+            .join("、")} —— 点开小P蛙看原因`}
+          className="bg-destructive text-white text-[10px] font-bold leading-none min-w-[16px] h-4 px-1 rounded-full flex items-center justify-center shadow ring-2 ring-paper tabular-nums"
+        >
+          {failedTotal > 99 ? "99+" : failedTotal}
+        </span>
+      )}
       {shown.map((kind) => {
         const meta = TASK_KIND_META[kind];
         return (

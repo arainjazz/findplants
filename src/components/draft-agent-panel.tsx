@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { XiaoPLogo } from "@/components/xiaop-logo";
 import { TaskProgressBars, TaskUnreadRings } from "@/components/task-feed-badges";
 import { TaskFeedList } from "@/components/task-feed-list";
-import { XiaoPAgentMountedContext } from "@/components/task-feed-launcher";
+import { usePageXiaoPRegistration } from "@/lib/xiaop-mounted";
 import { useTaskFeed } from "@/lib/use-task-feed";
 import { searchPlantImages, type PlantImgHit } from "@/components/html-doc-editor";
 import { XiaoPUserSettings } from "@/components/xiaop-user-settings";
@@ -86,6 +86,7 @@ export function XiaoPAgentPanel({
   onImageReplace,
   storageKey,
   isRegistered = true,
+  registerAsPageAgent = true,
 }: {
   greetingTitle?: string | null;
   canApply: boolean;
@@ -98,8 +99,17 @@ export function XiaoPAgentPanel({
   storageKey?: string;
   /** Logged-in? Guests can open the panel but every send returns GUEST_NOTICE. */
   isRegistered?: boolean;
+  /**
+   * 要不要向登记处声明「这一页自带小P蛙」。页面自带的那两只（草稿页 / 条目页）用默认的
+   * true；**全站那只（TaskFeedLauncher）必须传 false** —— 它自己就是据此让位的那个，
+   * 登记等于让它把自己关掉再打开，无限循环。详见 xiaop-mounted.ts。
+   */
+  registerAsPageAgent?: boolean;
 }) {
   const [open, setOpen] = useState(false);
+  // 向全局那只青蛙登记「本页自带面板」，让它让位 —— 否则右下角并排两只，
+  // 用户根本分不清该点哪个。原来用 context 表达这件事，方向是反的（见 xiaop-mounted.ts）。
+  usePageXiaoPRegistration(registerAsPageAgent);
   // 这一页的青蛙同时兼任通知中心（全局那只已让位），所以角标数据在这里也要拉一份。
   // useTaskFeed 底层是同一个 react-query key，两处共用一份缓存、不会重复轮询。
   const feed = useTaskFeed();
@@ -183,6 +193,13 @@ export function XiaoPAgentPanel({
   useEffect(() => {
     if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
   }, [messages, open]);
+
+  // 打开「任务动态」列表 = 用户看到了失败原因 → 清掉右上角那个红圈。
+  // 失败的任务多半没有草稿页可进，不在这里清就永远清不掉（见 markFailedReadFn）。
+  const markFailedRead = feed.markFailedRead;
+  useEffect(() => {
+    if (open && showFeed) markFailedRead();
+  }, [open, showFeed, markFailedRead]);
 
   // On desktop, push the page content left while the panel is open so the docked
   // panel sits in the freed right gutter instead of overlapping the text. On
@@ -352,8 +369,7 @@ export function XiaoPAgentPanel({
   const busy = sending || messages.some((m) => m.applying);
 
   return (
-    // 声明「本页已经有一只完整的小P蛙」——全局通知浮标据此让位，避免右下角并排两只。
-    <XiaoPAgentMountedContext.Provider value={true}>
+    <>
       {/* Launcher — logo + caption, right side. Swipe left/right (mobile) to
           collapse it to a side tab so it stops covering the article. */}
       {!open && !hiddenSide && (
@@ -365,7 +381,8 @@ export function XiaoPAgentPanel({
             }
             // 有没看过的结果时，点开**直接落在动态流**上 —— 用户点青蛙的动机
             // 十有八九就是「刚才那株出来了吗」。没有未读才回到对话。
-            setShowFeed(feed.unreadTotal > 0);
+            // 失败也算「要看一眼」（attentionTotal），否则跑炸了反而把人丢回聊天框。
+            setShowFeed(feed.attentionTotal > 0);
             setOpen(true);
           }}
           onTouchStart={onSwipeStart}
@@ -374,11 +391,11 @@ export function XiaoPAgentPanel({
           className="fixed bottom-24 right-3 md:bottom-8 md:right-6 z-40 flex flex-col items-center gap-1 group animate-in fade-in slide-in-from-right-2 touch-pan-y"
         >
           {/* 角标与全局浮标共用同一套组件 —— 这一页上全局那只已经让位了
-              （见 task-feed-launcher 的 XiaoPAgentMountedContext），
-              进度和未读必须由这只接着显示，否则在草稿页上反而看不到通知。 */}
+              （见 lib/xiaop-mounted.ts），进度和未读必须由这只接着显示，
+              否则在草稿页上反而看不到通知。 */}
           <span className="relative">
             <XiaoPLogo className="w-10 h-10 md:w-20 md:h-20 drop-shadow-lg group-hover:scale-105 group-active:scale-95 transition-transform" />
-            <TaskUnreadRings unread={feed.unread} />
+            <TaskUnreadRings unread={feed.unread} failed={feed.failed} />
           </span>
           <span className="flex flex-col items-center text-center font-semibold text-leaf-deep bg-paper/90 border border-leaf/30 rounded-lg px-2 py-0.5 leading-tight whitespace-nowrap shadow-sm">
             <span className="text-[10px]">小P蛙</span>
@@ -503,9 +520,9 @@ export function XiaoPAgentPanel({
                 }`}
               >
                 任务动态
-                {feed.unreadTotal > 0 && (
+                {feed.attentionTotal > 0 && (
                   <span className="bg-vermilion text-background text-[9px] font-bold leading-none min-w-[15px] h-[15px] px-1 rounded-full flex items-center justify-center tabular-nums">
-                    {feed.unreadTotal > 99 ? "99+" : feed.unreadTotal}
+                    {feed.attentionTotal > 99 ? "99+" : feed.attentionTotal}
                   </span>
                 )}
               </button>
@@ -553,7 +570,15 @@ export function XiaoPAgentPanel({
                     ) : (
                       "默认使用 Gemini 3 Flash 来作为我的大脑"
                     )}
-                    ，如果你发现内容什么问题我可以帮你调查，帮你修改（修改前会让你点「采纳并保存」）。如果你想使用你自己的智能模型，可以点击右下方的齿轮图标进行配置。准确的换图操作请在输入框的下方进行。
+                    ，
+                    {/* 能不能落地改写是**这一页**的属性，不是小P蛙的属性：草稿页/条目页能改，
+                        全站那只（识别页、名录、探索页…）只能聊。开场白照着念「我能帮你修改」
+                        会让人在改不了的页面上白等一场，所以两种页面分开说。 */}
+                    {canApply
+                      ? "如果你发现内容什么问题我可以帮你调查，帮你修改（修改前会让你点「采纳并保存」）。"
+                      : "这一页上我能陪你读、帮你查、回答关于本页内容的问题。想让我动手改内容，请到植物条目页或草稿页找我。"}
+                    如果你想使用你自己的智能模型，可以点击右下方的齿轮图标进行配置。
+                    {canApply && "准确的换图操作请在输入框的下方进行。"}
                   </div>
                 )}
                 {messages.map((m) => (
@@ -799,7 +824,7 @@ export function XiaoPAgentPanel({
           </button>
         </div>
       )}
-    </XiaoPAgentMountedContext.Provider>
+    </>
   );
 }
 

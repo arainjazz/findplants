@@ -123,6 +123,28 @@ export function unreadCounts(rows: TaskFeedRow[]): Record<TaskKind, number> {
 }
 
 /**
+ * 每类任务「失败且没看过」的条数。
+ *
+ * 为什么要单独数一份：`unreadCounts` 只数 done，于是**任务失败时浮标上什么都不出现** ——
+ * 进度条没有（已不 running）、未读圈也没有（不是 done）。用户 2026-07-29 报的
+ * 「识别失败了，可小P蛙底下没进度条、右上角也没角标」正是这个。失败恰恰是最该主动
+ * 告诉人的一件事，不该是三类状态里最安静的那个。
+ */
+export function failedCounts(rows: TaskFeedRow[]): Record<TaskKind, number> {
+  const out: Record<TaskKind, number> = { identify: 0, enrich_draft: 0, gold_page: 0 };
+  for (const r of rows) {
+    if (r.status === "error" && !r.readAt) out[r.kind] += 1;
+  }
+  return out;
+}
+
+/** 未看过的失败总数（右上角那个红圈里的数字）。 */
+export function totalFailed(rows: TaskFeedRow[]): number {
+  const c = failedCounts(rows);
+  return c.identify + c.enrich_draft + c.gold_page;
+}
+
+/**
  * 每类任务当前**正在跑**的那一条（小P蛙图标下面的进度条画的就是它）。
  *
  * 同类有多个在跑时取**最近更新**的那条 —— 用户连着点了三次「进一步生成草稿」时，

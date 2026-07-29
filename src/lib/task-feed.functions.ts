@@ -136,3 +136,37 @@ export const markDraftReadFn = createServerFn({ method: "POST" })
       return { marked: 0 };
     }
   });
+
+/**
+ * 把**失败**的动态标为已读。用户在小P蛙里打开「任务动态」列表时调用。
+ *
+ * 为什么失败必须走单独一条路：正常完成的那条判据是「进过那份草稿的详情页」，
+ * 可失败的任务**往往根本没有草稿页可进**（识别炸了就没建成草稿），
+ * 于是右上角那个红圈会永远挂着、没有任何办法消掉。错误信息只在列表里，
+ * 所以「列表被打开」就是这类动态唯一合理的已读时机。
+ *
+ * 只动 error 行 —— 顺手把未读的完成项也清了，就等于把用户还没看的结果偷偷标掉了。
+ */
+export const markFailedReadFn = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .handler(async ({ context }): Promise<{ marked: number }> => {
+    const { userId } = context as { userId: string };
+    try {
+      const db = await admin();
+      const { data: rows, error } = await db
+        .from("task_feed")
+        .update({ read_at: new Date().toISOString() })
+        .eq("user_id", userId)
+        .eq("status", "error")
+        .is("read_at", null)
+        .select("id");
+      if (error) {
+        console.warn("[TaskFeed] markFailedRead failed:", error.message);
+        return { marked: 0 };
+      }
+      return { marked: (rows ?? []).length };
+    } catch (e) {
+      console.warn("[TaskFeed] markFailedRead threw:", e instanceof Error ? e.message : e);
+      return { marked: 0 };
+    }
+  });

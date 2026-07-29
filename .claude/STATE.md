@@ -5506,3 +5506,78 @@ center 把配图/「暂无」虚线框吊在正文垂直中央，正文一长，
   `/identify` 在 dev 里真实渲染通过（修复前是 500）。
 - 10 套测试 **217 条全过**。
 - ⛔ 端到端只能上线后验：要真登录 + 真拍一张 + 真跑一轮。
+
+## ✅ 2026-07-29（续二）— 小P蛙上全站 + 失败终于看得见（tsc/build EXIT=0；已浏览器实测；**NOT deployed**）
+
+用户反馈三件事：① 识别页没有小P蛙；② 有小P蛙的页面上，图标下面没进度条、右上角没角标；
+③ 识别失败首次报「任务在服务端异常结束（多为触及平台单次请求上限）」。①② 已修，③ 见 Blockers。
+
+### 🔴 修掉的两个真 bug（都是「上一轮自认为做好了」的东西）
+
+**bug 1 — 全局浮标在动态流为空时整个不渲染。**
+`task-feed-launcher.tsx` 里原有一行 `if (!rows.length) return null`。新用户、或还没跑过任何
+任务的用户，动态流本来就是空的 → **全站除了草稿页/条目页，一只青蛙都没有**。
+识别页正是其中之一。通知为空只该让**角标**不画，不该让入口消失。
+
+**bug 2 — 让位机制用 React context，方向反了，从来没生效过。**
+全局那只挂在 `__root.tsx`，页面自带的那只在 `<Outlet/>` **里面** —— 是全局那只的
+**兄弟节点的后代**。context 只能向下流，后代里的 Provider 对上面的兄弟毫无影响，
+`useContext` 永远读到默认值 false。这个 bug 一直被 bug 1 掩盖着（两只都没出现，
+自然看不出去重失效），修好 bug 1 的同一刻就会暴露成右下角并排两只。
+改用模块级订阅仓库 [xiaop-mounted.ts](src/lib/xiaop-mounted.ts)：页面自带的那只挂载时登记，
+全局那只 `useSyncExternalStore` 订阅后让位。**计数不用布尔** —— 路由切换时新页面的 panel
+可能先挂载、旧页面的后卸载，布尔会被后卸载那次误置回 false。
+
+### 🔴 改的过程中现做现踩的第三个（只有浏览器抓得到，tsc/build 全绿）
+全局那只渲染的也是 `XiaoPAgentPanel`，于是它**把自己登记成了「页面自带的青蛙」** →
+看到有人登记 → 让位 → 登记随之消失 → 又出现 → 无限循环。
+React 报 `Maximum update depth exceeded`（栈顶 `forceStoreRerender`），
+整个 `TaskFeedLauncher` 被错误边界吃掉，**页面上反而一只青蛙都没有**。
+修法：`XiaoPAgentPanel` 加 `registerAsPageAgent`（默认 true），全局那只传 **false**。
+⚠️ 教训与 07-29 上一轮同款：`tsc --noEmit` + `npm run build` 双绿**证明不了组件能跑**，
+必须在浏览器里真打开。
+
+### 做了什么
+- **全站小P蛙**：`TaskFeedLauncher` 从「纯通知浮标」升级成完整的 `XiaoPAgentPanel`，
+  挂在根上，**每一页都有**。三合一：当前页对话 / 任务动态列表 / 模型设置。
+- **新服务端通道 `askPageAgentFn`**（identify-plant.functions.ts）：正文由客户端从
+  DOM 的 `<main>` 抓（抓 body 会把页眉页脚和小P蛙自己的对话记录一起喂进 prompt），
+  上限 8000 字。支持联网检索与网络参考图，**`canEdit` 恒为 false**。
+  🔑 **为什么刻意不给它落地改写**：能改的页面（草稿 / 已发布条目）各自挂着专用面板，
+  那两条路带着 scope 标注、改写、写 plant_edits、可撤销的一整套；让一个只拿到 DOM 文本、
+  够不着数据源的通用通道去「改页面」，只会写出改不到实处也无法回滚的东西。
+  system prompt 里明确要求它把用户引到能改的那两类页面去。开场白也按 `canApply` 分两种说法。
+- **失败终于看得见**：新增 `failedCounts` / `totalFailed`，`TaskUnreadRings` 多一个
+  **红圈**（三色之外单独一个 —— 失败若也按类着色，用户分不出「绿3」是三条成了还是三条炸了）。
+  新 `markFailedReadFn`：**打开「任务动态」列表即视为已读**。失败的任务往往根本没有草稿页
+  可进（识别炸了就没建成草稿），沿用「进过详情页才算已读」那条规则的话，红圈永远消不掉。
+  只动 error 行，顺手清掉未读的完成项等于把用户还没看的结果偷偷标掉。
+- `markFailedRead` 必须是 `useCallback` 稳定引用：调用点是 useEffect，每渲染换个新函数
+  会打成请求风暴（标记→刷新之间 failedTotal 还是 >0，早退那道闸拦不住）。
+
+### 验证证据
+- `tsc --noEmit` EXIT=0；`npm run build` EXIT=0。
+- `scratch/task-feed.test.mjs` 从 21 条加到 **28 条**（新增 7 条：失败按类计数 / 已看过的
+  失败不计 / 失败与「完成未读」互不串味 / 失败不画进度条）。
+- **浏览器实测**（dev :5203）：识别页出现小P蛙并能打开面板；`/plants`、`/plants/$slug`
+  各恰好 **1 只**；条目页 ⇄ 识别页 SPA 来回切换（含 history.back）始终 **1 只**，
+  控制台无新增报错；开场白在不能改写的页面上正确改口。
+- ⛔ **未验证**：小P蛙对话的真实往返（`askPageAgentFn` 挂 `requireSupabaseAuth`，
+  本地登录不了）；红圈与 `markFailedReadFn` 的端到端（要真跑一个失败任务）。
+
+### 下一步
+- 部署（07-28 三批 + 07-29 三批改动**全部未上线**）。上线后要看：识别页有青蛙、
+  登录后问一句本页问题能答、跑一个失败任务红圈亮起、点开「任务动态」后红圈消失。
+
+### 🔴 Blockers — 识别失败：「任务在服务端异常结束」
+用户 07-29 首次遇到。文案出自 [poll-job.ts:83](src/lib/poll-job.ts:83) 的 `snap.stale` 分支 ——
+**含义是任务行连丢 2 分钟心跳**，即那个 isolate 真的没了。已排除的两条：
+队列消费者是 `async queue()` 里 `await`（15 分钟挂钟），**不是** waitUntil 那条 26 秒的路
+（[server.ts:115](src/server.ts:115)）；`max_retries: 1` 也不会导致重复烧。
+剩下最可能的是**单次调用的子请求数或 CPU 时间超限**——
+识别一趟要：取图 + Pl@ntNet + 若干 Gemini + 联网调研 + 配图检索 + 多次 Supabase 写 +
+每 15 秒一次心跳，条数很容易堆上去。
+⚠️ **本地复现不了**（见 memory「本地模拟器不能验证平台限制」），必须拿生产日志：
+    npx wrangler tail --format pretty
+复现一次失败的识别，看抛出来的原话是 `Too many subrequests` 还是 `Exceeded CPU time limit` ——
+两者的修法完全不同（前者砍子请求数/升套餐，后者拆任务），**没拿到这行之前不要动手改**。

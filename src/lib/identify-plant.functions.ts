@@ -7947,6 +7947,106 @@ async function fetchPlantPageText(plantId: string): Promise<{
   };
 }
 
+// ─── 通用页面对话（全站那只小P蛙）───────────────────────────────────────────
+//
+// 与 askDraftAgentFn / askPlantAgentFn 的分工：
+//   · 那两个从**库里**读正文（草稿行 / 已发布 HTML），因此能改稿、能换图；
+//   · 本函数处理的是**任何一个页面**（识别页、名录、探索、博客、个人主页…），
+//     库里根本没有对应的「正文」，所以正文由客户端从 DOM 抓一段送上来。
+//
+// **刻意不给它落地修改的能力**：能改的页面（草稿 / 已发布条目）各自挂着专用面板，
+// 那两条路带着 scope 标注、改写、写 plant_edits、可撤销的一整套。让一个拿不到
+// 页面数据源的通用通道去「改页面」，只会写出改不到实处、也无法回滚的东西。
+// 所以这里 canEdit 恒为 false，并在 system 里明确告诉模型该把用户引到哪儿去改。
+const AskPageAgentInput = z.object({
+  /** 当前路由，如 /identify、/plants/xxx。给模型判断用户正在看什么。 */
+  path: z.string().max(300),
+  pageTitle: z.string().max(300).optional(),
+  /** 客户端从 DOM 抓的页面可见文本。截断由客户端做，这里只兜一个上限。 */
+  pageText: z.string().max(12000),
+  question: z.string().min(1).max(2000),
+  history: z
+    .array(z.object({ role: z.enum(["user", "assistant"]), text: z.string() }))
+    .max(24)
+    .optional(),
+  userModel: UserModelInput,
+});
+
+/**
+ * 全站小P蛙的对话通道：针对**当前这一页**（以及植物学常识）回答。
+ *
+ * 登录才可用 —— 与另外两条对话通道一致，避免匿名流量直接烧默认模型的 token。
+ */
+export const askPageAgentFn = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input) => AskPageAgentInput.parse(input))
+  .handler(async ({ data }) => {
+    const where = data.pageTitle ? `${data.pageTitle}（${data.path}）` : data.path;
+    const system = `你是「小P蛙」，Plantspedia（鄂尔多斯植物百科）的双语助手，正在陪用户看站内的一个页面：${where}。
+职责：
+- 用【中文】回答用户关于**这一页内容**的问题；页面文本没写到的，可以用植物学常识补充，但要说清哪些是页面上的、哪些是你的补充；不确定就如实说，不要编造。
+- 用户问的若是「这个网站怎么用 / 这一页是干什么的」，就依据页面文本解释。
+- 如果用户想**修改内容**：站内可直接改的只有两种页面 —— 植物条目详情页（/plants/…）和草稿页（/drafts/…）。请告诉他去那一页找小P蛙，那里的我能改写并保存。其余页面（识别页、名录、探索页等）属于站点功能界面，我改不了，别答应做不到的事。
+- 如果用户想「看某个物种的网络参考照片」，把 showImages 设为 true，把物种放进 imageQueries 数组（优先拉丁学名，最多 4 个）。**你具备这个能力，不要说"我无法联网/无法发图"**。
+- 如果准确回答需要【最新网络信息】（保护级别、新研究、时效性数据等），把 needsWebSearch 设为 true 并在 webQuery 给出简洁检索词；纯常识不必联网，设 false、webQuery 留空。
+- canEdit 恒为 false，editInstruction 留空。
+回答简明。
+【输出格式·务必严格】只返回一个 JSON 对象，键名固定为：reply（字符串）、canEdit（布尔）、editInstruction（字符串）、showImages（布尔）、imageQueries（字符串数组）、needsWebSearch（布尔）、webQuery（字符串）。不要加 markdown 代码块或多余文字。`;
+
+    const pageText = data.pageText.trim();
+    const contents: ChatContents = [
+      {
+        role: "user",
+        parts: [
+          {
+            text: pageText
+              ? `【当前页面：${where}】\n以下是页面上的可见文本：\n${pageText}`
+              : `【当前页面：${where}】\n（这一页没有可提取的正文，多半是操作界面。请据路径与用户提问作答。）`,
+          },
+        ],
+      },
+      { role: "model", parts: [{ text: "好的，我看到这一页了。想问什么？" }] },
+      ...(data.history || []).map((h) => ({
+        role: (h.role === "assistant" ? "model" : "user") as "user" | "model",
+        parts: [{ text: h.text }],
+      })),
+      { role: "user", parts: [{ text: data.question }] },
+    ];
+
+    const schema = {
+      type: "object",
+      properties: {
+        reply: { type: "string" },
+        canEdit: { type: "boolean" },
+        editInstruction: { type: "string" },
+        showImages: { type: "boolean" },
+        imageQueries: { type: "array", items: { type: "string" } },
+        needsWebSearch: { type: "boolean" },
+        webQuery: { type: "string" },
+      },
+      required: [
+        "reply",
+        "canEdit",
+        "editInstruction",
+        "showImages",
+        "imageQueries",
+        "needsWebSearch",
+        "webQuery",
+      ],
+    };
+
+    const ans = await xiaopAskWithGrounding({
+      contents,
+      system,
+      schema,
+      overrideSequence: toOverrideSlots(data.userModel),
+    });
+    await logChatUsage(ans, { draftTitle: data.pageTitle ?? data.path, label: "小P对话（页面）" });
+    // 这条通道落不了地，无论模型怎么说都不给「采纳并保存」按钮。
+    const parsed = harvestImageIntent(parseAgentReply(ans.text));
+    return { ...parsed, canEdit: false, editInstruction: "", imageEdit: false };
+  });
+
 const AskPlantAgentInput = z.object({
   plantId: z.string(),
   question: z.string().min(1).max(2000),

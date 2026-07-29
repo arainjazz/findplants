@@ -164,10 +164,10 @@ function RootComponent() {
         <Outlet />
         <Toaster />
         <OfflineStatus />
-        {/* 全局通知浮标：识别 / 银叶 / 金叶三类任务的进度与未读。
+        {/* 全站的小P蛙：当前页面的对话入口 + 三类任务（识别 / 银叶 / 金叶）的进度与未读。
             挂在根上是刻意的 —— 用户点完「生成」就会切走去识别下一株，
             而原来的小P蛙只在草稿页和条目页出现，那两页恰恰都不在路上。
-            有完整对话面板的页面上它会自动让位（见 XiaoPAgentMountedContext）。 */}
+            那两页上它会自动让位给页面自带的那只（见 lib/xiaop-mounted.ts）。 */}
         <TaskFeedLauncher />
       </AuthProvider>
     </QueryClientProvider>

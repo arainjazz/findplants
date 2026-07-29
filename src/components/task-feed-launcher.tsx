@@ -1,94 +1,97 @@
-// ─── 全局的小P蛙通知浮标 ──────────────────────────────────────────────────────
+// ─── 全站的小P蛙 ──────────────────────────────────────────────────────────────
 //
-// 为什么要单独做一个：原来的小P蛙（draft-agent-panel）**只挂在草稿页和条目页**，
-// 而用户要的恰恰是「去识别下一株时也能看到上一株的进度」—— 那两页都不在路上。
+// 挂在 `__root.tsx` 上，**每一页都出现**（用户 2026-07-29：「小P蛙图标应该出现在
+// 所有页面上」）。它同时是三件事：
+//   ① 对话入口 —— 针对**当前这一页**的内容问答（正文从 DOM 抓，见 readPageText）；
+//   ② 通知中心 —— 图标下面的三色进度条、右上角的三色未读圆圈、点开的摘要卡列表；
+//   ③ 模型设置 —— 用户自带模型的入口（这三个视图都由 XiaoPAgentPanel 提供）。
 //
-// 与 draft-agent-panel 的分工：
-//   · 本组件 = **通知中心**，全站可见，管进度条 / 未读圆圈 / 摘要卡列表；
-//   · draft-agent-panel = **对话 agent**，只在有正文可聊的页面出现。
-// 两者都会画同一套角标（共用 task-feed-badges），但**同一页只出现一只青蛙** ——
-// 有对话面板的页面上，本组件自动让位（见 XiaoPAgentMountedContext）。
+// **与页面自带的那两只（drafts/$id、plants/$slug）的分工**：那两页的正文在库里，
+// 小P蛙能改写并保存；本组件拿到的只是 DOM 文本，**只问不改**（askPageAgentFn 里
+// canEdit 恒为 false）。所以那两页上本组件让位，由页面自带的那只接管 —— 让位靠
+// `lib/xiaop-mounted.ts` 的登记处，不是 context（原来那版方向反了，从未生效）。
+//
+// 🔑 **本组件不再因为「动态流为空」就整个消失**。原来那行 `if (!rows.length) return null`
+// 是「识别页没有小P蛙」的直接原因：新用户、或还没跑过任何任务的用户，动态流是空的，
+// 于是全站除了草稿页/条目页以外一只青蛙都看不到。通知为空只该让**角标**不画，
+// 不该让入口消失。
 
-import { createContext, useContext, useState } from "react";
-import { XiaoPLogo } from "./xiaop-logo";
-import { TaskProgressBars, TaskUnreadRings } from "./task-feed-badges";
-import { TaskFeedList } from "./task-feed-list";
-import { useTaskFeed } from "@/lib/use-task-feed";
+import { useCallback } from "react";
+import { useRouterState } from "@tanstack/react-router";
+import { useServerFn } from "@tanstack/react-start";
+import { XiaoPAgentPanel, type AgentAskResult, type AgentHistory } from "./draft-agent-panel";
+import { askPageAgentFn } from "@/lib/identify-plant.functions";
+import { userModelArg } from "@/lib/xiaop-user-model";
+import { usePageXiaoPMounted, useHydrated } from "@/lib/xiaop-mounted";
+import { useAuth } from "@/hooks/use-auth";
+
+/** 送给模型的页面正文上限。够覆盖一屏到几屏内容，又不至于让每轮对话都贵得离谱。 */
+const PAGE_TEXT_LIMIT = 8000;
 
 /**
- * 页面上有没有挂完整的小P蛙对话面板。
+ * 把当前页面的可见文本抓出来喂给小P蛙。
  *
- * 草稿页/条目页把它置 true，本组件就不再画第二只青蛙 —— 否则右下角会并排出现
- * 两个一模一样的图标，用户根本分不清该点哪个。
+ * 优先 `<main>`：站内页面的正文都在里面，抓 body 会把页眉、页脚、导航连同小P蛙
+ * 自己的对话记录一起塞进去 —— 对话记录进 prompt 会让它把自己说过的话当成页面内容。
  */
-export const XiaoPAgentMountedContext = createContext(false);
+function readPageText(): string {
+  if (typeof document === "undefined") return "";
+  const root = document.querySelector("main") ?? document.body;
+  if (!root) return "";
+  const raw = (root as HTMLElement).innerText ?? "";
+  // 连续空行压成一行：站内页面里大量空 div 会撑出几十行空白，白白占 token。
+  return raw
+    .replace(/\n{3,}/g, "\n\n")
+    .trim()
+    .slice(0, PAGE_TEXT_LIMIT);
+}
 
 export function TaskFeedLauncher() {
-  const agentMounted = useContext(XiaoPAgentMountedContext);
-  const { rows, active, unread, unreadTotal, anyRunning } = useTaskFeed();
-  const [open, setOpen] = useState(false);
+  const { user } = useAuth();
+  const pageHasOwn = usePageXiaoPMounted();
+  const hydrated = useHydrated();
+  const askPage = useServerFn(askPageAgentFn);
+  // 路径既用来告诉模型「用户在看哪一页」，也用来分隔每页各自的对话记忆。
+  const path = useRouterState({ select: (s) => s.location.pathname });
 
-  // 有完整对话面板的页面上让位，避免两只青蛙。
-  if (agentMounted) return null;
-  // 没有任何任务、也没有未读时整个浮标不出现 —— 通知中心空着还占着右下角就是噪音。
-  if (!rows.length) return null;
+  const ask = useCallback(
+    async (question: string, history: AgentHistory): Promise<AgentAskResult> => {
+      const res = (await askPage({
+        data: {
+          path,
+          pageTitle: typeof document !== "undefined" ? document.title.slice(0, 300) : undefined,
+          pageText: readPageText(),
+          question,
+          history,
+          userModel: userModelArg(),
+        },
+      })) as AgentAskResult;
+      return res;
+    },
+    [askPage, path],
+  );
+
+  // 这条通道落不了地（服务端也把 canEdit 钉死成 false），所以 apply 永远不会被调到。
+  // 留一个会抛错的实现而不是空函数：真被调到了要立刻看得见，而不是静默无事发生。
+  const apply = useCallback(async () => {
+    throw new Error("这一页的内容不能由小P蛙直接改写。可到植物条目页或草稿页找我。");
+  }, []);
+
+  // 页面自带完整面板时让位（草稿页 / 条目页）。首帧一并让掉 —— 服务端读不到登记状态，
+  // 直接画会在那两页上闪出第二只青蛙。
+  if (!hydrated || pageHasOwn) return null;
 
   return (
-    <>
-      {!open && (
-        <button
-          onClick={() => setOpen(true)}
-          title={
-            anyRunning
-              ? "小P蛙 · 有任务正在跑"
-              : unreadTotal
-                ? `小P蛙 · ${unreadTotal} 条未查看`
-                : "小P蛙 · 任务动态"
-          }
-          className="fixed bottom-24 right-3 md:bottom-8 md:right-6 z-40 w-16 md:w-20 flex flex-col items-center animate-in fade-in slide-in-from-right-2"
-        >
-          <span className="relative">
-            <XiaoPLogo className="w-10 h-10 md:w-16 md:h-16 drop-shadow-lg hover:scale-105 active:scale-95 transition-transform" />
-            <TaskUnreadRings unread={unread} />
-          </span>
-          {/* 进度条在图标**下面** —— 用户明确指定的位置。 */}
-          <TaskProgressBars active={active} />
-        </button>
-      )}
-
-      {open && (
-        <div
-          className="fixed inset-0 z-[70] flex items-end md:items-center justify-center bg-black/40 p-0 md:p-4"
-          onClick={() => setOpen(false)}
-        >
-          <div
-            className="bg-background border border-rule w-full md:max-w-sm md:rounded-2xl rounded-t-2xl shadow-2xl max-h-[75vh] flex flex-col animate-in slide-in-from-bottom-4 md:zoom-in-95"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="flex items-center gap-2 px-3 py-2.5 border-b border-rule">
-              <XiaoPLogo className="w-6 h-6" />
-              <div className="min-w-0">
-                <p className="text-xs font-semibold text-leaf-deep leading-tight">
-                  小P蛙 · 任务动态
-                </p>
-                <p className="text-[10px] text-ink-faint leading-tight">
-                  点任意一条进入它的页面（进过就算已查看）
-                </p>
-              </div>
-              <button
-                onClick={() => setOpen(false)}
-                className="ml-auto text-ink-faint hover:text-vermilion text-lg leading-none px-1 cursor-pointer"
-                aria-label="关闭"
-              >
-                ×
-              </button>
-            </div>
-            <div className="overflow-y-auto overscroll-contain">
-              <TaskFeedList rows={rows} onGo={() => setOpen(false)} />
-            </div>
-          </div>
-        </div>
-      )}
-    </>
+    <XiaoPAgentPanel
+      // 每页各自的对话记忆：从识别页切到名录再切回来，刚才聊的还在。
+      storageKey={`page:${path}`}
+      canApply={false}
+      isRegistered={!!user}
+      // 🔴 全站这只**绝不能**登记 —— 它就是靠登记表决定自己该不该出现的那个组件。
+      // 登记 = 自己把自己关掉、然后又出现，React 直接报 Maximum update depth exceeded。
+      registerAsPageAgent={false}
+      ask={ask}
+      apply={apply}
+    />
   );
 }
