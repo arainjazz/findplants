@@ -5742,3 +5742,37 @@ update 0 行 → insert 201 → 再 update 命中 1 行、值已生效、该草�
 ### ✅ 已部署 — Version `d10fa611-7bdb-41d7-8e9c-8dbdad63826b`，2026-07-29（提交 `ed0b3ea`）
 （前 3 次 wrangler deploy 报 `fetch failed`，是本地代理抖动，第 4 次直接成功；见 memory
 `session-econnreset-root-cause`。）
+
+## ✅ 2026-07-29（续七）— 我把上一轮的修复写错了：`db.from(x).eq(...)` 不存在
+
+上一轮换掉 upsert 时把过滤条件接在了 `.from()` 上：
+
+```ts
+db.from("task_feed").eq("user_id", …)   // ❌ QueryBuilder 上根本没有 eq
+```
+
+`.from()` 返回的 QueryBuilder 只有 `select/insert/update/upsert/delete`，
+过滤条件必须接在 `.update()` / `.select()` **之后**。这行抛 TypeError，
+被函数自己的 catch 吞掉 → **所有动态流写入一次性全废**，连原本能用的绿条也没了
+（用户：「三个任务同时在跑，小P蛙下面没有任何颜色的进度条」）。
+
+**为什么 tsc 没拦住**：`admin()` 为绕开 task_feed 缺生成类型，把客户端 `as any` 了。
+**为什么上一轮的验证没发现**：`probe_task_feed_upsert.mjs` 打的是**裸 REST**，
+验的是 SQL 语义（ON CONFLICT 撞部分索引），**根本没跑到我写的那串 supabase-js 调用**。
+⚠️ 教训：验 SQL 语义 ≠ 验客户端调用链。改数据库调用时两层都要过。
+
+### 修法 + 这次补上的两层验证
+- 过滤条件改接在 `.update()` 之后；`filtered()` 的入参给了一个自指的最小类型
+  （eq/is 返回自身、可 await、可再 .select()），这段从此自带文档。
+- **新增 `scratch/task-feed-write.test.mjs`（10 条）**：桩严格照 supabase-js 的构造器形状 ——
+  `from()` 刻意**不给** eq/is，用错就像线上一样抛。最后一条专门断言
+  「桩会拒绝 `db.from(x).eq(...)`」，防止哪天又写回去。
+  覆盖：银叶/金叶首写、同草稿同类只留一条、识别按 job_id 认身份、
+  两个并行识别 = 两行、**三类同跑 = 三行三色**、并发撞索引后回头更新不丢进度。
+- **新增 `scratch/verify_task_feed_real_client.mjs`**：用**真 supabase-js + 真库**
+  跑同一串调用。实测输出：识别 inserted → updated(25%)、银叶 inserted、金叶 inserted
+  → **3 行 / 3 类**；识别收尾 updated → `status=done, progress=100`。测试行已清理。
+
+### 验证证据
+- `tsc --noEmit` EXIT=0；`npm run build` EXIT=0；lint 干净。
+- 三套测试：纯函数 41 条、写入形状 10 条、真库往返 1 轮 —— 全过。

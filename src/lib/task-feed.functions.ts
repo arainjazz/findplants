@@ -93,15 +93,31 @@ export async function upsertTaskFeed(input: {
     if (input.markUnread) row.read_at = null;
 
     // 认这一行的身份：有草稿就按草稿认，没有（新建识别，草稿跑完才诞生）就按任务认。
-    const matchRow = () => {
-      const q = db.from("task_feed").eq("user_id", input.userId).eq("kind", input.kind);
+    //
+    // ⚠️ 过滤条件必须接在 `.update()` **之后** —— `.from()` 返回的 QueryBuilder 上
+    // 只有 select/insert/update/upsert/delete，**没有 `.eq()`**。写成
+    // `db.from(x).eq(...)` 会抛 TypeError，被下面的 catch 吞掉，表现为「所有写入静默全废」。
+    // 这个错 `tsc` 抓不到：`admin()` 为了绕开 task_feed 缺生成类型而 `as any` 了。
+    // 回归测试见 scratch/task-feed-write.test.mjs（照着 supabase-js 的真实构造器形状做的桩）。
+    // supabase-js 过滤构造器的最小形状：eq/is 返回自身可以一直串，本身可 await，
+    // 也能再 .select() 把写入的行取回来。写全了这段就自带文档，不必去翻库的类型。
+    type WriteResult = { data?: { id: string }[] | null; error?: { message: string } | null };
+    type Filterable = PromiseLike<WriteResult> & {
+      eq: (c: string, v: unknown) => Filterable;
+      is: (c: string, v: unknown) => Filterable;
+      select: (cols: string) => PromiseLike<WriteResult>;
+    };
+    const filtered = (q: Filterable) => {
+      const f = q.eq("user_id", input.userId).eq("kind", input.kind);
       return input.draftId
-        ? q.eq("draft_id", input.draftId)
-        : q.eq("job_id", input.jobId).is("draft_id", null);
+        ? f.eq("draft_id", input.draftId)
+        : f.eq("job_id", input.jobId).is("draft_id", null);
     };
 
     // ① 先更新。`.select("id")` 是关键 —— 没有它就分不清「更新成功」和「没有匹配行」。
-    const { data: updated, error: upErr } = await matchRow().update(row).select("id");
+    const { data: updated, error: upErr } = await filtered(db.from("task_feed").update(row)).select(
+      "id",
+    );
     if (upErr) {
       console.error("[TaskFeed] 更新失败:", upErr.message);
       return;
@@ -115,7 +131,7 @@ export async function upsertTaskFeed(input: {
     // ③ 插入被拒，几乎只剩一种可能：另一个并发写抢先插了同一条，撞上那个部分唯一索引。
     //    那就说明行已经在了 —— 回到 ① 再更新一次，别把这次的进度丢掉。
     console.warn("[TaskFeed] 插入被拒，改为重试更新:", insErr.message);
-    const { error: retryErr } = await matchRow().update(row);
+    const { error: retryErr } = await filtered(db.from("task_feed").update(row));
     if (retryErr) console.error("[TaskFeed] 重试更新仍失败:", retryErr.message);
   } catch (e) {
     // 动态流写不进去只是少一条通知，绝不能让整趟生成翻车。
