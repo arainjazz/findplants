@@ -5697,3 +5697,5 @@ draft_id 为空的行不在管辖内，`onConflict` 无从落脚。所以这一�
   颜色各异、名牌在下方不重叠（gap 4px）。
 - 浏览器实测 toast：真触发一次登录失败，`ol[data-sonner-toaster]` 的
   `data-y-position=top` / `data-x-position=center`，与浮标矩形 `overlapsFrog:false`，截图确认。
+
+### ✅ 已部署 — Version `4d83e7ce-df11-4372-a5cf-3520c380650e`，2026-07-29（提交 `faec29c`）
