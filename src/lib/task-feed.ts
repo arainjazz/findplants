@@ -44,10 +44,11 @@ export type TaskFeedRow = {
  */
 export const TASK_KIND_META: Record<
   TaskKind,
-  { label: string; color: string; ring: string; bar: string; text: string }
+  { label: string; short: string; color: string; ring: string; bar: string; text: string }
 > = {
   identify: {
     label: "识别",
+    short: "识别",
     color: "绿",
     ring: "bg-emerald-500",
     bar: "bg-emerald-500",
@@ -55,6 +56,7 @@ export const TASK_KIND_META: Record<
   },
   enrich_draft: {
     label: "银叶草稿",
+    short: "银叶",
     color: "蓝",
     ring: "bg-sky-500",
     bar: "bg-sky-500",
@@ -62,6 +64,7 @@ export const TASK_KIND_META: Record<
   },
   gold_page: {
     label: "金叶详页",
+    short: "金叶",
     color: "橙",
     ring: "bg-amber-500",
     bar: "bg-amber-500",

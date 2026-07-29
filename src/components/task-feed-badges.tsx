@@ -29,7 +29,9 @@ export function TaskProgressBars({ tasks }: { tasks: TaskFeedRow[] }) {
 
   return (
     <div
-      className="relative z-10 w-full flex flex-col gap-[3px] bg-paper/95 border border-leaf/30 rounded-lg px-1.5 py-1 shadow-sm"
+      // min-w：不给下限的话整块宽度由「小P蛙」名牌决定（约 92px），
+      // 去掉类型名和内边距后留给条子的只剩 60 来 px，进度差别根本看不出来。
+      className="relative z-10 w-full min-w-[7.5rem] flex flex-col gap-[3px] bg-paper/95 border border-leaf/30 rounded-lg px-1.5 py-1 shadow-sm"
       aria-label={`${tasks.length} 个任务进行中`}
     >
       {shown.map((row) => {
@@ -37,14 +39,22 @@ export function TaskProgressBars({ tasks }: { tasks: TaskFeedRow[] }) {
         return (
           <div
             key={row.id}
-            className="h-2 w-full rounded-full bg-ink/10 overflow-hidden"
+            className="flex items-center gap-1"
             title={`${meta.label}${row.title ? ` · ${row.title}` : ""}：${row.phase || "进行中"}（${row.progress}%）`}
           >
-            <div
-              className={`h-full rounded-full ${meta.bar} transition-[width] duration-700 ease-out`}
-              // 至少留 6% —— 进度 0 时一条完全看不见的进度条等于没有反馈。
-              style={{ width: `${Math.max(6, row.progress)}%` }}
-            />
+            {/* 条上带类型名：三根条同时在跑时，光靠颜色分辨要求用户先背下
+                「绿=识别 / 蓝=银叶 / 橙=金叶」。写出来就不用猜，也让颜色对不对
+                一眼可验（用户 2026-07-29 就在质疑某根条的颜色对不对）。 */}
+            <span className={`text-[9px] leading-none shrink-0 font-semibold ${meta.text}`}>
+              {meta.short}
+            </span>
+            <span className="h-2 flex-1 rounded-full bg-ink/10 overflow-hidden">
+              <span
+                className={`block h-full rounded-full ${meta.bar} transition-[width] duration-700 ease-out`}
+                // 至少留 6% —— 进度 0 时一条完全看不见的进度条等于没有反馈。
+                style={{ width: `${Math.max(6, row.progress)}%` }}
+              />
+            </span>
           </div>
         );
       })}

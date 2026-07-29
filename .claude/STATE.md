@@ -5669,3 +5669,31 @@ draft_id 为空的行不在管辖内，`onConflict` 无从落脚。所以这一�
   三根都在、名牌在下方且不重叠（gapToCaption=4px）、整块没被挤出可视区。
 
 ### ✅ 已部署 — Version `efe95b7f-19ce-4427-863d-a19835d7df1c`，2026-07-29（提交 `8f0039c`）
+
+## ✅ 2026-07-29（续五）— 遮挡真凶是 toast，不是名牌；进度条写上任务类型
+
+### 🔴 「白条遮挡进度条」的真凶：sonner toast 默认就在右下角
+上一轮我以为遮挡物是小P蛙自己的白名牌，**猜错了**。用户第二张截图里那个宽白条是
+`toast.loading("正在撰写完整草稿正文…")` —— sonner 的默认 position 就是 **bottom-right**，
+而右下角现在常驻着小P蛙（浮标 + 进度条 + 名牌，全站每页都有）。
+修法：`ui/sonner.tsx` 显式 `position="top-center"`。
+同一块地还有 `offline-status.tsx`（`fixed bottom-6 right-6 z-50`），一并挪到左下。
+⚠️ **教训：报「A 遮住 B」时先查页面上所有 `fixed bottom-*` 与第三方浮层的默认位置，
+不要凭截图相对位置猜是哪个元素。**
+
+### 进度条写上任务类型（识别 / 银叶 / 金叶）
+用户重申三色语义并质疑某根条的颜色。查证结论：
+- `TASK_KIND_META` 的映射是对的（绿/蓝/橙），单测覆盖；
+- 三个 class 在构建产物 CSS 里**都在**（`bg-emerald-500` / `bg-sky-500` / `bg-amber-500` 各 1 处），
+  不存在「Tailwind 没扫到 lib/ 里的字符串」这种可能。
+所以颜色链路本身没坏。但光靠颜色要求用户先背下对照表，也没法自证 ——
+每根条前面加上 2 字类型名（`meta.short`），谁是谁一眼可验。
+另加 `min-w-[7.5rem]`：不给下限时整块宽度由名牌决定（约 92px），条子只剩 60 来 px，
+进度差别根本看不出来。
+
+### 验证证据
+- `tsc --noEmit` EXIT=0；`npm run build` EXIT=0；改动文件 lint 干净；单测 **41 条**全过。
+- 浏览器实测：注入四根条（识别绿 / 识别绿 / 银叶蓝 / 金叶橙）—— 四根都在、
+  颜色各异、名牌在下方不重叠（gap 4px）。
+- 浏览器实测 toast：真触发一次登录失败，`ol[data-sonner-toaster]` 的
+  `data-y-position=top` / `data-x-position=center`，与浮标矩形 `overlapsFrog:false`，截图确认。

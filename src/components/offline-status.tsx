@@ -44,7 +44,8 @@ export function OfflineStatus() {
   if (!showBanner) return null;
 
   return (
-    <div className="fixed bottom-6 right-6 z-50 animate-fade-in-up">
+    // 靠左：右下角常驻着小P蛙（浮标 + 进度条 + 名牌），压在它上面会盖掉任务进度。
+    <div className="fixed bottom-6 left-6 z-50 animate-fade-in-up">
       <div
         className={`flex items-center gap-3 px-4 py-3 rounded border shadow-2xl backdrop-blur-md max-w-sm ${
           bannerType === "offline"
