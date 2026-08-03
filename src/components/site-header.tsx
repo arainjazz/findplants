@@ -221,6 +221,8 @@ export function SiteHeader() {
             </Link>
           )}
           {user && <Link to="/admin" className="hover:text-vermilion transition-colors">添加/编辑内容</Link>}
+          {/* 关于 —— 对所有人可见（含未登录）。这是给新访客看的介绍页，藏在登录后面等于白做。 */}
+          <Link to="/about" className="hover:text-vermilion transition-colors" activeProps={{ className: "font-semibold" }}>关于 about</Link>
           {user && isAdmin && <AdminExportButton />}
         </nav>
 
@@ -289,6 +291,7 @@ export function SiteHeader() {
             </Link>
           )}
           {user && <Link to="/admin" onClick={() => setMenuOpen(false)} className="hover:text-vermilion">添加/编辑内容</Link>}
+          <Link to="/about" onClick={() => setMenuOpen(false)} className="hover:text-vermilion">关于 about</Link>
           <div className="border-t border-ink/20 mt-1 pt-3 flex flex-col gap-2">
             {user ? (
               <button

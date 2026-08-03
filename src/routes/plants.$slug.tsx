@@ -2,18 +2,27 @@ import { createFileRoute, Link, notFound, useNavigate } from "@tanstack/react-ro
 import { compressImage, extForMime } from "@/lib/image-compress";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 import { SiteHeader, SiteFooter } from "@/components/site-header";
 import { XiaoPAgentPanel } from "@/components/draft-agent-panel";
 import { askPlantAgentFn, applyPlantAgentEditFn } from "@/lib/identify-plant.functions";
 import { userModelArg } from "@/lib/xiaop-user-model";
-import { fetchPlantBySlug, fetchAuthor } from "@/lib/plants";
+import { fetchPlantBySlug, fetchAuthor, plantEntryKind } from "@/lib/plants";
+import { fetchPlantSourceKinds } from "@/lib/drafts";
+import { PlantKindBadge } from "@/components/plant-kind-badge";
 import { useAuth } from "@/hooks/use-auth";
-import { fetchEditById, isCurrentUserAdmin, revertEdit, fetchEditsForPlant, fetchOriginProvenance, type PlantEdit } from "@/lib/edits";
+import { fetchEditById, isCurrentUserAdmin, revertEdit, fetchEditsForPlant, fetchOriginProvenance, fetchPlantProvenance, type PlantEdit } from "@/lib/edits";
+import { detectFieldConflicts } from "@/lib/field-conflicts";
+import { FieldConflictsPanel } from "@/components/field-conflicts-panel";
 import { EditLogSection } from "@/components/edit-log-section";
 import { PlantComments } from "@/components/plant-comments";
 import { embedVideosInHtml } from "@/lib/embed";
+import { rewriteDraftOnlyHints } from "@/lib/draft-enhance";
+import {
+  SpeciesExistingLinks,
+  useSpeciesExistingForPlant,
+} from "@/components/species-existing-links";
 import { ImageSearchDialog } from "@/components/html-doc-editor";
 import { ReplaceImageFlow } from "@/components/replace-image-flow";
 import { ShareButton } from "@/components/share-button";
@@ -88,6 +97,10 @@ function PlantDetail() {
   // ResizeObserver 观察 iframe 内容高度变化以自适应外层 iframe 高度。
   const roRef = useRef<ResizeObserver | null>(null);
   useEffect(() => () => roRef.current?.disconnect(), []);
+  /** 已经接好点击/量高监听的那份 iframe document —— 防止一次 load 接一遍、重复挂监听。 */
+  const wiredDocRef = useRef<Document | null>(null);
+  /** 上一次真正写回 iframe 的高度。差 ≤1px 就不再写，掐掉回授循环。换文档时归零。 */
+  const lastSizedRef = useRef(0);
   const askPlantAgent = useServerFn(askPlantAgentFn);
   const applyPlantAgent = useServerFn(applyPlantAgentEditFn);
 
@@ -113,6 +126,20 @@ function PlantDetail() {
     plantId: plant?.id,
   });
 
+  // 本条目属于三类里的哪一类（🟢快速识别 / 🔵银叶科普 / 🟠skill 详页）。判据是来源草稿，
+  // 见 lib/plants.ts `plantEntryKind`；查的是全表小索引（当前 25 行），与档案列表共用缓存。
+  const { data: sourceKinds } = useQuery({
+    queryKey: ["plant-source-kinds"],
+    queryFn: fetchPlantSourceKinds,
+  });
+  const entryKind = plant ? plantEntryKind(plant, sourceKinds) : null;
+
+  // 同物种在站内的其它成品（银叶「进一步科普页」/ 金叶详页），本页自己排除在外。
+  const { data: speciesExisting } = useSpeciesExistingForPlant(
+    plant?.scientific_name,
+    plant?.slug ?? "",
+  );
+
   // 溯源表头：「AI 识别条目」显示「最早识别人/地点/时间」，从最早那条来源草稿回溯。
   // 注意：采纳流程当前不写 source（留 null）、content_type 为 html，故无法靠字段区分
   // AI识别 vs skill 上传——唯一可靠信号是「是否存在来源草稿」。对所有条目都查（有索引，
@@ -123,6 +150,19 @@ function PlantDetail() {
     enabled: !!plant?.id,
   });
 
+  // 来源草稿一次查回来：页尾的分角色贡献表 + 矛盾红框都用它，见 lib/edits.ts。
+  const { data: provenance } = useQuery({
+    queryKey: ["plant-provenance", plant?.id],
+    queryFn: () => fetchPlantProvenance(plant!.id),
+    enabled: !!plant?.id,
+  });
+  const contributors = provenance?.contributors ?? [];
+  // 合并后互相打架的结构化字段。纯前端比对，不花 token，见 lib/field-conflicts.ts。
+  const fieldConflicts = useMemo(
+    () => (plant && provenance ? detectFieldConflicts(plant, provenance.sources) : []),
+    [plant, provenance],
+  );
+
   // Fetch HTML content for srcdoc rendering (so relative refs / fonts work without host CORS issues)
   const [htmlDoc, setHtmlDoc] = useState<string | null>(null);
   useEffect(() => {
@@ -132,6 +172,13 @@ function PlantDetail() {
         .then((text) => {
           // Inject responsive-image CSS so original fixed-width <img> tags scale to viewport.
           const css = `<style>img,video,iframe{max-width:100%!important;height:auto!important;}body{overflow-x:hidden;}` +
+            // 🔴 iframe 自适应高度的**前提条件**（与草稿预览同一条，见 draft-enhance.ts 的
+            // VIEWER_STYLE）：模板给 body 写了 min-height:100vh —— 独立成页时是对的，但在
+            // iframe 里 100vh = 父层刚按上一次量到的值设好的 iframe 高度，于是 body 至少这么高，
+            // 再加 margin 量回去就又高一点，ResizeObserver 持续触发、永不收敛。
+            // 假连翘条目页实测：正文只有 7338px，iframe 却涨到 78378px 且还在长，下面裂出
+            // 七万像素的空白（2026-08-01 用户反馈）。草稿预览 07-21 就修了，条目页一直漏着。
+            `html,body{height:auto!important;min-height:0!important;}` +
             // 合并进来的「补充观测」卡片限宽居中，其配图限高，避免在模板内容列之外被撑满整页。
             `.merged-observation{max-width:680px!important;margin-left:auto!important;margin-right:auto!important;}` +
             `.merged-observation figure{max-width:420px!important;margin-left:0!important;}` +
@@ -147,8 +194,11 @@ function PlantDetail() {
           // Forward right-click on edit markers to the parent page.
           const script = `<script>document.addEventListener('contextmenu',function(e){var t=e.target;var m=t&&t.closest&&t.closest('.lov-edit-mark');if(!m)return;e.preventDefault();var id=m.getAttribute('data-edit-id');if(!id)return;var r=m.getBoundingClientRect();parent.postMessage({type:'lov-edit-mark-ctx',editId:id,x:r.left+r.width,y:r.top+r.height},'*');});</script>`;
           const inject = css + script;
-          // Embed video URLs inside the editor-comments section.
-          let processed = text;
+          // 摘要卡页尾那句「点击『让 AI 生成进一步介绍草稿』」在条目页上是**点不动的**
+          // （按钮长在草稿页）。发布路径已经改写掉，这里再改一次是为了存量条目 ——
+          // 2026-07-31 线上 12 个 ai_identify 条目里有 3 个带着它，不必为此跑迁移。
+          // 真正的去路由下面那块「站内已有该物种的内容」提供。
+          let processed = rewriteDraftOnlyHints(text);
           try {
             const parsed = new DOMParser().parseFromString(text, "text/html");
             const ec = parsed.body?.querySelector("section.editor-comments [data-comments-body]");
@@ -259,8 +309,21 @@ function PlantDetail() {
     // 容器宽度塌缩（≈0 宽）时，内容会回流成极高的窄条，量到的 scrollHeight 是垃圾值。
     // 跳过；等宽度恢复后 ResizeObserver 会再次触发、量到正确高度。
     if (iframe.clientWidth < 240) return;
-    const h = Math.max(doc.documentElement?.scrollHeight ?? 0, doc.body?.scrollHeight ?? 0);
-    if (h > 0) {
+    const body = doc.body;
+    if (!body) return;
+    // 🔴 **绝不能用 documentElement.scrollHeight**（草稿预览 07-21 踩过同一个坑，
+    // 见 draft-enhance.ts 里那段注释）：它不小于视口高，而 iframe 里的视口高就是父层刚按
+    // 上一次量到的值设好的 iframe 高度 —— 于是高度只增不减，内容变矮时永远缩不回去；配上
+    // 模板的 min-height:100vh 更是每轮 +16px（body margin）无限长高。
+    // 正确做法：只量 body 自身的内容盒 + 外边距，这个值与视口无关，因此收敛。
+    const rect = body.getBoundingClientRect();
+    const cs = doc.defaultView?.getComputedStyle(body);
+    const mt = parseFloat(cs?.marginTop || "0") || 0;
+    const mb = parseFloat(cs?.marginBottom || "0") || 0;
+    const h = Math.ceil(rect.height + mt + mb);
+    // 没有实质变化就不写回去，掐掉任何残余的回授循环。
+    if (h > 0 && Math.abs(h - lastSizedRef.current) > 1) {
+      lastSizedRef.current = h;
       iframe.style.height = `${h}px`;
       // ⚠️ 量到真高度就**必须拆掉 minHeight**。它原本写死 60vh 当加载占位，可 CSS 里
       // min-height 永远压过 height —— 内容比 60vh 矮时（精简摘要卡草稿被采纳后的条目就是
@@ -275,8 +338,17 @@ function PlantDetail() {
   const wireIframe = (iframe: HTMLIFrameElement) => {
     const doc = iframe.contentDocument;
     if (!doc) return;
+    // 同一个 iframe 的 load 会触发不止一次（srcDoc 换了、about:blank 先来一发）。
+    // 每次都挂一遍监听，点一下卡片就会滚动好几次、ResizeObserver 也会重复量高。
+    // 记住已经接好的那份 document；**文档换了就重接**（换文档 = 老监听已经随文档没了）。
+    const already = wiredDocRef.current === doc;
+    // 换了文档 = 换了一篇正文，上一篇的高度不能拿来当「没变化」的基准，否则新页量到相近
+    // 高度就被 ≤1px 阈值挡掉，iframe 一直卡在旧高度上。
+    if (!already) lastSizedRef.current = 0;
+    wiredDocRef.current = doc;
     // 自适应高度 + 图片/字体加载后重新量高。
     sizeIframe(iframe);
+    if (already) return;
     [120, 400, 1000, 2500].forEach((t) => setTimeout(() => sizeIframe(iframe), t));
     try {
       doc.querySelectorAll("img").forEach((im) => im.addEventListener("load", () => sizeIframe(iframe)));
@@ -287,6 +359,9 @@ function PlantDetail() {
       ro.observe(doc.documentElement);
       roRef.current = ro;
     } catch { /* ResizeObserver 不支持时退回定时量高 */ }
+    // 🔴 **capture 阶段**。页内锚点一旦走到浏览器的默认行为，沙箱 srcdoc 就会被导航成
+    // about:srcdoc#... 、渲染出一屏源码乱码，而且**不可挽回**。挂在捕获阶段可以确保
+    // 无论上传的 HTML 里有没有别的监听、会不会 stopPropagation，我们都先拦到。
     doc.addEventListener("click", (ev) => {
       const target = ev.target as Element | null;
       const mark = (target?.closest?.(".lov-edit-mark") as HTMLElement | null) ?? null;
@@ -312,7 +387,7 @@ function PlantDetail() {
         const top = iframe.getBoundingClientRect().top + window.scrollY + el.getBoundingClientRect().top;
         window.scrollTo({ top: Math.max(0, top - 90), behavior: "smooth" });
       }
-    });
+    }, true);
   };
 
   // 小P蛙: ask about this published page.
@@ -490,37 +565,101 @@ function PlantDetail() {
   // 采纳编辑/时间：用现有 create 行（editor_name 已解析），无需额外查询。
   const createRow = plantEdits.find((e) => e.kind === "create");
 
+  // 合并进来的每一份来源草稿都会写一条 merge 行（见 identify-plant.functions 的采纳合并），
+  // 它就是页内那张「补充观测」卡片上「注 N」指向的东西 —— 贡献表里把它单独列出来，
+  // 读者才知道这一页是几个人凑出来的、哪一段是谁补的。
+  const mergeRows = plantEdits.filter((e) => e.kind === "merge");
+
+  /**
+   * 分角色贡献表（用户 2026-08-01 的要求：「合并后还能清晰追溯不同的识别人和生成人」）。
+   *
+   * 从前这里只有「最早识别：某某」一行 —— 一株被补拍三次、由三个人识别、再由第四个人
+   * 花银叶生成正文时，后面三个人全被「最早」两个字盖掉了。现在按角色分行，每行列全人名。
+   */
+  const roleRow = (label: string, names: React.ReactNode) => (
+    <p>
+      {label}：{names}
+    </p>
+  );
+  const identifiers = contributors.filter((c) => c.role === "identify");
+  const enrichers = contributors.filter((c) => c.role === "enrich");
+
   const attributionFooter = (
     <div className="mt-10 pt-6 border-t border-rule text-xs text-ink-faint space-y-1">
-      <p>
-        创建者：<span className="text-ink">{author?.display_name ?? "佚名"}</span>
-        {plant.co_author_names && plant.co_author_names.length > 0 && (
-          <>
-            {" · "}共建者：
-            <span className="text-ink">{plant.co_author_names.join("，")}</span>
-          </>
+      <p className="font-semibold text-ink-soft">本页贡献</p>
+      {identifiers.length > 0 &&
+        roleRow(
+          `识别人（${identifiers.length} 次识别）`,
+          identifiers.map((c, i) => (
+            <span key={c.draftId + i}>
+              {i > 0 && "、"}
+              <span className="text-ink">{c.name}</span>
+              {c.place && <> · {c.place}</>}
+              {" · "}
+              {fmtDate(c.at)}
+            </span>
+          )),
         )}
-      </p>
-      {originProv ? (
-        // AI 识别条目：最早识别人/地点/时间 ｜ 采纳编辑/时间
-        <p>
-          最早识别：<span className="text-ink">{originProv.identifierName}</span>
-          {originProv.place && <> · {originProv.place}</>}
-          {" · "}{fmtDate(originProv.identifiedAt)}
-          {createRow && (
-            <>
-              {" ｜ "}采纳：<span className="text-ink">{createRow.editor_name ?? "编辑"}</span>
-              {" · "}{fmtDate(createRow.created_at)}
-            </>
-          )}
-        </p>
-      ) : (
-        // AI skill 条目（上传 HTML / 金叶一键）：上传编辑 + 时间
-        <p>
-          上传：<span className="text-ink">{createRow?.editor_name ?? author?.display_name ?? "编辑"}</span>
-          {" · "}{fmtDate(createRow?.created_at ?? plant.created_at)}
-        </p>
+      {enrichers.length > 0 &&
+        roleRow(
+          "银叶生成人",
+          enrichers.map((c, i) => (
+            <span key={c.draftId + i}>
+              {i > 0 && "、"}
+              <span className="text-ink">{c.name}</span>
+              {" · "}
+              {fmtDate(c.at)}
+              {/* 2026-08-01 之前生成的草稿没记生成人，只能退回识别人 —— 必须注明，
+                  不能把推断出来的名字当成查到的。 */}
+              {c.inferred && <span className="opacity-70">（存量数据未记录，按识别人推断）</span>}
+            </span>
+          )),
+        )}
+      {identifiers.length === 0 &&
+        roleRow(
+          "skill 创建者",
+          <span className="text-ink">
+            {createRow?.editor_name ?? author?.display_name ?? "编辑"}
+          </span>,
+        )}
+      {roleRow(
+        identifiers.length > 0 ? "采纳收录" : "上传",
+        <>
+          <span className="text-ink">
+            {createRow?.editor_name ?? author?.display_name ?? "编辑"}
+          </span>
+          {" · "}
+          {fmtDate(createRow?.created_at ?? plant.created_at)}
+        </>,
       )}
+      {mergeRows.length > 0 &&
+        roleRow(
+          `合并补充（${mergeRows.length} 次）`,
+          mergeRows.map((e, i) => (
+            <span key={e.id}>
+              {i > 0 && "、"}
+              <button
+                type="button"
+                onClick={() => {
+                  setFocusedNoteId(null);
+                  requestAnimationFrame(() => setFocusedNoteId(e.id));
+                }}
+                className="text-ink underline decoration-dotted hover:text-vermilion cursor-pointer"
+              >
+                注 {e.marker_n ?? i + 1}
+              </button>
+              {" · "}
+              {e.editor_name ?? "编辑"}
+              {" · "}
+              {fmtDate(e.created_at)}
+            </span>
+          )),
+        )}
+      {plant.co_author_names && plant.co_author_names.length > 0 &&
+        roleRow(
+          "共建者",
+          <span className="text-ink">{plant.co_author_names.join("，")}</span>,
+        )}
     </div>
   );
 
@@ -586,7 +725,10 @@ function PlantDetail() {
         <div className="border-b border-ink/30 bg-paper-deep/40">
           <div className="mx-auto max-w-6xl px-6 py-3 flex items-center justify-between text-sm">
             <Link to="/" className="label hover:text-vermilion">← 返回首页</Link>
-            <p className="label">{plant.scientific_name || plant.title}</p>
+            <p className="label flex items-center gap-2">
+              {plant.scientific_name || plant.title}
+              {entryKind && <PlantKindBadge kind={entryKind} />}
+            </p>
             <div className="flex items-center gap-2">
               {shareCardNode}
               <ShareButton title={plant.title} summary={plant.summary} />
@@ -610,6 +752,19 @@ function PlantDetail() {
             </div>
           </div>
         )}
+        {/* 矛盾红框。与正名核对同理放在正文 **之前**：正文是上传的整页 HTML，插不进去，
+            而「这一页的科属此刻有两种说法」必须在读正文之前就看到。 */}
+        <FieldConflictsPanel
+          plantId={plant.id}
+          conflicts={fieldConflicts}
+          canEdit={canEdit}
+          onResolved={() => {
+            void qc.invalidateQueries({ queryKey: ["plant", slug] });
+            void qc.invalidateQueries({ queryKey: ["plant-provenance", plant.id] });
+            void qc.invalidateQueries({ queryKey: ["plant-edits", plant.id] });
+          }}
+          className="mx-auto max-w-6xl px-6 w-full mt-3"
+        />
         <main className="flex-1">
           {htmlDoc ? (
             <iframe
@@ -633,6 +788,19 @@ function PlantDetail() {
             <p className="p-10 text-center text-ink-faint">未提供 HTML 文件。</p>
           )}
         </main>
+        {/* 同物种在站内的其它成品。**紧跟正文之后**，与草稿页共用同一个组件。
+            为什么条目页也要有（2026-07-31 用户反馈）：采纳「快速识别简介」落成的条目，
+            正文就是那张摘要卡，页尾还印着「点击『让 AI 生成进一步介绍草稿』」——
+            可那个按钮长在草稿页上，这一页根本没有。读者读完摘要就断了路。
+            现在断路补上了：绿=快速简介卡、蓝=银叶科普、橙=金叶/skill 详页；
+            本页自己、以及**被本页收录的那份来源草稿**都已排除（否则会指回自己）。 */}
+        <SpeciesExistingLinks
+          existing={speciesExisting}
+          fallbackTitle={plant.title}
+          className="mx-auto max-w-3xl px-6 w-full mt-6"
+          // 🟢 快速识别条目：正文只有一张摘要卡，同物种若已有银叶科普就**默认展开在下面**。
+          defaultOpen={entryKind === "quick"}
+        />
         <div className="mx-auto max-w-3xl px-6 w-full">
           {/* 封面图不在此重复展示——编辑封面请用条目右上角「编辑 →」。 */}
           {attributionFooter}
@@ -738,7 +906,10 @@ function PlantDetail() {
         </div>
         <article className="mt-6">
           <header className="border-b border-ink pb-6 mb-8">
-            <p className="label text-vermilion mb-2">Specimen Entry</p>
+            <p className="label text-vermilion mb-2 flex items-center gap-2">
+              Specimen Entry
+              {entryKind && <PlantKindBadge kind={entryKind} />}
+            </p>
             <h1 className="font-display text-5xl md:text-6xl font-bold leading-tight">{plant.title}</h1>
             {plant.scientific_name && <p className="italic text-ink-faint mt-3 text-xl font-serif">{plant.scientific_name}</p>}
             {chipsNode && <div className="mt-4">{chipsNode}</div>}
@@ -753,6 +924,17 @@ function PlantDetail() {
                 <Link to="/admin/edit/$id" params={{ id: plant.id }} className="text-sm border border-ink/40 px-3 py-1 hover:bg-ink hover:text-background transition-colors">编辑此条</Link>
               </div>
             )}
+            <FieldConflictsPanel
+              plantId={plant.id}
+              conflicts={fieldConflicts}
+              canEdit={canEdit}
+              onResolved={() => {
+                void qc.invalidateQueries({ queryKey: ["plant", slug] });
+                void qc.invalidateQueries({ queryKey: ["plant-provenance", plant.id] });
+                void qc.invalidateQueries({ queryKey: ["plant-edits", plant.id] });
+              }}
+              className="mt-5"
+            />
           </header>
 
           {plant.cover_url && (

@@ -8,6 +8,7 @@ import {
   type NameInput,
   type NameVerdict,
 } from "./name-authority";
+import { stripTentativeMarks } from "./tentative";
 
 // ─── 正名核对的服务端入口 ────────────────────────────────────────────────────
 //
@@ -144,8 +145,12 @@ export type NameAuthorityStamp = {
 export async function applyNameAuthority(
   fields: NamedFields,
 ): Promise<{ verdict: NameVerdict; stamp: NameAuthorityStamp; changed: boolean }> {
+  // 「疑似」是**置信度的标记，不是名字的一部分**，绝不能带着它去查名录：中文名反查必然
+  // 落空；更糟的是一旦靠拉丁名命中，「疑似长毛棘豆」会被当成一个别名收进俗名列
+  // （2026-08-02 线上那份 Oxytropis lanata 草稿的 aliases 里就躺着这么一条）。
+  // 只剥核对用的输入 —— `was.title` 仍记原样，回溯时看得见当时到底写的什么。
   const verdict = await checkName({
-    title: fields.title,
+    title: stripTentativeMarks((fields.title ?? "").toString()) || null,
     scientificName: fields.scientific_name,
     family: fields.family,
     genus: fields.genus,
@@ -164,9 +169,21 @@ export async function applyNameAuthority(
       fields.title = verdict.acceptedZh;
       changed = true;
     }
+    // 名录的 scientific_name 是**不含命名人**的（命名人在 author 列）。原样覆盖会把
+    // 「Oxytropis lanata (Pall.) DC.」削成「Oxytropis lanata」——AI_META_SCHEMA 明写着
+    // 学名含命名人，站内条目页也是这么展示的，白丢一段信息。
+    // 判据：**原学名以名录正名开头**（且归一化后同名）→ 多出来的那截就是命名人，保留原样；
+    // 否则（异名换正名、性数错配、变音符/斜体污染）一律采用名录的写法。
     if (verdict.acceptedLa && fields.scientific_name !== verdict.acceptedLa) {
-      fields.scientific_name = verdict.acceptedLa;
-      changed = true;
+      const orig = (fields.scientific_name ?? "").trim();
+      const keepAuthor =
+        !!orig &&
+        canonicalKey(orig) === canonicalKey(verdict.acceptedLa) &&
+        orig.toLowerCase().startsWith(verdict.acceptedLa.toLowerCase());
+      if (!keepAuthor) {
+        fields.scientific_name = verdict.acceptedLa;
+        changed = true;
+      }
     }
     const fam = verdict.familyZh && verdict.familyLa ? `${verdict.familyZh} ${verdict.familyLa}` : null;
     if (fam && fields.family !== fam) {

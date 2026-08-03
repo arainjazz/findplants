@@ -9,6 +9,33 @@ import { XiaoPUserSettings } from "@/components/xiaop-user-settings";
 import { getUserModel, type XiaoPUserModel } from "@/lib/xiaop-user-model";
 import { toast } from "sonner";
 
+// ── 桌面端面板宽度 ───────────────────────────────────────────────────────────
+const XIAOP_WIDTH_KEY = "xiaop-panel-width";
+const XIAOP_DEFAULT_WIDTH = 370;
+const XIAOP_MIN_WIDTH = 320;
+
+/** 上限跟着视口走：再宽也要给正文留出一半，否则拖到底就把页面整个盖住了。 */
+function clampPanelWidth(px: number): number {
+  const max =
+    typeof window === "undefined" ? 720 : Math.max(XIAOP_MIN_WIDTH, window.innerWidth * 0.6);
+  return Math.round(Math.min(Math.max(px, XIAOP_MIN_WIDTH), max));
+}
+
+function loadPanelWidth(): number {
+  if (typeof window === "undefined") return XIAOP_DEFAULT_WIDTH;
+  const raw = Number(window.localStorage.getItem(XIAOP_WIDTH_KEY));
+  return Number.isFinite(raw) && raw > 0 ? clampPanelWidth(raw) : XIAOP_DEFAULT_WIDTH;
+}
+
+function savePanelWidth(px: number) {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(XIAOP_WIDTH_KEY, String(px));
+  } catch {
+    /* 隐私模式下 localStorage 会抛 —— 记不住宽度不该让面板崩掉 */
+  }
+}
+
 type ChatMsg = {
   id: string;
   role: "user" | "agent";
@@ -124,6 +151,52 @@ export function XiaoPAgentPanel({
   const [showSettings, setShowSettings] = useState(false);
   const [userModel, setUserModelState] = useState<XiaoPUserModel | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+
+  // ── 桌面端面板宽度：可拖 ────────────────────────────────────────────────────
+  // 固定 370px 对模型设置这种表单太窄（用户 2026-07-31）。记在 localStorage 里，
+  // 下次打开还是这个宽度。移动端是底部抽屉，宽度由 inset-x-0 定，这个值用不上。
+  const [panelWidth, setPanelWidth] = useState(XIAOP_DEFAULT_WIDTH);
+  useEffect(() => {
+    setPanelWidth(loadPanelWidth());
+  }, []);
+  const draggingRef = useRef(false);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    // 面板贴在右边缘，所以宽度 = 视口宽 - 鼠标 x。
+    const onMove = (e: PointerEvent) => {
+      if (!draggingRef.current) return;
+      e.preventDefault();
+      setPanelWidth(clampPanelWidth(window.innerWidth - e.clientX));
+    };
+    const onUp = () => {
+      if (!draggingRef.current) return;
+      draggingRef.current = false;
+      document.body.style.removeProperty("cursor");
+      document.body.style.removeProperty("user-select");
+      // 拖完才落盘 —— 拖动途中每一帧都写 localStorage 是没必要的同步 IO。
+      setPanelWidth((w) => {
+        savePanelWidth(w);
+        return w;
+      });
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onUp);
+    return () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onUp);
+    };
+  }, []);
+
+  const startResize = (e: React.PointerEvent) => {
+    e.preventDefault();
+    draggingRef.current = true;
+    // 拖动期间锁光标 + 禁选中，否则一划过正文就把整页文字全选蓝了。
+    document.body.style.setProperty("cursor", "col-resize");
+    document.body.style.setProperty("user-select", "none");
+  };
   // Bumped on every send/stop; an in-flight reply whose seq no longer matches
   // is discarded — that's all the 停止 button needs to do.
   const seqRef = useRef(0);
@@ -448,13 +521,32 @@ export function XiaoPAgentPanel({
           Mobile: a bottom sheet (ChatGPT-style) so it never overlaps the body. */}
       {open && (
         <div
+          // 宽度走 CSS 变量 + styles.css 里的 `[data-xiaop-panel]` 媒体查询，
+          // 这样只有 md+ 才吃它 —— 移动端仍是 inset-x-0 的整宽抽屉。
+          data-xiaop-panel=""
+          style={{ "--xiaop-w": `${panelWidth}px` } as React.CSSProperties}
           className="fixed z-50 flex flex-col bg-paper shadow-2xl overflow-hidden
             inset-x-0 bottom-0 top-auto h-[85dvh] max-h-[85dvh] rounded-t-2xl border-t border-rule
             [animation:xiaopSheetIn_0.28s_ease-out]
             md:[animation:xiaopDockIn_0.3s_ease-out]
-            md:inset-x-auto md:top-16 md:right-0 md:bottom-0 md:h-auto md:max-h-none md:w-[370px] md:max-w-[90vw]
+            md:inset-x-auto md:top-16 md:right-0 md:bottom-0 md:h-auto md:max-h-none
+            md:max-w-[90vw]
             md:rounded-none md:border-t-0 md:border-l"
         >
+          {/* 左边缘的拖宽把手（仅桌面）。做成 6px 宽的热区、hover 才显色，
+              免得平时看起来像一条多余的竖线。 */}
+          <div
+            onPointerDown={startResize}
+            onDoubleClick={() => {
+              setPanelWidth(XIAOP_DEFAULT_WIDTH);
+              savePanelWidth(XIAOP_DEFAULT_WIDTH);
+            }}
+            title="拖动调整宽度（双击恢复默认）"
+            role="separator"
+            aria-orientation="vertical"
+            className="hidden md:block absolute left-0 top-0 bottom-0 w-1.5 z-10 cursor-col-resize
+              bg-transparent hover:bg-leaf/40 active:bg-leaf/60 transition-colors touch-none"
+          />
           {/* Mobile drag handle */}
           <div className="md:hidden pt-2 pb-1 flex justify-center shrink-0">
             <span className="w-10 h-1 rounded-full bg-ink/15" />
@@ -532,9 +624,18 @@ export function XiaoPAgentPanel({
             </div>
           )}
 
-          {/* Per-user model settings view (swaps out the chat body) */}
+          {/* Per-user model settings view (swaps out the chat body).
+              🔴 **必须自带滚动容器**（2026-07-31）：对话分支和任务动态分支各自都套了
+              `flex-1 overflow-y-auto`，唯独这一支是把 <XiaoPUserSettings/> 直接当 flex 子元素扔进来的
+              —— 面板本身是 `overflow-hidden`，于是设置项一超过面板高度就被**齐刷刷切掉、且滚不动**，
+              下半截（序列 2/3、保存按钮）用户根本够不着。左右也要留 padding，否则标题行贴死左边框。 */}
           {showSettings ? (
-            <XiaoPUserSettings onClose={() => setShowSettings(false)} onSaved={setUserModelState} />
+            <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain px-3 py-3">
+              <XiaoPUserSettings
+                onClose={() => setShowSettings(false)}
+                onSaved={setUserModelState}
+              />
+            </div>
           ) : showFeed ? (
             <div className="flex-1 overflow-y-auto overscroll-contain">
               <TaskFeedList rows={feed.rows} onGo={() => setOpen(false)} />

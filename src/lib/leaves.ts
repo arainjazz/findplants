@@ -23,6 +23,30 @@ export function isOwnerEmail(email: string | null | undefined): boolean {
   return !!email && OWNER_EMAILS.includes(email.trim().toLowerCase());
 }
 
+/**
+ * 「资深编辑」落在 `user_roles` 的哪个角色上。
+ *
+ * 复用现有 `app_role` 枚举里一直没被用过的 **moderator** —— 枚举加值要跑 DB 迁移
+ * （hosted 项目、只能去 dashboard 手工执行），而这里不需要新语义、只需要一个空位。
+ * 站内一律显示为「资深编辑」，moderator 这个词只活在数据库里。
+ */
+export const SENIOR_ROLE = "moderator";
+
+/**
+ * 某人是不是资深编辑。**只读判定**，用来决定 UI 显不显示采纳/撤销按钮；
+ * 真正的闸门在 roles.functions.ts 的服务端函数里（前端判据永远只是方便，不是安全边界）。
+ */
+export async function fetchIsSeniorEditor(userId: string | undefined | null): Promise<boolean> {
+  if (!userId) return false;
+  const { data } = await supabase
+    .from("user_roles")
+    .select("role")
+    .eq("user_id", userId)
+    .eq("role", SENIOR_ROLE as "moderator")
+    .maybeSingle();
+  return !!data;
+}
+
 export type LeafLevel = "senior" | "gold" | "silver" | "bronze" | "none";
 
 export const LEVEL_LABEL: Record<LeafLevel, string> = {
@@ -80,7 +104,11 @@ async function identifyBronze(userId: string): Promise<number> {
     return total + adopted;
   }
   let sum = 0;
-  for (const row of data as Array<{ retake_count: number | null; adopted: boolean | null; conf: string | null }>) {
+  for (const row of data as Array<{
+    retake_count: number | null;
+    adopted: boolean | null;
+    conf: string | null;
+  }>) {
     const tentative = row.conf === "low";
     if (tentative) {
       sum += 1; // 疑似恒 +1，不随补拍/采纳增加
@@ -104,38 +132,29 @@ const editCount = (userId: string, kind: "text" | "image", adopted?: boolean) =>
 };
 
 /**
- * Owner-only 采纳 (adopt) toggle on a contribution — doubles the author's bronze
- * leaf. Writes the adopted flag on a plant_edits (修文/换图) or plant_drafts (识别)
- * row. RLS already lets an admin/owner update both tables.
+ * ⛔ 客户端直写的 `setAdopted()` 已删除（2026-07-31）。改用 roles.functions.ts 的
+ * **`setAdoptedFn`** 服务端函数。
+ *
+ * 原因：它靠 RLS 兜底，而两张表的 RLS 松紧完全不同 —— `plant_edits` 只让 admin 写、
+ * `plant_drafts` 却让**任何已批准编辑**写。结果是「采纳」这件事对修文/换图是站长专属、
+ * 对识别草稿却人人可做，前端还各自另写了一套判据。现在统一到服务端一道门：
+ * 站长或资深编辑，用 service-role 落库。
  */
-export async function setAdopted(
-  table: "plant_edits" | "plant_drafts",
-  id: string,
-  adopted: boolean,
-  ownerId: string,
-) {
-  const patch = {
-    adopted,
-    adopted_by: adopted ? ownerId : null,
-    adopted_at: adopted ? new Date().toISOString() : null,
-  };
-  // table is a runtime union → cast the builder to keep update() typing simple.
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const { error } = await (supabase.from(table) as any).update(patch).eq("id", id);
-  if (error) throw error;
-}
 
 export async function computeLeaves(userId: string, email?: string | null): Promise<LeafStats> {
   const isOwner = isOwnerEmail(email);
 
-  const [identify, textTotal, textAdopted, imageTotal, imageAdopted, prof] = await Promise.all([
-    identifyBronze(userId),
-    editCount(userId, "text"),
-    editCount(userId, "text", true),
-    editCount(userId, "image"),
-    editCount(userId, "image", true),
-    supabase.from("profiles").select("gold_used, silver_used").eq("id", userId).maybeSingle(),
-  ]);
+  const [identify, textTotal, textAdopted, imageTotal, imageAdopted, prof, senior] =
+    await Promise.all([
+      identifyBronze(userId),
+      editCount(userId, "text"),
+      editCount(userId, "text", true),
+      editCount(userId, "image"),
+      editCount(userId, "image", true),
+      supabase.from("profiles").select("gold_used, silver_used").eq("id", userId).maybeSingle(),
+      fetchIsSeniorEditor(userId),
+    ]);
+  const isSenior = isOwner || senior;
 
   // Each adopted contribution counts twice → base + adopted.
   const text = textTotal + textAdopted;
@@ -148,14 +167,32 @@ export async function computeLeaves(userId: string, email?: string | null): Prom
   const silverUsed = (prof.data?.silver_used as number | undefined) ?? 0;
   // The owner spends unlimited silver + gold → Infinity available (gating passes
   // and the UI formats it as ∞). Everyone else is earned-minus-used.
+  // 资深编辑（用户 2026-07-31 选定的范围）：**银叶无限**，金叶照常按攒的算 ——
+  // 银叶换的是「完整科普草稿」，正是希望他们多写的东西；金叶那条整页生成的链路更贵，
+  // 留在站长手上。
   const goldAvailable = isOwner ? Infinity : Math.max(0, gold - goldUsed);
-  const silverAvailable = isOwner ? Infinity : Math.max(0, silver - silverUsed);
+  const silverAvailable = isSenior ? Infinity : Math.max(0, silver - silverUsed);
 
+  // 「资深编辑」= 站长或被站长指定的人。**不再是 `gold >= 10` 自动升**（2026-07-31）：
+  // 那条规则让它成了一个纯头衔 —— 不解锁任何权限，也没有任何人能指定谁当。
   let level: LeafLevel = "none";
-  if (isOwner || gold >= 10) level = "senior";
+  if (isSenior) level = "senior";
   else if (gold >= 1) level = "gold";
   else if (silver >= 1) level = "silver";
   else if (bronze >= 1) level = "bronze";
 
-  return { identify, text, image, bronze, silver, gold, goldUsed, goldAvailable, silverUsed, silverAvailable, level, isOwner };
+  return {
+    identify,
+    text,
+    image,
+    bronze,
+    silver,
+    gold,
+    goldUsed,
+    goldAvailable,
+    silverUsed,
+    silverAvailable,
+    level,
+    isOwner,
+  };
 }

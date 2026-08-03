@@ -156,6 +156,25 @@ export function stripStaleMissingNotes(html: string): string {
   });
 }
 
+/**
+ * 摘要卡页尾那句**只在草稿页上成立**的提示，改写成已收录条目上说得通的话。
+ *
+ * 起因（2026-07-31 用户实测）：「采纳快速识别简介」会把草稿的 html_content 原样发布成
+ * 条目正文，于是条目页上印着「点击『让 AI 生成进一步介绍草稿』可生成含多张配图的完整
+ * 科普草稿」—— 可那个按钮长在**草稿页**上，条目页根本没有，读者点无可点。
+ * 线上 12 个 `source=ai_identify` 条目里有 3 个是这样。
+ *
+ * 两处都要用：**发布时**改写（新条目干净），**渲染时**也改写（存量的 3 条不必迁移）。
+ * 纯字符串实现 —— 发布那一步跑在 Cloudflare Workers 上，没有 DOM。
+ */
+export function rewriteDraftOnlyHints(html: string): string {
+  if (!html || !html.includes("简介摘要卡")) return html;
+  return html.replace(
+    /<p[^>]*>\s*—\s*简介摘要卡（点击「让 AI 生成进一步介绍草稿」[^<]*）\s*<\/p>/g,
+    '<p style="color:#8a6b4a;font-size:13px">— 简介摘要卡 · 由 AI 快速识别生成，尚未撰写完整正文</p>',
+  );
+}
+
 /** Inject responsive CSS + the click-to-replace runtime into a draft document. */
 export function enhanceDraftHtmlForViewing(html: string): string {
   if (!html) return html;

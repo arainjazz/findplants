@@ -79,7 +79,10 @@ export const DRAFT_SLOTS: SlotSpec[] = [
 ];
 
 /**
- * 金叶详页 9 个图槽：6 张特征卡（根株/茎/叶/花/果/物候）+ 生境全景 + 2 张人文配图。
+ * 金叶详页 13 个图槽：6 张特征卡（根株/茎/叶/花/果/物候）+ 生境全景 + 2 张人文配图
+ * + 博物趣闻 3 张 + 演化与生态 1 张。
+ *
+ * ⚠️ 下标与 premium-page.ts 的 `img(i)` **一一绑定**，只能往后追加，不能插队。
  *
  * ⚠️ 这里从前有 **5 个单器官刚性槽**（叶/花/果/科学绘图各只认一种器官，零降级余地），
  * 是金叶配图常年大面积留空的直接原因 —— 尤其「果实与种子」和「人文·科学绘图」。
@@ -129,6 +132,33 @@ export const GOLD_SLOTS: SlotSpec[] = [
   {
     key: "人文·图像",
     want: ["flower", "plant", "fruit", "leaf", "habitat", "specimen"],
+    missingNote: "暂无该物种的公开配图",
+  },
+  // ── Section VI 博物趣闻博客的三张图（下标 9/10/11，与 premium-page.ts 的取图下标绑定）──
+  // 主图定调，两张内文图插在章节之间。想要的器官刻意与前面几个槽错开（主图偏全株/生境，
+  // 内文图偏花/果与生境），免得整节配图与「关键特征」那六张重复。
+  {
+    key: "博物趣闻·主图",
+    want: ["habitat", "plant", "flower", "leaf", "fruit", "specimen"],
+    missingNote: "暂无该物种的公开配图",
+  },
+  {
+    key: "博物趣闻·配图一",
+    want: ["flower", "fruit", "plant", "habitat", "leaf", "specimen"],
+    missingNote: "暂无该物种的公开配图",
+  },
+  {
+    key: "博物趣闻·配图二",
+    want: ["plant", "habitat", "leaf", "fruit", "flower", "specimen"],
+    missingNote: "暂无该物种的公开配图",
+  },
+  // ── Section V「演化与生态」左栏那张图（下标 12，与 premium-page.ts 的 img(12) 绑定）──
+  // 四合木 页的这一栏放的是生态关系图；我们没有那种示意图，退而求其次要**群落/生境**
+  // 或标本图版 —— 它要与「关键特征」那六张器官特写形成对照，所以 want 把 habitat/
+  // specimen 排在前面。
+  {
+    key: "演化与生态·生态图",
+    want: ["habitat", "specimen", "plant", "leaf", "fruit", "flower"],
     missingNote: "暂无该物种的公开配图",
   },
 ];
@@ -187,11 +217,28 @@ export function assignSlots(cands: PhotoCandidate[], specs: SlotSpec[]): SlotAss
     return null;
   };
 
-  /** 降级命中时的如实图注。拿不到器官名（未知标签）就只说「暂缺」，不编。 */
+  /**
+   * 降级命中时的如实图注。
+   *
+   * 🔴 **「没分类过」和「分类过但不是想要的」必须分开**（2026-07-29 用户实测）。
+   * 候选出厂时 `organ` 一律是空串（species-photos.ts：「一律现看现标，绝不按位置猜」），
+   * 要靠 `classifyPhotoOrgans` 现看现标。那一步只要失败（限流 / 超时 / 返回不是 JSON /
+   * 缩略图一张都没抓到），它就**静默退回原候选** —— 整池 organ 全是空串。
+   * 于是前两轮一张都命不中，**每一个槽**都落进第三轮，被扣上一句
+   * 「该物种的植株照片暂缺，此处为其它公开配图」。
+   *
+   * 可这句话在这种情形下**很可能是假的**：我们压根没看过这张图，它完全可能
+   * 正是这一栏要的植株照。用户报的「银叶草稿大量出现『xx 照片暂缺』」就是这么来的 ——
+   * 那不是检索太苛刻，是视觉分类没跑成，然后代码替它编了一个结论。
+   *
+   * 所以：没分类过 → **什么都不说**（不留假图注）；分类过、判成 other/未收录标签 →
+   * 才是真的「拿到的不是这一栏要的东西」，那句话如实。
+   */
   const noteFor = (spec: SlotSpec, got: PhotoCandidate): string => {
     const wantedZh = ORGAN_ZH[spec.want[0] ?? ""] || "";
-    const gotZh = ORGAN_ZH[got.organ] || "";
     if (!wantedZh) return "";
+    if (!got.organ) return ""; // 没看过这张图，不下结论
+    const gotZh = ORGAN_ZH[got.organ] || "";
     if (!gotZh) return `该物种的${wantedZh}照片暂缺，此处为其它公开配图`;
     return `图为${gotZh} · 该物种的${wantedZh}照片暂缺`;
   };

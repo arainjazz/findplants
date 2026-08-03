@@ -1,4 +1,5 @@
 import { speciesKey } from "./plants";
+import { isTentative } from "./tentative";
 
 // ─── 识别过程痕迹与「综合可信度%」 ────────────────────────────────────────────
 // 单独成纯函数模块（与 tentative.ts 同样的理由）：识别链路要模型调用 + 登录才跑得起来，
@@ -49,10 +50,26 @@ const PN_MEANINGFUL_PCT = 30;
 export function computeIdentifyConfidence(
   t: IdentifyTrace,
   finalSci: string,
-  finalConf: string,
+  /**
+   * 🔴 **传整份判定 meta，不要只传 confidence 字符串。**
+   *
+   * 起因（2026-07-30 用户实测）：草稿页判「疑似」用的是 `isTentative()` —— 它认三个
+   * 信号（confidence=low / 摘要以「疑似」开头 / 名字带「疑似」）；而这里从前只认
+   * `identification_confidence` 一个。于是模型写 `confidence: "high"` 却在正文里说
+   * 「疑似……」时，同一张卡上会同时出现「本次结论为**疑似**」和「置信度 9 颗星」。
+   * 参数收成对象、并在下面把档位钳到 low，是为了让「疑似」在全站**只有一个判据**。
+   */
+  final: { identification_confidence?: unknown; summary_zh?: unknown; title?: unknown },
 ): { pct: number; basis: string } {
+  const rawConf = (final.identification_confidence ?? "").toString();
+  // 疑似 = 模型在说「我没把握」。无论它把这句话写在哪个字段里，档位一律按 low 计。
+  const tentative = isTentative(final);
+  const finalConf = tentative ? "low" : rawConf;
   const base = CONF_TIER_BASE[finalConf] ?? 45;
-  const tierZh = `模型自评${confZh(finalConf)}档=${base}`;
+  const tierZh =
+    tentative && rawConf !== "low"
+      ? `结论为疑似（模型自评写的是${confZh(rawConf)}，但名称/正文标了「疑似」，按疑似计）=${base}`
+      : `模型自评${confZh(finalConf)}档=${base}`;
   const pnKey = speciesKey(t.primaryLabel || "");
   const hasPn = t.primaryPct != null;
   const pnUsable = hasPn && (t.primaryPct as number) >= PN_MEANINGFUL_PCT;
@@ -127,7 +144,10 @@ export function traceSteps(t: IdentifyTrace): { label: string; value: string }[]
     out.push({ label: "专业引擎 Pl@ntNet", value: "未参与" });
   }
   out.push({
-    label: `一线识别模型${t.phase1Model ? `（${t.phase1Model}）` : ""}`,
+    // 🔴 **不写具体模型名**（用户 2026-07-31）。模型换得很勤，写在读者面前的那一行迟早是
+    // 错的；真实的模型名只出现在管理员控制台和用量表里（那里是配置必需）。
+    // `t.phase1Model` 仍照常写进 trace 存库，只是不渲染给读者。
+    label: "一线识别模型",
     // 明确写出「只给档位、不给分数」：用户看到 Pl@ntNet 有 7% 这样的数字、这里却没有，
     // 会以为是漏显示了。视觉大模型输出的就是 high/medium/low 三档自评，没有可信的连续分数
     // ——真让它报一个百分比，那也是它编的，不比档位更可靠。
@@ -135,7 +155,7 @@ export function traceSteps(t: IdentifyTrace): { label: string; value: string }[]
   });
   if (t.review.ran) {
     out.push({
-      label: `二次自动复核（${t.review.model}）`,
+      label: "二次自动复核",
       value:
         `${confZh(t.review.confidence)} · ${t.review.action === "confirm" ? "确认原判" : "纠正物种"}` +
         ` → ${t.review.adopted ? "已采纳，跳过补拍" : "未采纳，维持疑似"}`,

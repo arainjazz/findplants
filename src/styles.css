@@ -133,6 +133,16 @@
   to { transform: translateX(0); opacity: 1; }
 }
 
+/* 小P蛙面板的**可拖宽度**（桌面端）。
+   写在这里而不是用 Tailwind 的 `md:w-[var(--xiaop-w)]` —— v4 下那个类没被生成，
+   面板于是退回 width:auto、被内容撑到 max-w-[90vw]（实测 830px 视口下成了 747px）。
+   组件把 --xiaop-w 作为 inline style 挂在面板上，这条规则负责吃它。 */
+@media (min-width: 768px) {
+  [data-xiaop-panel] {
+    width: var(--xiaop-w, 370px);
+  }
+}
+
 @keyframes scan-laser {
   0% {
     top: 0%;

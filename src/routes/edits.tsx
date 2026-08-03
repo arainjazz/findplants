@@ -1,5 +1,6 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useServerFn } from "@tanstack/react-start";
 import { useEffect, useMemo, useState } from "react";
 import { supabase } from "@/integrations/supabase/client";
 import { SiteHeader, SiteFooter } from "@/components/site-header";
@@ -17,8 +18,9 @@ import { revertCatalogEdit } from "@/lib/catalogs";
 import { fetchAllPlants, type Plant } from "@/lib/plants";
 import { useAuth } from "@/hooks/use-auth";
 import { toast } from "sonner";
-import { sourceLabel, sourceIsAI } from "@/lib/edit-source";
-import { isOwnerEmail, setAdopted } from "@/lib/leaves";
+import { sourceLabel, sourceLabelDetailed, sourceIsAI } from "@/lib/edit-source";
+import { isOwnerEmail, fetchIsSeniorEditor } from "@/lib/leaves";
+import { setAdoptedFn } from "@/lib/roles.functions";
 
 export const Route = createFileRoute("/edits")({
   head: () => ({
@@ -44,8 +46,16 @@ function EditsPage() {
     queryFn: () => isCurrentUserAdmin(user?.id),
     enabled: !!user,
   });
-  // 采纳 (adopt) is owner-only, per product decision (资深编辑 = 仅所有者).
+  // 采纳 / 撤销 = 站长**或资深编辑**（2026-07-31，此前是硬编码 OWNER_EMAILS）。
+  // 这里只是 UI 判据；真正的闸门在 roles.functions.ts 的服务端函数里。
   const isOwner = isOwnerEmail(user?.email);
+  const { data: isSeniorRole = false } = useQuery({
+    queryKey: ["is-senior-editor", user?.id],
+    queryFn: () => fetchIsSeniorEditor(user?.id),
+    enabled: !!user,
+  });
+  const isSenior = isOwner || isSeniorRole;
+  const adoptFn = useServerFn(setAdoptedFn);
 
   // Owner (admin) sees every editor's history; a normal editor sees only their
   // own (including entries reverted/rejected by the owner); anon sees nothing.
@@ -217,7 +227,7 @@ function EditsPage() {
   const onAdopt = async (e: PlantEdit) => {
     if (!user) return;
     try {
-      await setAdopted("plant_edits", e.id, !e.adopted, user.id);
+      await adoptFn({ data: { table: "plant_edits", id: e.id, adopted: !e.adopted } });
       toast.success(e.adopted ? "已取消采纳" : "已采纳 · 作者该枚铜叶 ×2");
       qc.invalidateQueries({ queryKey: ["plant-edits"] });
       qc.invalidateQueries({ queryKey: ["my-leaves"] });
@@ -446,7 +456,7 @@ function EditsPage() {
                           edit={e}
                           plant={plantById.get(e.plant_id)}
                           isAdmin={isAdmin}
-                          isOwner={isOwner}
+                          isSenior={isSenior}
                           onRevert={() => onRevert(e)}
                           onAdopt={() => onAdopt(e)}
                           selected={selected.has(e.id)}
@@ -485,7 +495,7 @@ function EditRow({
   edit,
   plant,
   isAdmin,
-  isOwner,
+  isSenior,
   onRevert,
   onAdopt,
   selected,
@@ -495,7 +505,7 @@ function EditRow({
   edit: PlantEdit;
   plant: Plant | undefined;
   isAdmin: boolean;
-  isOwner: boolean;
+  isSenior: boolean;
   onRevert: () => void;
   onAdopt: () => void;
   selected: boolean;
@@ -562,7 +572,9 @@ function EditRow({
   const isAI = sourceIsAI(edit.source);
   const SourceBadge = edit.source ? (
     <span
-      title={edit.source}
+      // 悬停提示：管理员看真实的来源串（排查/对账要用），其他人看与徽章一致的中性文字。
+      // 否则「徽章上不写模型名」等于白做 —— 鼠标一悬就露出来了。
+      title={isAdmin ? sourceLabelDetailed(edit.source) : srcLabel}
       className={`px-1.5 py-0.5 rounded text-[10px] shrink-0 ${
         isAI
           ? "bg-[oklch(0.55_0.18_280)]/15 text-[oklch(0.45_0.18_280)]"
@@ -670,7 +682,7 @@ function EditRow({
           </div>
         )}
       </div>
-      {isOwner && (edit.kind === "text" || edit.kind === "image") && !edit.reverted && (
+      {isSenior && (edit.kind === "text" || edit.kind === "image") && !edit.reverted && (
         <button
           onClick={onAdopt}
           title={edit.adopted ? "取消采纳（撤销该枚铜叶翻倍）" : "采纳此修改 · 作者该枚铜叶 ×2"}
@@ -683,7 +695,7 @@ function EditRow({
           {edit.adopted ? "已采纳 ✓" : "采纳"}
         </button>
       )}
-      {isAdmin &&
+      {(isAdmin || isSenior) &&
         edit.kind !== "revert" &&
         (() => {
           const restoring = edit.reverted;

@@ -77,6 +77,52 @@ export const THINKING_OFF = {
   thinking: { type: "disabled" }, // 智谱 GLM / Anthropic 风格
 } as const;
 
+/**
+ * 「请思考」—— 与 `THINKING_OFF` 严格对称的**开**思考参数集。
+ *
+ * 为什么需要它（2026-07-30 用户要求「点击开关是真的能开也能关」）：
+ * 在此之前，`thinking: "on"` 的实现是**一个参数都不发**、让模型按自己的默认来。
+ * 于是这个开关只有一半是真的 —— 「关」真能关，「开」只是「不管」。
+ * 后果在金叶详页上被实测抓住：`gold` 控制台默认 `"on"`，配的又是 kimi-k3
+ * （推理模型，自己默认开思维链），管理员在界面上看不到任何「已开启」的动作，
+ * 却每次都因为模型想太久、网关等不到字节而 HTTP 524。
+ *
+ * 三个键一起发，理由与 THINKING_OFF 逐条对应：不支持的那个通常被静默忽略，
+ * 真被 400 拒收时 postOpenAICompat 会从报错文本里认出它并去掉重试。
+ *
+ * ⚠️ `reasoning_effort` 刻意用 `"medium"` 而不是 `"high"`：这里要表达的是
+ * 「按正常强度思考」，不是「用尽预算深思」。后者在长文链路上很容易把单次调用
+ * 拖过中转的网关时限（正是 524 的成因），不该由一个「开/关」开关悄悄带来。
+ */
+export const THINKING_ON = {
+  enable_thinking: true, // 阿里 Qwen3 / DashScope
+  reasoning_effort: "medium", // OpenAI o 系列 / 部分中转
+  thinking: { type: "enabled" }, // 智谱 GLM / Anthropic 风格
+} as const;
+
+/**
+ * Gemini 的思考参数。**与上面那套 OpenAI 兼容的键完全不同**，所以单独一份 ——
+ * 放在这里是为了让「三家各自怎么开关思考」都待在同一个文件里，别散落到调用处。
+ *
+ * 代际差异是硬的，不能只发一种：
+ * · **Gemini 3**（`gemini-3*`）用 `thinkingLevel: "low" | "high"`，
+ *   而且**没有「完全关闭」这一档** —— 最低就是 low。所以「关」对 Gemini 3 的真实含义是
+ *   「把思考强度压到最低」，不是「不思考」。这一点必须写明，否则以后有人会拿它当
+ *   「已彻底关闭」的依据去查别的 bug。
+ * · **Gemini 2.5 及更早**用 `thinkingBudget`：`0` = 真关闭，`-1` = 动态（模型自己定）。
+ *
+ * ⚠️ 代际只能从模型名猜，而名字从来不是能力契约。猜错时 Gemini 直接 400，
+ * 且 `callGeminiWithRotation` 对 400 的策略是「配置错误，每个 key 结果一样 → 立刻上抛」，
+ * **没有**本文件 `postOpenAICompat` 那套「去掉惹祸的参数重试」。所以 geminiChat 里额外
+ * 加了一道「400 点名 thinking 字段就去掉该字段重发」的安全网 —— 两处要一起看。
+ */
+export function geminiThinkingConfig(model: string, thinkingOn: boolean): Record<string, unknown> {
+  if (/^gemini-3/i.test(String(model ?? "").trim())) {
+    return { thinkingConfig: { thinkingLevel: thinkingOn ? "high" : "low" } };
+  }
+  return { thinkingConfig: { thinkingBudget: thinkingOn ? -1 : 0 } };
+}
+
 /** 400 文本里点名了哪些我们发过的可调参数。 */
 export function offendingParams(errorText: string, body: Record<string, unknown>): string[] {
   const t = errorText.toLowerCase();

@@ -100,6 +100,17 @@ export type GeoSighting = {
   created_at: string;
   /** Identifying user's id — drives the「只显示我识别的植物」map filter (null = guest). */
   created_by: string | null;
+  /** 命中「国家和各省重点保护野生植物名录」（服务端按学名匹配，含属级/科级条目）。 */
+  is_protected: boolean;
+  /** 命中的名录名，如「国家（2021）」「内蒙古（2009）」；没命中为 null。 */
+  protected_label: string | null;
+  /**
+   * 这条记录的 `capture_lat/lng`（以及 `capture_place`）**已被脱敏**。
+   *
+   * 保护物种恒为 true；站长 / 资深编辑走精确坐标入口时为 false。凡是把坐标显示给人看的
+   * 地方，都必须读这个标志决定要不要标「已模糊」——见 lib/protected-coords.ts。
+   */
+  coords_fuzzed: boolean;
 };
 
 /**
@@ -107,48 +118,45 @@ export type GeoSighting = {
  * photo carrying GPS coordinates (phone EXIF / geolocation). Excludes rejected
  * drafts and anything without coordinates, so every pin is a genuine, accurately
  * located observation rather than a synthetic placement.
+ *
+ * 🔴 **走服务端函数，不再在浏览器里直查 `plant_drafts`。** 重点保护物种的坐标必须在数据
+ * 离开服务器之前就模糊掉；留在前端做等于把精确坐标先发给所有人、再假装看不见。
+ * 精确坐标另有入口（`geoSightingsExactFn`，仅站长 / 资深编辑）。
  */
 export async function fetchGeoSightings(limit = 500): Promise<GeoSighting[]> {
-  const BASE = "id,title,scientific_name,family,genus,capture_lat,capture_lng,capture_place,photo_url,status,published_plant_id,created_at,created_by";
-  // A sighting only shows on the map after the user submitted it for review. When the
-  // submitted_for_review column is missing (migration pending) the .eq is dropped by
-  // the fallback ladder so the map never breaks.
-  const run = (cols: string, gated: boolean) => {
-    let q = supabase
-      .from("plant_drafts")
-      .select(cols)
-      .not("capture_lat", "is", null)
-      .not("capture_lng", "is", null)
-      .neq("status", "rejected");
-    if (gated) q = q.eq("submitted_for_review", true);
-    return q.order("created_at", { ascending: false }).limit(limit);
-  };
-
-  // Prefer invasive columns + review gate; degrade gracefully if either migration is
-  // unapplied (invasive flag defaults false; ungated shows all).
-  let { data, error } = await run(`${BASE},is_invasive,gbif_taxon_key`, true);
-  if (error) {
-    console.warn("[fetchGeoSightings] gated/invasive columns missing, falling back:", error.message);
-    ({ data, error } = await run(`${BASE},is_invasive,gbif_taxon_key`, false));
-  }
-  if (error) {
-    ({ data, error } = await run(BASE, false));
-  }
-  if (error) throw error;
-  return (data ?? [])
-    .filter((d: any) => typeof d.capture_lat === "number" && typeof d.capture_lng === "number")
-    .map((d: any) => ({ ...d, is_invasive: !!d.is_invasive, gbif_taxon_key: d.gbif_taxon_key ?? null, created_by: d.created_by ?? null })) as GeoSighting[];
+  const { geoSightingsFn } = await import("@/lib/geo-sightings.functions");
+  return geoSightingsFn({ data: { limit } });
 }
 
-/** Set of plant ids that originated from an approved AI-identification draft. */
-export async function fetchAiPlantIds(): Promise<Set<string>> {
+/**
+ * plantId → 指向它的来源草稿里**有没有银叶那一份**。
+ *
+ * 已收录档案要把条目分成 🟢快速识别 / 🔵银叶科普 / 🟠skill详页 三类（用户 2026-08-01），
+ * 而 `plants.source` 分不出前两类：采纳流程历史上有的写 `ai_identify`、有的留 null。
+ * 唯一可靠的信号是来源草稿本身 —— 同一条目可能有好几份来源草稿（补拍 / 多人识别同一株），
+ * **只要其中一份是银叶，这个条目就算银叶科普**（银叶正文必然含快速识别简介）。
+ *
+ * 一次拉全表建索引：逐条查太贵（一屏可能列几百个条目），与 `fetchPlantCapturePlaces`
+ * 同一个路数。`enriched:ai_payload->>_enriched` 是 PostgREST 的 JSON 取值别名，
+ * 返回字符串 "true"/"false"，不必把整个 ai_payload 拉回来。
+ */
+export async function fetchPlantSourceKinds(): Promise<Map<string, boolean>> {
+  const m = new Map<string, boolean>();
   const { data, error } = await supabase
     .from("plant_drafts")
-    .select("published_plant_id")
+    .select("published_plant_id, enriched:ai_payload->>_enriched")
     .eq("status", "approved")
     .not("published_plant_id", "is", null);
-  if (error) return new Set<string>();
-  return new Set((data ?? []).map((d) => d.published_plant_id).filter(Boolean) as string[]);
+  if (error) return m;
+  type Row = {
+    published_plant_id: string | null;
+    enriched: string | null;
+  };
+  for (const d of (data ?? []) as Row[]) {
+    if (!d.published_plant_id) continue;
+    m.set(d.published_plant_id, (m.get(d.published_plant_id) ?? false) || d.enriched === "true");
+  }
+  return m;
 }
 
 /**

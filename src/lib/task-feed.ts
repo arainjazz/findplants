@@ -44,7 +44,18 @@ export type TaskFeedRow = {
  */
 export const TASK_KIND_META: Record<
   TaskKind,
-  { label: string; short: string; color: string; ring: string; bar: string; text: string }
+  {
+    label: string;
+    short: string;
+    color: string;
+    ring: string;
+    bar: string;
+    text: string;
+    /** 常驻进度面板的外框 + 底色（草稿页上那一大块）。 */
+    panel: string;
+    /** 类型徽章（实底小标签）的底色 + 字色。 */
+    chip: string;
+  }
 > = {
   identify: {
     label: "识别",
@@ -53,6 +64,8 @@ export const TASK_KIND_META: Record<
     ring: "bg-emerald-500",
     bar: "bg-emerald-500",
     text: "text-emerald-600",
+    panel: "border-emerald-500/45 bg-emerald-500/5",
+    chip: "bg-emerald-500 text-background",
   },
   enrich_draft: {
     label: "银叶草稿",
@@ -61,6 +74,8 @@ export const TASK_KIND_META: Record<
     ring: "bg-sky-500",
     bar: "bg-sky-500",
     text: "text-sky-600",
+    panel: "border-sky-500/45 bg-sky-500/5",
+    chip: "bg-sky-500 text-background",
   },
   gold_page: {
     label: "金叶详页",
@@ -69,6 +84,8 @@ export const TASK_KIND_META: Record<
     ring: "bg-amber-500",
     bar: "bg-amber-500",
     text: "text-amber-600",
+    panel: "border-amber-500/45 bg-amber-500/5",
+    chip: "bg-amber-500 text-background",
   },
 };
 

@@ -41,7 +41,16 @@ import {
 import { awaitJob, rememberJob, recallJob, forgetJob } from "@/lib/poll-job";
 import { useAuth } from "@/hooks/use-auth";
 import { supabase } from "@/integrations/supabase/client";
-import { setAdopted, computeLeaves } from "@/lib/leaves";
+import { computeLeaves } from "@/lib/leaves";
+import { setAdoptedFn, getMyRolesFn } from "@/lib/roles.functions";
+import {
+  FUZZ_EXPLAIN,
+  FUZZ_ORANGE,
+  FUZZ_SUFFIX,
+  coarsenPlace,
+  formatCoordPair,
+  fuzzCoord,
+} from "@/lib/protected-coords";
 import { keepVisualAdvice } from "@/lib/retake-advice";
 import { LeafIcon } from "@/components/leaf-panel";
 import { SafeImg } from "@/components/safe-img";
@@ -50,7 +59,14 @@ import { fetchAllTags } from "@/lib/tags";
 import { NameAuthorityNote, readNameStamp } from "@/components/name-authority-badge";
 import { renderShareCard, shareOrSaveImage } from "@/lib/share-card";
 import { markDraftReadFn } from "@/lib/task-feed.functions";
+import { useTaskFeed } from "@/lib/use-task-feed";
 import { lookupSpeciesExisting, type SpeciesExisting } from "@/lib/species-existing.functions";
+import {
+  SpeciesExistingLinks,
+  SPECIES_EXISTING_STYLE,
+  speciesExistingCountSuffix,
+  speciesExistingLabel,
+} from "@/components/species-existing-links";
 import { computeIdentifyConfidence, traceSteps, type IdentifyTrace } from "@/lib/identify-trace";
 import { JobProgressPanel } from "@/components/job-progress";
 import { ConfidenceStars } from "@/components/confidence-stars";
@@ -89,14 +105,64 @@ export const Route = createFileRoute("/drafts/$id")({
       ],
     };
   },
-  component: DraftPage,
+  component: DraftPageRoute,
 });
+
+/**
+ * **只做一件事：按草稿 id 给整棵子树打 key，强制换草稿时重新挂载。**
+ *
+ * 没有它，`/drafts/A` → `/drafts/B` 走的是 React 的同位置复用：元素类型没变，
+ * DraftPage 这个实例就**一直活着**，只有 `useParams()` 的返回值变了。于是所有
+ * 「属于某一份草稿」的局部状态全部跟着人走 —— goldProg / enrichProg / goldError /
+ * goldDone / isEditing / cardUrl …，而 `resumedRef` 又是个 ref，新草稿自己的待续任务
+ * 反而不会被接回。
+ *
+ * 2026-07-30 用户实测到的就是这个：在天人菊页点了「创建金叶详页」，随手从小P蛙动态流
+ * 点进朝天委陵菜、又点进疑似高加索榉 —— 那块「正在生成金叶物种详细科普页 · 排队中」
+ * 一路跟着走（秒表都不归零，01:06 → 01:53，正是「从没重新挂载过」的铁证），于是
+ * 「补拍识别」和「银叶草稿」都被读成了金叶在排队。动态流本身是对的，串台的是这一页。
+ */
+function DraftPageRoute() {
+  const { id } = Route.useParams();
+  return <DraftPage key={id} />;
+}
 
 // Ordinal label for the retake counter (第一次补拍 / 第二次补拍 / 最后一次补拍).
 // 3 is the last allowed retake (server forces a final result at count ≥ 3).
 function retakeOrdinalLabel(count: number): string {
   if (count >= 3) return "最后一次补拍（第三次补拍）";
   return count === 1 ? "第一次补拍" : count === 2 ? "第二次补拍" : `第 ${count} 次补拍`;
+}
+
+/**
+ * 分享卡「画的是哪一轮」的指纹。
+ *
+ * 必须按**内容**认、不能只看草稿 id：补拍会把新一轮识别**合并回同一份草稿**
+ * （见 goRetake 的 `md: id`），id 一直没变，卡面内容却整个换了一个物种。
+ * 任一影响卡面的字段变了 → 指纹变 → 卡要重画。
+ */
+function draftStamp(
+  d:
+    | {
+        title?: string | null;
+        scientific_name?: string | null;
+        summary?: string | null;
+        retake_count?: number | null;
+        photo_url?: string | null;
+        ai_payload?: { identification_confidence?: unknown } | null;
+      }
+    | null
+    | undefined,
+): string {
+  if (!d) return "";
+  return [
+    d.title ?? "",
+    d.scientific_name ?? "",
+    (d.summary ?? "").slice(0, 40),
+    String(d.retake_count ?? 0),
+    String(d.ai_payload?.identification_confidence ?? ""),
+    d.photo_url ?? "",
+  ].join("|");
 }
 
 type MergePrompt = {
@@ -129,6 +195,7 @@ function DraftPage() {
   const askAgent = useServerFn(askDraftAgentFn);
   const applyAgentEdit = useServerFn(applyDraftAgentEditFn);
   const revertDraftEdit = useServerFn(revertDraftEditFn);
+  const adoptDraftFn = useServerFn(setAdoptedFn);
   const startEnrich = useServerFn(startEnrichDraftFn);
   const lookupExisting = useServerFn(lookupSpeciesExisting);
   const markRead = useServerFn(markDraftReadFn);
@@ -162,11 +229,24 @@ function DraftPage() {
   const [submitting, setSubmitting] = useState(false);
   const [enriching, setEnriching] = useState(false);
   const [enrichError, setEnrichError] = useState<string | null>(null);
+  // 银叶草稿的**成功**结论。原先只发一条 toast —— 用户 2026-07-31 要求去掉进度类 toast
+  // （颜色进度条 + 小P蛙动态流已经把三态都显示了），成功这一条改成页内常驻，
+  // 与失败那一条并排，不会一闪而过。
+  const [enrichDone, setEnrichDone] = useState<string | null>(null);
   // 常驻进度：非空 = 该任务正在跑，页面上一直显示阶段文案 + 进度条 + 已用时。
   // toast 会自动消失、又挤在角落，几分钟的长任务里用户根本不知道它还在不在跑。
   type JobProg = { phase: string; progress: number; startedAt: number };
   const [enrichProg, setEnrichProg] = useState<JobProg | null>(null);
   const [goldProg, setGoldProg] = useState<JobProg | null>(null);
+  // 第三条进度：**补拍识别**。它不是这一页发起的（补拍在 /identify 跑），所以没有本地
+  // jobId 可轮询 —— 数据取自动态流（与小P蛙同一份 react-query 缓存，不额外发请求）。
+  // 有它才补齐「绿=识别」这一色：用户从动态流点回这份草稿时，看到的是绿色的识别进度，
+  // 而不是一块看不出主人的进度条。
+  const taskFeed = useTaskFeed();
+  const identifyRow =
+    taskFeed.rows.find(
+      (r) => r.kind === "identify" && r.draftId === id && r.status === "running",
+    ) ?? null;
   const [goldConfirm, setGoldConfirm] = useState(false);
   const [goldBusy, setGoldBusy] = useState(false);
   const [goldError, setGoldError] = useState<string | null>(null);
@@ -181,10 +261,26 @@ function DraftPage() {
   /** 刚刚采纳/合并成功后拿到的条目 slug —— 用来在页内给出「去看已收录条目」的去向。 */
   const [approvedSlug, setApprovedSlug] = useState<string | null>(null);
   const [cardBusy, setCardBusy] = useState(false);
+  const [cardError, setCardError] = useState<string | null>(null);
+  /** 「进一步科普页」那一栏是不是展开着（就地展开，不跳页）。 */
+  const [inlineOpen, setInlineOpen] = useState(false);
   const [cardUrl, setCardUrl] = useState<string | null>(null);
   // 这张卡是不是「识别完自动弹出来的」（而非用户事后点按钮生成的）。决定关卡后要不要送去补拍。
   const [cardAutoOpened, setCardAutoOpened] = useState(false);
   const cardBlobRef = useRef<Blob | null>(null);
+  /**
+   * 出卡那一刻的**草稿快照**。卡面是一张 PNG（画完就冻住了），而卡片下面那几行字
+   * 是活的 React 状态 —— 两边各读各的，就会出现用户 2026-07-30 报的那种自相矛盾：
+   * 图上印着「草木樨状黄芪 · 置信度 9 颗星」，底下却写「本次结论为疑似（第三次补拍）」。
+   * 成因是补拍把结果合并回**同一份草稿**，卡画完之后草稿又被新一轮识别改写了。
+   * 所以：卡下面那几行一律读这份快照，与卡面同源；草稿真变了就重画（见下面的 effect）。
+   */
+  const [cardSnap, setCardSnap] = useState<{
+    tentative: boolean;
+    retakeCount: number;
+    /** 画这张卡时草稿的 updated_at，用来发现「卡画完之后草稿又变了」。 */
+    stamp: string;
+  } | null>(null);
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const editorRef = useRef<HtmlDocEditorHandle>(null);
 
@@ -270,10 +366,16 @@ function DraftPage() {
     review: { ran: false, reason: "本次识别早于该功能上线，没有留下过程记录" },
     retakeCount: Number(draft?.retake_count ?? 0),
   };
+  // 传整份 meta（而不是只传 finalConf）：星数与「疑似」判据必须同源，
+  // 否则会出现「本次结论为疑似 + 置信度 9 颗星」这种自相矛盾（见 identify-trace.ts）。
   const traceConfidence = computeIdentifyConfidence(
     traceForView,
     (draft?.scientific_name ?? "").toString(),
-    finalConf,
+    {
+      identification_confidence: finalConf,
+      summary_zh: draft?.summary || draft?.ai_payload?.summary_zh,
+      title: draft?.title,
+    },
   );
   const traceStepList = traceSteps(traceForView);
 
@@ -328,6 +430,42 @@ function DraftPage() {
     tags: draftTags,
   });
 
+  // ── 重点保护物种的坐标脱敏 ────────────────────────────────────────────────
+  // 这一页是从地图气泡「点进来」的那一页 —— 地图上把坐标模糊了，这里却原样印着
+  // 四位小数的精确 GPS，等于把刚锁上的门开了一条缝。所以同一条规则必须在这里也生效。
+  //
+  // 谁能看到精确值：站长 / 资深编辑（要导出授权给科研机构、政府部门），
+  // 外加**这条记录的提交者本人** —— 他人就站在那株植物旁边拍的照片，对他脱敏毫无意义。
+  const protectedHere = registryChipList.some((c) => c.kind.startsWith("protected_"));
+  const rolesFn = useServerFn(getMyRolesFn);
+  const { data: myRoles } = useQuery({
+    queryKey: ["my-roles", user?.id ?? "anon"],
+    queryFn: () => rolesFn({ data: undefined }),
+    enabled: !!user,
+    staleTime: 5 * 60 * 1000,
+  });
+  const isAuthorOfDraft = !!user && !!draft?.created_by && draft.created_by === user.id;
+  const hideExactCoords = protectedHere && !myRoles?.isSenior && !isAuthorOfDraft;
+  /** 页面上要显示的坐标与地点：保护物种 + 无权看精确值时，这里已是脱敏后的值。 */
+  const shownGeo = useMemo(() => {
+    const lat = draft?.capture_lat ?? null;
+    const lng = draft?.capture_lng ?? null;
+    const place = draft?.capture_place ?? null;
+    if (!hideExactCoords || lat == null || lng == null) return { lat, lng, place, fuzzed: false };
+    const c = fuzzCoord(lat, lng, id);
+    // 坐标模糊到 5 km、旁边却写着整条街道地址，等于没模糊 —— 地点一起粗化到区/县/旗。
+    return { lat: c.lat, lng: c.lng, place: coarsenPlace(place) || "地点已隐去", fuzzed: true };
+  }, [draft?.capture_lat, draft?.capture_lng, draft?.capture_place, hideExactCoords, id]);
+
+  /** 分享卡上的坐标 —— 命中名录就一律模糊，不看身份（理由见 renderShareCard 调用处）。 */
+  const cardGeo = useMemo(() => {
+    const lat = draft?.capture_lat ?? null;
+    const lng = draft?.capture_lng ?? null;
+    if (!protectedHere || lat == null || lng == null) return { lat, lng, fuzzed: false };
+    const c = fuzzCoord(lat, lng, id);
+    return { lat: c.lat, lng: c.lng, fuzzed: true };
+  }, [draft?.capture_lat, draft?.capture_lng, protectedHere, id]);
+
   // 「进一步生成草稿」与「金叶详页」都跑联网调研 + 长文生成，总耗时超过 Cloudflare 边缘
   // 100 秒响应上限 —— 以前是同一个前台 HTTP 请求，必被掐断（前端报 failed to fetch）。
   // 现在改为：server fn 立刻返回 jobId，服务端后台继续跑，这里每 3 秒轮询阶段进度。
@@ -337,21 +475,18 @@ function DraftPage() {
   const goldScope = `gold:${id}`;
 
   /** 轮询一个已启动的 enrich 任务直到结束，并落地 UI 反馈。 */
-  const followEnrichJob = async (jobId: string, tId: string | number) => {
+  const followEnrichJob = async (jobId: string) => {
     rememberJob(enrichScope, jobId);
     setEnrichProg({ phase: "正在启动生成任务…", progress: 0, startedAt: Date.now() });
     const out = await awaitJob<{ silverRemaining?: number | null }>(jobId, (phase, progress) => {
-      // 常驻面板是主反馈；toast 保留作为「已经滚走到别处」时的兜底提示。
       setEnrichProg((p) => ({ phase, progress, startedAt: p?.startedAt ?? Date.now() }));
-      toast.loading(phase, { id: tId, duration: Infinity });
     });
     setEnrichProg(null);
     // 只有服务端给了明确结论（成功 / 明确失败）才丢掉 jobId。轮询侧自己放弃时
     // （超时、疑似卡死）**必须留着** —— 任务多半还在服务端跑，留着才能刷新接回。
     if (out.ok || out.reported) forgetJob(enrichScope);
     if (!out.ok) {
-      setEnrichError(out.error); // keep it on screen — the cause matters more than the toast
-      toast.error(out.error, { id: tId, duration: 12000 });
+      setEnrichError(out.error); // 页内常驻，比一闪而过的提示更有用
       return;
     }
     await qc.invalidateQueries({ queryKey: ["draft", id] });
@@ -362,14 +497,14 @@ function DraftPage() {
         : `，剩余银叶 ${out.result.silverRemaining} 枚`;
     // 生成成功即 submitted_for_review=true（runEnrichCore 写库时就置了），所以这里把
     // 「已进待审序列」一并说清楚 —— 否则用户不知道自己还需不需要再点一次「提交审核」。
-    toast.success(`完整草稿已生成，自动进入待审序列${rem}`, { id: tId, duration: 8000 });
+    setEnrichDone(`完整草稿已生成，自动进入待审序列${rem}`);
   };
 
   const onEnrich = async () => {
     if (enriching) return;
     setEnriching(true);
     setEnrichError(null);
-    const tId = toast.loading("正在启动生成任务…", { duration: Infinity });
+    setEnrichDone(null);
     try {
       const res = (await startEnrich({ data: { draft_id: id } })) as {
         alreadyEnriched: boolean;
@@ -377,17 +512,16 @@ function DraftPage() {
       };
       if (res.alreadyEnriched || !res.jobId) {
         await qc.invalidateQueries({ queryKey: ["draft", id] });
-        toast.success("这份草稿已经生成过完整内容了", { id: tId });
+        setEnrichDone("这份草稿已经生成过完整内容了");
         return;
       }
-      await followEnrichJob(res.jobId, tId);
+      await followEnrichJob(res.jobId);
     } catch (e) {
       const msg =
         e instanceof Error && e.message
           ? e.message
           : "生成失败（UNKNOWN）：发生了未知错误，请重试。";
       setEnrichError(msg);
-      toast.error(msg, { id: tId, duration: 12000 });
     } finally {
       setEnriching(false);
     }
@@ -396,29 +530,25 @@ function DraftPage() {
   // 金叶：一键创建物种详细科普页。消耗 1 枚金叶（服务端校验余额并扣减）。三段式 LLM +
   // 3 次联网调研 + 真实名录取证，耗时数分钟 —— 现在是**真正的服务端后台任务**：
   // server fn 立刻返回 jobId，生成在服务端继续，前端只负责轮询。关标签页也不会中断。
-  const followGoldJob = async (jobId: string, tId: string | number) => {
+  const followGoldJob = async (jobId: string) => {
     rememberJob(goldScope, jobId);
     setGoldProg({ phase: "正在启动金叶详页生成任务…", progress: 0, startedAt: Date.now() });
     const out = await awaitJob<{ slug: string; goldRemaining: number | null }>(
       jobId,
       (phase, progress) => {
         setGoldProg((p) => ({ phase, progress, startedAt: p?.startedAt ?? Date.now() }));
-        toast.loading(phase, { id: tId, duration: Infinity });
       },
     );
     setGoldProg(null);
     if (out.ok || out.reported) forgetJob(goldScope);
     if (!out.ok) {
       setGoldError(out.error);
-      toast.error(out.error, { id: tId, duration: 14000 });
       return;
     }
     const r = out.result;
     void qc.invalidateQueries({ queryKey: ["leaves", user?.id] });
-    // 收掉那条 loading toast。**成功不再只靠 toast 通知**：它 12 秒就消失，「查看」又藏在角落，
-    // 用户等了好几分钟回来经常正好错过，于是「明明说生成好了却找不到结果」（线上实测反馈）。
-    // 改成必须显式关闭的弹窗，把「立即查看 / 稍后查看」两条路摆明。
-    toast.dismiss(tId);
+    // 成功走的是必须显式关闭的弹窗，把「立即查看 / 稍后查看」两条路摆明 ——
+    // 用户等了好几分钟回来，一闪而过的提示接不住。
     setGoldDone(r);
   };
 
@@ -427,16 +557,14 @@ function DraftPage() {
     setGoldBusy(true);
     setGoldError(null);
     setGoldConfirm(false);
-    const tId = toast.loading("正在启动金叶详页生成任务…", { duration: Infinity });
     void startGoldDetailPageFn({ data: { draft_id: id, userModel: userModelArg() } })
-      .then((res) => followGoldJob((res as { jobId: string }).jobId, tId))
+      .then((res) => followGoldJob((res as { jobId: string }).jobId))
       .catch((e: unknown) => {
         const msg =
           e instanceof Error && e.message
             ? e.message
             : "创建失败（UNKNOWN）：发生了未知错误，请重试。";
         setGoldError(msg);
-        toast.error(msg, { id: tId, duration: 14000 });
       })
       .finally(() => {
         setGoldBusy(false);
@@ -452,14 +580,12 @@ function DraftPage() {
     const pendingEnrich = recallJob(enrichScope);
     if (pendingEnrich) {
       setEnriching(true);
-      const tId = toast.loading("正在接回上次的草稿生成任务…", { duration: Infinity });
-      void followEnrichJob(pendingEnrich, tId).finally(() => setEnriching(false));
+      void followEnrichJob(pendingEnrich).finally(() => setEnriching(false));
     }
     const pendingGold = recallJob(goldScope);
     if (pendingGold) {
       setGoldBusy(true);
-      const tId = toast.loading("正在接回上次的金叶详页生成任务…", { duration: Infinity });
-      void followGoldJob(pendingGold, tId).finally(() => setGoldBusy(false));
+      void followGoldJob(pendingGold).finally(() => setGoldBusy(false));
     }
     // 只在挂载后跑一次；followXxxJob 依赖的都是稳定引用（id / qc / user）。
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -631,9 +757,13 @@ function DraftPage() {
   const onAdoptApprove = async () => {
     if (!user || !draft) return;
     try {
-      if (!draft.adopted) await setAdopted("plant_drafts", id, true, user.id);
+      // 采纳只有站长/资深编辑做得了（服务端闸门）。普通编辑点这个按钮时，
+      // **收录照常、采纳那一笔被拒** —— 于是按钮对他就等价于「审核通过收录」。
+      if (!draft.adopted) {
+        await adoptDraftFn({ data: { table: "plant_drafts", id, adopted: true } });
+      }
     } catch {
-      /* 采纳标记失败（如权限）不阻断收录 */
+      /* 采纳标记失败（权限不足）不阻断收录 */
     }
     await onApprove();
   };
@@ -726,7 +856,8 @@ function DraftPage() {
   const onMakeCard = async (opts?: { silent?: boolean }) => {
     if (!draft || cardBusy) return;
     setCardBusy(true);
-    const tId = opts?.silent ? undefined : toast.loading("正在生成分享卡…");
+    // 进度不发 toast —— 按钮自己就写着「生成中…」，失败落到 cardError 页内常驻。
+    setCardError(null);
     try {
       // 头像**在出卡这一刻现取**，不能直接读 creatorProfile 的当前值：识别完这张卡是自动弹的
       // （见下方 autoCardFiredRef 那个 effect），它只等 draft + 叶子统计，profiles 那条查询
@@ -763,9 +894,13 @@ function DraftPage() {
         commonNamesZh: draft.common_names_zh || draft.ai_payload?.common_names_zh,
         family: draft.family || draft.ai_payload?.family,
         genus: draft.genus || draft.ai_payload?.genus,
-        place: draft.capture_place,
-        lat: draft.capture_lat,
-        lng: draft.capture_lng,
+        // 分享卡的脱敏比页面更严：**只要命中名录就模糊**，站长、资深编辑、拍摄者本人
+        // 一律如此。因为卡是拿去转发的 —— 有权看精确坐标 ≠ 有权把精确坐标发出去，
+        // 而卡一旦被截图转出，就再也收不回来了。
+        place: protectedHere ? coarsenPlace(draft.capture_place) || null : draft.capture_place,
+        lat: cardGeo.lat,
+        lng: cardGeo.lng,
+        coordsFuzzed: cardGeo.fuzzed,
         summary: draft.summary || draft.ai_payload?.summary_zh,
         photoUrl: draft.photo_url,
         discovererName,
@@ -785,13 +920,20 @@ function DraftPage() {
         leafGold: leaves?.gold ?? null,
       });
       cardBlobRef.current = blob;
+      // 把卡面所依据的那份草稿一并记下来 —— 卡下面的「本次结论为疑似 / 第几次补拍」
+      // 只准读这份快照，绝不能读活状态（否则图与字会分别来自两轮识别）。
+      setCardSnap({
+        tentative,
+        retakeCount,
+        stamp: draftStamp(draft),
+      });
       setCardUrl((prev) => {
         if (prev) URL.revokeObjectURL(prev);
         return URL.createObjectURL(blob);
       });
-      if (tId) toast.success("分享卡已生成", { id: tId });
+      // 成功不必再说 —— 卡片当场就渲染出来了。
     } catch (e) {
-      if (tId) toast.error(e instanceof Error ? e.message : "生成分享卡失败", { id: tId });
+      if (!opts?.silent) setCardError(e instanceof Error ? e.message : "生成分享卡失败");
     } finally {
       setCardBusy(false);
     }
@@ -814,8 +956,13 @@ function DraftPage() {
 
   /** 关掉分享卡后是否直接送去补拍：识别刚出结果、结论是疑似、且还有补拍次数。
    *  只认「识别完自动弹出来的那张卡」——用户事后自己点「生成分享卡」是想分享，
-   *  那时候把人拽走是耍流氓（他也未必找得回来）。 */
-  const jumpToRetakeOnClose = cardAutoOpened && draftTentative && retakeCount < 3;
+   *  那时候把人拽走是耍流氓（他也未必找得回来）。
+   *
+   *  ⚠️ 判据一律取 `cardSnap`（出卡那一刻的快照），不取活状态：卡面是冻住的 PNG，
+   *  底下这行字要和它说同一件事。没有快照（卡还没画完）时才退回活状态。 */
+  const cardTentative = cardSnap?.tentative ?? draftTentative;
+  const cardRetakeCount = cardSnap?.retakeCount ?? retakeCount;
+  const jumpToRetakeOnClose = cardAutoOpened && cardTentative && cardRetakeCount < 3;
 
   /** 分享卡底部那一行放几个按钮：保存/分享 + 关闭 恒有，疑似多一个「去补拍」，未登录多一个
    *  「登录/注册」。全部挤在**同一行**（第二行会被手机浏览器地址栏压住，点不到），所以按数量
@@ -850,6 +997,7 @@ function DraftPage() {
     });
     cardBlobRef.current = null;
     setCardAutoOpened(false);
+    setCardSnap(null);
   };
 
   /** 关掉分享卡后，若这个物种已经有人做过，先把现成的推给用户 —— 别让他白花一枚银叶
@@ -862,7 +1010,10 @@ function DraftPage() {
       const found = (await lookupExisting({
         data: { scientificName: sci, excludeDraftId: id },
       })) as SpeciesExisting;
-      if (found.drafts.count > 0 || found.plant) setExisting(found);
+      // **快速简介卡不算「已经有人做过了」**：每次识别都会落一条，拿它弹面板等于天天打扰。
+      // 只有银叶科普 / 金叶详页 / skill 详页才值得拦一下——那才是能替用户省下一枚银叶的东西。
+      // （常驻那一栏仍然把绿色的快速卡列出来，两处门槛不同是有意的。）
+      if (found.items.some((i) => i.kind !== "quick")) setExisting(found);
     } catch {
       /* 锦上添花的功能，查不到就当没有 */
     }
@@ -990,6 +1141,21 @@ function DraftPage() {
     void onMakeCard({ silent: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [draft, leaves, user, id]);
+
+  /**
+   * 卡还开着，草稿却变了 → 立刻按新数据重画。
+   *
+   * 补拍是把新一轮识别**合并回同一份草稿**的，草稿页可能在补拍任务还没跑完时就已经
+   * 挂上了（从动态流点回来、或轮询接回），这时自动弹的那张卡画的是**上一轮**的物种。
+   * 任务一收尾草稿被刷新，卡面就与页面上其余部分对不上了 —— 用户 2026-07-30 看到的
+   * 「卡上 9 颗星的草木樨状黄芪 + 底下写着疑似、第三次补拍」正是这个。
+   */
+  useEffect(() => {
+    if (!cardUrl || cardBusy || !draft || !cardSnap) return;
+    if (draftStamp(draft) === cardSnap.stamp) return;
+    void onMakeCard({ silent: true });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [draft, cardUrl, cardBusy, cardSnap]);
 
   const handleReplaceImage = async (url: string) => {
     if (replaceSlot == null || !draft?.html_content) return;
@@ -1134,6 +1300,11 @@ function DraftPage() {
                     <ImageIcon className="w-3.5 h-3.5" />
                     <span>{cardBusy ? "生成中…" : "生成分享卡·存相册"}</span>
                   </button>
+                  {cardError && (
+                    <span className="text-[11px] text-destructive">
+                      分享卡生成失败：{cardError}
+                    </span>
+                  )}
                   <button
                     onClick={handleShare}
                     className="border border-ink/40 text-ink px-3 py-1.5 text-xs hover:border-ink hover:bg-paper-deep transition-colors inline-flex items-center gap-1 cursor-pointer"
@@ -1310,10 +1481,19 @@ function DraftPage() {
                               <path d="M12 21s-7-6.2-7-11a7 7 0 0 1 14 0c0 4.8-7 11-7 11Z" />
                               <circle cx="12" cy="10" r="2.6" />
                             </svg>
-                            <span>{draft.capture_place || "未知地点"}</span>
-                            {draft.capture_lat != null && draft.capture_lng != null && (
-                              <span className="text-ink-faint text-xs">
-                                ({draft.capture_lat.toFixed(4)}, {draft.capture_lng.toFixed(4)})
+                            <span>{shownGeo.place || "未知地点"}</span>
+                            {shownGeo.lat != null && shownGeo.lng != null && (
+                              <span
+                                className="text-xs"
+                                style={
+                                  shownGeo.fuzzed
+                                    ? { color: FUZZ_ORANGE, fontWeight: 600 }
+                                    : undefined
+                                }
+                                title={shownGeo.fuzzed ? FUZZ_EXPLAIN : undefined}
+                              >
+                                ({formatCoordPair(shownGeo.lat, shownGeo.lng, shownGeo.fuzzed)})
+                                {shownGeo.fuzzed && FUZZ_SUFFIX}
                               </span>
                             )}
                           </dd>
@@ -1419,47 +1599,43 @@ function DraftPage() {
               </section>
             )}
 
-            {/* 同物种站内已有的成品 —— 常驻在简介卡下方，方便直接跳过去看更完整的内容。
-                与关分享卡时弹的那个面板同源（lookupSpeciesExisting），区别是这里不打断操作。 */}
-            {!isEditing &&
-              speciesExisting &&
-              (speciesExisting.drafts.count > 0 || speciesExisting.plant) && (
-                <section className="mx-auto max-w-5xl px-6 mt-3">
-                  <div className="border border-rule rounded-lg p-3 bg-paper-deep/25">
-                    <p className="text-[12px] font-bold text-ink-soft mb-2">站内已有该物种的内容</p>
-                    <div className="flex flex-wrap gap-2">
-                      {speciesExisting.drafts.count > 0 && speciesExisting.drafts.latestId && (
-                        <Link
-                          to="/drafts/$id"
-                          params={{ id: speciesExisting.drafts.latestId }}
-                          className="text-[12px] border border-leaf-deep/50 text-leaf-deep px-3 py-1.5 rounded-sm hover:bg-leaf-deep hover:text-background transition-colors"
-                        >
-                          {speciesExisting.drafts.count} 份 AI 科普草稿
-                          {speciesExisting.drafts.userCount > 0 &&
-                            ` · ${speciesExisting.drafts.userCount} 位用户`}
-                        </Link>
-                      )}
-                      {speciesExisting.plant && (
-                        <Link
-                          to="/plants/$slug"
-                          params={{ slug: speciesExisting.plant.slug }}
-                          className="text-[12px] border border-amber-600/50 text-amber-700 px-3 py-1.5 rounded-sm hover:bg-amber-600 hover:text-background transition-colors"
-                        >
-                          科普详页：{speciesExisting.plant.title}
-                        </Link>
-                      )}
-                    </div>
-                  </div>
-                </section>
-              )}
+            {/* 同物种站内已有的成品 —— 常驻在简介卡下方。与已收录条目页**共用同一个组件**，
+                见 components/species-existing-links.tsx：绿=快速简介卡、蓝=银叶科普、
+                橙=金叶/skill 详页；只有未收录的银叶草稿是就地展开，其余跳页。 */}
+            {!isEditing && (
+              <SpeciesExistingLinks
+                existing={speciesExisting}
+                fallbackTitle={draft?.title}
+                className="mx-auto max-w-5xl px-6 mt-3"
+                open={inlineOpen}
+                onOpenChange={setInlineOpen}
+              />
+            )}
 
             {/* 生成任务的常驻进度面板。**刻意放在这里而不是各自按钮旁边**：按钮所在的分支会
                 随 notEnriched / 余额 / 编辑态切换而消失，进度面板一旦跟着藏起来，用户就又回到
                 「等了几分钟不知道还在不在跑」的老问题。这里是两种草稿状态下都稳定可见的位置。 */}
+            {identifyRow && (
+              <section className="mx-auto max-w-5xl px-6 mt-4">
+                <JobProgressPanel
+                  kind="identify"
+                  // 补拍是这一页最常见的来源，但首识别的动态流行也会短暂带上 draftId ——
+                  // 那时候说「补拍」就是假的，所以按 retake_count 分开写。
+                  title={retakeCount > 0 ? "正在重新识别这株植物（补拍）" : "正在识别这株植物"}
+                  subject={draft?.title}
+                  phase={identifyRow.phase}
+                  progress={identifyRow.progress}
+                  // 动态流行没有本地起始时刻，用它的建行时间 —— 那正是任务真正开始排队的时刻。
+                  startedAt={Date.parse(identifyRow.createdAt) || Date.now()}
+                />
+              </section>
+            )}
             {enrichProg && (
               <section className="mx-auto max-w-5xl px-6 mt-4">
                 <JobProgressPanel
+                  kind="enrich_draft"
                   title="正在生成进一步介绍草稿"
+                  subject={draft?.title}
                   phase={enrichProg.phase}
                   progress={enrichProg.progress}
                   startedAt={enrichProg.startedAt}
@@ -1469,7 +1645,9 @@ function DraftPage() {
             {goldProg && (
               <section className="mx-auto max-w-5xl px-6 mt-4">
                 <JobProgressPanel
+                  kind="gold_page"
                   title="正在生成金叶物种详细科普页"
+                  subject={draft?.title}
                   phase={goldProg.phase}
                   progress={goldProg.progress}
                   startedAt={goldProg.startedAt}
@@ -1569,6 +1747,18 @@ function DraftPage() {
                     <div className="mt-3 text-left rounded-lg border border-destructive/40 bg-destructive/5 px-3 py-2.5">
                       <p className="text-xs font-semibold text-destructive">生成失败</p>
                       <p className="mt-1 text-xs text-ink-soft leading-relaxed">{enrichError}</p>
+                    </div>
+                  )}
+                  {enrichDone && (
+                    <div className="mt-3 text-left rounded-lg border border-leaf/50 bg-leaf/10 px-3 py-2.5 flex items-start gap-2">
+                      <p className="flex-1 text-xs text-leaf-deep leading-relaxed">{enrichDone}</p>
+                      <button
+                        onClick={() => setEnrichDone(null)}
+                        className="shrink-0 text-[11px] text-ink-faint hover:text-ink cursor-pointer"
+                        title="知道了"
+                      >
+                        ✕
+                      </button>
                     </div>
                   )}
                 </div>
@@ -2039,7 +2229,7 @@ function DraftPage() {
 
       {/* 「这个物种已经有人做过了」——关掉分享卡后弹出（仅非疑似 + 本草稿尚未生成正文）。
           目的很直接：库里已有现成内容时，先推给用户，别让他白花一枚银叶等几分钟生成重复的。
-          三个去向平铺，第三个始终保留 —— 推荐归推荐，不能剥夺「我就是要自己生成」。 */}
+          去向平铺，最后那个「仍然生成」始终保留 —— 推荐归推荐，不能剥夺「我就是要自己生成」。 */}
       {existing && (
         <div
           className="fixed inset-0 z-[80] bg-black/70 flex items-center justify-center p-4"
@@ -2056,37 +2246,30 @@ function DraftPage() {
               （非疑似）。已经有现成内容可以直接看，不必再花一枚银叶等几分钟。
             </p>
             <div className="flex flex-col gap-2">
-              {existing.drafts.count > 0 && existing.drafts.latestId && (
-                <button
-                  onClick={() => {
-                    const to = existing.drafts.latestId as string;
-                    setExisting(null);
-                    navigate({ to: "/drafts/$id", params: { id: to } });
-                  }}
-                  className="w-full border border-leaf-deep/60 text-leaf-deep px-4 py-2.5 text-sm font-semibold hover:bg-leaf-deep hover:text-background transition-colors cursor-pointer rounded-sm text-left"
-                >
-                  已有 {existing.drafts.count} 份 AI 科普草稿
-                  {existing.drafts.userCount > 0 && ` · ${existing.drafts.userCount} 位用户`}
-                  <span className="block text-[11px] font-normal opacity-70">
-                    点击查看最新的一份
-                  </span>
-                </button>
-              )}
-              {existing.plant && (
-                <button
-                  onClick={() => {
-                    const slug = existing.plant!.slug;
-                    setExisting(null);
-                    navigate({ to: "/plants/$slug", params: { slug } });
-                  }}
-                  className="w-full border border-amber-600/60 text-amber-700 px-4 py-2.5 text-sm font-semibold hover:bg-amber-600 hover:text-background transition-colors cursor-pointer rounded-sm text-left"
-                >
-                  已有该植物的科普详页
-                  <span className="block text-[11px] font-normal opacity-70">
-                    {existing.plant.title} —— 点击跳转
-                  </span>
-                </button>
-              )}
+              {/* 颜色与文案跟常驻那一栏同一套（SPECIES_EXISTING_STYLE），两处不能各说各话。 */}
+              {existing.items.map((item) => {
+                const inline = item.kind === "silver" && !!item.draftId;
+                return (
+                  <button
+                    key={item.kind}
+                    onClick={() => {
+                      setExisting(null);
+                      // 未收录的银叶草稿：**不跳页**，就地展开在快速识别简介下面。
+                      if (inline) setInlineOpen(true);
+                      else if (item.draftId)
+                        navigate({ to: "/drafts/$id", params: { id: item.draftId } });
+                      else navigate({ to: "/plants/$slug", params: { slug: item.slug! } });
+                    }}
+                    className={`w-full border px-4 py-2.5 text-sm font-semibold transition-colors cursor-pointer rounded-sm text-left ${SPECIES_EXISTING_STYLE[item.kind].cls}`}
+                  >
+                    {speciesExistingLabel(item, draft?.title)}
+                    {speciesExistingCountSuffix(item)}
+                    <span className="block text-[11px] font-normal opacity-70">
+                      {inline ? "点击就在本页展开，不会跳走" : "点击跳转到该页"}
+                    </span>
+                  </button>
+                );
+              })}
               <button
                 onClick={() => {
                   setExisting(null);
@@ -2128,7 +2311,8 @@ function DraftPage() {
             {jumpToRetakeOnClose && (
               <p className="text-[11px] text-amber-700 mt-2 text-center leading-relaxed font-medium">
                 本次结论为<strong>疑似</strong>，点「去补拍」会进入补拍界面（
-                {retakeOrdinalLabel(retakeCount + 1)}）；点「关闭」则放弃补拍，直接看简介摘要卡。
+                {retakeOrdinalLabel(cardRetakeCount + 1)}
+                ）；点「关闭」则放弃补拍，直接看简介摘要卡。
               </p>
             )}
             {/* 「登录/注册」挪进按钮行后只剩四个字，为什么值得登录得由这行字来说。 */}

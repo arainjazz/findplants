@@ -12,6 +12,8 @@ import {
   type EditorApplication,
 } from "@/lib/edits";
 import { approveApplicationFn, confirmUserEmailFn } from "@/lib/identify-plant.functions";
+import { setSeniorEditorFn, listSeniorEditorsFn } from "@/lib/roles.functions";
+import { isOwnerEmail } from "@/lib/leaves";
 import { toast } from "sonner";
 
 export const Route = createFileRoute("/_authenticated/admin/applications")({
@@ -35,6 +37,16 @@ function AdminApplicationsPage() {
     queryKey: ["editor-applications"],
     queryFn: () => fetchApplications(),
     enabled: isAdmin,
+  });
+
+  // 「指定资深编辑」是站长专属 —— admin 也不行（否则权限会自我扩散：
+  // 一个 admin 可以给自己或别人加资深，站长就失去了这道人事口）。
+  const isOwner = isOwnerEmail(user?.email);
+  const listSeniors = useServerFn(listSeniorEditorsFn);
+  const { data: seniorIds = [] } = useQuery({
+    queryKey: ["senior-editors"],
+    queryFn: () => listSeniors({ data: undefined }),
+    enabled: isOwner,
   });
 
   useEffect(() => {
@@ -95,6 +107,13 @@ function AdminApplicationsPage() {
           <p className="label text-vermilion mb-2">Admissions · 编辑申请审核</p>
           <h1 className="font-display text-4xl font-bold">编辑申请</h1>
           <p className="text-ink-faint mt-2">审核新用户提交的编辑申请，通过后用户将获得编辑权限。</p>
+          {isOwner && (
+            <p className="text-xs text-ink-faint mt-2 leading-relaxed">
+              「已通过」的每张卡片上还有一个<b>资深编辑</b>开关（仅你可见）。资深编辑可以：
+              采纳他人的贡献（让对方那一枚铜叶 ×2）、撤销他人的错误改动、银叶不限量。当前有{" "}
+              {seniorIds.length} 位。
+            </p>
+          )}
         </div>
 
         <div className="flex border border-ink mb-6 w-fit">
@@ -123,7 +142,13 @@ function AdminApplicationsPage() {
         ) : (
           <ul className="space-y-4">
             {filtered.map((app) => (
-              <ApplicationCard key={app.id} app={app} adminId={user!.id} />
+              <ApplicationCard
+                key={app.id}
+                app={app}
+                adminId={user!.id}
+                canGrantSenior={isOwner}
+                isSenior={seniorIds.includes(app.user_id)}
+              />
             ))}
           </ul>
         )}
@@ -133,13 +158,49 @@ function AdminApplicationsPage() {
   );
 }
 
-function ApplicationCard({ app, adminId }: { app: EditorApplication; adminId: string }) {
+function ApplicationCard({
+  app,
+  adminId,
+  canGrantSenior,
+  isSenior,
+}: {
+  app: EditorApplication;
+  adminId: string;
+  /** 仅站长为 true —— 见 AdminApplicationsPage 里那段注释。 */
+  canGrantSenior: boolean;
+  isSenior: boolean;
+}) {
   const qc = useQueryClient();
   const [busy, setBusy] = useState(false);
   const [showReject, setShowReject] = useState(false);
   const [reason, setReason] = useState("");
   const approveFn = useServerFn(approveApplicationFn);
   const confirmEmailFn = useServerFn(confirmUserEmailFn);
+  const setSenior = useServerFn(setSeniorEditorFn);
+
+  const onToggleSenior = async () => {
+    const next = !isSenior;
+    if (
+      next &&
+      !confirm(
+        `把 ${app.email} 设为资深编辑？\n\n` +
+          "他将可以：采纳他人的贡献（对方铜叶 ×2）、撤销他人的错误改动、银叶不限量。\n" +
+          "这些操作都会照常记进 Log，随时可以在这里取消。",
+      )
+    )
+      return;
+    setBusy(true);
+    try {
+      await setSenior({ data: { userId: app.user_id, senior: next } });
+      toast.success(next ? `${app.email} 已成为资深编辑` : `已取消 ${app.email} 的资深编辑`);
+      qc.invalidateQueries({ queryKey: ["senior-editors"] });
+      qc.invalidateQueries({ queryKey: ["is-senior-editor"] });
+    } catch (e) {
+      toast.error("操作失败：" + (e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const onApprove = async () => {
     setBusy(true);
@@ -228,6 +289,24 @@ function ApplicationCard({ app, adminId }: { app: EditorApplication; adminId: st
           >
             {busy ? "处理中…" : "确认邮箱 · 放行登录"}
           </button>
+          {canGrantSenior && (
+            <button
+              onClick={onToggleSenior}
+              disabled={busy}
+              title={
+                isSenior
+                  ? "取消资深编辑（收回采纳 / 撤销 / 无限银叶）"
+                  : "设为资深编辑：可采纳他人贡献、撤销他人改动、银叶不限量"
+              }
+              className={`px-3 py-1.5 text-sm border transition-colors disabled:opacity-60 ${
+                isSenior
+                  ? "border-vermilion bg-vermilion/12 text-vermilion font-semibold"
+                  : "border-ink hover:bg-ink hover:text-background"
+              }`}
+            >
+              {isSenior ? "资深编辑 ✓ · 点此取消" : "设为资深编辑"}
+            </button>
+          )}
           <span className="text-xs text-ink-faint">已通过审核。若对方登录仍报「email not confirmed」，点左侧按钮。</span>
         </div>
       )}

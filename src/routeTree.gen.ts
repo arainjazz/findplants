@@ -16,6 +16,7 @@ import { Route as LoginRouteImport } from './routes/login'
 import { Route as IdentifyRouteImport } from './routes/identify'
 import { Route as ExploreRouteImport } from './routes/explore'
 import { Route as EditsRouteImport } from './routes/edits'
+import { Route as AboutRouteImport } from './routes/about'
 import { Route as AuthenticatedRouteImport } from './routes/_authenticated'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as ProjectsIndexRouteImport } from './routes/projects.index'
@@ -74,6 +75,11 @@ const ExploreRoute = ExploreRouteImport.update({
 const EditsRoute = EditsRouteImport.update({
   id: '/edits',
   path: '/edits',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const AboutRoute = AboutRouteImport.update({
+  id: '/about',
+  path: '/about',
   getParentRoute: () => rootRouteImport,
 } as any)
 const AuthenticatedRoute = AuthenticatedRouteImport.update({
@@ -208,6 +214,7 @@ const AuthenticatedAdminBlogEditIdRoute =
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
+  '/about': typeof AboutRoute
   '/edits': typeof EditsRoute
   '/explore': typeof ExploreRoute
   '/identify': typeof IdentifyRoute
@@ -240,6 +247,7 @@ export interface FileRoutesByFullPath {
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
+  '/about': typeof AboutRoute
   '/edits': typeof EditsRoute
   '/explore': typeof ExploreRoute
   '/identify': typeof IdentifyRoute
@@ -274,6 +282,7 @@ export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/_authenticated': typeof AuthenticatedRouteWithChildren
+  '/about': typeof AboutRoute
   '/edits': typeof EditsRoute
   '/explore': typeof ExploreRoute
   '/identify': typeof IdentifyRoute
@@ -308,6 +317,7 @@ export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
   fullPaths:
     | '/'
+    | '/about'
     | '/edits'
     | '/explore'
     | '/identify'
@@ -340,6 +350,7 @@ export interface FileRouteTypes {
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
+    | '/about'
     | '/edits'
     | '/explore'
     | '/identify'
@@ -373,6 +384,7 @@ export interface FileRouteTypes {
     | '__root__'
     | '/'
     | '/_authenticated'
+    | '/about'
     | '/edits'
     | '/explore'
     | '/identify'
@@ -407,6 +419,7 @@ export interface FileRouteTypes {
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   AuthenticatedRoute: typeof AuthenticatedRouteWithChildren
+  AboutRoute: typeof AboutRoute
   EditsRoute: typeof EditsRoute
   ExploreRoute: typeof ExploreRoute
   IdentifyRoute: typeof IdentifyRoute
@@ -474,6 +487,13 @@ declare module '@tanstack/react-router' {
       path: '/edits'
       fullPath: '/edits'
       preLoaderRoute: typeof EditsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/about': {
+      id: '/about'
+      path: '/about'
+      fullPath: '/about'
+      preLoaderRoute: typeof AboutRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/_authenticated': {
@@ -686,6 +706,7 @@ const AuthenticatedRouteWithChildren = AuthenticatedRoute._addFileChildren(
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   AuthenticatedRoute: AuthenticatedRouteWithChildren,
+  AboutRoute: AboutRoute,
   EditsRoute: EditsRoute,
   ExploreRoute: ExploreRoute,
   IdentifyRoute: IdentifyRoute,

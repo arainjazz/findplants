@@ -308,7 +308,11 @@ const CONSOLE_ADVICE: Record<
     ),
     avoid:
       "别配为「跟手」调的快模型：金叶正文会明显偏薄，而且容易在三轮撰稿中途被截断（报 GOLD_BAD_JSON）。留空则自动借用「草稿生成模型」的配置。",
-    thinkingWhy: "复杂长文正是思维链加分的地方，且不赶时间 → 默认开。",
+    thinkingWhy:
+      "默认关（2026-07-30 从「开」改过来的）。挂钟够，但**中转的网关时限不够**：" +
+      "实测 kimi-k3 开着思维链写第一轮正文，两三分钟不吐字节，中转直接判源站超时 → " +
+      "每次都停在「正在撰稿 1/3」+ HTTP 524。这种失败没有救法（重试一样慢、改流式也没用，" +
+      "因为思维链阶段不产生输出）。要开可以手动开，但配的必须是不经中转、或时限很宽的模型。",
   },
   organ: {
     needs: "能读图的多模态模型，要快要便宜",
@@ -407,7 +411,7 @@ function ThinkingRow({
             effective === "on" ? "bg-amber-500/15 text-amber-700" : "bg-leaf/15 text-leaf-deep"
           }`}
         >
-          当前：{effective === "on" ? "开（不发关思考参数）" : "关"}
+          当前：{effective === "on" ? "开" : "关"}
         </span>
       </div>
       {suspected && effective === "on" && (
@@ -418,9 +422,13 @@ function ThinkingRow({
         </p>
       )}
       <p className="text-[10px] text-ink-faint leading-relaxed">
-        「关」会发一组<b>厂商无关</b>的关思考参数（enable_thinking / reasoning_effort / thinking
-        三种写法一起发，不认的那个会被自动摘掉）；「开」则一个都不发，让模型按自己的默认来。
-        <b>部分模型（如 qwen3.8-max）思考不可关闭</b>，这时开关不起作用，只能换模型。
+        两档<b>都会真的发参数</b>，不是「建议」：OpenAI 兼容路发 enable_thinking / reasoning_effort
+        / thinking 三种写法（不认的那个会被自动摘掉）；Gemini 发 thinkingConfig；Anthropic 发
+        thinking。<b>三条路都已接通</b>—— 2026-07-30 之前只有 OpenAI 兼容那条认这个开关，配 Gemini
+        或 Anthropic 时它是死的， 而「开」也只是「什么都不发、随模型默认」。
+        <br />
+        注意两件事：<b>Gemini 3 没有「完全不思考」这一档</b>，「关」对它是把强度压到最低；
+        <b>部分模型（如 qwen3.8-max）思考不可关闭</b>，这时只能换模型。
       </p>
     </div>
   );

@@ -451,6 +451,131 @@ export async function fetchOriginProvenance(plantId: string): Promise<OriginProv
   };
 }
 
+// ─── 条目的分角色贡献 ────────────────────────────────────────────────────────
+//
+// 用户 2026-08-01：「合并后还能清晰追溯不同的识别人和生成人」「合并后也是能追溯不同的
+// 创建者的贡献」。页尾原来只有一行「创建者 / 共建者」加一行「最早识别」——同一条目被
+// 多次补拍、多人识别、再由别人花银叶生成时，这些人全被那一行「最早」盖掉了。
+//
+// 角色取自三处，互不重叠：
+//   · identify —— 每一份指向本条目的来源草稿的创建者（补拍/多人识别就有多条）
+//   · enrich   —— 花掉那枚银叶的人（`ai_payload._enriched_by`，2026-08-01 起才记；
+//                 存量草稿没有这个字段 → 退回识别人并标 `inferred`，页面上注明「同识别人」）
+//   · adopt/merge/edit —— 由页面已有的 `plantEdits` 渲染，不在这里重复查
+
+export type PlantContributorRole = "identify" | "enrich";
+
+export type PlantContributor = {
+  role: PlantContributorRole;
+  name: string;
+  at: string;
+  place?: string | null;
+  draftId: string;
+  /** 存量数据缺字段、由识别人推断出来的 —— 页面必须注明，不能假装是查到的。 */
+  inferred?: boolean;
+};
+
+/** 一份来源草稿在**结构化字段**上的说法 —— 给矛盾比对用（见 lib/field-conflicts.ts）。 */
+export type PlantSourceClaim = {
+  draftId: string;
+  /** 「宗秀 · 07/30 识别」，直接当矛盾表里的「谁说的」。 */
+  from: string;
+  title: string | null;
+  scientific_name: string | null;
+  family: string | null;
+  genus: string | null;
+  common_name_en: string | null;
+  common_names_zh: string | null;
+};
+
+export type PlantProvenance = { contributors: PlantContributor[]; sources: PlantSourceClaim[] };
+
+export async function fetchPlantProvenance(plantId: string): Promise<PlantProvenance> {
+  const { data: drafts, error } = await supabase
+    .from("plant_drafts")
+    .select(
+      "id, created_by, creator_label, capture_place, created_at, title, scientific_name, family, genus, common_name_en, common_names_zh, enriched:ai_payload->>_enriched, enrichedBy:ai_payload->>_enriched_by, enrichedAt:ai_payload->>_enriched_at",
+    )
+    .eq("published_plant_id", plantId)
+    .order("created_at", { ascending: true });
+  if (error || !drafts?.length) return { contributors: [], sources: [] };
+
+  type Row = {
+    id: string;
+    created_by: string | null;
+    creator_label: string | null;
+    capture_place: string | null;
+    created_at: string;
+    title: string | null;
+    scientific_name: string | null;
+    family: string | null;
+    genus: string | null;
+    common_name_en: string | null;
+    common_names_zh: string | null;
+    enriched: string | null;
+    enrichedBy: string | null;
+    enrichedAt: string | null;
+  };
+  const rows = drafts as unknown as Row[];
+
+  // 一次把所有用到的显示名查回来（识别人 + 生成人），别逐条查。
+  const ids = [
+    ...new Set(rows.flatMap((r) => [r.created_by, r.enrichedBy]).filter(Boolean) as string[]),
+  ];
+  const nameById = new Map<string, string>();
+  if (ids.length) {
+    const { data: profs } = await supabase
+      .from("profiles")
+      .select("id, display_name")
+      .in("id", ids);
+    for (const p of profs ?? []) if (p.display_name) nameById.set(p.id, p.display_name);
+  }
+  const nameOf = (userId: string | null, fallback: string | null) =>
+    (userId ? nameById.get(userId) : null) || fallback || "访客";
+
+  const contributors: PlantContributor[] = [];
+  const sources: PlantSourceClaim[] = [];
+  const md = (ts: string) => {
+    try {
+      return new Date(ts).toLocaleDateString("zh-CN", { month: "2-digit", day: "2-digit" });
+    } catch {
+      return ts.slice(5, 10);
+    }
+  };
+  for (const r of rows) {
+    const who = nameOf(r.created_by, r.creator_label);
+    contributors.push({
+      role: "identify",
+      name: who,
+      at: r.created_at,
+      place: r.capture_place,
+      draftId: r.id,
+    });
+    if (r.enriched === "true") {
+      // 记到了生成人且查得到显示名才算「查到的」；否则退回识别人并标 inferred。
+      const known = r.enrichedBy ? nameById.get(r.enrichedBy) : undefined;
+      contributors.push({
+        role: "enrich",
+        name: known || who,
+        at: r.enrichedAt || r.created_at,
+        draftId: r.id,
+        inferred: !known,
+      });
+    }
+    sources.push({
+      draftId: r.id,
+      from: `${who} · ${md(r.created_at)} 识别`,
+      title: r.title,
+      scientific_name: r.scientific_name,
+      family: r.family,
+      genus: r.genus,
+      common_name_en: r.common_name_en,
+      common_names_zh: r.common_names_zh,
+    });
+  }
+  return { contributors, sources };
+}
+
 /** Change log for a draft. Draft edit rows are tagged `block_path = draft:<id>`
  *  (see logDraftEditFn) so they can be listed without a schema change. */
 export async function fetchEditsForDraft(draftId: string) {
@@ -541,27 +666,34 @@ export async function revertEdit(edit: PlantEdit, currentUserId: string, bucket 
   if (upErr) throw upErr;
   const newUrl = supabase.storage.from(bucket).getPublicUrl(path).data.publicUrl;
 
-  // 6. Update plant
-  const { error: updErr } = await supabase
-    .from("plants")
-    .update({ html_url: newUrl })
-    .eq("id", plant.id);
-  if (updErr) throw updErr;
-
-  // 7. Toggle reverted flag on the source edit (real DB rows only)
+  // 6 + 7. 落库：换 plants.html_url + 翻 plant_edits.reverted。
+  //
+  // 🔴 这两笔**走服务端函数**（2026-07-31）。原先是客户端直写，靠 `plant_edits` 的
+  // UPDATE RLS 兜底 —— 而那条策略是 admin-only，于是「撤销」实际只有 admin 做得了，
+  // 资深编辑点了会在第 7 步静默失败、第 6 步却已经写进去了（内容换了、记录没翻）。
+  // 服务端函数用 service-role 一次做完，权限判定收在 roles.functions.ts 里。
+  // DOM 那一半留在浏览器（DOMParser 服务端没有），所以只把结果传过去。
   if (edit.editor_id) {
-    const { error: revErr } = await supabase
-      .from("plant_edits")
-      .update({
-        before_html: beforeSnapshot,
-        after_html: afterSnapshot,
-        reverted: !restoring,
-        reverted_by: restoring ? null : currentUserId,
-        reverted_at: restoring ? null : new Date().toISOString(),
-      })
-      .eq("id", edit.id);
-    if (revErr) throw revErr;
+    const { applyRevertFn } = await import("@/lib/roles.functions");
+    await applyRevertFn({
+      data: {
+        plantId: plant.id,
+        newHtmlUrl: newUrl,
+        editId: edit.id,
+        beforeHtml: beforeSnapshot,
+        afterHtml: afterSnapshot,
+        restoring,
+      },
+    });
   } else {
+    // 历史遗留：这条修改在库里没有对应行（editor_id 为空），补插一条。
+    // INSERT 的 RLS 认「本人 + 已批准编辑」，客户端写得进去，不必绕服务端。
+    const { error: updErr } = await supabase
+      .from("plants")
+      .update({ html_url: newUrl })
+      .eq("id", plant.id);
+    if (updErr) throw updErr;
+
     const { error: insErr } = await supabase.from("plant_edits").insert({
       id: edit.id,
       plant_id: plant.id,

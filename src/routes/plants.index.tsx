@@ -5,7 +5,14 @@ import { zodValidator, fallback } from "@tanstack/zod-adapter";
 import { z } from "zod";
 import { SiteHeader, SiteFooter } from "@/components/site-header";
 import { ChecklistResults } from "@/components/checklist-results";
-import { fetchPaginatedPlants, fetchPlantsMetadata, type Plant } from "@/lib/plants";
+import {
+  fetchPaginatedPlants,
+  fetchPlantsMetadata,
+  plantEntryKind,
+  type Plant,
+  type PlantEntryKind,
+} from "@/lib/plants";
+import { PlantKindBadge } from "@/components/plant-kind-badge";
 import { FilterDropdown } from "@/components/filter-dropdown";
 import {
   fetchAllCatalogs,
@@ -28,7 +35,7 @@ import { useServerFn } from "@tanstack/react-start";
 import { useAuth } from "@/hooks/use-auth";
 import { toast } from "sonner";
 import { fetchAllTags, fetchTagMembership, type TagWithCount, type TagMembership } from "@/lib/tags";
-import { fetchAiPlantIds } from "@/lib/drafts";
+import { fetchPlantSourceKinds } from "@/lib/drafts";
 import {
   CITES_APPENDICES,
   GTS_CATEGORIES,
@@ -49,7 +56,7 @@ const searchSchema = z.object({
   cites: fallback(z.string(), "").default(""), // 华盛顿贸易管制 appendix: "I" | "II"
   gts: fallback(z.string(), "").default(""), // GTS 全球树木红色名录: "CR" | "EN" | "VU"
   griis: fallback(z.string(), "").default(""), // GRIIS degreeOfEstablishment
-  type: fallback(z.string(), "").default(""), // "" | "ai" | "edited"
+  type: fallback(z.string(), "").default(""), // "" | "quick" | "silver" | "skill"（三色类别）
   page: fallback(z.number(), 1).default(1),
   q: fallback(z.string(), "").default(""),
 });
@@ -66,6 +73,8 @@ export const Route = createFileRoute("/plants/")({
 });
 
 const EMPTY_ID_SET = new Set<string>();
+/** 稳定引用，避免 useQuery 还没回来时每次渲染都新建一个 Map 触发下游 useMemo。 */
+const EMPTY_KIND_MAP = new Map<string, boolean>();
 
 function PlantsList() {
   const { family, genus, iucn, region, tag, rcat, cites, gts, griis, type, page, q: searchVal } = Route.useSearch();
@@ -345,16 +354,21 @@ function PlantsList() {
   const PAGE_SIZE = 15;
   const offset = (page - 1) * PAGE_SIZE;
 
-  const { data: aiIdsData } = useQuery({ queryKey: ["ai-plant-ids"], queryFn: fetchAiPlantIds });
-  const aiIds = aiIdsData ?? EMPTY_ID_SET;
+  // plantId → 来源草稿里有没有银叶那份。三色类别全靠它 + `plants.source` 算出来。
+  const { data: sourceKindsData } = useQuery({
+    queryKey: ["plant-source-kinds"],
+    queryFn: fetchPlantSourceKinds,
+  });
+  const sourceKinds = sourceKindsData ?? EMPTY_KIND_MAP;
 
-  // Combine the region/tag filter with the 条目类型 (AI vs edited) filter into a
+  // Combine the region/tag filter with the 条目类型 (三色类别) filter into a
   // single inclusion id-list for the paginated query (null = no id constraint).
   const plantIdsFilter = useMemo(() => {
     let typeSet: Set<string> | null = null;
-    if (type === "ai") typeSet = aiIds;
-    else if (type === "edited")
-      typeSet = new Set(plantsMetadata.filter((p) => !aiIds.has(p.id)).map((p) => p.id));
+    if (type === "quick" || type === "silver" || type === "skill")
+      typeSet = new Set(
+        plantsMetadata.filter((p) => plantEntryKind(p, sourceKinds) === type).map((p) => p.id),
+      );
     // Intersect every active id-constraint (region/tag, 条目类型, conservation registries).
     const sets = [regionPlantSlugs, typeSet, conservationIds].filter(
       (s): s is Set<string> => s !== null,
@@ -362,7 +376,7 @@ function PlantsList() {
     if (sets.length === 0) return null;
     sets.sort((a, b) => a.size - b.size);
     return Array.from(sets[0]).filter((id) => sets.every((s) => s.has(id)));
-  }, [regionPlantSlugs, type, aiIds, plantsMetadata, conservationIds]);
+  }, [regionPlantSlugs, type, sourceKinds, plantsMetadata, conservationIds]);
 
   const { data: paginatedData, isLoading: isListLoading } = useQuery({
     queryKey: ["plants-paginated", { family, genus, iucn, q: searchVal, page, plantIds: plantIdsFilter }],
@@ -458,8 +472,9 @@ function PlantsList() {
               label="条目类型"
               value={type}
               options={[
-                { value: "ai", label: "AI 识别条目" },
-                { value: "edited", label: "编辑提交条目" },
+                { value: "quick", label: "AI 快速识别" },
+                { value: "silver", label: "银叶科普" },
+                { value: "skill", label: "skill 创建详页" },
               ]}
               emptyLabel="全部条目"
               onChange={(v) => setParam("type", v)}
@@ -540,7 +555,7 @@ function PlantsList() {
               <>
                 <ul className="divide-y divide-rule border-y border-rule">
                   {paginatedPlants.map((p) => (
-                    <PlantRow key={p.id} plant={p} isAi={aiIds.has(p.id)} />
+                    <PlantRow key={p.id} plant={p} kind={plantEntryKind(p, sourceKinds)} />
                   ))}
                 </ul>
 
@@ -711,7 +726,7 @@ function PlantsList() {
   );
 }
 
-function PlantRow({ plant, isAi }: { plant: Plant; isAi?: boolean }) {
+function PlantRow({ plant, kind }: { plant: Plant; kind: PlantEntryKind }) {
   return (
     <li>
       <Link
@@ -739,11 +754,10 @@ function PlantRow({ plant, isAi }: { plant: Plant; isAi?: boolean }) {
         <div className="flex-1 min-w-0">
           <div className="flex items-baseline gap-2 flex-wrap">
             <h3 className="font-display text-xl font-semibold leading-tight group-hover:text-vermilion transition-colors">
-              {isAi ? `[${plant.title}]` : plant.title}
+              {/* 方括号是老的「AI 识别」标记，现在类别由右边的三色标说清楚了，标题不必再改写。 */}
+              {plant.title}
             </h3>
-            {isAi && (
-              <span className="text-[10px] px-1.5 py-0.5 rounded bg-[oklch(0.45_0.18_240)]/12 text-[oklch(0.45_0.18_240)] shrink-0">AI 识别</span>
-            )}
+            <PlantKindBadge kind={kind} className="shrink-0" />
             {plant.scientific_name && (
               <span className="italic text-sm text-ink-soft">{plant.scientific_name}</span>
             )}

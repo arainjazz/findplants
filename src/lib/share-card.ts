@@ -5,6 +5,7 @@ import leafGoldUrl from "@/assets/leaf-gold.png";
 import { proxyImageDataUrlFn } from "@/lib/image-proxy.functions";
 import type { RegistryChip, RegistryChipKind } from "@/lib/conservation";
 import { CONFIDENCE_STARS_TOTAL, confidenceStars } from "@/lib/identify-trace";
+import { FUZZ_ORANGE, FUZZ_SUFFIX, formatCoordPair } from "@/lib/protected-coords";
 
 /**
  * Renders a plant-identification "share card" to a PNG Blob for social sharing
@@ -34,6 +35,13 @@ export type ShareCardData = {
   place?: string | null;
   lat?: number | null;
   lng?: number | null;
+  /**
+   * 该记录命中重点保护名录、坐标已脱敏。为 true 时坐标数字画成**橙色**并缀上「（已模糊）」。
+   *
+   * 分享卡是最容易被转发出圈的一张图 —— 一串看着像精确 GPS 的数字被截图传开，就再也收不回来了。
+   * 所以模糊与否必须画在卡面上，而不只是靠站内页面提示。
+   */
+  coordsFuzzed?: boolean;
   summary?: string | null;
   photoUrl: string;
   /** 识别者显示名：注册用户名，或访客时为「小P蛙」。 */
@@ -585,11 +593,16 @@ export async function renderShareCard(data: ShareCardData): Promise<Blob> {
       locY += 32;
     }
 
-    // 坐标
+    // 坐标 —— 脱敏的画成橙色并缀「（已模糊）」，其余维持原来的灰色精确值。
     if (data.lat != null && data.lng != null) {
-      ctx.fillStyle = C.inkFaint;
-      ctx.font = `400 22px ${FONT}`;
-      ctx.fillText(`${data.lat.toFixed(4)}, ${data.lng.toFixed(4)}`, rightX, locY);
+      const fz = !!data.coordsFuzzed;
+      ctx.fillStyle = fz ? FUZZ_ORANGE : C.inkFaint;
+      ctx.font = `${fz ? 600 : 400} 22px ${FONT}`;
+      ctx.fillText(
+        formatCoordPair(data.lat, data.lng, fz) + (fz ? FUZZ_SUFFIX : ""),
+        rightX,
+        locY,
+      );
     }
 
     ctx.textAlign = "left";

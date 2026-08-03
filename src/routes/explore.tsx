@@ -1,11 +1,29 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useQuery } from "@tanstack/react-query";
+import { useServerFn } from "@tanstack/react-start";
 import { useEffect, useMemo, useRef, useState, type TouchEvent as ReactTouchEvent } from "react";
 import { SiteHeader, SiteFooter } from "@/components/site-header";
 import { fetchGeoSightings, type GeoSighting } from "@/lib/drafts";
 import { gbifChinaOccurrencesFn } from "@/lib/identify-plant.functions";
+import { geoSightingsExactFn } from "@/lib/geo-sightings.functions";
+import { getMyRolesFn } from "@/lib/roles.functions";
 import { displayPlace } from "@/lib/editor-stats";
 import { fetchConservationData, buildConservationMatcher } from "@/lib/conservation";
+import {
+  FUZZ_EXPLAIN,
+  FUZZ_NOTICE,
+  FUZZ_ORANGE,
+  FUZZ_SUFFIX,
+  formatCoordPair,
+} from "@/lib/protected-coords";
+import { fetchTags, fetchTagMembership, type TagMembership } from "@/lib/tags";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { useAuth } from "@/hooks/use-auth";
 
 export const Route = createFileRoute("/explore")({
@@ -135,6 +153,8 @@ function ExplorePage() {
   const [selectedArea, setSelectedArea] = useState<string | null>(null);
   const [invasiveOnly, setInvasiveOnly] = useState(false);
   const [protectedOnly, setProtectedOnly] = useState(false);
+  /** 选中的主题标签 id；null = 全部主题（不筛）。 */
+  const [themeTag, setThemeTag] = useState<string | null>(null);
   // 「只显示我识别的植物」— login-only. Off = everyone's sightings; on = only mine.
   const { user } = useAuth();
   const [mineOnly, setMineOnly] = useState(false);
@@ -172,10 +192,36 @@ function ExplorePage() {
     }
   }, [routeStops]);
 
-  const { data: sightings = [], isLoading } = useQuery({
+  const { data: publicSightings = [], isLoading } = useQuery({
     queryKey: ["geo-sightings"],
     queryFn: () => fetchGeoSightings(500),
   });
+
+  // ── 保护物种的精确坐标（仅站长 / 资深编辑）────────────────────────────────────
+  // 公开数据里，命中重点保护名录的记录坐标与地点都已在服务端脱敏（见 protected-coords.ts）。
+  // 站长要把准确数据导出授权给科研机构 / 政府部门，所以给他们留一条精确入口：
+  // **点开「只显示重点保护物种」时**才切到精确坐标 —— 平时浏览全图看到的和所有人一样是
+  // 模糊值，避免站长自己截个图发出去就把位置泄了。
+  const rolesFn = useServerFn(getMyRolesFn);
+  const { data: myRoles } = useQuery({
+    queryKey: ["my-roles", user?.id ?? "anon"],
+    queryFn: () => rolesFn({ data: undefined }),
+    enabled: !!user,
+    staleTime: 5 * 60 * 1000,
+  });
+  const canSeeExact = !!myRoles?.isSenior; // isSenior 已含站长
+
+  const exactFn = useServerFn(geoSightingsExactFn);
+  const exactMode = canSeeExact && protectedOnly;
+  const { data: exactSightings, isFetching: exactLoading } = useQuery({
+    queryKey: ["geo-sightings", "exact"],
+    queryFn: () => exactFn({ data: { limit: 500 } }),
+    enabled: exactMode,
+    staleTime: 5 * 60 * 1000,
+  });
+
+  // 精确那份到手之前先用公开（模糊）的顶着，地图不会空一下。
+  const sightings = exactMode && exactSightings ? exactSightings : publicSightings;
 
   // Conservation registries (国家/省级重点保护 · CITES · GTS · GRIIS) — loaded once and
   // matched client-side against each sighting's scientific name (same rank-aware matcher
@@ -200,7 +246,12 @@ function ExplorePage() {
   // A sighting counts as invasive if the draft was GRIIS-flagged at ingest OR the local
   // GRIIS registry matches it; protected if any 重点保护 list matches.
   const isInvasiveSighting = (s: GeoSighting) => s.is_invasive || !!consStatus.get(s.id)?.griis;
-  const isProtectedSighting = (s: GeoSighting) => !!consStatus.get(s.id)?.protected;
+  // 服务端判定（决定坐标脱不脱敏）与前端匹配器**取并集**：两边用的是同一套匹配规则，
+  // 但名录表是分页拉的，万一前端那份少了一页，也绝不能因此把某条按「非保护」显示 ——
+  // 宁可多打一次盾牌，不可少模糊一个坐标。
+  const isProtectedSighting = (s: GeoSighting) => s.is_protected || !!consStatus.get(s.id)?.protected;
+  const protectedLabelOf = (s: GeoSighting) =>
+    consStatus.get(s.id)?.label || s.protected_label || "重点保护物种";
 
   // ── 地图 4 类点：按优先级取单色 入侵红 > 保护棕 > 采纳绿 > 未采纳蓝 ──
   // 采纳 = 草稿已收录(status='approved')；入侵/保护由物种身份决定，与采纳无关。
@@ -339,6 +390,60 @@ function ExplorePage() {
       .slice(0, 6); // Only show top 6 most recent areas
   }, [sightings]);
 
+  // ── 主题标签筛选（「只显示某个专题下的物种分布」）────────────────────────────
+  // 走 fetchTagMembership 而不是自己拿 `plant_drafts.tags` 比名字 —— 主题标签有**三个
+  // 来源**（plant_tags 关联表 / plants.tags / plant_drafts.tags），只认其中一个，
+  // 就会出现「专题页说有 5 条、地图上只有 3 条」这种对不上账的情况（那正是 07-24
+  // 「手动添加的标签下面永远是 0」那个 bug 的由来，见 tags.ts 开头的长注释）。
+  const { data: tagIndex } = useQuery({
+    queryKey: ["explore-tag-index"],
+    queryFn: async () => {
+      const tags = await fetchTags();
+      if (!tags.length) return { tags, membership: new Map<string, TagMembership>() };
+      return { tags, membership: await fetchTagMembership(tags) };
+    },
+    staleTime: 5 * 60 * 1000,
+  });
+
+  /** tagId → 该专题下的草稿 id / 已收录条目 id，查成 Set 好逐条 O(1) 判定。 */
+  const tagSets = useMemo(() => {
+    const m = new Map<string, { drafts: Set<string>; plants: Set<string> }>();
+    for (const [id, v] of tagIndex?.membership ?? []) {
+      m.set(id, { drafts: new Set(v.draftIds), plants: new Set(v.plantIds) });
+    }
+    return m;
+  }, [tagIndex]);
+
+  /**
+   * 一条实拍记录算不算在某个专题下。
+   *
+   * 两条都要认：记录本身挂了标签（草稿），**或者**它已被采纳、而标签挂在采纳后的
+   * 条目上。只认前者的话，一个专题越是"做得好"（条目都收录了）、地图上反而越空。
+   */
+  const inTheme = (s: GeoSighting, tagId: string) => {
+    const set = tagSets.get(tagId);
+    if (!set) return false;
+    return set.drafts.has(s.id) || (!!s.published_plant_id && set.plants.has(s.published_plant_id));
+  };
+
+  /** 下拉里列出的专题：只留**地图上真有点**的，并按记录数从多到少排。 */
+  const themeOptions = useMemo(() => {
+    if (!tagIndex?.tags.length) return [];
+    return tagIndex.tags
+      .map((t) => ({ id: t.id, name: t.name, count: sightings.filter((s) => inTheme(s, t.id)).length }))
+      .filter((t) => t.count > 0)
+      .sort((a, b) => b.count - a.count);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tagIndex, tagSets, sightings]);
+
+  // 选中的专题若因数据变化不再有点（例如刚好被别的筛选清空），自动退回「全部」，
+  // 免得下拉显示着一个专题、地图却是空的。
+  useEffect(() => {
+    if (themeTag && !themeOptions.some((t) => t.id === themeTag)) setThemeTag(null);
+  }, [themeOptions, themeTag]);
+
+  const themeFilter = (s: GeoSighting) => !themeTag || inTheme(s, themeTag);
+
   // When either 名录 filter is on, keep sightings matching EITHER active category (union).
   const consFilter = (s: GeoSighting) =>
     !invasiveOnly && !protectedOnly
@@ -349,17 +454,17 @@ function ExplorePage() {
   const mineFilter = (s: GeoSighting) => !mineOnly || (!!user && s.created_by === user.id);
 
   const visibleSightings = useMemo(() => {
-    let arr = sortedSightings.filter((s) => consFilter(s) && mineFilter(s));
+    let arr = sortedSightings.filter((s) => consFilter(s) && mineFilter(s) && themeFilter(s));
     if (selectedArea) arr = arr.filter((s) => displayPlace(s.capture_place) === selectedArea);
     return arr;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sortedSightings, selectedArea, invasiveOnly, protectedOnly, mineOnly, user?.id, consStatus]);
+  }, [sortedSightings, selectedArea, invasiveOnly, protectedOnly, mineOnly, themeTag, tagSets, user?.id, consStatus]);
 
   // Sightings drawn on the map (名录 filters narrow to flagged species).
   const mapSightings = useMemo(
-    () => sightings.filter((s) => consFilter(s) && mineFilter(s)),
+    () => sightings.filter((s) => consFilter(s) && mineFilter(s) && themeFilter(s)),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [sightings, invasiveOnly, protectedOnly, mineOnly, user?.id, consStatus],
+    [sightings, invasiveOnly, protectedOnly, mineOnly, themeTag, tagSets, user?.id, consStatus],
   );
   // Count of the current user's own sightings — shown on the mine-only toggle.
   const mineCount = useMemo(
@@ -453,15 +558,24 @@ function ExplorePage() {
       const nav =
         `https://uri.amap.com/navigation?to=${glng.toFixed(6)},${glat.toFixed(6)},` +
         `${encodeURIComponent(name)}&mode=car&coordinate=gaode&callnative=1`;
+      // 坐标那一行只对**保护物种**出，因为只有它有话要说：要么标明已模糊（橙字），
+      // 要么标明这是站长/资深编辑才看得到的精确值（绿字）。普通记录的坐标信息由
+      // 「📍 地点」和图钉位置本身表达，不必再堆一行数字。
+      const coordLine = !isProtectedSighting(s)
+        ? ""
+        : s.coords_fuzzed
+          ? `<p style="margin:0 0 6px 0;font-size:11px;font-weight:700;color:${FUZZ_ORANGE};" title="${escapeHtml(FUZZ_EXPLAIN)}">🧭 ${formatCoordPair(s.capture_lat, s.capture_lng, true)}${FUZZ_SUFFIX}</p>`
+          : `<p style="margin:0 0 6px 0;font-size:11px;font-weight:700;color:#15803d;" title="保护物种的精确坐标，仅网站所有者与资深编辑可见，请勿外传或截图分享。">🧭 ${formatCoordPair(s.capture_lat, s.capture_lng, false)}（精确·仅你可见）</p>`;
       const div = document.createElement("div");
       div.style.cssText = "min-width:210px;font-family:system-ui,sans-serif;padding:2px 2px 0;";
       div.innerHTML = `
         <h4 style="margin:0 0 2px 0;font-weight:700;font-size:14px;color:#1e1008;">${escapeHtml(s.title)}</h4>
         ${s.scientific_name ? `<p style="margin:0 0 4px 0;font-style:italic;font-size:12px;color:#6e4c28;">${escapeHtml(s.scientific_name)}</p>` : ""}
         ${isInvasiveSighting(s) ? `<p style="margin:0 0 6px 0;display:inline-block;background:#dc2626;color:#fff;font-size:11px;font-weight:700;padding:2px 8px;border-radius:999px;">⚠️ 外来入侵物种</p>` : ""}
-        ${!isInvasiveSighting(s) && isProtectedSighting(s) ? `<p style="margin:0 0 6px 0;display:inline-block;background:#ca8a04;color:#fff;font-size:11px;font-weight:700;padding:2px 8px;border-radius:999px;">🛡️ ${escapeHtml(consStatus.get(s.id)?.label || "重点保护物种")}</p>` : ""}
+        ${!isInvasiveSighting(s) && isProtectedSighting(s) ? `<p style="margin:0 0 6px 0;display:inline-block;background:#ca8a04;color:#fff;font-size:11px;font-weight:700;padding:2px 8px;border-radius:999px;">🛡️ ${escapeHtml(protectedLabelOf(s))}</p>` : ""}
         ${!isInvasiveSighting(s) && !isProtectedSighting(s) ? `<p style="margin:0 0 6px 0;display:inline-block;background:${s.status === "approved" ? "#2e9e5b" : "#2563eb"};color:#fff;font-size:11px;font-weight:700;padding:2px 8px;border-radius:999px;">${s.status === "approved" ? "✓ 已采纳收录" : "待编辑采纳"}</p>` : ""}
         ${s.capture_place ? `<p style="margin:0 0 6px 0;font-size:11px;color:#6e4c28;">📍 ${escapeHtml(s.capture_place)}</p>` : ""}
+        ${coordLine}
         ${s.photo_url ? `<img src="${escapeHtml(s.photo_url)}" style="width:100%;height:96px;object-fit:cover;border-radius:4px;margin-top:4px;" />` : ""}
         <a href="${nav}" target="_blank" rel="noopener" style="display:block;text-align:center;background:#2e9e5b;color:#fff;font-size:12px;font-weight:600;padding:6px;border-radius:4px;margin-top:8px;text-decoration:none;">🧭 导航到此地</a>
         <button data-role="addstop" style="display:block;width:100%;text-align:center;background:#c2410c;color:#fff;font-size:12px;font-weight:600;padding:6px;border-radius:4px;margin-top:6px;border:none;cursor:pointer;">➕ 加入路线</button>
@@ -1028,17 +1142,30 @@ function ExplorePage() {
         </button>
 
         {!panelOpen && (
-          <button
-            type="button"
-            onClick={() => setPanelOpen(true)}
-            aria-label="展开物种列表"
-            className="absolute top-4 left-4 z-[500] w-11 h-11 rounded-full bg-background/95 backdrop-blur-md border border-ink/20 shadow-xl flex items-center justify-center text-ink hover:text-vermilion transition-colors"
-          >
-            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-              <circle cx="11" cy="11" r="7" />
-              <path d="m21 21-4.3-4.3" />
-            </svg>
-          </button>
+          <>
+            <button
+              type="button"
+              onClick={() => setPanelOpen(true)}
+              aria-label="展开物种列表"
+              className="absolute top-4 left-4 z-[500] w-11 h-11 rounded-full bg-background/95 backdrop-blur-md border border-ink/20 shadow-xl flex items-center justify-center text-ink hover:text-vermilion transition-colors"
+            >
+              <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                <circle cx="11" cy="11" r="7" />
+                <path d="m21 21-4.3-4.3" />
+              </svg>
+            </button>
+            {/* 面板收起后声明也不能跟着消失 —— 用户要的是「所有人的界面都提示」，
+                而移动端多数时间面板是收着的。 */}
+            <div
+              className="absolute top-4 left-[4.25rem] right-4 z-[500] rounded-full bg-amber-50/95 backdrop-blur-md border border-amber-300 px-3 py-2 shadow-lg pointer-events-none"
+              title={FUZZ_EXPLAIN}
+            >
+              <p className="text-[10px] font-semibold text-amber-900 leading-snug truncate">
+                <span aria-hidden="true">🛡️ </span>
+                {FUZZ_NOTICE}
+              </p>
+            </div>
+          </>
         )}
 
         {panelOpen && (
@@ -1061,9 +1188,73 @@ function ExplorePage() {
             <p className="md:hidden text-[10px] text-ink-faint/70 mb-1">← 左右滑动此卡片即可收起 →</p>
             <p className="label text-vermilion mb-1 pr-8">Explorer · 身边物种地图</p>
             <h1 className="font-display text-2xl font-bold leading-tight mb-2 text-ink">身边物种地图</h1>
-            <p className="text-xs text-ink-faint leading-relaxed mb-4">
+            <p className="text-xs text-ink-faint leading-relaxed mb-3">
               地图上每个标记都是有人用手机拍照识别、并带真实 GPS 坐标的物种记录。点击标记可「导航到此地」或「加入路线」；聚合圆点（少于 20 种）点开会在右侧展开物种卡片，同种在别处的记录以绿线相连。
             </p>
+
+            {/* 坐标脱敏声明 —— 所有人（含未登录）都看得到，不受任何筛选开关影响。
+                放在筛选按钮之前：这是地图数据的一条**前提**，不是某个视图下的补充说明。 */}
+            <div className="mb-4 rounded-md border border-amber-300 bg-amber-50 px-3 py-2">
+              <p className="text-[11px] font-semibold text-amber-900 leading-snug">
+                <span aria-hidden="true">🛡️ </span>
+                {FUZZ_NOTICE}
+              </p>
+              <p className="mt-1 text-[10px] text-amber-800/90 leading-relaxed">
+                命中国家 / 省级重点保护野生植物名录的记录，对外只显示模糊坐标与区县级地点，
+                <b>以防不法盗挖</b>；图钉位置随之偏移，不代表植株的真实所在。
+              </p>
+            </div>
+
+            {/* 主题标签筛选。放在所有开关**之前**：其它几个是「在当前这批点里再挑一挑」，
+                而选专题是先决定「看哪一批点」，顺序应当由粗到细。
+                只在真有可选专题时出现 —— 一个永远只有「全部主题」的下拉是纯噪音。 */}
+            {!isLoading && themeOptions.length > 0 && (
+              <div className="mb-3">
+                <Select
+                  value={themeTag ?? "__all__"}
+                  onValueChange={(v) => setThemeTag(v === "__all__" ? null : v)}
+                >
+                  <SelectTrigger
+                    className={`w-full h-auto text-xs font-semibold px-3 py-2 rounded-md border transition-colors ${
+                      themeTag
+                        ? "bg-vermilion text-background border-vermilion shadow"
+                        : "bg-paper-deep/60 text-ink border-ink/20 hover:border-vermilion"
+                    }`}
+                    title="按主题标签筛选：只显示该专题下的物种分布"
+                  >
+                    <span aria-hidden="true" className="mr-1.5">🏷️</span>
+                    <SelectValue placeholder="按主题标签筛选" />
+                  </SelectTrigger>
+                  {/* z-[900]：下拉是 portal 到 body 的，默认 z-50 会被面板（z-500）和
+                      高德自己的图层压住，必须显式抬高，否则点开是一片空白。 */}
+                  <SelectContent className="z-[900] max-h-[50vh]">
+                    <SelectItem value="__all__">全部主题（不筛选）</SelectItem>
+                    {themeOptions.map((t) => (
+                      <SelectItem key={t.id} value={t.id}>
+                        {t.name} · {t.count}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                {themeTag && (
+                  <p className="mt-1.5 text-[10px] text-ink-faint leading-relaxed">
+                    当前只显示
+                    <b className="text-vermilion">
+                      「{themeOptions.find((t) => t.id === themeTag)?.name}」专题下的{" "}
+                      {themeOptions.find((t) => t.id === themeTag)?.count} 条记录
+                    </b>
+                    ；含挂在草稿上和已收录条目上的两种。
+                    <button
+                      type="button"
+                      onClick={() => setThemeTag(null)}
+                      className="ml-1 underline hover:text-vermilion"
+                    >
+                      清除
+                    </button>
+                  </p>
+                )}
+              </div>
+            )}
 
             {/* 只显示我识别的植物 — login-only. Guests never see this button; without
                 logging in there's no way to tell「我的」记录 apart. */}
@@ -1135,9 +1326,24 @@ function ExplorePage() {
                   <span className={protectedOnly ? "opacity-90" : "text-amber-600"}>{protectedCount}</span>
                 </button>
                 {protectedOnly && (
-                  <p className="mt-1.5 text-[10px] text-ink-faint leading-relaxed">
-                    金色盾牌＝匹配<b className="text-amber-700">国家/省级重点保护名录</b>的实拍记录（按学名匹配，含属级/科级条目）。
-                  </p>
+                  <>
+                    <p className="mt-1.5 text-[10px] text-ink-faint leading-relaxed">
+                      金色盾牌＝匹配<b className="text-amber-700">国家/省级重点保护名录</b>的实拍记录（按学名匹配，含属级/科级条目）。
+                    </p>
+                    {/* 站长 / 资深编辑：此视图下切到精确坐标，供日后导出授权给科研机构或政府部门。
+                        这块提示必须显眼 —— 屏幕上正摆着一份不该外传的数据，得让人知道自己在看什么。 */}
+                    {canSeeExact && (
+                      <div className="mt-2 rounded-md border border-emerald-400 bg-emerald-50 px-2.5 py-2">
+                        <p className="text-[10px] font-bold text-emerald-900 leading-snug">
+                          🔓 精确坐标模式{exactLoading && <span className="animate-pulse font-normal"> · 载入中…</span>}
+                        </p>
+                        <p className="mt-1 text-[10px] text-emerald-800 leading-relaxed">
+                          你的身份为<b>{myRoles?.isOwner ? "网站所有者" : "资深编辑"}</b>，本视图显示的是保护物种的
+                          <b>真实 GPS 坐标</b>（其他人看到的是模糊值）。请勿截图外传；关闭本开关即恢复模糊显示。
+                        </p>
+                      </div>
+                    )}
+                  </>
                 )}
               </div>
             )}

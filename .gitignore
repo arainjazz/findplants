@@ -40,3 +40,7 @@ dist-ssr
 .serena/
 scratch/
 supabase/.temp/
+
+# 一次性工具留下的构建产物（本地跑 PPT / workbuddy 时生成，含各自的 node_modules）
+.codex-ppt-build/
+.workbuddy/

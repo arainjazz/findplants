@@ -568,6 +568,9 @@ function BatchNewPage() {
               ref={folderRef}
               type="file"
               webkitdirectory=""
+              // multiple：批量录入本来就是「一次多个物种」，Chromium 系下按住 ⌘ / Shift
+              // 可一次勾选多个物种文件夹（少了它，文件夹选择器每次只让选一个）。
+              multiple
               className="sr-only"
               onChange={onPickFiles}
             />

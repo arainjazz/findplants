@@ -48,6 +48,41 @@ export function entryType(p: { source?: string | null; content_type?: string | n
   return { key: "manual", label: "富文本" };
 }
 
+// ─── 已收录档案的三类内容 ────────────────────────────────────────────────────
+//
+// 用户 2026-08-01 定的分法，与草稿页/条目页那一栏「站内已有该物种的内容」**同一套配色**
+// （见 lib/species-existing.functions.ts 的 SpeciesExistingKind）：
+//   🟢 quick  AI 快速识别      —— 采纳「快速识别简介卡」落成的条目
+//   🔵 silver 银叶科普          —— 采纳银叶生成的完整科普落成的条目（正文必然含快速识别简介）
+//   🟠 skill  skill 创建详页    —— 金叶一键（gold_oneclick）或编辑用 skill 做好后上传的页
+//
+// 判据同样是**内容来源**而不是「表里哪一列」：`plants.source` 只能认出金叶一键，
+// 采纳流程历史上有的写 `ai_identify`、有的留 null（见 STATE 07-31 的交叉统计），
+// 真正可靠的信号是「有没有草稿 `published_plant_id` 指向它、那份草稿是不是银叶」。
+export type PlantEntryKind = "quick" | "silver" | "skill";
+
+export const PLANT_ENTRY_KIND_META: Record<PlantEntryKind, { label: string; cls: string }> = {
+  quick: { label: "AI 快速识别", cls: "border-leaf/60 bg-leaf/10 text-leaf-deep" },
+  silver: { label: "银叶科普", cls: "border-sky-600/60 bg-sky-500/10 text-sky-800" },
+  skill: { label: "skill 创建详页", cls: "border-amber-600/60 bg-amber-500/10 text-amber-700" },
+};
+
+/**
+ * `sourceEnriched`：plantId → 指向它的来源草稿里有没有银叶那份（见 drafts.ts
+ * `fetchPlantSourceKinds`）。查不到（没有来源草稿）= 编辑用 skill 上传的页。
+ */
+export function plantEntryKind(
+  plant: { id: string; source?: string | null },
+  sourceEnriched?: Map<string, boolean> | null,
+): PlantEntryKind {
+  // 金叶一键优先级最高：哪怕恰好有草稿指过来，它也仍然是 skill 详页。
+  if (plant.source === "gold_oneclick") return "skill";
+  const enriched = sourceEnriched?.get(plant.id);
+  if (enriched === true) return "silver";
+  if (enriched === false) return "quick";
+  return "skill";
+}
+
 /**
  * 归一化学名到「属+种」查重键：去掉 markdown 星号/下划线，取前两个空格分词，小写。
  * 用于判定「同一物种」——容忍命名人后缀与格式差异。
@@ -227,7 +262,8 @@ export async function fetchPaginatedPlants(options: FetchPlantsOptions) {
 export async function fetchPlantsMetadata() {
   const { data, error } = await supabase
     .from("plants")
-    .select("id, slug, title, scientific_name, family, genus, iucn_status");
+    // `source` 是给「条目类型」筛选算三色类别用的（见 plantEntryKind）。
+    .select("id, slug, title, scientific_name, family, genus, iucn_status, source");
   if (error) throw error;
   return data ?? [];
 }

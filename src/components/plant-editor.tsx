@@ -551,8 +551,18 @@ export function PlantEditor({ initial }: Props) {
 
   const processHtmlFiles = async (files: File[]) => {
     if (files.length === 0) return;
-    const htmlFile = files.find((f) => /\.html?$/i.test(f.name) || f.type === "text/html");
+    const htmlFiles = files.filter((f) => /\.html?$/i.test(f.name) || f.type === "text/html");
+    const htmlFile = htmlFiles[0];
     if (!htmlFile) return toast.error("请选择 .html 文件，或拖入包含 HTML 与图片的文件夹");
+    // 这一页是**单条目**编辑器：一次只能落一个物种。多选/多文件夹选进来好几份 HTML 时
+    // 明确说清楚只用了哪一份，并把人指向「批量上传」——静默丢掉其余几份最伤人。
+    if (htmlFiles.length > 1) {
+      toast.warning(
+        `选中了 ${htmlFiles.length} 份 HTML，本页只能建一个条目，已采用「${htmlFile.name}」。` +
+          `要一次录入多个物种请用「批量上传」。`,
+        { duration: 9000 },
+      );
+    }
     setUploadingHtml(true);
     try {
       const text = await htmlFile.text();
@@ -804,6 +814,9 @@ export function PlantEditor({ initial }: Props) {
         ref={htmlFolderInputRef}
         type="file"
         webkitdirectory=""
+        // 与「选择文件」那个 input 一样加 multiple：Chromium 系浏览器下按住
+        // ⌘ / Shift 就能一次勾选多个文件夹（少了它，文件夹选择器每次只让选一个）。
+        multiple
         onChange={onHtmlUpload}
         disabled={uploadingHtml || extracting}
         className="sr-only"
@@ -1045,6 +1058,8 @@ export function PlantEditor({ initial }: Props) {
                 </p>
                 <p className="text-xs text-ink-faint max-w-md mx-auto leading-relaxed">
                   当你的页面有本地配图时，请拖入文件夹；或使用下方按钮点击上传。
+                  两个按钮都支持按住 ⌘ / Shift 多选（多选到几份 HTML 时本页只建一个条目，
+                  要一次录入多个物种请用「批量上传」）。
                 </p>
                 <div className="flex flex-wrap justify-center gap-3 mt-3">
                   <button

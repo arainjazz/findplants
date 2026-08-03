@@ -119,13 +119,24 @@ export async function fetchTagMembership(tags: Tag[]): Promise<Map<string, TagMe
   );
 }
 
-export async function fetchAllTags(): Promise<TagWithCount[]> {
+/**
+ * 标签本体，**不带计数**。
+ *
+ * 计数要跑 {@link fetchTagMembership} 的三表并集（`plant_tags` + `plants.tags` +
+ * `plant_drafts.tags`，每张都要分页）。调用方如果本来就要自己拿 membership
+ * （地图的主题筛选就是这样），走 `fetchAllTags` 等于把那趟分页白跑两遍。
+ */
+export async function fetchTags(): Promise<Tag[]> {
   const { data, error } = await supabase
     .from("tags")
     .select("*")
     .order("created_at", { ascending: false });
   if (error) throw error;
-  const tags = (data ?? []) as Tag[];
+  return (data ?? []) as Tag[];
+}
+
+export async function fetchAllTags(): Promise<TagWithCount[]> {
+  const tags = await fetchTags();
   if (tags.length === 0) return [];
   const membership = await fetchTagMembership(tags);
   return tags.map((t) => {
