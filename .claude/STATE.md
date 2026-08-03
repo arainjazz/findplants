@@ -7090,3 +7090,50 @@ HTTP 请求上 → 必撞 Cloudflare 边缘 100 秒上限。登录用户 07-29 �
   已经卡住的手机捞回来的那条路：页面虽不水合，浏览器每次导航仍会自己重拉 sw.js
 - 首页正常出内容、汉堡菜单点开正常、/identify 显示「未登录最多同时排 2 条」提示
 - 部署后头几秒裸 URL 仍返回旧 HTML（传播延迟，非边缘缓存）；之后三次连测均为新版
+
+---
+
+## 2026-08-03（续二）— 积压代码入库 + 推 GitHub + 正名回填已执行
+
+### 1. 代码终于进了版本历史
+此前线上跑着 2650 行改动 + 13 个源码文件，git 里一份都没有（部署打包的是工作区、不看 git）。
+现已：
+- `.gitignore` 加 `.codex-ppt-build/`、`.workbuddy/`（一次性工具的构建产物，各带 node_modules，共 3.5M）
+- `b4a81f3 chore: 积压改动检查点` —— 60 个文件、+5689/-443。含关于页、分布地图 + 坐标脱敏、
+  字段冲突、roles、以及 premium-page(+718)/drafts.$id(+400)/plants.$slug(+256)/explore(+250) 等
+- **已 push**：本地与 `origin/main` 均为 `b4a81f3`，GitHub 上三条提交齐全
+- ⚠️ push 时报 `RPC failed; Recv failure: Connection reset`，但 `git ls-remote` 显示远端**已经收到** ——
+  这台机器的老毛病（见 wrangler-deploy-proxy-fix）。**先查远端再重推，别盲目重试。**
+- 按用户要求保留在工作区外、不提交：`package-lock.json`（仓库用 bun，两份锁并存需先定夺）、
+  `mcp/`、`.claude/MCP-PLAN.md`
+
+用户已移走与网站无关的项目文档（docs/、蒿属 PPT、质兰申请稿）。顺带实测确认：
+wrangler 只上传 `dist/client`，这些文件**从未被发布到线上**（四个路径实测全 404）。
+
+### 2. 匿名识别
+用户实测：未登录状态下识别功能正常。
+
+### 3. 正名回填已执行（改库）
+- 写库前对 13 份做了快照：`scratch/backfill-snapshot-2026-08-03114229.json`（回退依据）
+- `--scope stamped --apply` → **实际写入 10 份**，例如疑似长毛棘豆→疑似绵毛棘豆、
+  鹅绒委陵菜→蕨麻、百金花→美丽百金花、Cyperus→Kyllinga、疑似白香草木樨→疑似白花草木犀。
+  线上抽查 28c5e133：标题「疑似绵毛棘豆」、学名 `Oxytropis lanata (Pall.) DC.`
+  （**命名人保住了**）、旧名进别名、页面自带「已按名录改用正名」说明 ✅
+
+### 🔴 脚本报告曾经在骗人（已修）
+`--apply` 报「成功 13，失败 0」，可复跑 dry-run 仍显示「待改 3」。
+根因：写库那句带着 `.neq("status","approved")`（**按设计**不动已收录的），但没有 `.select()` ——
+PostgREST 不回传受影响行时，「被过滤掉、一行没改」和「改成功」返回的东西**一模一样**，
+于是跳过被当成成功。已加 `.select("id")` 并把计数拆成 `写入 / 跳过(已采纳) / 失败`。
+> 教训：Supabase 的 update 只看 `error` 判断成败是不够的，`.neq/.eq` 过滤掉全部行时它不报错。
+
+### ⚠️ 待你定夺：3 个**已发布条目**仍是旧名
+被跳过的 3 份都是 `status=approved`，它们对应 plants 表里的成品条目：
+| slug | 现名 | 名录正名 |
+|---|---|---|
+| `cyperus-brevifolius` | 短叶水蜈蚣 / *Cyperus brevifolius* / 莎草属 | *Kyllinga brevifolia* / 水蜈蚣属 |
+| `cynanchum-acutum-l` | 鹅绒藤 | 尖舌鹅绒藤（学名不变） |
+| `sium-suave-walt` | 疑似泽芹 | 仅俗名多一个「山藁本」（纯补充） |
+
+动它们比动草稿重：`slug` 是按旧学名生成的（改 slug 会断已分享的链接、不改则名实不符），
+`html_content` 正文里也印着名字。需要单独决定。
