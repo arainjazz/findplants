@@ -7159,3 +7159,24 @@ PostgREST 不回传受影响行时，「被过滤掉、一行没改」和「改�
 - 3 份草稿仍是 `status=approved`。`approvedSlug` 只在采纳当下的会话里有值，
   所以不会出现指向幽灵的链接；唯一瑕疵是草稿页上「这份草稿已进入已收录条目」
   这句话现在不成立。**要不要把它们改回 pending（重新进待审队列）待定。**
+
+### 三份草稿改为 rejected（用户 2026-08-03 决定）
+条目删掉之后，那三份 `approved` 的草稿状态悬着（既不在待审队列、也没有对应条目），
+用户选择标记为 **rejected**（明确「不收录」）。
+
+照 `rejectPlantDraft` 的完整口径做，而不是只改一个字段（`scratch/_reject3.mjs`，默认 dry-run）：
+① `status → rejected`（3 份）；② 银叶退款 —— 三份都没花过，无需退；
+③ 写 `kind=draft_reject` 的修改记录，`block_path` 存草稿 id（保留可撤销回 pending 的路径）。
+
+验收：待审队列 188 份（这三份已退出）、三条驳回记录已入库、
+草稿本体与 4 张用户实拍照片全部健在。
+
+**📌 顺带更正一条过期认知**：`plant_edits.kind` 那条过窄的 CHECK 约束
+（记忆 plant-edits-kind-constraint）**加宽迁移早已应用**。库里现有
+draft_reject 7 / draft_image 5 / draft_text 2 —— 正是当初被静默吞掉的那几种。
+记忆已更新。`blog_publish / blog_edit / ai_page_edit` 仍无实例，未验证。
+
+**⚠️ 选 rejected 的连带影响（已确认代码）**：
+`geo-sightings.functions.ts:85` 与 `tags.ts:103` 都带 `.neq("status","rejected")`，
+所以这三条观察记录会**从「身边物种地图」和主题标签计数里消失**。
+照片和草稿本身还在，只是不再出现在那两处聚合里。
