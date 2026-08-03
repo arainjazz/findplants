@@ -2,8 +2,9 @@ import { useEffect, useRef, useState } from "react";
 import { useServerFn } from "@tanstack/react-start";
 import { useNavigate } from "@tanstack/react-router";
 import { useQueryClient } from "@tanstack/react-query";
-import { quickIdentifyDraft, startQuickIdentifyFn } from "@/lib/identify-plant.functions";
+import { cancelJobFn, startQuickIdentifyFn } from "@/lib/identify-plant.functions";
 import { awaitJob, rememberJob, forgetJob } from "@/lib/poll-job";
+import { getAnonId } from "@/lib/anon-id";
 import { findDraftByPhotoHash } from "@/lib/species-existing.functions";
 import { keepVisualAdvice } from "@/lib/retake-advice";
 import { explainError, isNetworkError } from "@/lib/explain-error";
@@ -63,6 +64,9 @@ export function CameraIdentify({
   // Coarse location-permission status, surfaced on the review screen so a wrong
   // "deny" tap doesn't silently persist. "denied" → we show a re-acquire button
   // + settings guide instead of failing quietly.
+  // 拍照/选图后的本地预处理（压缩、读 EXIF、等定位）在页内显示，**不再发 toast**
+  // —— 用户 2026-07-31：进度一律走颜色条 / 页内文字，浮动白框会挡住导航和正文。
+  const [busyText, setBusyText] = useState<string | null>(null);
   const [geoStatus, setGeoStatus] = useState<
     "idle" | "loading" | "granted" | "denied" | "unavailable" | "timeout"
   >("idle");
@@ -94,11 +98,19 @@ export function CameraIdentify({
   const exifCoordsRef = useRef<{ lat: number; lng: number } | null>(null);
   const navigate = useNavigate();
   const qc = useQueryClient();
-  const submit = useServerFn(quickIdentifyDraft);
   const startIdentify = useServerFn(startQuickIdentifyFn);
   // 走队列时的**真实**阶段文案（取代那串固定轮播的 LOADING_STEPS）。
   const [jobPhase, setJobPhase] = useState<{ text: string; pct: number } | null>(null);
   const findDuplicate = useServerFn(findDraftByPhotoHash);
+  // ── 取消这一轮识别（补拍传错图时的退路）────────────────────────────────────
+  // 两件事必须都做：① abort 掉前端轮询，② 让服务端在落草稿之前收手。
+  // 只做 ① 的话，那张错图的识别结果几分钟后照样会**合并回同一份草稿**，
+  // 把原来的判定覆盖掉 —— 那正是用户 2026-07-30 要根除的情形。
+  const cancelJob = useServerFn(cancelJobFn);
+  const cancelRef = useRef<AbortController | null>(null);
+  /** 非空 = 这一轮识别还在队列里跑，可以取消。 */
+  const [runningJobId, setRunningJobId] = useState<string | null>(null);
+  const [cancelling, setCancelling] = useState(false);
   // 非空 = 这张照片以前识别过，弹「去看看 / 再识别一次」确认框。
   const [dupHit, setDupHit] = useState<{
     draftId: string;
@@ -292,7 +304,7 @@ export function CameraIdentify({
     }
 
     originalFileRef.current = file;
-    const toastId = toast.loading("正在优化图片并获取位置...");
+    setBusyText("正在优化图片并获取位置…");
 
     // NOTE: do NOT reset coords/geoStatus here. The live position was already
     // requested from the shutter/album TAP (a real user gesture) — resetting would
@@ -351,7 +363,7 @@ export function CameraIdentify({
     setImgAspect(await readAspect(url));
 
     setPhase("captured");
-    toast.dismiss(toastId);
+    setBusyText(null);
   };
 
   /** 额外角度照：只压缩 + 存进内存，**不碰定位**。位置属于「这一株植物」，主图那次已经定好了，
@@ -367,7 +379,7 @@ export function CameraIdentify({
       toast.error("请选择图片文件");
       return;
     }
-    const toastId = toast.loading("正在优化图片...");
+    setBusyText("正在优化图片…");
     const { compressImage } = await import("@/lib/image-compress");
     const added: { blob: Blob; url: string }[] = [];
     for (const f of picked) {
@@ -381,7 +393,7 @@ export function CameraIdentify({
       added.push({ blob, url: URL.createObjectURL(blob) });
     }
     setExtraShots((prev) => [...prev, ...added].slice(0, MAX_RETAKE_PHOTOS - 1));
-    toast.dismiss(toastId);
+    setBusyText(null);
     if (files.length > picked.length)
       toast.info(`已加入 ${picked.length} 张，一次最多识别 ${MAX_RETAKE_PHOTOS} 张`);
   };
@@ -548,13 +560,13 @@ export function CameraIdentify({
 
     // If geolocation is still pending, wait up to 3 seconds for it to complete
     if (geoRequested) {
-      const waitId = toast.loading("等待位置信息...");
+      setBusyText("等待位置信息…");
       let waited = 0;
       while (geoRequested && waited < 3000) {
         await new Promise((resolve) => setTimeout(resolve, 300));
         waited += 300;
       }
-      toast.dismiss(waitId);
+      setBusyText(null);
     }
 
     // For album uploads, EXIF GPS was already applied to coords if present.
@@ -575,6 +587,9 @@ export function CameraIdentify({
           mime: s.blob.type || "image/jpeg",
         })),
       );
+      // 未登录时带上本地取件号 —— 服务端拿它认领队列里的那份任务（登录用户不需要，
+      // 服务端只认令牌里的 sub）。见 lib/anon-id.ts。
+      const anonId = user?.id ? undefined : getAnonId();
       const payload = {
         photo_base64: base64,
         photo_mime: blob.type || "image/jpeg",
@@ -582,6 +597,7 @@ export function CameraIdentify({
         lat: finalCoords?.lat ?? null,
         lng: finalCoords?.lng ?? null,
         logged_in_user_id: user?.id, // 传递登录用户 ID
+        anon_id: anonId,
         retake_count: retakeCtx?.count ?? 0,
         species_hint_title: retakeCtx?.title,
         species_hint_sci: retakeCtx?.sci,
@@ -589,32 +605,44 @@ export function CameraIdentify({
         photo_sha256: photoSha256 ?? undefined,
       };
 
-      // ── 登录用户走队列 ──────────────────────────────────────────────────────
+      // ── 一律走队列（登录与否都一样）──────────────────────────────────────────
       // 照片先上云，识别在服务端后台跑，这里只轮询。这是 07-26「等了 101 秒报
       // Load failed、其实后台已经成功」的**根治**：整条识别挂在一个 HTTP 请求上
       // 必然撞 Cloudflare 边缘 100 秒上限，而锁屏 / 切后台会让手机更早掐断连接。
       // 走队列后消费者有 15 分钟，用户可以锁屏、切走、去识别下一株。
       //
+      // 2026-08-03：**匿名也搬进来了**。原先他们被留在同步老路上，也就等于留在那个
+      // 100 秒的死线里 —— 未登录不该是「注定等不到结果」的意思。匿名与登录的差别只剩
+      // 两处：不进小P蛙动态流（那张表只服务注册用户），以及同时最多排 2 条。
+      //
       // 下面那段「断线自愈」**依然保留**：轮询本身也会断（切网、代理掉线），
       // 断了照样要回查一次「是不是其实已经写进去了」。两层防护不冲突。
-      //
-      // 匿名用户仍走同步老路 —— 他们没有动态流，也没有跨设备接回任务的需求。
-      let draftId: string;
-      if (user?.id) {
-        const { jobId } = await startIdentify({ data: payload });
-        rememberJob("identify", jobId);
-        setJobPhase({ text: "已排队，正在启动…", pct: 3 });
-        const outcome = await awaitJob<{ draftId: string }>(jobId, (phase, pct) =>
-          setJobPhase({ text: phase, pct }),
-        );
-        forgetJob("identify");
-        if (!outcome.ok) throw new Error(outcome.error);
-        draftId = outcome.result.draftId;
-        // 刚落一条绿色动态，让小P蛙上的角标立刻更新，不等下一轮轮询。
-        qc.invalidateQueries({ queryKey: ["task-feed"] });
-      } else {
-        draftId = ((await submit({ data: payload })) as { draftId: string }).draftId;
+      const { jobId } = await startIdentify({ data: payload });
+      rememberJob("identify", jobId);
+      setRunningJobId(jobId);
+      const ac = new AbortController();
+      cancelRef.current = ac;
+      setJobPhase({ text: "已排队，正在启动…", pct: 3 });
+      const outcome = await awaitJob<{ draftId: string }>(
+        jobId,
+        (phase, pct) => setJobPhase({ text: phase, pct }),
+        { signal: ac.signal, anonId },
+      );
+      cancelRef.current = null;
+      setRunningJobId(null);
+      forgetJob("identify");
+      // 用户自己撤销的：静默退回上传环节，不要按「识别失败」那一套弹错误、跑断线自愈回查。
+      if (!outcome.ok && outcome.cancelled) {
+        setPhase("captured");
+        setJobPhase(null);
+        setCancelling(false);
+        setErrorMsg(null);
+        return;
       }
+      if (!outcome.ok) throw new Error(outcome.error);
+      const draftId = outcome.result.draftId;
+      // 刚落一条绿色动态，让小P蛙上的角标立刻更新，不等下一轮轮询。
+      if (user?.id) qc.invalidateQueries({ queryKey: ["task-feed"] });
       toast.success("已生成简介摘要卡，正在跳转…");
       goToDraft(draftId);
     } catch (e) {
@@ -649,6 +677,37 @@ export function CameraIdentify({
       setErrorMsg(msg);
       toast.error(msg, { duration: 12000 });
     }
+  };
+
+  /**
+   * 「取消这次识别」——补拍时发现传错了图的退路。
+   *
+   * 顺序**不能颠倒**：先让服务端记下取消（它在落草稿之前会查一次），再停前端轮询。
+   * 反过来的话，abort 之后组件已经回到上传界面，取消请求万一慢一点、服务端那一轮
+   * 就已经把错图的结果合并进草稿了。
+   */
+  const onCancelIdentify = async () => {
+    const jobId = runningJobId;
+    if (!jobId || cancelling) return;
+    setCancelling(true);
+    let marked = false;
+    try {
+      marked = !!(
+        await cancelJob({
+          data: { jobId, anonId: user?.id ? undefined : getAnonId() },
+        })
+      )?.ok;
+    } catch {
+      /* 标记没写上也照样停轮询 —— 见下面的文案，如实告诉用户拦没拦住 */
+    }
+    forgetJob("identify");
+    cancelRef.current?.abort();
+    if (marked) toast.success("已取消这次识别，可以重新选照片上传");
+    else
+      toast.warning(
+        "已停止等待，但服务端可能已经在写入这一轮结果了。若草稿被改成了错误的物种，再补拍一次即可覆盖。",
+        { duration: 9000 },
+      );
   };
 
   /** 成功收尾：清缓存 → 标记「刚识别完」→ 跳转。正常路径与断线自愈路径共用，
@@ -886,6 +945,18 @@ export function CameraIdentify({
                           请稍候，先别重新识别 —— 后台可能已经跑完了
                         </p>
                       )}
+                      {/* 传错图的退路。**只在还能拦住的时候摆出来**：断线回查阶段
+                          （recoverNote）服务端多半已经写完了，这时给个「取消」是骗人。 */}
+                      {runningJobId && !recoverNote && (
+                        <button
+                          type="button"
+                          onClick={onCancelIdentify}
+                          disabled={cancelling}
+                          className="mt-1 w-full border border-rule text-ink-faint text-[11px] py-1.5 rounded-lg hover:border-destructive hover:text-destructive transition-colors cursor-pointer disabled:opacity-60"
+                        >
+                          {cancelling ? "正在终止…" : "传错图了？取消这次识别"}
+                        </button>
+                      )}
                     </div>
                   </div>
                 </div>
@@ -981,6 +1052,12 @@ export function CameraIdentify({
             </div>
           ) : (
             <>
+              {busyText && (
+                <p className="mb-1.5 flex items-center justify-center gap-1.5 text-xs text-ink-soft">
+                  <span className="w-3 h-3 rounded-full border-2 border-ink/25 border-t-vermilion animate-spin" />
+                  {busyText}
+                </p>
+              )}
               <button
                 onClick={requestGeo}
                 className="w-full flex items-center justify-center gap-1.5 text-xs text-ink-soft bg-paper-deep/40 hover:bg-paper-deep/70 border border-rule/50 rounded-xl px-3 py-2 transition-colors cursor-pointer"
@@ -1002,6 +1079,21 @@ export function CameraIdentify({
             </>
           )}
         </div>
+      )}
+
+      {/* 未登录的排队上限，**提前说**而不是等撞上了才弹错误。
+          匿名识别 2026-08-03 才搬进队列（此前挂在一个 HTTP 请求上，超过 100 秒必失败），
+          排队本身对所有人开放，只是同时最多 2 条。 */}
+      {!user && phase !== "submitting" && (
+        <p className="mt-3 text-[11px] text-ink-faint leading-relaxed text-center">
+          未登录也能用 AI 识别，任务同样交给后台队列跑（可以锁屏、切走）。
+          <br />
+          只是<strong>未登录最多同时排 2 条</strong>；
+          <a href="/login" className="text-vermilion underline underline-offset-2">
+            登录
+          </a>
+          后不受此限，还能在小P蛙的通知里跨设备接回任务。
+        </p>
       )}
 
       {/* Identify failure — stays on screen with the full cause + next step, so the

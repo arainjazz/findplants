@@ -48,6 +48,16 @@ export type JobRecord = {
   payload?: unknown;
   createdAt: string;
   updatedAt: string;
+  /**
+   * 队列消费者**真正开始跑**这个任务的时刻。入队时没有，被消费到才写。
+   *
+   * 为什么必须有：心跳是消费者打的，任务在队列里**排队等待**期间根本没有心跳，
+   * 而 `createdAt` 之后 2 分钟就到了 `JOB_STALE_MS` —— 于是「队列有点积压」被
+   * 判成了「任务死了」。用户 2026-07-29 报的「前端说识别失败，可后台明明成功了」
+   * 就是它：一次连开四个任务，后面几个排队超过两分钟，前端先弹了「生成中断」，
+   * 消费者随后照常把它们跑完（库里那几条 job 行全是 done/100）。
+   */
+  startedAt?: string;
 };
 
 /** 过期阈值：超过这个时间的任务行会在下次建任务时被清掉。 */
@@ -71,6 +81,21 @@ export const JOB_HEARTBEAT_MS = 15 * 1000;
  */
 export const JOB_STALE_MS = 2 * 60 * 1000; // 2min ≈ 8 次心跳
 
+/**
+ * **还没被队列消费**的任务，多久算真的没人管了。
+ *
+ * 这条和上面那条判的完全是两件事，绝不能共用一个阈值：
+ * `JOB_STALE_MS` 判的是「正在跑的任务是不是死了」，靠的是 15 秒心跳；
+ * 而排队中的任务**根本没有心跳**（心跳由消费者打），拿 2 分钟去卡它，
+ * 等于把「队列有积压」直接判成「任务已中断」。
+ *
+ * Cloudflare Queues 的消费者并发是自动伸缩的：起步就一个，要看到积压才扩。
+ * 用户一次连开四个任务时，后面几个等上几分钟完全正常 —— 那期间任务好端端地
+ * 待在队列里，什么都没出错。给 15 分钟：比消费者那 15 分钟挂钟略宽一点，
+ * 真出现「投递了但永远没人消费」（绑定错了、消费者部署炸了）时仍报得出来。
+ */
+export const JOB_QUEUE_WAIT_MS = 15 * 60 * 1000;
+
 const KEY_PREFIX = "job:";
 
 const jobKey = (id: string) => `${KEY_PREFIX}${id}`;
@@ -88,6 +113,68 @@ function newId(): string {
   const c = (globalThis as { crypto?: { randomUUID?: () => string } }).crypto;
   if (c?.randomUUID) return c.randomUUID();
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+// ─── 匿名领主 ────────────────────────────────────────────────────────────────
+//
+// 未登录访客也能把识别交给队列（2026-08-03）。他们的「领主」是浏览器本地那把取件号
+// （见 lib/anon-id.ts），服务端统一加上 `anon:` 前缀再落进 `JobRecord.userId`。
+//
+// 🔑 **前缀不是装饰，是隔离带**：真实领主永远是 Supabase 的 uuid，带前缀的这一类
+// 与它在字符串上永不相交 —— 于是 `readJob(id, owner)` 那条既有的归属校验一行都不用改，
+// 匿名也绝无可能凑出一个真实用户的 id 去读别人的任务。
+// 另一面同样重要：动态流那张表 `task_feed.user_id` 是 uuid 且 not null，
+// 带前缀的领主一眼可辨、直接跳过写入（`upsertTaskFeed` 收到 null 就返回）。
+export const ANON_OWNER_PREFIX = "anon:";
+
+/**
+ * 未登录访客**同时进行中**的识别任务上限（用户 2026-08-03 定的数）。
+ *
+ * 它防的是手滑连点和一个人把队列占满，不是防刷 —— 清掉浏览器存储就换一个取件号、
+ * 计数重来。真要挡刷得在别处（IP / Turnstile），那是另一件事。
+ */
+export const ANON_MAX_ACTIVE_JOBS = 2;
+
+/** 把访客取件号包装成任务领主。 */
+export const anonOwner = (anonId: string): string => `${ANON_OWNER_PREFIX}${anonId}`;
+
+/** 这个领主是不是未登录访客。动态流、通知这类「只服务注册用户」的地方据此让路。 */
+export const isAnonOwner = (owner: string | null | undefined): boolean =>
+  !!owner && owner.startsWith(ANON_OWNER_PREFIX);
+
+/**
+ * 某个领主名下**还在进行中**的任务数（可按 kind 过滤）。
+ *
+ * 用途：匿名识别的并发上限（未登录最多同时排 2 条）。判「进行中」用的是
+ * `status === "running" && !isJobStale()` —— 卡死的行不该永久占着名额，
+ * 否则一次超时会让这个浏览器再也提交不了识别。
+ *
+ * 走 jsonb 过滤（`value->>userId`）而不是全表扫：createJob 每次已经有一趟
+ * `pruneExpiredJobs()` 的全扫了，不该再叠一趟。过滤语法万一不被支持就退回全扫 ——
+ * 宁可慢一点，也不能因为一次查询失败就把上限静默变成「无上限」。
+ */
+export async function countActiveJobs(owner: string, kind?: JobRecord["kind"]): Promise<number> {
+  const now = Date.now();
+  const tally = (rows: { value?: unknown }[]) =>
+    rows.filter((row) => {
+      const raw = row.value;
+      const rec = (typeof raw === "string" ? JSON.parse(raw) : raw) as JobRecord | null;
+      if (!rec || rec.userId !== owner) return false;
+      if (kind && rec.kind !== kind) return false;
+      return rec.status === "running" && !isJobStale(rec, now);
+    }).length;
+
+  const db = await admin();
+  const { data, error } = await db
+    .from("site_config")
+    .select("value")
+    .like("key", `${KEY_PREFIX}%`)
+    .eq("value->>userId", owner);
+  if (!error) return tally(data ?? []);
+
+  console.warn("[jobs] countActiveJobs 的 jsonb 过滤失败，退回全扫：", error.message);
+  const { data: all } = await db.from("site_config").select("value").like("key", `${KEY_PREFIX}%`);
+  return tally(all ?? []);
 }
 
 /** 建一个任务行，返回任务 ID。写失败会抛 —— 拿不到 ID 的话前端根本无从轮询。 */
@@ -166,6 +253,17 @@ export function bindJobUpdates(initial: JobRecord) {
     }
   };
 
+  /**
+   * 标记「消费者已经接走、开始跑了」。**必须在真正干活之前调一次** ——
+   * 从这一刻起 isJobStale 才改用严格的心跳阈值；在此之前它算「排队中」。
+   */
+  const markStarted = (): Promise<void> => {
+    if (terminal || rec.startedAt) return Promise.resolve();
+    const now = new Date().toISOString();
+    rec = { ...rec, startedAt: now, updatedAt: now };
+    return flush();
+  };
+
   /** 推进阶段文案 + 进度。耗时步骤前调一次。终态后静默忽略。 */
   const phase = (phaseText: string, progress: number): Promise<void> => {
     if (terminal) return Promise.resolve();
@@ -231,7 +329,55 @@ export function bindJobUpdates(initial: JobRecord) {
     };
   };
 
-  return { phase, heartbeat, finish, fail, startHeartbeat };
+  return { markStarted, phase, heartbeat, finish, fail, startHeartbeat };
+}
+
+// ─── 取消（用户主动撤销一次识别）──────────────────────────────────────────────
+//
+// 🔴 **为什么另开一个 key，而不是把 job 行改成 error**：消费者对 `job:<id>` 是
+// **blind upsert**（bindJobUpdates 从不 read，见上面那段说明），下一次心跳就会把
+// 我们写的 error 原样盖回 running。取消标记必须落在消费者**不会写**的另一把 key 上。
+//
+// 起因（2026-07-30 用户要求）：补拍时传错了图，得能当场终止这一轮识别、退回上传环节 ——
+// 否则那张错图的识别结果会在几分钟后**合并回同一份草稿**，把原来的判定覆盖掉。
+const cancelKey = (id: string) => `jobcancel:${id}`;
+
+/** 标记「这个任务被用户取消了」。只有任务的发起人能取消。返回是否真的写下了标记。 */
+export async function requestJobCancel(id: string, userId: string): Promise<boolean> {
+  const rec = await readJob(id, userId);
+  if (!rec) return false;
+  if (rec.status !== "running") return false; // 已经跑完/失败了，没什么可取消的
+  const db = await admin();
+  const { error } = await db
+    .from("site_config")
+    .upsert(
+      { key: cancelKey(id), value: { jobId: id, userId, at: new Date().toISOString() } },
+      { onConflict: "key" },
+    );
+  if (error) {
+    console.warn(`[jobs] cancel marker write failed for ${id}:`, error.message);
+    return false;
+  }
+  return true;
+}
+
+/**
+ * 任务是不是被取消了。**一次读**，所以只在真正要动数据库之前问一次
+ * （见 runQuickIdentifyCore 落草稿之前那一处），绝不放进心跳里。
+ * 查询本身失败一律当作「没取消」——宁可多跑一次，也不能因为一次网络抖动就丢掉结果。
+ */
+export async function isJobCancelled(id: string): Promise<boolean> {
+  try {
+    const db = await admin();
+    const { data } = await db
+      .from("site_config")
+      .select("key")
+      .eq("key", cancelKey(id))
+      .maybeSingle();
+    return !!data;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -254,6 +400,16 @@ export async function pruneExpiredJobs(): Promise<number> {
         return !rec?.createdAt || rec.createdAt < cutoff;
       })
       .map((row: { key: string }) => row.key);
+    // 取消标记同样要清 —— 它的 key 前缀是 `jobcancel:`，落不进上面那条 `job:%`。
+    const { data: cancels } = await db
+      .from("site_config")
+      .select("key, value")
+      .like("key", "jobcancel:%");
+    for (const row of cancels ?? []) {
+      const raw = (row as { value?: unknown }).value;
+      const v = (typeof raw === "string" ? JSON.parse(raw) : raw) as { at?: string } | null;
+      if (!v?.at || v.at < cutoff) stale.push((row as { key: string }).key);
+    }
     if (!stale.length) return 0;
     await db.from("site_config").delete().in("key", stale);
     return stale.length;
@@ -263,10 +419,30 @@ export async function pruneExpiredJobs(): Promise<number> {
   }
 }
 
-/** 任务是否「疑似卡死」：还在 running，但很久没更新过阶段了。 */
+/**
+ * 任务是否「疑似卡死」。
+ *
+ * **两段判据，取决于它有没有真的开始跑**：
+ * · 还在队列里排队（没有 startedAt）→ 按 `JOB_QUEUE_WAIT_MS` 宽判。排队期间没有
+ *   心跳是正常的，心跳是消费者打的。用 2 分钟去卡，队列一积压就会把好任务判死
+ *   （用户 2026-07-29：「前端报识别失败，后台其实成功了」）。
+ * · 已经在跑（有 startedAt）→ 按 `JOB_STALE_MS` 严判，有 15 秒心跳做依据。
+ *
+ * 老任务行没有 startedAt 字段，会落进「排队中」那一档 —— 只是宽松些，不会误判成死。
+ */
 export function isJobStale(rec: JobRecord, now = Date.now()): boolean {
   if (rec.status !== "running") return false;
+  if (!rec.startedAt) {
+    const c = Date.parse(rec.createdAt);
+    if (!Number.isFinite(c)) return false;
+    return now - c > JOB_QUEUE_WAIT_MS;
+  }
   const t = Date.parse(rec.updatedAt);
   if (!Number.isFinite(t)) return false;
   return now - t > JOB_STALE_MS;
+}
+
+/** 还没被消费者接走 —— 前端据此显示「排队中」而不是假装它在跑。 */
+export function isJobQueued(rec: JobRecord): boolean {
+  return rec.status === "running" && !rec.startedAt;
 }

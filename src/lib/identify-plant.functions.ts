@@ -1,15 +1,20 @@
 import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
+// 「有令牌就认令牌、没令牌也放行（userId=null）」。识别的入队 / 轮询 / 取消这三条
+// 要同时接待登录用户和匿名访客，见该文件顶部说明。
+import { optionalSupabaseAuth } from "@/integrations/supabase/auth-optional";
 import { renderDraftHtml, type PlantDraftFields } from "./plant-html-template";
 import {
   renderPremiumHtml,
   premiumPrompt1,
   premiumPrompt2,
   premiumPrompt3,
+  premiumPrompt4,
   PREMIUM_SCHEMA_1,
   PREMIUM_SCHEMA_2,
   PREMIUM_SCHEMA_3,
+  PREMIUM_SCHEMA_4,
   type PremiumFields,
   type VerifiedFacts,
 } from "./premium-page";
@@ -45,6 +50,7 @@ import {
   DRAFT_SLOTS,
   GOLD_SLOTS,
 } from "./photo-slots";
+import { FUZZ_SUFFIX, coarsenPlace, fuzzCoord } from "./protected-coords";
 import { checkDraftQuality, checkGoldQuality, describeIssues } from "./quality-gate";
 import { lookupChinaInvasive } from "./china-invasive-list";
 import { keepVisualAdvice, DEFAULT_VISUAL_ADVICE } from "./retake-advice";
@@ -52,11 +58,12 @@ import { stripMetaMarkdown, markdownEmphasisToHtml } from "./strip-markdown";
 import {
   TENTATIVE_RE,
   stripTentativePrefix,
+  stripTentativeMarks,
   isTentative,
   draftTitleFor,
   sanitizeSpeciesName,
 } from "./tentative";
-import { stripStaleMissingNotes } from "./draft-enhance";
+import { rewriteDraftOnlyHints, stripStaleMissingNotes } from "./draft-enhance";
 import {
   DRAFT_CARD_SCOPE,
   DRAFT_CARD_FIELD_KEYS,
@@ -75,6 +82,8 @@ import {
   postOpenAICompat,
   postOpenAICompatStream,
   THINKING_OFF,
+  THINKING_ON,
+  geminiThinkingConfig,
 } from "./ai-key-pool";
 import {
   readModelQueue,
@@ -706,15 +715,20 @@ type AiProviderConfig = {
 };
 
 /**
- * 按配置决定要不要发那组「别思考，直接答」的参数。
+ * 按配置发出那组厂商无关的思考参数。展开进请求体即可：`...thinkingParams(cfg)`。
  *
- * 展开进请求体即可：`...thinkingParams(cfg)`。开思考时返回空对象 —— **什么都不发**，
- * 让模型按自己的默认来，而不是反过来发一组「请思考」的参数（那种参数各家写法更乱，
- * 且对本来就不推理的模型纯属白发一个会被 400 的键）。
+ * 🔴 **2026-07-30 改动：「开」现在也真的发参数了。**
+ * 旧实现是 `cfg.thinking === "on" ? {} : {...THINKING_OFF}` —— 开思考时**什么都不发**，
+ * 让模型按自己的默认来。当时的理由是「请思考」的参数各家写法更乱、对不推理的模型
+ * 白发一个会被 400 的键。这个顾虑其实已经被 `postOpenAICompat` 那套
+ * 「从 400 报错里认出是哪个参数惹的祸，去掉重试」的机制罩住了（TUNABLE_PARAMS
+ * 收录了这三个键），而代价是**开关只有一半是真的**：管理员选了「开」，界面显示开，
+ * 实际什么也没做。用户 2026-07-30 明确要求两档都要真生效。
  */
 function thinkingParams(cfg: Pick<AiProviderConfig, "thinking">): Record<string, unknown> {
-  return cfg.thinking === "on" ? {} : { ...THINKING_OFF };
+  return cfg.thinking === "on" ? { ...THINKING_ON } : { ...THINKING_OFF };
 }
+
 
 // ─── 优先调用序列：读写（三个控制台共用一套）──────────────────────────────────
 // 每个控制台在 site_config 里占一个 key，存的都是同一个 ModelQueue 形态。
@@ -3094,8 +3108,12 @@ async function classifyPhotoOrgans(
     );
     return out;
   } catch (e) {
-    console.warn(
-      "[PhotoOrgans] 视觉分类失败，退回数据源标注：",
+    // 🔴 **必须 error 级**。这一步失败不是「少个标签」这么轻：候选出厂时 organ 全是
+    // 空串，退回去就等于整池未分类 → assignSlots 前两轮全落空 → 每张配图都是降级命中。
+    // 用户 2026-07-29 报的「银叶草稿大量出现『该物种的植株照片暂缺』」就是这条 catch
+    // 的下游表现。以前这里是 console.warn，混在日志里根本看不出整页配图已经废了。
+    console.error(
+      `[PhotoOrgans]「${speciesName}」视觉分类失败 —— 本次所有配图都将是「未核对部位」的降级命中：`,
       e instanceof Error ? e.message : e,
     );
     return cands;
@@ -3663,6 +3681,8 @@ async function buildDraftContent(opts: {
   let conservationBadgesList: PlantDraftFields["conservation"] = null;
   let conservationCardObj: PlantDraftFields["conservation_card"] = null;
   let griisHit: { degreeLabel: string; source: string; source_url: string | null } | null = null;
+  /** 命中国家 / 省级重点保护名录 —— 决定正文里的拍摄坐标要不要脱敏（防盗挖）。 */
+  let isProtectedSpecies = false;
   const sciFull = (meta.scientific_name || "").trim();
   try {
     if (sciFull) {
@@ -3687,6 +3707,7 @@ async function buildDraftContent(opts: {
         const badges = conservationBadges(hit, lists);
         if (badges.length) conservationBadgesList = badges;
         const protectedEntries = [...hit.protectedLists.entries()];
+        isProtectedSpecies = protectedEntries.length > 0;
         if (protectedEntries.length) {
           const protLists = protectedEntries.map(([id, status]) => {
             const l = lists.find((x) => x.id === id);
@@ -3771,6 +3792,15 @@ async function buildDraftContent(opts: {
   }
 
   const captureDate = new Date().toISOString().slice(0, 10);
+
+  // ── 正文里的「拍摄记录」坐标：保护物种一律脱敏 ────────────────────────────
+  // 这段 HTML 会被采纳成公开详页，是全站最公开的一块地方。地图和分享卡都模糊了，
+  // 详页却印着五位小数（≈1 m）的精确 GPS，防盗挖就等于白做。
+  // 种子用真实坐标本身：哈希单向、且模糊点必落在同格内，所以同一处拍的两条记录会
+  // 得到同一个模糊点 —— 这是实话，不是泄露。
+  const geoFuzzed = isProtectedSpecies && lat != null && lng != null;
+  const shownGeo = geoFuzzed ? fuzzCoord(lat!, lng!, `${lat},${lng}`) : null;
+
   const rawHtml = renderDraftHtml({
     ...meta,
     photo_url: photoUrl,
@@ -3782,9 +3812,14 @@ async function buildDraftContent(opts: {
     invasive: invasiveCard,
     conservation: conservationBadgesList,
     conservation_card: conservationCardObj,
-    capture_place: place || "未知地点",
-    capture_lat: lat != null ? lat.toFixed(5) : "",
-    capture_lng: lng != null ? lng.toFixed(5) : "",
+    capture_place: geoFuzzed ? coarsenPlace(place) || "地点已隐去" : place || "未知地点",
+    // 模糊值只留 2 位小数（≈1 km）：一个被模糊到 5 km 的数字写成 5 位小数本身就是撒谎。
+    capture_lat: shownGeo ? shownGeo.lat.toFixed(2) : lat != null ? lat.toFixed(5) : "",
+    capture_lng: shownGeo
+      ? `${shownGeo.lng.toFixed(2)}${FUZZ_SUFFIX}`
+      : lng != null
+        ? lng.toFixed(5)
+        : "",
     capture_date: captureDate,
     ai_model: usedModel,
   });
@@ -3925,8 +3960,13 @@ function registryChipsHtml(chips: { kind: string; label: string; tone?: number }
 // 同一个数字，各写一份迟早算出两个不一样的百分比。
 
 /** 把痕迹渲染成简介卡底部那块「识别过程」。分享卡不含此块（分享出去只要结论）。 */
-function identifyTraceHtml(t: IdentifyTrace, finalSci: string, finalConf: string): string {
-  const { pct, basis } = computeIdentifyConfidence(t, finalSci, finalConf);
+function identifyTraceHtml(
+  t: IdentifyTrace,
+  finalSci: string,
+  /** 整份判定 meta —— 星数必须与「疑似」判据同源，见 identify-trace.ts。 */
+  final: { identification_confidence?: unknown; summary_zh?: unknown; title?: unknown },
+): string {
+  const { pct, basis } = computeIdentifyConfidence(t, finalSci, final);
   const steps: string[] = [];
   if (t.primaryEngine === "plantnet") {
     steps.push(
@@ -4008,7 +4048,15 @@ function buildSummaryCardHtml(opts: {
     famGenLine +
     registryChipsHtml(opts.chips ?? []) +
     `<p>${htmlEsc(summaryZh)}</p>` +
-    (opts.trace ? identifyTraceHtml(opts.trace, sci, opts.finalConfidence || "") : "") +
+    // 传 displayTitle 而不是原 title：它已经按 tentative 加过「疑似」前缀，
+    // 于是 isTentative 认得出**这张卡实际给出的结论**，星数不会与卡面打架。
+    (opts.trace
+      ? identifyTraceHtml(opts.trace, sci, {
+          identification_confidence: opts.finalConfidence || "",
+          summary_zh: summaryZh,
+          title: displayTitle,
+        })
+      : "") +
     `<p style="color:#8a6b4a;font-size:13px">— 简介摘要卡（点击「让 AI 生成进一步介绍草稿」可生成含多张配图的完整科普草稿）</p>` +
     `</div>`
   );
@@ -4025,6 +4073,12 @@ const SubmitInput = z.object({
   creator_label: z.string().max(80).optional(),
   // 前端传递：当前登录用户的 ID，用于识别人显示（非访客）
   logged_in_user_id: z.string().uuid().optional(),
+  /**
+   * 未登录访客的本地取件号（见 lib/anon-id.ts）。**只用来认领队列里的那份任务**，
+   * 换不来任何权限：服务端一律加 `anon:` 前缀，与真实用户 uuid 永不相交。
+   * 登录用户不必传 —— 有令牌时服务端只认令牌里的 sub。
+   */
+  anon_id: z.string().min(8).max(64).optional(),
   // 补拍复核：这是同一株植物的第 N 次补拍。retake_count 决定识别铜叶 = 1 + retake_count
   // （疑似恒 1）；≥3 时强制出结论（哪怕疑似）。species_hint 传上一轮的判断供复核。
   retake_count: z.number().int().min(0).max(10).optional().default(0),
@@ -4284,10 +4338,12 @@ const htmlEsc = (s: string) =>
 // demand, by enrichDraft. If the fast path is unavailable it falls back to the
 // full pipeline so this never hard-fails.
 /**
- * 同步识别的入口 —— **保留它**，因为两种情形仍然需要：
- * ① 队列绑定不可用时（本地 vite dev 没有 workerd）的退路；
- * ② 匿名用户（不进动态流，也就没有轮询的必要）。
- * 登录用户的正路是 `startQuickIdentifyFn`（走队列，可切后台）。
+ * 同步识别的入口。**前端已经不再调用它**（2026-08-03 起匿名也走队列了）——
+ * 它挂在单个 HTTP 请求上，必然撞 Cloudflare 边缘 100 秒上限，那正是当初把登录用户
+ * 搬走、这次把匿名用户也搬走的原因。
+ *
+ * 留着是因为它是 `runQuickIdentifyCore` 唯一的同步入口：本地 dev 没有 workerd、
+ * 想绕开队列直接跑一趟识别时用得上（脚本 / 手工重放）。**别再把 UI 接回来。**
  */
 export const quickIdentifyDraft = createServerFn({ method: "POST" })
   .inputValidator((input) => SubmitInput.parse(input))
@@ -4306,18 +4362,46 @@ export const quickIdentifyDraft = createServerFn({ method: "POST" })
  * value 全量拉回来解析，塞进一张 8MB 的图会把它撑爆。所以照片**先传存储**，
  * payload 只带地址；消费者用地址把字节取回来。
  *
- * 仅限登录用户。匿名识别继续走同步的 `quickIdentifyDraft` —— 他们没有动态流、
- * 也没有跨设备接回任务的需求（用户明确表示重点照顾注册用户与编辑）。
+ * **匿名访客同样走这条路**（2026-08-03 改）。原先他们被留在同步的 `quickIdentifyDraft`
+ * 上，那正是这段注释里说的那个必死之地：识别一超过 100 秒就报「Load failed」，
+ * 而后台其实跑完了。未登录 ≠ 活该等不到结果。
+ *
+ * 两点差别，都是既有设计的自然延伸、不是新规矩：
+ * · **领主**是浏览器本地的取件号加 `anon:` 前缀（见 background-jobs.ts 的隔离带说明）；
+ * · **不进动态流**（`task_feed.user_id` 是 uuid not null，本来就只服务注册用户），
+ *   所以匿名看到的是识别页上那根进度条，而不是小P蛙的通知中心。
+ * 外加一条上限：未登录同一浏览器**最多同时排 2 条**，超了当场说清楚、并请他登录。
  */
 export const startQuickIdentifyFn = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
+  .middleware([optionalSupabaseAuth])
   .inputValidator((input) => SubmitInput.parse(input))
   .handler(async ({ data, context }) => {
-    const { userId } = context as { userId: string };
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { createJob, pruneExpiredJobs } = await import("./background-jobs");
+    const { createJob, pruneExpiredJobs, anonOwner, countActiveJobs, ANON_MAX_ACTIVE_JOBS } =
+      await import("./background-jobs");
     const { keepAlive } = await import("./worker-ctx");
     const { enqueueJob } = await import("./job-queue");
+
+    // 领主只可能来自两处：服务端验过的令牌，或访客取件号。前端传来的 id 一概不采信。
+    const authedId = (context as { userId: string | null }).userId;
+    const anon = !authedId;
+    if (anon && !data.anon_id)
+      throw new AiError(
+        "ANON_ID_MISSING",
+        "无法认领这次识别任务：浏览器没有生成访客编号（可能禁用了本地存储）。登录后即可正常使用。",
+      );
+    const userId = authedId ?? anonOwner(data.anon_id!);
+
+    // 上限**在传图之前**卡：超了才报错的话，那张几 MB 的图已经白传上云、还留下垃圾文件。
+    if (anon) {
+      const active = await countActiveJobs(userId, "quick_identify");
+      if (active >= ANON_MAX_ACTIVE_JOBS)
+        throw new AiError(
+          "ANON_QUEUE_FULL",
+          `未登录状态下最多同时排 ${ANON_MAX_ACTIVE_JOBS} 条识别任务（当前已有 ${active} 条在跑）。` +
+            `请等前面的出结果，或登录后再试 —— 登录用户不受这条限制，还能在小P蛙的通知里跨设备接回任务。`,
+        );
+    }
 
     const extOf = (mime: string) =>
       mime.includes("png") ? "png" : mime.includes("webp") ? "webp" : "jpg";
@@ -4367,10 +4451,12 @@ export const startQuickIdentifyFn = createServerFn({ method: "POST" })
     // 一入队就进动态流，绿色进度条立刻可见 —— 用户点完识别就会切走去拍下一株，
     // 等第一个 onPhase 才落地会留一段「点了没反应」的空窗（冷启动可达几十秒）。
     // 缩略图直接用刚传上去的那张原图，不必等草稿建好。
-    await feedStart(userId, "identify", data.merge_draft_id ?? null, job.id, {
-      title: "正在识别…",
-      thumbUrl: photoUrl,
-    });
+    // 匿名跳过：动态流那张表的 user_id 是 uuid not null，只服务注册用户。
+    if (!anon)
+      await feedStart(userId, "identify", data.merge_draft_id ?? null, job.id, {
+        title: "正在识别…",
+        thumbUrl: photoUrl,
+      });
 
     if (!(await enqueueJob(job.id))) keepAlive(runQueuedJob(job.id));
 
@@ -4382,6 +4468,37 @@ type QuickIdentifyData = z.infer<typeof SubmitInput>;
 
 /** 阶段回调。同步调用时是空函数，走队列时把文案写进 job 行与动态流。 */
 type PhaseFn = (phase: string, progress: number) => void;
+
+/**
+ * 【正名核对 · 出卡链路】把 meta 的名字对齐到《中国植物物种名录 2026》的正名。
+ *
+ * 起因（2026-08-02 用户报）：快速识别这一档**完全不核对**，模型给什么名字就写什么；
+ * 而银叶草稿在 `buildDraftContent` 里是核对过的。于是同一份草稿上，简介卡写「长毛棘豆」
+ * （模型说的），正文写「绵毛棘豆」（名录的正名）。两处名字必须同源，源就是名录。
+ *
+ * 必须在 `buildSummaryCardHtml` **之前**调用：卡片 HTML 是照 meta.title 渲染的，
+ * 摆在后面就又是「卡面一个名、库里另一个名」，正是这次要根除的那类不一致。
+ *
+ * 「疑似」要单独伺候：它是置信度的标记、不是名字的一部分，`applyNameAuthority` 换正名时
+ * 会把它一并洗掉。可一份草稿疑不疑似由置信度说了算，不能因为换了个名字就凭空变成确诊 ——
+ * 所以先记下判定，核对完把前缀原样补回去，让后面的 `draftTitleFor` / `isTentative`
+ * （标题、卡面、补拍横幅三处共用的判据）仍然判得出来。
+ *
+ * 代价是识别链路多 1–2 个子请求（查 `species_names`）。Workers Paid 上限 1000，可忽略。
+ * 任何失败都在 `checkName` 内部吞掉并按「未核对」处理，不会让一次识别因此报废。
+ */
+async function alignMetaToChecklist(meta: AiMeta, where: string): Promise<void> {
+  const tentative = isTentative(meta);
+  const { applyNameAuthority } = await import("./name-authority.functions");
+  const { stamp, changed } = await applyNameAuthority(meta);
+  if (tentative && (meta.title || "").toString().trim())
+    meta.title = `疑似${stripTentativeMarks((meta.title || "").toString())}`;
+  (meta as unknown as Record<string, unknown>)._name_authority = stamp;
+  console.log(
+    `[NameAuthority] ${where}「${meta.title}」：${stamp.status}/${stamp.matchedBy}` +
+      `${changed ? " · 已按名录改写" : ""}${stamp.note ? " · " + stamp.note.slice(0, 120) : ""}`,
+  );
+}
 
 /**
  * 一次快速识别的**全部实际工作**。
@@ -4401,7 +4518,15 @@ type PhaseFn = (phase: string, progress: number) => void;
 async function runQuickIdentifyCore(
   data: QuickIdentifyData,
   onPhase: PhaseFn = () => {},
-  opts: { photoUrl?: string; extraUrls?: string[] } = {},
+  opts: {
+    photoUrl?: string;
+    extraUrls?: string[];
+    /**
+     * 走队列时传本次的 jobId，落草稿之前会据此查一次「用户是不是已经取消了」。
+     * 同步路径（匿名用户）没有 job，也就没有可取消的对象 —— 不传即整段跳过。
+     */
+    jobId?: string;
+  } = {},
 ) {
   const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
   const { dbCreatedBy, creatorLabel } = await resolveCreator(
@@ -4839,6 +4964,9 @@ async function runQuickIdentifyCore(
       meta.needs_more_photos_en = "";
     }
 
+    // 【正名核对】卡片、库里的 title、以及日后银叶正文，从这一刻起用的是同一个名字。
+    await alignMetaToChecklist(meta, "快速识别");
+
     // Summary-card HTML with the full gallery of the user's own shots (newest first).
     html = buildSummaryCardHtml({
       photos: allPhotos,
@@ -4884,6 +5012,9 @@ async function runQuickIdentifyCore(
       summary_zh: `由专业识别引擎 Pl@ntNet 判定为 ${primaryFallback.sci}（置信度 ${primaryFallback.pct}%）。本次出卡模型未能返回结果，因此暂不做进一步描述——建议补拍关键部位以确认到种。`,
     } as AiMeta;
     normalizeIdentification(meta);
+    // 【正名核对】这条兜底路上 title 是一串**拉丁学名**（Pl@ntNet 给的），命中名录就能换成
+    // 中文正名 —— 从「疑似 Oxytropis lanata」变成「疑似绵毛棘豆」，草稿卡上才像个名字。
+    await alignMetaToChecklist(meta, "Pl@ntNet 兜底出卡");
     // Pl@ntNet 不消耗 token，所以这一趟的用量是 0 —— 用量表上出现 provider=plantnet-fallback
     // 且 token 为 0 的记录，就代表「出卡模型全挂、靠专业引擎兜底出的卡」。
     usedProvider = "plantnet-fallback";
@@ -4919,6 +5050,21 @@ async function runQuickIdentifyCore(
       ...(data.photo_sha256 ? { _photo_sha256: data.photo_sha256 } : {}),
     }),
   );
+
+  // ── 落库之前问一次「用户取消了吗」──────────────────────────────────────────
+  //
+  // 只在这一处问（一次读）。识别的时间几乎全花在模型调用上，写库是最后一步，所以这里
+  // 是**代价最小、拦截率最高**的一刀。用户补拍传错图后点「取消」，靠的就是它 ——
+  // 否则那张错图的结果会在几分钟后覆盖掉草稿原来的判定（2026-07-30 用户要求）。
+  if (opts.jobId) {
+    const { isJobCancelled } = await import("./background-jobs");
+    if (await isJobCancelled(opts.jobId)) {
+      throw new AiError(
+        "JOB_CANCELLED",
+        "已取消这次识别 —— 结果没有写进草稿，可以重新上传照片。",
+      );
+    }
+  }
 
   let draftId: string;
   if (data.merge_draft_id) {
@@ -5238,14 +5384,58 @@ async function runEnrichCore(
 
   // Identity is LOCKED to phase-1 (with meta as fallback for anything phase-1 left
   // blank). Guarantees card ↔ draft name consistency even if the model drifts.
-  const lockTitle = (draft.title || meta.title || meta.scientific_name || "待鉴定植物")
+  //
+  // ⚠️ 锁的是**物种身份**，不是「phase-1 那串字符」。buildDraftContent 里
+  // applyNameAuthority 刚把名字对齐到《中国植物物种名录 2026》的正名，正文、图注、
+  // 页面 <title> 全是照它写的；这里若一律回退 draft.title，就会出现「标题长毛棘豆、
+  // 正文绵毛棘豆」——2026-08-02 用户实际撞到的那份草稿（Oxytropis lanata）。
+  // 判据是**名录核对的输入正是 phase-1 钉住的那个学名**：满足就说明这次改名是名录对
+  // 同一个物种的裁定，采信；不满足（meta 的名字是模型自己漂出来的）仍旧锁死 phase-1。
+  const nameStamp = (meta as unknown as Record<string, unknown>)._name_authority as
+    | import("./name-authority.functions").NameAuthorityStamp
+    | undefined;
+  const { canonicalKey } = await import("./name-authority");
+  const authoritative =
+    !!nameStamp &&
+    (nameStamp.status === "accepted" ||
+      nameStamp.status === "renamed" ||
+      nameStamp.status === "synonym") &&
+    !!draft.scientific_name &&
+    canonicalKey(nameStamp.was.scientific_name) === canonicalKey(draft.scientific_name as string);
+  /** 名录说了算时优先取 meta（已对齐正名）；否则维持「锁死 phase-1」的老行为。 */
+  const pick = (fromMeta: unknown, fromDraft: unknown): string | null =>
+    ((authoritative ? fromMeta || fromDraft : fromDraft || fromMeta) as string | null) || null;
+
+  // 换正名会把「疑似」一并洗掉（applyNameAuthority 只认名字、不认置信度标记）。但一份
+  // 草稿疑不疑似由置信度说了算，不能因为改了个名字就凭空变成确诊 —— 按 phase-1 的判定
+  // 原样补回去，让草稿页的疑似横幅、分享卡、铜叶计数仍然算得对。
+  const payload1 = (draft.ai_payload ?? {}) as Record<string, unknown>;
+  const keepTentative = isTentative({
+    title: draft.title,
+    summary_zh: payload1.summary_zh,
+    identification_confidence: payload1.identification_confidence,
+  });
+  const acceptedTitle = authoritative ? stripTentativeMarks((meta.title ?? "").toString()) : "";
+  const lockTitle = (
+    acceptedTitle
+      ? keepTentative
+        ? `疑似${acceptedTitle}`
+        : acceptedTitle
+      : draft.title || meta.title || meta.scientific_name || "待鉴定植物"
+  )
     .toString()
     .slice(0, 200);
-  const lockSci = draft.scientific_name || meta.scientific_name || null;
-  const lockFamily = draft.family || meta.family || null;
-  const lockGenus = draft.genus || meta.genus || null;
+  const lockSci = pick(meta.scientific_name, draft.scientific_name);
+  const lockFamily = pick(meta.family, draft.family);
+  const lockGenus = pick(meta.genus, draft.genus);
+  // 英文俗名名录不管，没有「谁更权威」可言 —— 保持原样优先 phase-1。
   const lockEn = draft.common_name_en || meta.common_name_en || null;
-  const lockZh = draft.common_names_zh || meta.common_names_zh || null;
+  const lockZh = pick(meta.common_names_zh, draft.common_names_zh);
+  if (authoritative && nameStamp)
+    console.log(
+      `[NameAuthority] 银叶草稿 ${draft.id}：采用名录正名「${lockTitle}」` +
+        `（原「${nameStamp.was.title ?? ""}」·${nameStamp.status}/${nameStamp.matchedBy}）`,
+    );
   const aiPayload = JSON.parse(
     JSON.stringify({
       ...(draft.ai_payload || {}),
@@ -5257,6 +5447,12 @@ async function runEnrichCore(
       common_name_en: lockEn ?? "",
       common_names_zh: lockZh ?? "",
       _enriched: true,
+      // 「生成人」——**花掉这枚银叶的人**，不一定就是识别人（草稿页任何登录用户都能点生成）。
+      // 条目页的分角色贡献表要把两者分开列（用户 2026-08-01）。记在 ai_payload 里而不是
+      // 新开一列：hosted Supabase 加列要人工去 dashboard 跑迁移，能不加就不加。
+      // 存量草稿没有这两个字段 → 页面退回显示识别人，并注明「同识别人」。
+      _enriched_by: userId,
+      _enriched_at: new Date().toISOString(),
     }),
   );
 
@@ -5520,23 +5716,35 @@ async function feedFinish(
   jobId: string,
 ): Promise<void> {
   const { upsertTaskFeed } = await import("./task-feed.functions");
-  let title: string | null = null;
-  let thumbUrl: string | null = null;
-  let summary: string | null = null;
+  // ⚠️ 三个字段的初值必须是 **undefined 而不是 null**：upsertTaskFeed 的判据是
+  // `!== undefined` 才写列，而 `null !== undefined` 为真 —— 用 null 当「没读到」的
+  // 占位，会把 feedStart 早就写好的标题和封面**覆盖成空**。
+  // 用户 2026-07-29 报的「识别成功了，任务动态里却显示（未命名）、缩略图是灰块」正是这个：
+  // 下面那条 select 因为列名写错整条报错（见注释），三个值全落回初值，然后清空了好行。
+  let title: string | undefined;
+  let thumbUrl: string | undefined;
+  let summary: string | undefined;
   try {
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { data } = await (supabaseAdmin as any)
+    // 🔴 列名是 `summary`，不是 `summary_zh`。写错的那版会让**整条 select** 报
+    // `42703 column plant_drafts.summary_zh does not exist`（PostgREST 一个列不存在
+    // 就拒整条查询），于是 title / photo_url 这两个**存在的**列也一起拿不到。
+    // supabase-js 这里不抛异常、只把错误放在 error 里 → catch 也兜不住 → 静默。
+    const { data, error } = await (supabaseAdmin as any)
       .from("plant_drafts")
-      .select("title, photo_url, summary_zh")
+      .select("title, photo_url, summary")
       .eq("id", draftId)
       .maybeSingle();
+    // 读失败必须吼一声：这条链路上一次静默失败，代价是所有已完成动态的标题被清空。
+    if (error) console.error(`[TaskFeed] feedFinish 读草稿失败（${draftId}）:`, error.message);
     if (data) {
-      title = data.title ?? null;
-      thumbUrl = data.photo_url ?? null;
-      summary = (data.summary_zh ?? "").toString().slice(0, 200) || null;
+      title = data.title ?? undefined;
+      thumbUrl = data.photo_url ?? undefined;
+      summary = (data.summary ?? "").toString().slice(0, 200) || undefined;
     }
-  } catch {
+  } catch (e) {
     // 读不到就只更状态 —— 卡片少几个字，总好过整条动态不落地。
+    console.error(`[TaskFeed] feedFinish 读草稿抛异常（${draftId}）:`, e);
   }
   await upsertTaskFeed({
     userId,
@@ -5594,14 +5802,32 @@ export async function runQueuedJob(jobId: string): Promise<void> {
   let feedDraftId = job.draftId || null;
   /** 归属三件事（谁的、哪类、哪份草稿）由 job 决定，调用方只管传变化的部分。 */
   type FeedPatch = Omit<Parameters<typeof upsertTaskFeed>[0], "userId" | "kind" | "draftId">;
+  // ⚠️ **返回 promise，不要在这里 void 掉**。收尾那两处（成功/失败）必须 await ——
+  // 它们是 runQueuedJob 的最后一件事，函数一返回队列消费者的调用就结束了，
+  // 没被 await 的写库 promise 会**连发都没发出去就被丢弃**。
+  // 用户 2026-07-29 报的「金叶失败了，橙色进度条一直不消失、也看不到失败原因」正是这个：
+  // job 行里明明是 error（那条 await 过），task_feed 却永远停在 running。
+  // 匿名领主（`anon:` 前缀）在动态流这一路直接给 null —— 那张表的 user_id 是 uuid
+  // not null，塞个带前缀的字符串进去只会每次写库报类型错、然后被 upsertTaskFeed
+  // 的 try/catch 悄悄吞掉：日志里刷屏，功能上一点用没有。
+  const { isAnonOwner } = await import("./background-jobs");
+  const feedOwner = isAnonOwner(job.userId) ? null : job.userId;
   const feed = (patch: FeedPatch) =>
-    void upsertTaskFeed({ userId: job.userId, kind: feedKind, draftId: feedDraftId, ...patch });
+    upsertTaskFeed({ userId: feedOwner, kind: feedKind, draftId: feedDraftId, ...patch });
 
   const onPhase = (phase: string, progress: number) => {
-    // 不 await：进度写库不该拖慢生成，写失败也已在 flush 里吞掉。
+    // 中途的进度更新才可以不 await：写库不该拖慢生成，后面还有很长的 await
+    // 给它跑完的机会，写失败也已在 upsertTaskFeed 里吞掉并打日志。
     void jobs.phase(phase, progress);
-    feed({ jobId, status: "running", phase, progress });
+    void feed({ jobId, status: "running", phase, progress });
   };
+
+  // 打上「消费者已接走」的戳。**必须在干活之前**：在此之前任务是在队列里排队，
+  // 那期间没有心跳（心跳是这里打的），isJobStale 会按宽松的排队阈值判它；
+  // 打了戳之后才切到严格的 2 分钟心跳阈值。
+  // 用户 2026-07-29 报的「前端弹识别失败，可后台明明成功了」就是缺这一戳：
+  // 一次连开四个任务，后面几个排队超过两分钟就被前端判成中断，而它们随后都跑完了。
+  await jobs.markStarted();
 
   // 心跳独立于阶段推进：撰稿是一整个 await，慢模型能跑五分钟以上，
   // 光靠阶段更新推 updatedAt 会让前端把还在干活的任务判成「已中断」。
@@ -5623,13 +5849,15 @@ export async function runQueuedJob(jobId: string): Promise<void> {
       const ident = await runQuickIdentifyCore({ ...qp.identify, photo_base64: b64 }, onPhase, {
         photoUrl: qp.photoUrl,
         extraUrls: qp.extraUrls ?? [],
+        // 落草稿之前据此查一次取消标记（补拍传错图时用户可当场撤销）。
+        jobId,
       });
       // 草稿这时才存在 —— 补上 id，下面 feedFinish 才知道这条动态挂在哪份草稿上。
       // 同时把之前按 jobId 建的那条占位动态认领过去，否则它会变成一条永远 running 的孤儿。
       feedDraftId = ident.draftId;
-      if (feedDraftId) {
+      if (feedDraftId && feedOwner) {
         const { adoptFeedDraft } = await import("./task-feed.functions");
-        await adoptFeedDraft(job.userId, feedKind, jobId, feedDraftId);
+        await adoptFeedDraft(feedOwner, feedKind, jobId, feedDraftId);
       }
       result = ident;
     } else if (job.kind === "enrich_draft") {
@@ -5648,14 +5876,18 @@ export async function runQueuedJob(jobId: string): Promise<void> {
     await jobs.finish(result);
     // 完成时补齐摘要卡要显示的字段，并**重新标为未读** —— 内容刚变，就该重新算作没看过。
     // 读草稿本体（而不是从 result 里翻）：三条链路的返回形状各不相同，从库里读一次最稳。
-    if (feedDraftId) await feedFinish(feedDraftId, job.userId, feedKind, jobId);
+    if (feedDraftId && feedOwner) await feedFinish(feedDraftId, feedOwner, feedKind, jobId);
   } catch (e) {
     stopHeartbeat();
     const msg =
       e instanceof Error && e.message ? e.message : "生成失败（UNKNOWN）：发生了未知错误，请重试。";
     console.error(`[job-runner] 任务 ${jobId}（${job.kind}）失败：`, e);
     await jobs.fail(msg);
-    feed({
+    // **必须 await** —— 见上面 feed 的说明。不 await 就等于没写，
+    // 动态流里那条会永远停在 running（进度条不消失、失败原因也看不到）。
+    // progress 刻意**不覆盖**：留着失败那一刻的进度（金叶就是 45%），
+    // 列表里一眼看得出「卡在撰稿 1/3 挂的」。进度条只画 running，不受影响。
+    await feed({
       jobId,
       status: "error",
       phase: "已失败",
@@ -5674,24 +5906,71 @@ export async function runQueuedJob(jobId: string): Promise<void> {
  * 停止无休止的轮询并提示重试，而不是转圈到天荒地老。
  */
 export const pollJobFn = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .inputValidator((input) => z.object({ jobId: z.string().min(1).max(80) }).parse(input))
+  .middleware([optionalSupabaseAuth])
+  .inputValidator((input) =>
+    z
+      .object({
+        jobId: z.string().min(1).max(80),
+        /** 未登录时的取件号 —— 认领自己那份任务用，见 lib/anon-id.ts。 */
+        anonId: z.string().min(8).max(64).optional(),
+      })
+      .parse(input),
+  )
   .handler(async ({ data, context }) => {
-    const { userId } = context;
-    const { readJob, isJobStale } = await import("./background-jobs");
-    const rec = await readJob(data.jobId, userId);
+    const { readJob, isJobStale, isJobQueued, anonOwner } = await import("./background-jobs");
+    const authedId = (context as { userId: string | null }).userId;
+    // 令牌优先。没登录又没取件号 → 认不出归属，一律当「查无此任务」（不能放行读任意任务）。
+    const owner = authedId ?? (data.anonId ? anonOwner(data.anonId) : null);
+    if (!owner) return { found: false as const };
+    const rec = await readJob(data.jobId, owner);
     if (!rec) return { found: false as const };
+    const queued = isJobQueued(rec);
     return {
       found: true as const,
       status: rec.status,
-      phase: rec.phase,
+      // 排队中就照实说。原来这里会把 createJob 写的初始文案（「已排队，正在启动…」）
+      // 一直显示成在跑，用户看着进度条纹丝不动、以为卡死了。
+      phase: queued ? "排队中：前面还有任务，轮到它就会开始…" : rec.phase,
       progress: rec.progress,
       kind: rec.kind,
       draftId: rec.draftId || null,
       result: rec.result ?? null,
       error: rec.error ?? null,
+      /** 还没被队列消费者接走。前端据此别把「在排队」说成「在生成」。 */
+      queued,
       stale: isJobStale(rec),
     };
+  });
+
+/**
+ * 取消一个还在跑的任务（当前只有识别用得到）。
+ *
+ * 用户场景：补拍时传错了图。这一轮识别要跑几分钟，跑完会把结果**合并回同一份草稿**、
+ * 把原来的判定整个覆盖掉 —— 所以「不看结果」是不够的，必须让服务端别写。
+ *
+ * ⚠️ **能挡住的边界要说清楚**：标记是在服务端**落草稿之前**那一刻检查的
+ * （见 runQuickIdentifyCore 里的 assertNotCancelled）。识别的绝大部分时间花在模型调用上，
+ * 落库是最后一步，所以正常情况下都来得及；万一恰好在那一刻之后才点取消，这一轮仍会写进去。
+ * 前端的文案据此写成「正在终止」而不是保证。
+ */
+export const cancelJobFn = createServerFn({ method: "POST" })
+  .middleware([optionalSupabaseAuth])
+  .inputValidator((input) =>
+    z
+      .object({
+        jobId: z.string().min(1).max(80),
+        anonId: z.string().min(8).max(64).optional(),
+      })
+      .parse(input),
+  )
+  .handler(async ({ data, context }) => {
+    const { requestJobCancel, anonOwner } = await import("./background-jobs");
+    const authedId = (context as { userId: string | null }).userId;
+    const owner = authedId ?? (data.anonId ? anonOwner(data.anonId) : null);
+    // 认不出归属就什么都不做 —— requestJobCancel 本来就只让发起人取消。
+    if (!owner) return { ok: false };
+    const ok = await requestJobCancel(data.jobId, owner);
+    return { ok };
   });
 
 // ── GBIF China occurrence overlay (design C: server-side proxy, no storage) ───
@@ -5923,7 +6202,12 @@ async function gatherVerifiedFacts(draft: any): Promise<VerifiedFacts> {
     isInvasive,
     chinaInvasive,
     iucnStatus: draft.iucn_status || null,
-    capturePlace: draft.capture_place || null,
+    // 保护物种的拍摄地点先粗化到区/县/旗再喂给模型。这一行会进「已核实事实」块，
+    // 模型会照抄进正文 —— `capture_place` 是逆地理编码来的自由文本，粒度可能细到
+    // 整条街道地址（见 CLAUDE.md），原样递进去等于让金叶详页把盗挖路线写出来。
+    capturePlace: protectedBasis
+      ? coarsenPlace(draft.capture_place) || null
+      : draft.capture_place || null,
     sources,
   };
 }
@@ -5972,8 +6256,8 @@ async function goldPreflight(draftId: string, userId: string, email: string | nu
 }
 
 /**
- * 金叶详页的重活：名录取证 → 配图检索 → **3 次联网调研** → **3 段长文生成** →
- * 渲染上传 → 写库 → 记账 → 扣叶。这是全站最重的一条链路，比 enrich 还慢，
+ * 金叶详页的重活：名录取证 → 配图检索 → **3 次联网调研** → **4 段长文生成** →
+ * **绘制全球分布图** → 渲染上传 → 写库 → 记账 → 扣叶。这是全站最重的一条链路，比 enrich 还慢，
  * 必须在后台跑。以前它只是前端 `void` 掉 Promise，请求仍是同一个前台 HTTP 请求
  * ——所以才有那句「请勿关闭或刷新标签页」。现在真的可以关了。
  */
@@ -6053,11 +6337,13 @@ async function runGoldCore(
   try {
     const term =
       facts.scientificName.split(/\s+/).slice(0, 2).join(" ") || facts.commonNameEn || facts.title;
-    // 9 个槽要覆盖 根株/茎/叶/花/果/物候/生境/标本/人文，候选必须给够挑选余地。
+    // 13 个槽要覆盖 根株/茎/叶/花/果/物候/生境/标本/人文 + 博物趣闻的主图与两张内文图
+    // + 演化与生态那张生态图，候选必须给够挑选余地：槽会**消费**候选（assignSlots 的
+    // used），候选比槽少就会走到第四轮复用，同一张图在页面上出现两次。20 张 ≈ 五成余量。
     // specimenFloor: 2 —— 金叶的「人文·科学绘图」槽 want 是单元素 ["specimen"]，零降级余地。
-    // 不给独立配额，常见种前三级就把 14 张填满，标本/图版级永远不跑，那个槽结构性必空。
+    // 不给独立配额，常见种前三级就把配额填满，标本/图版级永远不跑，那个槽结构性必空。
     // 多出的 1–2 个子请求在 Workers Paid（上限 1000）下可以忽略。
-    const external = await fetchSpeciesPhotos(term, 14, { specimenFloor: 2 });
+    const external = await fetchSpeciesPhotos(term, 20, { specimenFloor: 2 });
     // 同银叶：用户实拍排最前，但一样要过器官识别才进得了槽。
     const mine = userPhotoCandidates({
       photoUrl: draft.photo_url,
@@ -6125,7 +6411,7 @@ async function runGoldCore(
     console.log(`[GoldPage Phase2] Web research: ${webResearch2.sources.length} sources`);
   }
 
-  onPhase("正在联网调研 3/3：生态功能、保护与科研进展…", 36);
+  onPhase("正在联网调研 3/4：生态功能、保护与科研进展…", 34);
   // Phase 3 调研：生态功能、入侵状态、最新科研
   const query3 = `${speciesFullName} 的生态功能、入侵风险、保护管理、近期重要科研进展（优先 IUCN、GBIF、学术期刊）`;
   webResearch3 = await xiaopGroundedSearch(query3, overrideSequence);
@@ -6133,6 +6419,25 @@ async function runGoldCore(
   if (webResearch3) {
     console.log(`[GoldPage Phase3] Web research: ${webResearch3.sources.length} sources`);
   }
+
+  // ── 第 4 路调研：媒体报道，专供页尾的「最新资讯」栏 ─────────────────────────
+  //
+  // 这一栏在 v19–v21 一直是**刻意空着**的：模型没有联网能力，让它写带链接的新闻卡
+  // 等于逼它编 URL（见 premium-page.ts 开头那段说明）。现在补上，靠的不是「相信模型」，
+  // 而是**链接由服务端提供、渲染前再过一次白名单**：这次检索真的返回过的网址才画得出来，
+  // 一条都对不上就整块不渲染。
+  onPhase("正在联网调研 4/4：媒体报道与最新资讯…", 38);
+  const newsQuery =
+    `${speciesFullName} 最近的新闻报道、媒体报道、保护动态（2016 年以后；` +
+    `优先新闻网站与地方媒体，不要论文和数据库条目）`;
+  const webNews = await xiaopGroundedSearch(newsQuery, overrideSequence);
+  goldUsage = addUsage(goldUsage, webNews?.usage);
+  /** 「最新资讯」允许出现的网址白名单 —— 只有这次检索真实返回过的来源。 */
+  const newsAllowedUrls = (webNews?.sources ?? []).map((s) => s.uri).filter(Boolean);
+  console.log(
+    `[GoldPage Phase4] News research: ${newsAllowedUrls.length} 条可引用来源` +
+      (newsAllowedUrls.length ? "" : "（本页「最新资讯」将整块不渲染）"),
+  );
 
   // 5. Three LLM passes. One mega-call reliably blows the output-token ceiling and
   //    comes back as truncated JSON, so each pass owns a bounded slice of the page.
@@ -6203,25 +6508,54 @@ async function runGoldCore(
       : "";
   })();
 
-  onPhase("正在撰稿 1/3（正文主体）…", 45);
+  onPhase("正在撰稿 1/4（正文主体）…", 44);
   const p1 = await ask(
     withWebContext(premiumPrompt1(facts, goldSkill), webResearch1) + imageManifest,
     PREMIUM_SCHEMA_1,
     "1",
   );
-  onPhase("正在撰稿 2/3（人文与应用）…", 58);
+  onPhase("正在撰稿 2/4（人文与应用）…", 54);
   const p2 = await ask(
     withWebContext(premiumPrompt2(facts, goldSkill), webResearch2) + imageManifest,
     PREMIUM_SCHEMA_2,
     "2",
   );
-  onPhase("正在撰稿 3/3（生态与延伸阅读）…", 70);
+  onPhase("正在撰稿 3/4（生态与全球分布）…", 63);
+  // 「可引用的新闻来源」清单单独拼一段喂进去。**只给网址与标题，不给别的** ——
+  // 模型的活是「从这几条里挑合适的、写一句摘要」，不是「想一个链接」。
+  const newsBlock = newsAllowedUrls.length
+    ? `\n\n【可引用的新闻来源】以下是本站刚刚联网检索到的报道来源。写 news 时**只能从这里挑**，` +
+      `source_url 必须逐字复制；不在这张表里的网址会被服务端丢弃。挑不出合适的就返回空数组。\n` +
+      (webNews?.sources ?? []).map((s, i) => `[${i + 1}] ${s.title || "(未标题)"} — ${s.uri}`).join("\n") +
+      `\n检索摘要：${webNews?.digest ?? ""}\n`
+    : `\n\n【可引用的新闻来源】本次没有检索到可引用的报道 —— news **必须返回空数组**。\n`;
   const p3 = await ask(
-    withWebContext(premiumPrompt3(facts, goldSkill), webResearch3) + imageManifest,
+    withWebContext(premiumPrompt3(facts, goldSkill), webResearch3) + imageManifest + newsBlock,
     PREMIUM_SCHEMA_3,
     "3",
   );
-  const fields = { ...p1, ...p2, ...p3 } as PremiumFields;
+  // 第 4 轮只写「博物趣闻博客」。它按 plantstory 标准要 3000–4000 字，塞进第 3 轮
+  // 一定撞输出上限、回来是截断的 JSON（GOLD_BAD_JSON_3 的老病根）。单独一轮 = 单独的
+  // 输出预算。调研资料复用 webResearch3（生态/科研那一路，正是这一节的素材来源）。
+  onPhase("正在撰稿 4/4（博物趣闻博客）…", 72);
+  // 🔴 **媒体报道也要喂给这一轮**。plantstory 的硬性规则是「导语必须从当代事件切入，
+  // 文献综述不算」，而 webResearch3 那一路查的是生态/保护/科研进展 —— 里面多半只有综述。
+  // 真正的当代事件（中毒、管控、判例、入侵、政策、产业、新种发现）在新闻那一路里。
+  // 不给它这份材料，就等于一边要求「先声夺人」、一边只发给它一摞文献（用户 2026-07-30：
+  // 「section vi 没有当代事件钩子，很多内容不够有趣」）。
+  const newsForCurio = webNews?.digest
+    ? `\n\n【本页可参考的媒体报道（当代事件钩子的第一来源）】\n${webNews.digest}\n` +
+      (webNews.sources ?? []).map((s, i) => `[${i + 1}] ${s.title || "(未标题)"}`).join("\n") +
+      `\n⚠️ 这些是**真实检索到的报道**，导语优先从这里挑一个事件切入。` +
+      `但叙事里**不要写出媒体名/网址**（出处由页面的「最新资讯」栏承担），只写事件本身。\n`
+    : `\n\n【本页可参考的媒体报道】本次没有检索到可用的报道。` +
+      `导语请退而用**形态或生态上的反常识事实**开篇，**绝不可编造事件**。\n`;
+  const p4 = await ask(
+    withWebContext(premiumPrompt4(facts, goldSkill), webResearch3) + imageManifest + newsForCurio,
+    PREMIUM_SCHEMA_4,
+    "4",
+  );
+  const fields = { ...p1, ...p2, ...p3, ...p4 } as PremiumFields;
 
   // 【质量闸门】比草稿严一档：它要收一枚金叶，且会直接落进公开档案 plants。
   // 放在渲染之前 —— 渲染/上传/入库/扣费全在下面，抛出去就什么都没发生。
@@ -6236,19 +6570,65 @@ async function runGoldCore(
         o && typeof o === "object" ? Object.keys(o as object).join(",") : "(非对象)";
       console.error(
         `[QualityGate] gold ${draft.id} 各轮顶层键：p1=[${keysOf(p1)}] p2=[${keysOf(p2)}] ` +
-          `p3=[${keysOf(p3)}] · 模型=${goldProvider}/${goldModel}`,
+          `p3=[${keysOf(p3)}] p4=[${keysOf(p4)}] · 模型=${goldProvider}/${goldModel}`,
       );
       throw new AiError("GOLD_QUALITY_FAILED", gate.summary);
     }
   }
 
-  onPhase("正在渲染并上传详页…", 82);
+  // 【全球分布图】国界底图 + GBIF 记录密度，服务端实时生成 inline SVG。
+  // 放在质量闸门之后：闸门不通过就整单取消，没必要先去打 GBIF 的接口。
+  // 任何一步失败都返回 null，页面就少这一块 —— 绝不退回一张画不准的图。
+  onPhase("正在绘制全球分布图…", 80);
+  let distributionSvg: string | null = null;
+  try {
+    const { buildSpeciesDistributionMap } = await import("./distribution-map");
+    const dm = await buildSpeciesDistributionMap(facts.scientificName);
+    distributionSvg = dm?.svg ?? null;
+    console.log(
+      `[GoldPage] 分布图「${facts.scientificName}」：` +
+        (dm ? `GBIF taxon ${dm.gbifTaxonKey} · ${dm.recordCount} 条记录` : "无 GBIF 坐标记录，整块不渲染"),
+    );
+  } catch (e) {
+    console.warn("[GoldPage] 分布图生成失败，整块不渲染：", e);
+  }
+
+  // ── 易混近缘种的配图 ───────────────────────────────────────────────────────
+  //
+  // 必须**单独按近缘种自己的学名**检索：它不在本种的候选池里，而且要等第一轮撰稿返回
+  // 才知道近缘种是谁，所以只能在这里后补。抓不到就是 null，卡片退回单栏 ——
+  // 绝不拿一张本种的照片去冒充近缘种，那正是「易混」这一栏最不能犯的错。
+  onPhase("正在检索近缘种配图…", 82);
+  let similarPhoto: { url: string; credit?: string; sourceUrl?: string } | null = null;
+  try {
+    const simLa = (fields.similar_species?.name_la || "").trim();
+    const simTerm = simLa.replace(/[*_]/g, "").split(/\s+/).slice(0, 2).join(" ");
+    // 属名一致还不够 —— 只有真的是另一个种才值得配图（同名同种等于又放一张本种的照片）。
+    if (simTerm && speciesKey(simTerm) !== speciesKey(facts.scientificName)) {
+      const cands = await fetchSpeciesPhotos(simTerm, 3);
+      const rehosted = await rehostImagesAligned(cands.slice(0, 1), `plants/gold/${draft.id}/sim`);
+      const pick = rehosted[0];
+      if (pick?.url) {
+        similarPhoto = { url: pick.url, credit: creditLine(pick), sourceUrl: pick.sourceUrl };
+      }
+    }
+    console.log(
+      `[GoldPage] 近缘种配图「${simTerm || "(模型未给近缘种)"}」：${similarPhoto ? "已抓到" : "无（卡片退回单栏）"}`,
+    );
+  } catch (e) {
+    console.warn("[GoldPage] 近缘种配图检索失败，卡片退回单栏：", e);
+  }
+
+  onPhase("正在渲染并上传详页…", 84);
   // 6. Render + upload the HTML body.
   const html = renderPremiumHtml(
     fields,
     facts,
     {
       heroUrl: draft.photo_url as string,
+      distributionSvg,
+      similarPhoto,
+      newsAllowedUrls,
       // 署名跟着图走：每张图注渲染「摄影：X · CC BY-NC · iNaturalist」，可点回原始页。
       images: photos.map((c, i) =>
         c
@@ -6654,7 +7034,11 @@ export const approvePlantDraft = createServerFn({ method: "POST" })
     // 发布前顺手清掉「已经换上真图的槽位却还挂着『暂无该物种的…公开照片』」——
     // 老草稿的正文里存着这种自相矛盾的组合，收录时照抄就会带到正式条目页上去。
     const htmlPath = `${dbUserId}/draft-${draft.id}.html`;
-    const publishHtml = stripStaleMissingNotes(String(draft.html_content || ""));
+    // rewriteDraftOnlyHints：摘要卡页尾那句「点击『让 AI 生成进一步介绍草稿』」只在草稿页
+    // 上成立 —— 那个按钮不在条目页上。发布时就改写掉，别把一条点不动的指令印到正式条目上。
+    const publishHtml = rewriteDraftOnlyHints(
+      stripStaleMissingNotes(String(draft.html_content || "")),
+    );
     const blob = new Blob([publishHtml], { type: "text/html" });
     const { error: upErr } = await supabaseAdmin.storage
       .from("plant-html")
@@ -7019,10 +7403,16 @@ async function geminiChat(
   images?: InlineImage[],
   /** 报错文案里自称什么。三条传输层都要，理由见 openaiCompatChat 的 `label`。 */
   who = "小P",
+  /**
+   * 这次调用开不开思维链。**2026-07-30 新增** —— 在此之前这条路完全无视推理开关，
+   * 配 Gemini 的控制台上那个开关是死的（只有 openai-compat 一条路认它）。
+   */
+  thinking: ThinkingMode = "off",
 ): Promise<AiTextResult> {
-  const generationConfig: Record<string, unknown> = schema
-    ? { responseMimeType: "application/json", responseSchema: schema }
-    : {};
+  const generationConfig: Record<string, unknown> = {
+    ...(schema ? { responseMimeType: "application/json", responseSchema: schema } : {}),
+    ...geminiThinkingConfig(model, thinking === "on"),
+  };
   const gContents: { role: string; parts: unknown[] }[] = contents.map((c) => ({
     role: c.role,
     parts: [...c.parts],
@@ -7038,16 +7428,41 @@ async function geminiChat(
   // per-minute limit on a single key. Rotation spreads them across projects.
   // Vision questions can take >1min, hence the 120s per-attempt timeout.
   try {
-    const res = await callGeminiWithRotation(splitGeminiKeys(apiKey), {
-      model,
-      timeoutMs: 120_000,
-      label: who,
-      body: {
-        contents: gContents,
-        systemInstruction: { parts: [{ text: system }] },
-        generationConfig,
-      },
-    });
+    const call = (genCfg: Record<string, unknown>) =>
+      callGeminiWithRotation(splitGeminiKeys(apiKey), {
+        model,
+        timeoutMs: 120_000,
+        label: who,
+        body: {
+          contents: gContents,
+          systemInstruction: { parts: [{ text: system }] },
+          generationConfig: genCfg,
+        },
+      });
+
+    let res;
+    try {
+      res = await call(generationConfig);
+    } catch (e) {
+      // 【thinkingConfig 的安全网】Gemini 的思考字段是**分代际**的
+      // （3 代用 thinkingLevel、2.5 用 thinkingBudget，见 geminiThinkingConfig），
+      // 而模型代际只能从名字猜。猜错时 Gemini 回 400，且
+      // callGeminiWithRotation 对 400 的策略是「配置错误，每个 key 结果一样 → 立刻上抛」，
+      // **没有** openai-compat 那条路的「去掉惹祸的参数重试一次」。
+      // 所以在这里补一次：只要 400 点名了 thinking 相关字段，就去掉它重发 ——
+      // 宁可这一次不控制思考强度，也不能让一个「猜错代际」把整条链路打死。
+      const msg = e instanceof Error ? e.message : String(e);
+      const rejectedThinking =
+        /thinking|thought/i.test(msg) &&
+        /400|invalid|unknown|unsupported|not supported|unrecognized/i.test(msg);
+      if (!rejectedThinking) throw e;
+      const { thinkingConfig: _dropped, ...withoutThinking } = generationConfig;
+      console.warn(
+        `[${who}] ${model} 不接受 thinkingConfig（${msg.slice(0, 120)}）—— 已去掉该字段重发，` +
+          `本次调用的思考强度由模型自己决定。`,
+      );
+      res = await call(withoutThinking);
+    }
     const txt = res.candidates?.[0]?.content?.parts?.[0]?.text;
     if (!txt) throw new Error(`${who} 未返回有效内容。`);
     const u = res.usageMetadata ?? {};
@@ -7193,18 +7608,20 @@ async function openaiCompatChat(
 
   // One request with its own network retry + timeout. Returns the Response, or
   // throws a described network/timeout error.
+  // NOTE: deliberately DO NOT send response_format:json_object — some relays /
+  // reasoning models return an EMPTY reply when it's set. We instruct JSON in the
+  // system prompt + cleanJson() instead.
+  const buildBody = (useImages: boolean): Record<string, unknown> => ({
+    model,
+    messages: buildMessages(useImages),
+    max_tokens: 16000,
+    // 小P蛙默认关思考：它要么在跟用户对话（要跟手），要么在做配图器官打标签
+    // （机械活）。两种都不吃思维链，却都会被它拖到 2 分钟超时那条分支上。
+    ...thinkingParams({ thinking }),
+  });
+
   const send = async (useImages: boolean, key: string): Promise<Response> => {
-    // NOTE: deliberately DO NOT send response_format:json_object — some relays /
-    // reasoning models return an EMPTY reply when it's set. We instruct JSON in the
-    // system prompt + cleanJson() instead.
-    const body: Record<string, unknown> = {
-      model,
-      messages: buildMessages(useImages),
-      max_tokens: 16000,
-      // 小P蛙默认关思考：它要么在跟用户对话（要跟手），要么在做配图器官打标签
-      // （机械活）。两种都不吃思维链，却都会被它拖到 2 分钟超时那条分支上。
-      ...thinkingParams({ thinking }),
-    };
+    const body = buildBody(useImages);
     let lastErr: unknown = null;
     for (let attempt = 0; attempt < 2; attempt++) {
       const controller = new AbortController();
@@ -7244,10 +7661,12 @@ async function openaiCompatChat(
   // limited. Both mean the NEXT key in the pool is worth trying; anything else is a
   // real error we should surface immediately.
   let usedKey = keyPool[0];
-  let resp = await send(!!images?.length, usedKey);
+  /** 最后一次实际发出去时带没带图 —— 下面的流式重发要照着同一份 body 重来。 */
+  let sentImages = !!images?.length;
+  let resp = await send(sentImages, usedKey);
   for (let i = 1; i < keyPool.length && !resp.ok && keyRejected(resp.status); i++) {
     usedKey = keyPool[i];
-    resp = await send(!!images?.length, usedKey);
+    resp = await send(sentImages, usedKey);
   }
   // Text-only models (e.g. DeepSeek deepseek-chat) reject the vision `image_url`
   // part with a 400. Rather than fail the whole chat, retry once WITHOUT images so
@@ -7268,9 +7687,59 @@ async function openaiCompatChat(
       console.warn(
         `[openaiCompatChat] ${model} 拒收图片，已**去掉图**重发一次 —— 本次回答没有看到任何图片。`,
       );
+      sentImages = false;
       resp = await send(false, usedKey);
     }
   }
+
+  // ── 🔴 524 / 504 / 408：网关等不到上游吐字节 → 改用流式重发 ──────────────────
+  //
+  // 用户 2026-07-29 报的「金叶创建**所有**进度都卡在正在撰稿 1/3（正文主体）」就是这个。
+  // 实库取证：site_config 里 5 条 gold_page 失败行清一色停在 `progress=45`
+  // （45 正是撰稿 1/3 那一步），错误全是 `金叶详页模型 调用失败 (HTTP 524)`。
+  //
+  // 为什么偏偏总是第一轮：三轮撰稿里「正文主体」的 prompt 最长、要写的字最多，
+  // 推理模型开着思维链常常两三分钟不吐第一个字节，而中转（Moonshot 等前面都挂着
+  // Cloudflare）在那之前就判了源站超时。第二、三轮根本没机会跑到。
+  //
+  // 为什么之前那些办法都不管用：
+  //   · **重试无效** —— 每次都同样慢，524 必然复现；
+  //   · **放宽 timeoutMs 无效** —— 524 是对方那端掐的，我们的 AbortController
+  //     压根没来得及触发（上一轮把 gold 放宽到 300 秒，白放）；
+  //   · **顺位换模型也多半无效** —— shouldFailOver 对 5xx 确实会顺位，但同一个
+  //     控制台里的几项常常指向同一个中转，换个模型名照样撞同一道网关。
+  //
+  // 唯一对症的是**流式**：token 边生成边回，网关一直看得到数据就不会判超时。
+  // 这套办法 callAiIdentify 里早就在用（见那边的 `HTTP ${resp.status} 网关超时，改用流式重试`），
+  // 只是一直没搬到 `xiaopTextCall → openaiCompatChat` 这条路上来 —— 而金叶三轮撰稿
+  // 恰恰走的是这条。对方若把 stream 参数吃掉（回 200 但不是 SSE），
+  // postOpenAICompatStream 约定返回 599，这里就原样落回下面的报错分支。
+  if (resp.status === 524 || resp.status === 504 || resp.status === 408) {
+    console.warn(`[openaiCompatChat] ${who} HTTP ${resp.status} 网关超时，改用流式重试`);
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    try {
+      const streamed = await postOpenAICompatStream(
+        `${apiBase}/chat/completions`,
+        usedKey,
+        buildBody(sentImages),
+        { signal: ctrl.signal },
+      );
+      if (streamed.ok) resp = streamed;
+      else
+        console.warn(
+          `[openaiCompatChat] ${who} 流式重试也失败（HTTP ${streamed.status}${
+            streamed.status === 599 ? " = 中转把 stream 参数吃掉了" : ""
+          }），回到常规报错`,
+        );
+    } catch (e) {
+      // 流式这一路自己挂了不该掩盖原本那个 524 —— 记一笔，继续用原 resp 报错。
+      console.warn(`[openaiCompatChat] ${who} 流式重试抛异常：`, e);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   if (!resp.ok) {
     const t = await resp.text();
     throw new Error(
@@ -7291,6 +7760,12 @@ async function openaiCompatChat(
   };
 }
 
+/**
+ * Anthropic 单次调用的输出上限。抽成常量是因为 extended thinking 的 `budget_tokens`
+ * 必须严格小于它 —— 两处写死同一个数字，改一处忘一处就会被 API 400 拒。
+ */
+const ANTHROPIC_MAX_TOKENS = 16000;
+
 /** Anthropic Messages chat (optional vision). */
 async function anthropicChat(
   apiKey: string,
@@ -7302,6 +7777,11 @@ async function anthropicChat(
   images?: InlineImage[],
   /** 报错文案里自称什么。三条传输层都要，理由见 openaiCompatChat 的 `label`。 */
   who = "小P",
+  /**
+   * 这次调用开不开思维链。**2026-07-30 新增** —— 在此之前这条路完全无视推理开关，
+   * 配 Anthropic 的控制台上那个开关是死的（只有 openai-compat 一条路认它）。
+   */
+  thinking: ThinkingMode = "off",
 ): Promise<AiTextResult> {
   const apiBase = normalizeBaseUrl(baseUrl) || "https://api.anthropic.com/v1";
   const idx = images?.length ? lastUserIndex(contents) : -1;
@@ -7332,7 +7812,26 @@ async function anthropicChat(
     },
     // 16000 与 OpenAI 兼容路径取齐：金叶详页第一轮要一次写出 6 张特征卡 + 导语 + 株型总览
     // 的中英双语，8000 挡不住，截断后 JSON.parse 直接抛 GOLD_BAD_JSON。
-    body: JSON.stringify({ model, system: sys, messages, max_tokens: 16000 }),
+    body: JSON.stringify({
+      model,
+      system: sys,
+      messages,
+      max_tokens: ANTHROPIC_MAX_TOKENS,
+      // Anthropic 的 extended thinking：`disabled` 是它的默认，但**显式发**才对得起
+      // 界面上那个开关（管理员选了「关」，就该在请求里看得见）。
+      // ⚠️ `budget_tokens` 有两条硬约束：必须 ≥1024，且必须 < max_tokens。
+      // 取 max_tokens 的一半并压在 1024 以上，既满足约束又不会把输出预算吃光 ——
+      // 思维链和正文共用 max_tokens，budget 给太多会让正文写不完、JSON 被截断
+      // （那就是 GOLD_BAD_JSON 的成因）。
+      ...(thinking === "on"
+        ? {
+            thinking: {
+              type: "enabled",
+              budget_tokens: Math.max(1024, Math.floor(ANTHROPIC_MAX_TOKENS / 2)),
+            },
+          }
+        : { thinking: { type: "disabled" } }),
+    }),
   });
   if (!resp.ok) {
     const t = await resp.text();
@@ -7341,7 +7840,16 @@ async function anthropicChat(
     );
   }
   const res = await resp.json();
-  const txt = res.content?.[0]?.text;
+  // ⚠️ **不能写 `res.content[0].text`**。开了 extended thinking 之后，Anthropic 返回的
+  // content 数组第一个 block 是 `{type:"thinking", thinking:"…"}`，正文在后面那个
+  // `{type:"text"}` 里 —— 取下标 0 会拿到 undefined，然后抛「未返回有效内容」。
+  // 也就是说：一旦有人把这条链路的推理开关拨到「开」，旧写法必然当场失败。
+  // 按类型找，顺带兼容多个 text block 被拆开返回的情况。
+  const blocks: { type?: string; text?: string }[] = Array.isArray(res.content) ? res.content : [];
+  const txt = blocks
+    .filter((b) => b?.type === "text" && typeof b.text === "string")
+    .map((b) => b.text)
+    .join("");
   if (!txt) throw new Error(`${who} 未返回有效内容。`);
   const u = res.usage ?? {};
   return {
@@ -7388,6 +7896,9 @@ async function xiaopTextCall(opts: {
   const callSlot = async (
     slot: ModelSlot,
   ): Promise<AiTextResult & { provider: string; model: string }> => {
+    // 推理开关解析一次，三条路共用。**三条都要传** —— 2026-07-30 之前只有
+    // openai-compat 那条接了它，所以控制台里配 Gemini 或 Anthropic 时开关是死的。
+    const thinking = thinkingOf(slot, consoleId);
     if (slot.provider === "gemini") {
       const r = await geminiChat(
         slot.apiKey,
@@ -7398,6 +7909,7 @@ async function xiaopTextCall(opts: {
         opts.maxRetry ?? 3,
         opts.images,
         who,
+        thinking,
       );
       return { ...r, provider: "gemini", model: slot.model };
     }
@@ -7411,6 +7923,7 @@ async function xiaopTextCall(opts: {
         opts.schema,
         opts.images,
         who,
+        thinking,
       );
       return { ...r, provider: "anthropic", model: slot.model };
     }
@@ -7707,6 +8220,16 @@ async function logChatUsage(
   }
 }
 
+/**
+ * 三个小P蛙 persona 共用的一条硬约束（用户 2026-07-31）：**不向用户报出底层模型**。
+ * 与 identify-trace.ts / edit-source.ts 那两处同一个理由 —— 模型换得很勤，说出口的名字
+ * 过两个月就是错的；而且「小P蛙」是站内的一个角色，不该是某家模型的贴牌。真实模型只在
+ * 管理员的模型控制台和用量表里可见（那里是配置必需）。
+ */
+const NO_MODEL_DISCLOSURE =
+  "- 若被问到「你是什么模型 / 哪家公司的 AI / 什么版本」：**不要说出任何具体模型名称、厂商或版本号**，" +
+  "答「我是 Plantspedia 的站内助手小P蛙，底层模型由站点配置、会不定期更换」即可，然后把话题带回植物；\n";
+
 /** Chat with 小P about a draft. Returns its reply plus, when relevant, a concrete
  *  edit instruction the editor can choose to apply. */
 export const askDraftAgentFn = createServerFn({ method: "POST" })
@@ -7753,6 +8276,7 @@ export const askDraftAgentFn = createServerFn({ method: "POST" })
     const system = `你是「小P蛙」，Plantspedia（鄂尔多斯植物百科）的双语审稿助手，性格友好、专业、简洁。
 编辑正在审核一份由 AI 生成的植物科普草稿，可能对其中内容有疑问。${scopeLine}你的职责：
 - 用【中文】回答编辑关于该草稿的问题，必要时给出基于植物学常识的核对与修改建议；${data.scope ? "范围已限定时，回答与改动只应涉及该部分；" : ""}
+${NO_MODEL_DISCLOSURE.trimEnd()}
 - ${photos.length ? `本条消息附带了${data.scope ? `草稿「${data.scope}」这一部分的配图` : "访客上传的原始照片以及草稿全部配图"}，共 ${photos.length} 张。鉴定物种时请【以照片为准】，文本仅作参考；若编辑问「配图对不对/有没有错配」，请逐张把照片与正文描述核对，指出哪一张与所述物种矛盾（叶单叶/复叶、花色花数、果实有无刺等）、疑似为何物种；` : "（本次未能附上照片，仅能依据文本判断，请说明这一点）"}
 - 当你不确定物种鉴定或具体数据时，要诚实说明，不要编造；
 - 如果编辑的诉求是一处「可以直接落地到草稿里的具体修改」（例如订正学名、改写某段、调整养护数值、修正错别字等），
@@ -8066,7 +8590,8 @@ export const askPageAgentFn = createServerFn({ method: "POST" })
     const system = `你是「小P蛙」，Plantspedia（鄂尔多斯植物百科）的双语助手，正在陪用户看站内的一个页面：${where}。
 职责：
 - 用【中文】回答用户关于**这一页内容**的问题；页面文本没写到的，可以用植物学常识补充，但要说清哪些是页面上的、哪些是你的补充；不确定就如实说，不要编造。
-- 用户问的若是「这个网站怎么用 / 这一页是干什么的」，就依据页面文本解释。
+- 用户问的若是「这个网站怎么用 / 这一页是干什么的」，就依据页面文本解释；站内有一页专门讲这些，可以请他看导航栏的「关于 about」。
+${NO_MODEL_DISCLOSURE.trimEnd()}
 - 如果用户想**修改内容**：站内可直接改的只有两种页面 —— 植物条目详情页（/plants/…）和草稿页（/drafts/…）。请告诉他去那一页找小P蛙，那里的我能改写并保存。其余页面（识别页、名录、探索页等）属于站点功能界面，我改不了，别答应做不到的事。
 - 如果用户想「看某个物种的网络参考照片」，把 showImages 设为 true，把物种放进 imageQueries 数组（优先拉丁学名，最多 4 个）。**你具备这个能力，不要说"我无法联网/无法发图"**。
 - 如果准确回答需要【最新网络信息】（保护级别、新研究、时效性数据等），把 needsWebSearch 设为 true 并在 webQuery 给出简洁检索词；纯常识不必联网，设 false、webQuery 留空。
@@ -8164,6 +8689,7 @@ export const askPlantAgentFn = createServerFn({ method: "POST" })
 ${scopeLine}
 职责：
 - 用【中文】回答编辑关于该页面的问题，给出基于植物学常识的核对与修改建议；不确定时如实说明，不要编造；
+${NO_MODEL_DISCLOSURE.trimEnd()}
 - ${
       photos.length
         ? `本条消息附带了${data.scope ? `「${data.scope}」这一分区` : "本页"}的实际配图，共 ${photos.length} 张（按页面中出现的先后顺序排列）。涉及物种鉴定、或编辑问「配图对不对/有没有错配」时，请【逐张把照片与正文描述相互核对】：判断每一张是否确为本页所述物种，指出与描述矛盾的可见特征（如叶序单叶/复叶、叶形、花色花数、果实形态、有无刺毛等）；若发现张冠李戴，请明确说是第几张、错在哪、疑似为何物种。文本仅作参考，以图为准；`
@@ -9317,8 +9843,24 @@ async function callSlotForProbe(
   const contents: ChatContents = [{ role: "user", parts: [{ text: prompt }] }];
   const system = "你是一个图像识别助手。严格按用户要求作答，不要解释。";
   let r: AiTextResult;
+  // 自检要判定的只有一个事实：**这个模型看没看见图**。思维链对它毫无增益，
+  // 却能把一次自检从几秒拖到几十秒、甚至拖到超时（那会被误判成「不读图」）。
+  // 所以两档都显式关掉 —— 默认值也是 "off"，写出来是为了让意图留在代码里。
+  // `who` 同样显式给成「视觉自检」：默认值是「小P」，而这条路跟小P蛙无关，
+  // 报错自称小P会把管理员指到无关的控制台去（与 2026-07-29 修过的那批文案同类问题）。
+  const PROBE = { who: "视觉自检", thinking: "off" as const };
   if (slot.provider === "gemini") {
-    r = await geminiChat(slot.apiKey, slot.model, contents, system, undefined, 1, images);
+    r = await geminiChat(
+      slot.apiKey,
+      slot.model,
+      contents,
+      system,
+      undefined,
+      1,
+      images,
+      PROBE.who,
+      PROBE.thinking,
+    );
   } else if (slot.provider === "anthropic") {
     r = await anthropicChat(
       slot.apiKey,
@@ -9328,6 +9870,8 @@ async function callSlotForProbe(
       system,
       undefined,
       images,
+      PROBE.who,
+      PROBE.thinking,
     );
   } else {
     r = await openaiCompatChat(
@@ -10284,11 +10828,7 @@ export async function ingestMcpIdentification(input: McpIdentifyInput): Promise<
     source: "mcp",
   };
 
-  const conf = computeIdentifyConfidence(
-    trace,
-    (meta.scientific_name || "").toString(),
-    (meta.identification_confidence || "").toString(),
-  );
+  const conf = computeIdentifyConfidence(trace, (meta.scientific_name || "").toString(), meta);
 
   const html = buildSummaryCardHtml({
     photos: [photoUrl],

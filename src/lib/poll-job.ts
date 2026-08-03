@@ -19,18 +19,44 @@ export type JobOutcome<T> =
       ok: false;
       error: string;
       /** true = 服务端已明确判定失败（而非轮询侧放弃） */ reported: boolean;
+      /** 用户自己撤销的 —— 调用方据此静默收场，不要弹「识别失败」。 */
+      cancelled?: boolean;
     };
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+/** 可被 signal 打断的等待：取消时不该再干等满 3 秒才有反应。 */
+const sleepOrAbort = (ms: number, signal?: AbortSignal) =>
+  new Promise<void>((resolve) => {
+    if (signal?.aborted) return resolve();
+    const t = setTimeout(done, ms);
+    function done() {
+      clearTimeout(t);
+      signal?.removeEventListener("abort", done);
+      resolve();
+    }
+    signal?.addEventListener("abort", done, { once: true });
+  });
 
 /**
  * 一直轮询到任务结束。**不会 reject** —— 失败信息走返回值，调用方只需处理一种分支。
  *
  * `onPhase` 每次拿到新阶段文案时被调用（同一段文案不会重复回调，避免 toast 抖动）。
+ *
+ * `opts.signal` 一旦 abort，轮询立刻收手并返回 `cancelled: true`。**注意它只停轮询、
+ * 不停服务端**：真正让服务端别再往草稿里写，靠的是 `cancelJobFn` 写的取消标记
+ * （见 background-jobs.ts 的 requestJobCancel）。两件事必须都做。
  */
 export async function awaitJob<T>(
   jobId: string,
   onPhase?: (phase: string, progress: number) => void,
+  opts?: {
+    signal?: AbortSignal;
+    /**
+     * 未登录访客的取件号（见 lib/anon-id.ts）。没有它，服务端认不出这份任务归谁，
+     * 一律回 `found:false` —— 匿名识别就会在「找不到这个生成任务」上原地打转。
+     * 登录用户不传：服务端只认令牌。
+     */
+    anonId?: string;
+  },
 ): Promise<JobOutcome<T>> {
   const startedAt = Date.now();
   let lastPhase = "";
@@ -38,6 +64,9 @@ export async function awaitJob<T>(
   let missStreak = 0;
 
   for (;;) {
+    if (opts?.signal?.aborted) {
+      return { ok: false, reported: true, cancelled: true, error: "已取消这次识别。" };
+    }
     if (Date.now() - startedAt > POLL_TIMEOUT_MS) {
       return {
         ok: false,
@@ -49,7 +78,7 @@ export async function awaitJob<T>(
 
     let snap: Awaited<ReturnType<typeof pollJobFn>> | null = null;
     try {
-      snap = await pollJobFn({ data: { jobId } });
+      snap = await pollJobFn({ data: { jobId, anonId: opts?.anonId } });
     } catch {
       // 网络/鉴权抖动：下一轮再试。
       snap = null;
@@ -70,17 +99,26 @@ export async function awaitJob<T>(
         };
       }
       if (snap.stale) {
-        // 后台任务每 15 秒打一次心跳，所以「连丢两分钟心跳」基本只剩一种解释：
-        // 那个 isolate 真的没了、任务不会自己复活。**换模型救不了**，这跟模型快慢无关。
-        // 实测过的真凶：生成一趟发的对外请求数超过 Cloudflare 单次调用上限（免费版 50），
-        // 连「把失败原因写回任务行」的那次写入都没了配额 → 只能退回这条兜底文案。
-        // 已按「减少每趟子请求数」优化；若仍反复出现，多半是配图/联网调研太重，
-        // 需要进一步精简或升级 Workers 套餐（子请求上限 50→1000），而不是换模型。
+        // 走到这里意味着：任务**已经被消费者接走**（有 startedAt），然后连丢两分钟心跳。
+        // 排队等待期间不会再进这个分支了 —— 那是 2026-07-29 修掉的一个大误判：
+        // 心跳由消费者打，排队中的任务本来就没有心跳，却被 2 分钟阈值判成了死亡，
+        // 于是用户一次连开几个任务，后面几个必然弹「生成中断」，而它们其实都跑完了。
+        //
+        // ⚠️ 文案**刻意不再归因到「平台单次请求上限」**：那是 2026-07-21 免费版时期的
+        // 真凶，用户当天就开了 Workers Paid（子请求 50→1000），这条归因从此是错的，
+        // 却一直把人往「精简配图 / 升级套餐」这个死胡同里带。现在只说观察到的事实，
+        // 并把人指向真正查得到东西的地方（管理后台的任务记录里有服务端写下的真错误）。
         return {
           ok: false,
           reported: false,
           error:
-            "生成中断：任务在服务端异常结束（多为触及平台单次请求上限，与模型快慢无关）。请重试一次；若反复出现，请联系站点维护者精简配图或升级 Workers 套餐。",
+            "生成中断：任务在服务端失去响应（已连续两分钟没有心跳）。" +
+            // 从前这里断言「多半是模型那端长时间不返回」—— 那是猜的，而且常常猜错。
+            // 真正的判定现在由服务端给：任务被平台掐死时会走死信队列，几十秒内就会
+            // 被如实写成「生成中断（SERVER_ABORTED）」。所以这里只说观察到的事实，
+            // 并告诉用户去哪儿看真结论。
+            "服务端可能仍在收尾 —— 稍等片刻刷新本页，若确实失败了，小P蛙动态流里会写出具体原因。" +
+            "反复出现请把这个时间点告诉站点维护者，Cloudflare 日志里有确切死因。",
         };
       }
     } else if (snap) {
@@ -90,7 +128,7 @@ export async function awaitJob<T>(
       }
     }
 
-    await sleep(POLL_INTERVAL_MS);
+    await sleepOrAbort(POLL_INTERVAL_MS, opts?.signal);
   }
 }
 

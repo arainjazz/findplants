@@ -1,9 +1,15 @@
-const CACHE_NAME = "plantspedia-cache-v5";
-const ASSETS_TO_CACHE = [
-  "/",
-  "/favicon.ico",
-  "/explore"
-];
+// ⚠️ 改这个版本号会让 activate 把**所有旧缓存整个删掉** —— 这是把线上已经卡住的
+// 用户救回来的唯一办法（他们的页面不水合，注册 SW 的那段 React 代码永远跑不到，
+// 但浏览器自己会在每次导航时重新拉 sw.js，于是新版本还是能装上）。
+// v5 → v6：清掉 2026-08-03 那批「壳是旧的、里面指的 chunk 已 404」的 HTML 缓存。
+const CACHE_NAME = "plantspedia-cache-v6";
+
+// 🔴 **预缓存里不放 HTML**。install 时抓的 "/" 会在下一次部署后立刻变成一张
+// 指向已删除 chunk（`/assets/index-<旧hash>.js`，现在 404 且返回 HTML）的死壳，
+// 而它偏偏是断网兜底时最先被端出来的那一份 —— 页面能画出来、却一个按钮都不响应。
+// 离线兜底改由下面 navigate 分支里「成功访问过才写入」的那份承担，它至少是用户
+// 真正打开过的版本；壳彻底过期时由页面里的水合看门狗清缓存自救（见 __root.tsx）。
+const ASSETS_TO_CACHE = ["/favicon.ico"];
 
 self.addEventListener("install", (e) => {
   e.waitUntil(

@@ -114,11 +114,71 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
   errorComponent: ErrorComponent,
 });
 
+// ─── 水合看门狗 ───────────────────────────────────────────────────────────────
+//
+// 🔴 **必须是内联的普通 script，绝不能挪进 React**。它要救的正是「React 没跑起来」
+// 这一种故障，写在组件里等于把灭火器锁在着火的屋子里。
+//
+// 修的是什么（2026-08-03 用户报「未登录状态下所有功能都消失了」）：
+//   SW 缓存里存着上一次部署的 HTML 壳 → 壳里写的是 `/assets/index-<旧hash>.js`
+//   → 那个 chunk 早被新部署换掉，现在返回 **404 而且 body 是 HTML**
+//   → `<script type="module">` 解析失败 → 整页不水合。
+//   于是用户看到的是一张**服务端渲染出来的死图**：首页停在「载入中…」（那行字本来
+//   就在 SSR 输出里）、汉堡菜单和标签页点了毫无反应、识别页打得开却什么都不能做。
+//   最要命的是它**自己好不了**：注册/更新 SW 的代码在 RootComponent 的 effect 里，
+//   不水合就永远执行不到，那份坏掉的壳于是一直发下去。
+//
+// 自救动作：注销所有 SW + 清空所有 cache + 刷新一次。一个会话只做一次
+// （sessionStorage 打点），避免变成刷新循环。
+const HYDRATION_WATCHDOG = `(function(){
+  var KEY = "pp-selfheal-at";
+  function heal(){
+    try {
+      var last = +sessionStorage.getItem(KEY) || 0;
+      if (Date.now() - last < 60000) return;
+      sessionStorage.setItem(KEY, String(Date.now()));
+    } catch (e) { return; }
+    var reload = function(){ location.reload(); };
+    var jobs = [];
+    try {
+      if (navigator.serviceWorker) jobs.push(navigator.serviceWorker.getRegistrations().then(function(rs){
+        return Promise.all(rs.map(function(r){ return r.unregister(); }));
+      }));
+      if (window.caches) jobs.push(caches.keys().then(function(ks){
+        return Promise.all(ks.map(function(k){ return caches.delete(k); }));
+      }));
+    } catch (e) {}
+    Promise.all(jobs).catch(function(){}).then(reload);
+    setTimeout(reload, 3000);
+  }
+  window.addEventListener("error", function(e){
+    // 只认「水合之前、同源的 script 加载失败」这一种：
+    //   · 水合成功之后再刷新纯属添乱 —— 那会打断正在上传的识别、清掉小P蛙输入框；
+    //   · 第三方脚本（字体、RUM）挂掉不影响本站运转，不值得为它清缓存重来。
+    if (window.__PP_HYDRATED__) return;
+    var t = e.target;
+    if (!t || t.tagName !== "SCRIPT" || !t.src) return;
+    if (t.src.lastIndexOf(location.origin, 0) !== 0) return;
+    heal();
+  }, true);
+  // 兜底：没等到任何报错、页面就是不动。要等 readyState 真的 complete 才判死刑 ——
+  // 否则慢网下只是入口 chunk 还在下载，刷新反而让它从头再下一遍。
+  var waited = 0;
+  var tick = setInterval(function(){
+    waited += 5000;
+    if (window.__PP_HYDRATED__ || navigator.onLine === false) { clearInterval(tick); return; }
+    if (document.readyState !== "complete" && waited < 45000) return;
+    clearInterval(tick);
+    heal();
+  }, 5000);
+})()`;
+
 function RootShell({ children }: { children: React.ReactNode }) {
   return (
     <html lang="zh-CN">
       <head>
         <HeadContent />
+        <script dangerouslySetInnerHTML={{ __html: HYDRATION_WATCHDOG }} />
       </head>
       <body>
         {children}
@@ -132,7 +192,11 @@ function RootComponent() {
   const { queryClient } = Route.useRouteContext();
 
   useEffect(() => {
-    if (typeof window === "undefined" || !("serviceWorker" in navigator)) return;
+    if (typeof window === "undefined") return;
+    // 看门狗的「活着」信号（见 HYDRATION_WATCHDOG）。effect 跑到这里就说明水合成功了，
+    // 必须在下面那行 serviceWorker 提前 return 之前打，否则不支持 SW 的浏览器会被误判成死页。
+    (window as unknown as { __PP_HYDRATED__?: boolean }).__PP_HYDRATED__ = true;
+    if (!("serviceWorker" in navigator)) return;
 
     // If a SW already controls this page, a controllerchange means a *new* SW just
     // took over (an update) — reload once so the freshly deployed UI shows up without
