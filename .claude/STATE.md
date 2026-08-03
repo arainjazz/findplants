@@ -1,6 +1,38 @@
 # Plantspedia — Working State  (single source of truth)
 
-_Last updated: 2026-07-26 — by Claude（本轮草稿页五修：① 换了配图仍显示「暂无该物种的…公开
+_Last updated: 2026-08-02 — by Claude（**名字三处不一致，一次修到同源**。用户报：草稿
+`28c5e133`（Oxytropis lanata）快速识别简介卡写「疑似长毛棘豆」，银叶正文写「绵毛棘豆」。
+根因不是模型漂移，是三条链路对名录态度不同：① 快速识别**完全不核对**；② `buildDraftContent`
+核对了（正文因此是正名）；③ `runEnrichCore` 的锁名 `draft.title || meta.title` 又把正名顶回去 ——
+锁的是字符串，不是物种身份。三修：**A** 锁名改判「名录核对的输入 == phase-1 钉住的学名」
+才采信 meta（`canonicalKey` 比对），并按 phase-1 判定补回「疑似」前缀；**B** 快速识别
+（含 Pl@ntNet 兜底）在 `buildSummaryCardHtml` **之前**新增 `alignMetaToChecklist`，卡面/列/
+日后正文同源；**C** 一次性回填脚本 `scratch/backfill_name_authority.mjs`（**默认 dry-run**）。
+顺带两修：`applyNameAuthority` 送核对前剥「疑似」（否则「疑似长毛棘豆」会被当成别名收进俗名列）；
+学名**保留命名人**（名录的 scientific_name 不含命名人，原样覆盖会把 `(Pall.) DC.` 削掉 ——
+判据是「原名以正名开头且归一化同名」）。tsc=0、eslint 无新增、name-authority 离线 25 条断言全过。
+dry-run：38 份有留痕的草稿里 **13 份待改**（含 2 例异名换正名 Cyperus→Kyllinga、Cynanchum→
+Vincetoxicum）。**⚠️ 未 --apply、未部署**，等用户过目 dry-run 清单。详见文件最下方本轮小节。）_
+_上一轮：2026-07-30 — by Claude（推理开关「点了就真生效」：① 实库取证金叶配的是
+custom/kimi-k3/Moonshot 且**那一项没有 thinking 字段** → fallback 到 gold 默认 "on"，
+而旧 `thinkingParams` 的 "on" 是**空操作**（一个参数都不发）→ kimi-k3 自带思维链想两三分钟
+不吐字节 → 中转网关判超时 → 每次卡在撰稿 1/3 + 524；07-29 的流式兜底救不了它，因为
+**思维链阶段不产生 content 增量**。② 新增 THINKING_ON 与 geminiThinkingConfig，
+**三条传输层（openai-compat/gemini/anthropic）全部接通**——此前只有 openai-compat 认这个开关。
+③ 顺带修掉 `anthropicChat` 读 `content[0].text` 的坑（开 thinking 后 content[0] 是 thinking
+block，一开就必然报「未返回有效内容」）。④ gold 默认 on→off（配套，否则会变成强制开、更糟）。
+tsc/build/lint=0，thinking-toggle 单测 32→46 条，9 套无回归。**✅ 已部署 Version `648875ab`。**）_
+_上一轮：2026-07-29（续八）— by Claude（五个症状一次性定根因，**全部有实库铁证**：
+① 任务动态「（未命名）」= feedFinish select 了不存在的列 `summary_zh`，整条查询报错 +
+初值用 null 把好标题覆盖成空；② 金叶失败橙条不消失 = catch 里 `feed()` 没 await，
+函数一返回那次写库就被丢弃；③ 金叶每次卡在撰稿 1/3 = **HTTP 524**（不是挂钟被斩 ——
+catch 明明跑了），而 `openaiCompatChat` 这条路缺了 `callAiIdentify` 早就有的流式兜底；
+④ 识别假失败 = 把「在队列里排队」当成「心跳丢了」，加 startedAt 分两段判；
+⑤ 配图大量「暂缺」= **视觉分类没工作**（不是检索苛刻），organ 全空还替没看过的图下结论。
+tsc/build/lint=0，单测 photo-slots 20 + 新增 job-stale 11 条全过。
+**✅ 已部署 Version `81882774`；历史坏数据用户选择暂不回填（`scratch/repair_task_feed_0729.mjs --apply` 随时可跑）。**
+详见文件最下方本轮小节。）_
+_上一轮：2026-07-26 — by Claude（草稿页五修：① 换了配图仍显示「暂无该物种的…公开
 照片」→ 新增 stripStaleMissingNotes，三条换图路径 + 视图 + 保存 + 收录发布全清；② 银叶草稿的
 简介卡不再顶「疑似」、不再压补拍框（showTentativeOnCard）；③ 正文下新增编辑专属绿框
 「草稿内容符合我的观察」=采纳+收录；④ 小P蛙讨论范围新增「快速识别简介卡」并能真改那几个字段；
@@ -5778,3 +5810,1283 @@ db.from("task_feed").eq("user_id", …)   // ❌ QueryBuilder 上根本没有 eq
 - 三套测试：纯函数 41 条、写入形状 10 条、真库往返 1 轮 —— 全过。
 
 ### ✅ 已部署 — Version `57237c4e-f60f-4d10-b569-503631a075cf`，2026-07-29（提交 `0846ce6`）
+
+## ✅ 2026-07-29（续八）— 五个症状一次性定根因：全部有实库铁证，无一靠猜
+
+用户第五轮实测一次报了五件事。**这轮的方法变了**：不再读代码猜，先写探针
+`scratch/probe_0729_five_bugs.mjs` 去真库取证，五条根因全部被数据钉死。
+
+### 🔴 ① 任务动态显示「（未命名）」+ 缩略图是灰块 —— 一个列名写错，毁掉所有已完成动态
+`feedFinish` 里 `select("title, photo_url, summary_zh")` —— **`summary_zh` 这一列根本不存在**
+（实测 `42703 column plant_drafts.summary_zh does not exist`，hint 说「Perhaps you meant
+`plant_drafts.summary`」）。PostgREST **一个列不存在就拒整条查询**，于是 title / photo_url
+这两个存在的列也一起没读到。更致命的是三个变量的初值是 **null 而不是 undefined**，
+而 `upsertTaskFeed` 的判据是 `!== undefined` 才写列 —— `null !== undefined` 为真，
+于是**把 feedStart 早就写好的标题和封面覆盖成了空**。
+
+实测印证得干干净净：task_feed 里所有 `status=done` 的行 title/thumb_url 全是 null；
+而两条还在跑的 gold_page 行 title 是「狗牙根」「天人菊」、封面也在 —— 因为它们还没走到
+feedFinish。**这正是用户截图里「金叶有名字、识别和银叶是（未命名）」的成因。**
+- 修：列名改 `summary`；三个初值改 undefined；读失败 `console.error` 吼出来。
+
+### 🔴 ② 金叶失败后橙条不消失、看不到失败原因 —— `feed()` 没 await，等于没写
+`runQueuedJob` 的 catch 里 `feed({status:"error"})` 走的是 `const feed = (patch) => void upsertTaskFeed(...)`。
+**`void` 掉的 promise 是这个函数的最后一件事** —— 函数一返回，队列消费者的调用就结束了，
+那次写库**连发都没发出去就被丢弃**。所以 job 行里明明是 error（那条 `await jobs.fail()` 过），
+task_feed 却永远停在 running。实测：库里两条 gold_page 动态是 running，对应 job 全是 error。
+- 修：`feed` 改成返回 promise；收尾那处 `await feed(...)`；中途的 onPhase 仍不 await
+  （后面还有很长的 await 给它跑完）。progress 刻意不覆盖，留住失败那一刻的 45%。
+
+### 🔴 ③ 金叶**每次**都卡在「正在撰稿 1/3（正文主体）」 —— 524，且这条路没有流式兜底
+实测铁证：site_config 里 **5 条 gold_page 失败行清一色 `progress=45`**（45 正是撰稿 1/3），
+错误全是 `金叶详页模型 调用失败 (HTTP 524)`。
+⚠️ **顺手推翻一个诱人的错误假设**：不是「队列 15 分钟挂钟被斩」。挂钟被斩的话 catch 根本
+不会执行，job 行不可能是 error、更不可能带着这句 524。**catch 跑了、fail() 写进去了。**
+
+为什么偏偏总是第一轮：三轮撰稿里「正文主体」prompt 最长、要写的字最多，推理模型开着
+思维链常常两三分钟不吐第一个字节，中转（前面挂着 Cloudflare）在那之前就判了源站超时。
+为什么以前的招都没用：**重试无效**（每次都同样慢）；**放宽 timeoutMs 无效**（524 是对方
+那端掐的，我们的 AbortController 根本没来得及触发 —— 上一轮把 gold 放宽到 300 秒，白放）；
+**顺位换模型多半也无效**（同一控制台里几项常指向同一个中转）。
+- 修：`openaiCompatChat` 收到 **524/504/408 时改用流式重发**（token 边生成边回，网关一直
+  看得到数据就不判超时）。**这套办法 `callAiIdentify` 里早就在用**，只是一直没搬到
+  `xiaopTextCall → openaiCompatChat` 这条路上 —— 而金叶三轮撰稿恰恰走的是这条。
+  对方若把 stream 参数吃掉（回 200 但非 SSE），postOpenAICompatStream 约定回 599，原样落回报错。
+
+### 🔴 ④ 识别报「生成中断」但后台其实成功 —— 把「在排队」判成了「已死」
+心跳是**队列消费者**打的，任务在队列里排队期间一次心跳都没有；而 `isJobStale` 拿
+`JOB_STALE_MS`（2 分钟，为「心跳丢了 8 次」定的）去卡它 → **Cloudflare Queues 的消费者
+并发还没扩上来** 被判成 isolate 死了。用户一次连开四个任务，后面几个必然中招；
+而它们随后都跑完了（库里 quick_identify 清一色 done/100）。
+- 修：`JobRecord` 加 `startedAt`（消费者真正开始跑时写）+ 新阈值 `JOB_QUEUE_WAIT_MS`（15 分钟）；
+  `isJobStale` **分两段判**：没 startedAt 走宽松档，有 startedAt 才用严格的心跳档。
+  新增 `isJobQueued`，`pollJobFn` 排队时照实说「排队中：前面还有任务…」。
+  老任务行没有这个字段 → 落进宽松档，只会更宽容，不会误判。
+- 顺带删掉 `poll-job.ts` 里那句**已经过期的归因**：「多为触及平台单次请求上限…升级 Workers
+  套餐」是 07-21 免费版时期的真凶，用户当天就开了 Paid（50→1000），这条归因从此是错的，
+  却一直把人往「精简配图 / 升级套餐」的死胡同带。
+
+### 🔴 ⑤ 银叶配图大量「该物种的植株照片暂缺，此处为其它公开配图」 —— 是**视觉分类没工作**
+用户问「检索太苛刻还是视觉模型没工作」：**答案是后者，而且这句文案就是它的指纹。**
+候选出厂时 `organ` 一律空串（species-photos.ts:261「一律现看现标，绝不按位置猜」），
+靠 `classifyPhotoOrgans` 现看现标。那一步只要失败（限流/超时/返回非 JSON/缩略图没抓到），
+它就静默 `return cands` → **整池 organ 全空** → assignSlots 前两轮一张都命不中 →
+每个槽都落进第三轮 → 每张图都被扣上那句话。
+**而那句话在这种情形下很可能是假的**：我们压根没看过那张图，它完全可能正是要的植株照。
+- 修：`noteFor` 区分两种「未知」—— `organ === ""`（没分类过）→ **不写图注，不下结论**；
+  `organ === "other"`（看过了、确实不是要的）→ 才说「暂缺，此处为其它公开配图」。
+  `classifyPhotoOrgans` 的失败日志 warn→**error**，并写明「本次所有配图都将是未核对部位的降级命中」。
+
+### 验证证据
+- `tsc --noEmit` EXIT=0；`npm run build` EXIT=0；改动文件 lint 干净
+  （identify-plant.functions.ts 那 97 条是既有的，非本轮引入）。
+- 单测：photo-slots **20 条**（改口径 + 新增 3 条把两种「未知」分开）、
+  **新增 `scratch/job-stale.test.mjs` 11 条**（专防「排队被判死」改回去，
+  含一条「排队阈值必须显著宽于心跳阈值」的结构性断言）、
+  task-feed 41 / task-feed-write 10 / organ-verdicts 16 / species-photos 19 / quality-gate 16 全过。
+- 实库取证：`scratch/probe_0729_five_bugs.mjs`（只读）。
+- ⛔ **未验证**：五条都要上线后真跑一轮才算数，尤其 ③ 的流式兜底（要真撞一次 524）。
+
+### 🧹 历史坏数据（代码修好也不会自愈，要单独跑）
+`scratch/repair_task_feed_0729.mjs`（默认 dry-run，`--apply` 才写）。dry-run 实测待修：
+**标题/封面 3 行**（积雪草 / 疑似Astragalus austriacus / 积雪草）、**僵尸 running 2 行**
+（两条 gold_page，按 job 行回填成 error + 524 原文）。幂等，可重复跑。
+
+### 📌 本轮**发现但没动**的两个真缺陷（下轮候选，与本次五症状无关）
+- **`anthropicChat` 完全没有超时**：内部是裸 fetch，没有 AbortController、没有 timer。
+  `xiaopTextCall` 的 `timeoutMs` 只传给了 openai-compat 分支 —— 即「BACKGROUND_CONSOLES
+  放宽到 300 秒」**三条传输层里只有一条生效**。若哪天金叶序列配成 anthropic 协议，
+  一次挂住就是无限期，只能等 15 分钟挂钟斩它。
+- **15 分钟被斩时 job 状态还是 running**，而 `runQueuedJob` 的幂等闸是 `status !== "running"`
+  → `max_retries: 1` 那次重投会**从头再跑一遍整个金叶生成**（再烧一次 token）。
+
+### ✅ 已部署 — Version `81882774-cc73-4c13-abeb-6affc7efd4da`，2026-07-29
+⚠️ **第一次 deploy「部分成功」，差点被当成成功**：Worker 本体和自定义域名都上去了，
+只在末尾报 `Some triggers failed to deploy: fetch failed`，而漏掉的恰恰是
+**`Consumer for plant-jobs`** —— 消费者没注册的话，队列消息没人消费，所有后台任务
+（识别/银叶/金叶）都会静静地永远排队。第二次重跑才出现那一行。
+📌 **以后判断部署成不成功，别只看有没有 Success，要数触发器清单里有没有
+`Consumer for plant-jobs` 这一行。**
+
+上线核验（不需登录）：`plantspedia.club` HTTP 200；线上 chunk
+`species-existing.functions-D8Rt3jbC.js` 含新文案「已连续两分钟没有心跳」，
+且旧的误导文案「触及平台单次请求上限」已消失。
+⛔ 仍需真人复看：① 再跑一轮识别，看任务动态里有没有名字和封面（不再是「未命名」）；
+② 连开三四个任务，看后面几个是否显示「排队中」而不是弹「生成中断」；
+③ 再创建一次金叶，看是否还卡在撰稿 1/3（撞 524 时应自动转流式跑完）；
+④ 若金叶仍失败，橙条应当消失、任务动态里应当能看到失败原因。
+
+### 🧹 历史坏数据（未处理，用户 2026-07-29 选择暂不动）
+`scratch/repair_task_feed_0729.mjs`（默认 dry-run，`--apply` 才写）。dry-run 实测待修：
+标题/封面 **3 行**、僵尸 running **2 行**。代码已修好，但这 5 行不会自愈。
+
+## ✅ 2026-07-30 — 推理开关「点了就真生效」：三条传输层全部接通 + 「开」不再是空操作
+
+用户要求：「把所有模型的思考模式开关都做好，也就是点击开关是真的可以关闭或开启思考模式」。
+起因是金叶详页反复 HTTP 524，而用户确认已把思维链设成「强制关闭」仍然复现。
+
+### 🔴 根因（实库取证 `scratch/probe_gold_provider.mjs`，只读）
+`gold_model_config` 实配 **1 项**：`provider=custom / model=kimi-k3 / baseUrl=api.moonshot.cn/v1`。
+**那一项里没有 `thinking` 字段** → `thinkingOf(slot,"gold")` fallback 到
+`THINKING_DEFAULTS.gold`，而它是 **`"on"`** → 再进 `thinkingParams`，旧实现是
+`thinking==="on" ? {} : {...THINKING_OFF}` —— **返回空对象、一个参数都不发**。
+于是 kimi-k3 按自己的默认（开思维链）跑，先写两三分钟思维链不吐字节 →
+Moonshot 前面那道网关判源站超时 → **每次都停在「正在撰稿 1/3」+ 524**。
+
+用户在界面上看到的「当前：关」不是金叶这个控制台 —— 金叶 2026-07-26 才从小P蛙序列里
+拆出来独立配，小P蛙默认才是 off。
+
+**为什么 07-29 加的流式兜底救不回来**：**思维链阶段不产生 `content` 增量**，
+开 `stream:true` 网关照样看不到字节，一样 524。那个修复对「思考半天不吐字」天生无解。
+
+### 🔴 顺带挖出的三个「开关是死的」
+1. **`thinkingParams` 的「开」是空操作** —— 开关只有一半是真的（关真能关，开只是「不管」）。
+2. **`geminiChat` / `anthropicChat` 完全无视推理开关** —— `thinkingOf` 只在 openai-compat
+   分支被调用。**配 Gemini 或 Anthropic 的控制台，那个开关从来没起过作用。**
+3. **`anthropicChat` 读响应写的是 `res.content[0].text`** —— 开了 extended thinking 之后
+   content[0] 是 `{type:"thinking"}`，正文在后面的 text block 里 → 取下标 0 拿到 undefined
+   → 抛「未返回有效内容」。**也就是说：一旦有人把 Anthropic 那条路的开关拨到「开」，
+   旧写法必然当场失败。** 这个坑是加「真开启」时才会引爆的，一并修掉了。
+
+### 做了什么
+- **[ai-key-pool.ts](src/lib/ai-key-pool.ts)** 新增 `THINKING_ON`（与 `THINKING_OFF` 严格对称：
+  enable_thinking / reasoning_effort / thinking 三种写法一起发，不认的那个由既有的
+  「400 点名就去掉重试」机制摘掉）。`reasoning_effort` 刻意用 **medium 而非 high** ——
+  要表达「正常强度思考」，不是「用尽预算深思」，后者最容易拖过网关时限。
+  同时把 **`geminiThinkingConfig`** 也放这儿（三家的思考参数集中一处，且能脱离网络测）。
+- **Gemini 分代际**：`gemini-3*` 用 `thinkingLevel: high|low`，**Gemini 3 没有「完全不思考」
+  这一档**，「关」= 压到最低；2.5 及更早用 `thinkingBudget: -1|0`（0 才是真关）。
+  代际只能从模型名猜，猜错 Gemini 直接 400 而 `callGeminiWithRotation` 对 400 是立刻上抛
+  （没有去掉参数重试）→ 所以 `geminiChat` 里加了一道
+  **「400 点名 thinking 字段就去掉该字段重发」** 的安全网。
+- **Anthropic**：关发 `thinking:{type:"disabled"}`，开发 `{type:"enabled",budget_tokens}`。
+  `budget_tokens` 有两条硬约束（≥1024 且 < max_tokens），所以把 max_tokens 抽成常量
+  `ANTHROPIC_MAX_TOKENS`，取它的一半 —— 两处写死同一个数字迟早改一处忘一处被 400。
+  思维链与正文**共用** max_tokens，budget 给太多会让正文写不完 → 那就是 GOLD_BAD_JSON。
+- **`callSlot` 三条路都传 `thinking`**（解析一次，共用）。
+- **`callSlotForProbe`（视觉自检）显式关思考**，并把 `who` 从默认的「小P」改成「视觉自检」
+  —— 与 07-29 修过的那批「报错认错主人」同类问题：自检失败自称小P会把管理员指到无关控制台。
+- **`THINKING_DEFAULTS.gold`: `"on"` → `"off"`**。⚠️ 这一条是**必须的配套**，不是可选项：
+  让「开」变成真开启之后，若还留着 gold 默认 on，金叶会从「跟随模型默认」变成
+  **「强制开思维链」**，524 只会更频繁。理由写进了代码注释与单测断言里，别照着
+  「同属长文诉求」的直觉改回去 —— 队列的 15 分钟挂钟够，**中转的网关时限不够**。
+  （`enrich` 保持 on：它配的 qwen3.7-plus 本来就默认开思考，改成显式开等于现状，且实测跑得通。）
+- **UI 文案更正**（[model-queue-console.tsx](src/components/model-queue-console.tsx)）：
+  删掉「当前：开（不发关思考参数）」这种自我暴露的说法；写明两档都真发参数、三条路都已接通、
+  Gemini 3 没有完全关闭这一档；金叶那条 `thinkingWhy` 改成说清 524 的来历。
+
+### 验证证据
+- `tsc --noEmit` EXIT=0；`npm run build` EXIT=0；改动文件 lint 干净。
+- `scratch/thinking-toggle.test.mjs` 从 32 条扩到 **46 条**，新增 14 条覆盖本轮：
+  开/关两组**键集合必须完全一致**（少一个键就等于那家的开关是死的）、
+  **每个键的值都必须不同**（否则开关白做）、Gemini 四种代际×档位组合、
+  「不管哪代哪档都必须真的产出 thinkingConfig（空对象=开关是死的）」。
+  以及把 gold 默认值那条断言改成 `"off"` 并写上原因。
+- 无回归：failover 25 / vision-probe 26 / organ-verdicts 16 / photo-slots 20 / job-stale 11 /
+  task-feed 41 / task-feed-write 10 / quality-gate 16 / species-photos 19 全过。
+### ✅ 已部署 — Version `648875ab-9cfd-436f-acc9-1e80cd94b841`，2026-07-30
+一次成功（触发器清单里 **`Consumer for plant-jobs` 在**，那是 07-29 差点漏掉的那一行）。
+
+上线核验：`plantspedia.club` HTTP 200；线上 entry chunk `index-BBkC8kzy.js` 与本地构建产物
+**md5 完全一致**（`79ce921b…`），且含 `gold:"off"`、「都会真的发参数」、「三条路都已接通」、
+「没有『完全不思考』这一档」；旧的「开（不发关思考参数）」已消失；「视觉自检」在
+`identify-W-yhDa3b.js`。
+
+⚠️ **核验方法上踩的两个坑，记下来省下次的时间**：
+① `grep` 遇到含中文的 bundle 会把它当二进制、静默不输出匹配 —— 必须
+   `LC_ALL=C grep -a`，否则会得出「新代码没上线」的错误结论。
+② 别拿跨 JSX 标签的文案当核验串：源码里 `两档<b>都会真的发参数</b>` 编译后是**两个**
+   独立字符串，搜连起来的那句必然找不到。要搜标签内部连续的片段。
+
+⛔ **仍需真人复看**：跑一次金叶（应当不再卡在撰稿 1/3）；若走 Gemini 那条路，
+留意有没有「不接受 thinkingConfig，已去掉该字段重发」的日志 —— 出现了说明代际正则
+要按实际在用的模型再调。
+
+## ✅ 2026-07-30（下午）— 进度面板串台：根因是路由组件跨草稿复用 + 三色化
+
+用户报：「疑似高加索榉的**再次补拍识别**显示为金叶创建排队，朝天委陵菜的**银叶草稿**显示为
+金叶创建（最后银叶创建成功）」，要求「置信度下面的详情进度条也要按三种颜色区分任务」。
+
+### 🔴 根因（不是队列、不是动态流，是这一页）
+`createFileRoute("/drafts/$id")({ component: DraftPage })` —— `/drafts/A` → `/drafts/B`
+走的是 React **同位置复用**：元素类型没变，`DraftPage` 这个实例一直活着，只有
+`useParams()` 的返回值变了。于是所有「属于某一份草稿」的局部状态全部跟着人走：
+`goldProg` / `enrichProg` / `goldError` / `goldDone` / `isEditing` / `cardUrl`…，
+而 `resumedRef` 是个 ref，**新草稿自己的待续任务反而不会被接回**。
+
+用户的操作序列（实库对得上）：在**天人菊**页点了「创建金叶详页」（job 618943f2），
+随手从小P蛙动态流点进朝天委陵菜、再点进疑似高加索榉 —— 那块「正在生成金叶物种详细
+科普页 · 排队中」一路跟着走。**秒表是铁证：01:06 → 01:53 连续走字、从不归零，说明
+组件从来没有重新挂载过。** 动态流本身一直是对的（三条任务分别落在三株上）。
+
+**A/B 实测（dev + 客户端路由，非整页刷新）**：
+- 改前 `component: DraftPage`：换草稿后 `<h1>` **还是同一个 DOM 节点对象**
+  （`isConnected=true`、`sameNodeObject=true`），文字被就地打补丁 疑似榉树→朝天委陵菜
+  ⇒ 复用坐实。
+- 改后 `component: DraftPageRoute`（内部 `<DraftPage key={id} />`）：老节点被摘掉
+  （`isConnected=false`、`sameNodeObject=false`）⇒ 真重新挂载，状态清零。
+
+### 做了什么
+1. **[drafts.$id.tsx](src/routes/drafts.$id.tsx)** 加 `DraftPageRoute` 包一层
+   `key={id}` —— 一行修掉所有跨草稿串台，顺带让新草稿的待续任务能被 `recallJob` 接回。
+2. **三色化常驻进度面板**（用户要求）：`JobProgressPanel` 新增 `kind` / `subject`，
+   颜色一律从 **`TASK_KIND_META`** 取（绿=识别 / 蓝=银叶 / 橙=金叶，与小P蛙动态流同源）。
+   META 新增 `panel`（外框+底色）与 `chip`（类型徽章）两个字段 —— 颜色继续集中一处，
+   不散落进组件。面板上现在同时摆着**类型徽章 + 任务名 + 是哪一株**，看一眼就能证伪。
+3. **补上第三色**：草稿页原本只有银叶/金叶两块面板，补拍识别在 /identify 跑、这一页没有
+   进度可看。现在从动态流里找「本草稿 + identify + running」那一行渲染绿色面板
+   （同一个 react-query key，不额外发请求）。标题按 `retake_count` 分「补拍/首识别」。
+4. **toast 带抬头** `【金叶详页 · 天人菊】…`：面板不会串台了，但 toast 本来就是全局的、
+   本来就该跟着人走 —— 不写清「谁的什么任务」，它落在别的草稿页上照样被读成那一株的进度。
+
+### 验证证据
+- `tsc --noEmit` EXIT=0；`npm run build` ✓ built；改动文件 lint 0 error
+  （drafts.$id.tsx 剩的 2 条 `draftTags` warning 是既有的）。
+- `scratch/task-feed.test.mjs` 41→**44 条**：新增「面板底色三类不撞色」「徽章三类不撞色」
+  「面板/徽章/进度条必须同色系」——防止有人只改一处、把三色改回撞色。
+  无回归：task-feed-write 10 / job-stale 11 / photo-slots 20 / organ-verdicts 16 /
+  failover 25 / vision-probe 26 / quality-gate 16 / species-photos 19 /
+  thinking-toggle 46 / tentative 36 全过。
+- 浏览器实测：两份草稿页 console 无报错；9 组新 class 全部由 Tailwind 产出、
+  computed color 三色可辨（emerald 162° / sky 237° / amber 70°）；三块面板截图确认版式。
+- 取证脚本 `scratch/probe_0730_progress_mixup.mjs`（只读）。
+
+### 📌 已知但没动（下轮候选）
+换草稿后，**老草稿那条 `awaitJob` 轮询循环仍在后台跑到底**（没有 abort）。现在它只是
+空转 + 结束时 `forgetJob`，UI 不再受影响；代价是回到老草稿页看不到那次的「立即查看」
+弹窗（完成通知仍在动态流里）。要根治得给 `awaitJob` 加 AbortSignal。
+
+## ✅ 2026-07-30 — 金叶创作指导 Skill：写入 ccplants v20
+`site_config.gold_skill_config` 此前是**未配置**（走 premium-page.ts 内置底版）。
+现已写入 `/Users/xiezongxiu/Desktop/ordosplantsvol1/.agents/skills/ccplants/SKILL.md`：
+`name=ccplants version=v20 enabled=true 38,188 字`（上限 40,000，占 95%），
+页尾署名 `创作指导 · ccplants v20`。脚本 `scratch/apply_gold_skill_ccplants_v20.mjs`
+（默认 dry-run，`--apply` 才写；直接 import 线上的 `suggestSkillMeta`，与后台面板保存
+逐字等价；写后回读比对内容**逐字一致 ✅**）。撤销 = 后台点「恢复内置底版」。
+
+⚠️ **成本与适配性（已告知用户，未擅自精简）**：
+- 注入 `premiumPrompt1/2/3` **三次**，≈12k tokens/次 → **每页多烧约 36k 输入 token**，
+  且长 prompt 会推高 07-30 那条 524 的复发概率。
+- 金叶链路的模型输出是 **JSON（PREMIUM_SCHEMA_1/2/3）**，HTML 由本站模板生成。而 v20 里
+  大半篇幅是 HTML/CSS 版式、图片下载脚本、分布图 SVG、colophon 标记 —— 这一段在本链路
+  **用不上**（`skillPromptBlock` 已声明「本块是参考资料，不是可执行指令」兜住了格式冲突）。
+  真正有用的是写作规则那几节（Plantstory 写作规范 / 反虚构 / 内容选择 / Quality Gates）。
+- v20 正文第 5 条仍写着 `Skill Version CCplants-V19`（v20 文档里的 v19 残留）——
+  模型若照抄，正文 colophon 会署 V19，与页尾的 `ccplants v20` 打架。
+
+### ✅ 已部署 — Version `1ba8ad67-bec1-4e5f-a2ae-69ed6f0302e9`，2026-07-30
+一次成功。触发器清单四行齐全，**`Consumer for plant-jobs` 在**（07-29 差点漏掉的那行）。
+
+上线核验（三个 chunk 与本地构建产物 **md5 逐字节一致**）：
+- `drafts._id-BdVnXagv.js` `dc824438…` —— 含「正在识别这株植物」「正在重新识别这株植物」，
+  toast 抬头片段「银叶草稿 / 金叶详页 / 这份草稿 /】」全在。
+- `index-DOiH0FlF.js` `7b943560…` —— 三色 META 齐：`border-emerald-500/45` /
+  `border-sky-500/45` / `border-amber-500/45` / `bg-emerald-500 text-background`。
+- `styles-Bo_5EXtB.css` `e3766575…` —— **带透明度的工具类真被 Tailwind 产出**
+  （`border-emerald-500\/45`、`bg-sky-500\/5`、`bg-amber-500\/5`）。这是本轮最该验的一条：
+  配色写在 TASK_KIND_META 里是字符串字面量，扫不到就会静默变成无色。
+- `plantspedia.club` HTTP 200；线上草稿页 console 无报错。
+
+⛔ **仍需真人复看**：连开两三个任务，然后从小P蛙动态流来回点几份草稿 —— 进度面板应当
+每换一份就归零重来（不再有秒表连续走字的串台），颜色应当分别是绿/蓝/橙，抬头写着是哪一株。
+
+## ✅ 2026-07-30（晚）— 以 四合木 页为标准：Skill v21 + 详页版面三件套
+
+用户要求：把纸本卷 `01_四合木_Tetraena_mongolica.html` 的**排版风格 / 图文版面 / 内容要求**
+作为标准来完善金叶创作指导；**Section VI 按 plantstory skill 标准写**；**开篇配图下的摘要卡
+跳转必须真的能用**；**全球分布配图按此前谈定的要求绘制**。
+
+### 🔑 先看清链路，再动手（这决定了 v20 为什么写歪）
+金叶详页的 HTML 是 **`renderPremiumHtml()` 在服务端生成的**，模型只返回 JSON。
+所以「摘要卡跳转」「分布图」「Section VI 两栏博客版式」**光靠 skill 文本永远做不出来** ——
+v20 里大半篇幅是 HTML/CSS/curl/SVG 手写指令，在这条链路上一行都用不上，只会诱导模型
+把 HTML 塞进 JSON 字段。这一轮是「skill 管内容、渲染器管版面」两边一起改。
+
+### 1. 创作指导 v20 → v21（已写入 `site_config.gold_skill_config`，全站立即生效）
+源文件 `ordosplantsvol1/.agents/skills/ccplants-v21/SKILL.md`。
+**38,188 字 → 7,318 字（-81%）**：删掉全部 HTML/CSS/图片下载脚本/colophon 标记，
+腾出的篇幅全给内容标准。写入脚本沿用 `scratch/apply_gold_skill_ccplants_v20.mjs --src=…`
+（回读逐字一致 ✅）。页尾现署 `创作指导 · ccplants v21`。
+成本顺带下来了：注入次数虽从 3 次涨到 4 次，总量 114,564 字 → 29,272 字。
+新增/强化的内容标准：四合木页的分节图文版面表、Section VI 的 plantstory 全套规范
+（驱动性问题 / 导语 / 5 节 600–900 字 / 当代钩子 / 死标题黑名单 / 破折号 ≤2 /
+库名机构名不进叙事 / 严禁「（续）」）、分布图配文四要素、`lead_zh` 就是摘要卡文案。
+
+### 2. 撰稿拆成 4 轮（`premium-page.ts` + `identify-plant.functions.ts`）
+`PREMIUM_SCHEMA_4` / `premiumPrompt4` **让「博物趣闻」独占一轮**。
+原因：按 plantstory 标准这一节要 3000–4000 字，塞在第 3 轮里必撞输出上限 →
+回来是截断 JSON（`GOLD_BAD_JSON_3` 的老病根）。调研资料复用 webResearch3。
+curio 新增 `lead_zh/en`、`chapters[].heading_en`；`body_zh` 约定**空行分段**，
+渲染时拆成多个 `<p>`。质量闸门相应加了 curio 的空/短/缺导语检查（空=fatal，其余 warn）。
+
+### 3. 版面三件套（`premium-page.ts` 渲染器）
+- **摘要卡 `.vi-card`**：开篇配图正下方，`href="#section-vi"`，文案 = 驱动性问题 +
+  导语前 92 字 + 英文副标。**跳转的宿主侧早就写好了** —— `plants.$slug.tsx:302` 的
+  `wireIframe` 接管页内锚点（详页是 srcdoc iframe，直接走 #hash 会变成一屏源码乱码），
+  缺的一直是渲染器从来没输出过 `id="section-vi"` 和那张卡。现在两头对上了。
+- **Section VI 博客版式**：`.blog-post` = 元信息条（📅/✍️ Plantstory skill/🏷️）+
+  驱动性问题 + 英文副标 + 主图 + 导语（左色条）+ **两栏 `.blog-grid`（3+2）** + 2 张内文图。
+  刻意**不用** `column-count` 多栏流：那种排法图片会被切断在栏边界上。
+- **全球分布图**：见下。
+
+### 4. 全球分布图（新 `distribution-map.ts` + `world-borders.data.ts`）
+四合木页的标准是**国界作底、记录叠加**，不是涂满的色块分布区。照做：
+- 底图：从四合木页的 SVG 里抽出 340 条国界 path 写死进仓库（70 KB，CC BY-SA 3.0，
+  署名行 `WORLD_MAP_ATTRIBUTION` 必须印在图上）。构建后是独立 chunk 74.78 kB，不进主包。
+- 投影：等距圆柱 `x=(lon+180)×950/360`、`y=(90−lat)×620/180`。
+  **是从四合木图上三个已知点反解出来并验算的，误差 <0.01 px**（skill 里那条
+  `2.6865*lon+449.31` 是另一张底图的公式，套上去会整体偏几百公里）。
+- 数据层：**GBIF 密度瓦片**（`/v2/map/occurrence/density/0/{0,1}/0@2x.png?srs=EPSG:4326`），
+  两张 PNG 约 26 KB，内联成 data URI（浏览时不依赖 GBIF）。
+  ⚠️ **试过并废弃**：拉 `/occurrence/search?limit=300` 自己画圆点 —— 那个接口
+  **默认顺序按数据集聚簇**，朝天委陵菜全库 25,065 条里前 300 条几乎全在荷兰一个数据集，
+  画出来是「这个种只长在荷兰」，比没有图还糟。密度瓦片是对全库做的栅格聚合，无抽样偏差。
+- 查不到 taxonKey / 记录数为 0 / 两张瓦片都没抓到 → **整块不渲染**。
+  空世界地图会被读成「全球都没有」，那是编造出来的信息。
+
+### 5. 配图槽 9 → 12（`photo-slots.ts`）
+新增 `博物趣闻·主图 / 配图一 / 配图二`（下标 9/10/11，与渲染器取图下标绑定）。
+候选数 14 → 18：槽会**消费**候选，候选比槽少就走第四轮复用、同一张图页面上出现两次。
+
+### ✅ 已部署 — Version `25be234b-cf80-4224-a29c-0fce277f6ddd`，2026-07-30
+`tsc --noEmit` ✅ / `npm run lint` ✅ / `npm run build` ✅。
+触发器四行齐全，**`Consumer for plant-jobs` 在**。`plantspedia.club` HTTP 200。
+
+🔴 **部署踩坑（已写进 memory）**：`wrangler deploy` 连报两次
+`fetch failed / connectivity issue`，**不是 CF 的问题** —— 是本机 `HTTP_PROXY`
+（127.0.0.1）与 TUN 全局路由打架把大响应截断。
+修法：`env -u HTTP_PROXY -u HTTPS_PROXY ./node_modules/.bin/wrangler deploy`，一次就通。
+同一个代理还会截断任何 >150 KB 的本地 fetch（GBIF limit=300 必挂、limit=20 才过）。
+
+### 本地版面核验（1280px，构造样例数据渲染真页面）
+摘要卡在开篇图正下方、箭头/悬停都在；`#section-vi` 目标存在；分布图 1052×687 落在
+「全球分布与入侵」标题下、图例与署名齐；Section VI 两栏 5 节（3+2）、栏高 2185/1687、
+内文图各 1 张、**无横向溢出**。
+
+### ⛔ 还差最后一步：重跑朝天委陵菜详页
+`startGoldDetailPageFn` 走 `requireSupabaseAuth`，**没有用户会话就触发不了**
+（service-role 只能写库，进不了 CF Queue；也不该去伪造用户 JWT）。
+所以这一步要真人点：草稿 `3977c12a-ab6e-4e0a-b3b8-1eb04299c6ad`（朝天委陵菜）
+→ 点「创建金叶详页」。
+⚠️ `runGoldCore` **没有防重入**，每跑一次就 insert 一行新 plants。跑完要删掉旧的那行：
+`73a0decd-0e44-4089-935c-79fd0a32ce18`（slug `potentilla-supina`，07-30 04:30 的 v20 产物）。
+跑完该看到：页尾署 `ccplants v21`、开篇图下有摘要卡且点得动、第 V 节有世界分布图、
+第 VI 节是两栏博客且每节 600–900 字。
+
+### ✅ 朝天委陵菜已按 v21 重跑完成（本轮收尾）
+
+跑了三次，最终版本 = 第三次（10:35 那次）：
+1. **10:17 首跑**：结构全对（摘要卡 / 锚点 / 分布图 / 两栏 5 节都在），但**每节只有 330–375 字**，
+   五节合计 2,905 字 —— 密度只有标准的一半。而当时闸门的短文阈值是 300 字，**一条都没报**，
+   比问题还松等于没有。
+2. **10:31 二跑**：上游 HTTP 429「engine is currently overloaded」失败在 44%，未扣叶。纯瞬时故障。
+3. **10:35 三跑**：✅
+
+**为首跑偏短做的三处收紧（已随 `ed9249a3` 上线）**：
+- `PREMIUM_SCHEMA_4` 的 `body_zh`：「600–900 字 / 3–5 段」→「**硬性下限 600 字**、目标 700–900、
+  **4–6 段**」，并写明「写够长度靠把细节写透，不是把一句话说三遍」。
+- `premiumPrompt4` 加「🔴 篇幅是硬指标」块（五节合计 ≥3000 字）+ 交稿前逐节自查。
+- `quality-gate.ts` 短文阈值 300 → **450**（卡在「明显偏短」与合格下限 600 之间）。
+- skill v21 同步这几个数字（7,318 → 7,492 字）。
+
+**终稿实测**：五节 702 / 774 / 741 / 852 / 833 字，各 4–5 段，**合计 3,902 字**；
+破折号「——」**0** 处（预算 ≤2）；叙事里无 POWO/PMC/Flora of China/百度百科
+（GBIF 只出现在图片署名行，不是叙事）；12 个配图槽**零空槽**；页尾署 `ccplants v21`。
+⚠️ 唯一没达标的软指标：直角引号「」用了 27 个（skill 写的是 ≤20）。属文风偏好，未重跑。
+
+**摘要卡跳转线上实测**（`/plants/potentilla-supina`）：点卡片后**父窗口**滚到 scrollY=11779，
+Section VI 标题落在视口 y=90（正是 `scroll-margin-top:90px` 留的余量），
+`iframe.contentDocument.location` 仍是 `about:srcdoc` —— 没被 #hash 导航成源码乱码。✅
+
+**重复行已清理**：三次重跑各插了一行 plants（`runGoldCore` 无防重入），但存储路径
+`${userId}/gold-${draftId}.html` 是 upsert，**三行指向同一份最新 HTML**。
+用 `scratch/_dedupe_chaotian_gold.mjs`（默认 dry-run，会先校验三行 html_url 相同再删，
+删前备份到 `scratch/_deleted_chaotian_gold_backup.json`）删掉带随机后缀的两行，
+保留 slug 干净的 `potentilla-supina`。现存两行：`potentilla-supina-l`（银叶草稿页，
+02:16 就有，非本轮产物）+ `potentilla-supina`（金叶详页）。
+
+### 📌 已知但没动（下轮候选）
+1. `runGoldCore` **没有防重入**：同一份草稿每点一次「创建金叶详页」就多一行 plants。
+   HTML 是 upsert 所以不会分叉，但 `/plants` 列表会出现同名重复条目。
+   要根治：insert 前先按 `draft_id` 查有没有金叶行，有就 update 而不是 insert
+   （得先给 plants 加一列记住来源草稿）。
+2. 同一物种同时有银叶条目（`potentilla-supina-l`）和金叶条目（`potentilla-supina`）——
+   本轮之前就存在，没动。要不要合并是产品决定。
+
+## 🔧 2026-07-30（夜）— 用户六条反馈：全部改完，**尚未部署**
+
+代码全在工作区，`tsc --noEmit` ✅。**没有跑 `wrangler deploy`**（CLAUDE.md 要求先确认）。
+唯一已经生效的是 skill —— 它写在库里，不经部署。
+
+### 1. 金叶详页「失去心跳」中断（百金花）
+**不是 key 的问题**（用户的读图自检/连通体检都正常，那两项测的是 key，不是这条链路）。
+库里两条 gold_page 任务行是实证：
+- `10:24` p44「正在撰稿 1/4」跑了 260 秒后 **不再有心跳、也没有终态**；
+- `13:03` p12「正在检索并转存配图」跑了 114 秒后同样断掉。
+两条都停在 `running`，**没有 error** —— 说明不是异常路径（异常会走 catch 写 `jobs.fail()`），
+而是 isolate 被平台**直接终止**，代码根本没机会写下死因。前端只好按「两分钟没心跳」去猜，
+而它猜的那句「多半是模型那端长时间不返回」是**错误归因**。
+
+改了三处（**都是拆天花板 + 把真相暴露出来，不是已证实的根因修复**）：
+- `wrangler.jsonc` 加 `limits.cpu_ms: 300000`。Queues 消费者有 15 分钟挂钟，但 CPU 时间
+  另算，默认 30 秒（Paid 默认值，官方 limits 页写明可调到 300,000ms 上限）。金叶一趟要
+  转存 18–20 张图 + 4 轮长文 JSON + 拼 150KB HTML，累计 CPU 逼近 30 秒完全可能。
+  **按用量计费，抬高上限不额外花钱**，没有下行风险。
+- `wrangler.jsonc` + `server.ts`：给 `plant-jobs-dlq` **接上消费者**。从前死信无人过问，
+  任务行永远躺在 running。现在最后一次失败会被写成
+  「生成中断（SERVER_ABORTED）… 阶段：X」，动态流那条橙色进度条也一并收尾。
+- `poll-job.ts` 的失联文案不再乱归因，改成「稍等片刻刷新，真失败了动态流里会写出原因」。
+
+⛔ **真正的死因仍要人去查**：Cloudflare Observability 按 `2026-07-30 10:24` / `13:03`
+两个时间点搜，日志里会写是 CPU 还是内存。这一步我做不了（没有 CF 日志读取权限）。
+
+### 2. 分享卡「9 颗星 vs 结论疑似」
+两个独立的毛病，都修了：
+- **真实成因是卡面与卡下文字不同源。** 用户那张卡画的是 07-26 的
+  `草木樨状黄芪`（conf=high、Pl@ntNet 只有 2% 被忽略 → 90% → 9 星，卡面自身是自洽的），
+  而卡下面那行「疑似 · 最后一次补拍」来自今天 `66756d8e` 那份
+  `疑似奥地利黄芪`（conf=low、retake_count=2）。补拍把新结果**合并回同一份草稿**，
+  卡是一张画完就冻住的 PNG，底下的字却是活的 React 状态。
+  修法：`drafts.$id.tsx` 记一份 `cardSnap`（出卡那一刻的 tentative / retakeCount /
+  内容指纹 `draftStamp`），卡下面那几行只读快照；草稿指纹一变就**自动重画**。
+- **判据本身也确实会打架。** `isTentative()` 认三个信号，`computeIdentifyConfidence()`
+  从前只认 `identification_confidence`。现在后者收整份 meta，`isTentative` 为真就把档位
+  钳到 low，依据行会写明「模型自评写的是确诊，但名称/正文标了疑似，按疑似计」。
+  三个调用点全部改成传 meta（TS 会挡住漏改）。
+
+### 3. 补拍传错图可以取消
+- `background-jobs.ts` 新增取消标记，**另开一把 key `jobcancel:<id>`** ——
+  不能写进 `job:<id>`，消费者对它是 blind upsert，下一次心跳就盖回去了。
+- `runQuickIdentifyCore` 在**落草稿之前**查一次（只此一处，一次读）。这是代价最小、
+  拦截率最高的一刀：识别时间几乎全在模型调用上，写库是最后一步。
+- `poll-job.ts` 的 `awaitJob` 支持 `AbortSignal`，返回 `cancelled: true`。
+- 相框里那张「AI 深度分析中」卡上多了「传错图了？取消这次识别」。点了之后**先**让服务端
+  记下取消、**再**停轮询，然后退回 `captured`（重选照片）。断线回查阶段不显示这个按钮
+  —— 那时服务端多半已经写完了，给个「取消」是骗人。
+- ⚠️ 拦不住的边界如实写进了 toast：万一恰好在检查点之后才点，这一轮仍会写进去。
+
+### 4.「科普详页」按钮跳到银叶
+`lookupSpeciesExisting` 的 plants 查询**没有 order**，`.find()` 命中的是物理顺序里最早
+那行。朝天委陵菜正好有两行：`potentilla-supina-l`（02:16，source=ai_identify，银叶）和
+`potentilla-supina`（04:30，source=gold_oneclick，金叶）。
+改成 `pickBestPlant()`：**金叶优先，同档取最新**；返回值带上 `kind`，按钮文案相应写
+「金叶详页：X」/「科普详页：X」，点之前就知道要去哪。
+
+### 5. 详页版面对齐四合木（`premium-page.ts` 大改）+ skill v21.1
+| 用户说的 | 实际成因 | 改法 |
+|---|---|---|
+| 形态特征卡跑到摘要卡下面 | `.form-panel` 排在 intro 之后、「关键特征」标题之前，成了无主卡片 | 归位到 `secTitle("II")` 之后（标准页里它就是关键特征这节的开场） |
+| 易混近缘种没有配图 | `.sim-card` 根本没有图列，且近缘种不在本种候选池里 | 加左 320px 图列；**按 `similar_species.name_la` 单独检索**一张（学名与本种同种则跳过），抓不到退回单栏 |
+| Section V 没对齐 | 只有 c/d 两格 | 补成标准页的**总起句 + a 系统发育 / b 起源与驯化 / c 生态功能 / d 全球分布与入侵 / e 保护状态**，两栏左图右文，分布图嵌在 d 格，e 格下按**真实名录**画保护徽章 |
+| 最新资讯丢失 | v19 起**刻意不做**（怕模型编链接） | 打开了，但链接不由模型产生：新增第 4 路联网检索 → 把返回的来源清单喂给模型挑 → **渲染前再过一次白名单**，对不上的丢弃，一条不剩就整块不渲染 |
+| 页尾没对齐 | 居中三行小字 | 换成标准页的三格版心（编纂 / 出品 / 创作指导版本）+ 底线 |
+| 摘要卡点了出乱码 | **线上实测拦得住**（`defaultPrevented=true`，iframe 仍是 `about:srcdoc`） | 仍加固：监听改**捕获阶段** + 用 `wiredDocRef` 防止一次 load 重复挂监听。用户那边多半是 PWA 旧缓存，硬刷一次 |
+
+配套：`photo-slots.ts` 槽 12→13（新增「演化与生态·生态图」，下标 12 与 `img(12)` 绑定），
+候选 18→20；`quality-gate.ts` 给 Section V 新三格 + 总起句加 **warn 级**检查（不判 fatal
+—— 为新字段毙掉整页、让用户白等一轮并重烧 token，代价与收益不成比例）。
+
+skill 从 v21 → **v21.1**（7,492 → 9,998 字，已写进 `site_config.gold_skill_config`，
+回读逐字一致 ✅）：新增 Section V 五格写法、最新资讯取材铁律、近缘种要按「能配图」来选、
+株型总览归属关键特征。版本号带 `.1` 是为了让页尾署名分得清是哪一版产出的。
+
+### 6. 添加/编辑内容页多选 + 文件夹上传
+「选择文件」本来就有 `multiple`；**两个文件夹 input 都缺 `multiple`**，所以按 ⌘/Shift
+一次只能选一个文件夹。`plant-editor.tsx` 与 `admin.batch-new.tsx` 各补一个。
+单条目编辑器多选到几份 HTML 时**明说只用了哪一份**并指向「批量上传」，不静默丢弃。
+
+### ⛔ 还差的两步（都要真人做）
+1. **部署**：`npm run build && env -u HTTP_PROXY -u HTTPS_PROXY ./node_modules/.bin/wrangler deploy`。
+   本轮改了 `wrangler.jsonc`（新增 DLQ 消费者 + cpu_ms），部署后要核对触发器清单里
+   **`Consumer for plant-jobs` 和 `Consumer for plant-jobs-dlq` 两行都在**。
+2. **重跑朝天委陵菜详页**：`startGoldDetailPageFn` 走 `requireSupabaseAuth`，没有用户会话
+   触发不了。草稿 `3977c12a-ab6e-4e0a-b3b8-1eb04299c6ad` → 点「创建金叶详页」。
+   ⚠️ `runGoldCore` 仍**没有防重入**，跑完要删掉旧的 `potentilla-supina` 那行
+   （或用 `scratch/_dedupe_chaotian_gold.mjs` 的同款做法）。
+
+### ✅ 已部署 — Version `14e9e5a3-84f5-42dd-ad59-5cbfb360236a`，2026-07-30 15:03
+
+部署**中途报了 `fetch failed`，但代码其实上线了** —— 别被那句红字骗了。核对过：
+- `plantspedia.club` HTTP 200；
+- `identify-F4EnlzwJ.js` 与本地构建产物 **md5 逐字节一致**（含「传错图了？取消这次识别」）；
+- `plants._slug-Du2sS1u7.js` 同样逐字节一致（含捕获阶段的锚点接管）。
+
+断的是**上传之后的「注册触发器」那一步**，日志里最后一条是
+`PUT /queues/66b173e2…/consumers/50a75f35…`。后果只有一个：
+**`plant-jobs-dlq` 的消费者没建上**（`plant-jobs` 的消费者一直在，后台任务没受影响）。
+
+补法**不必整包重传**，单独加一条即可（已执行，回查 `Number of Consumers: 1` ✅）：
+```
+wrangler queues consumer worker add plant-jobs-dlq tanstack-start-app \
+  --batch-size 10 --batch-timeout 5 --message-retries 0
+```
+参数与 `wrangler.jsonc` 里那份逐字一致，下次整包部署不会打架。
+
+⚠️ 注意：`env -u HTTP_PROXY -u HTTPS_PROXY` 这条老修法**这次没能挡住** —— TUN 全局路由
+不看环境变量。已把这条补进 memory 的 `wrangler-deploy-proxy-fix`。
+
+🔎 没能回读验证的一项：`limits.cpu_ms: 300000`。它随版本上传（那一步是成功的）走，
+应当已生效，但 `wrangler versions view` 不显示 limits。要确认就去 Dashboard →
+Workers → tanstack-start-app → Settings 看 CPU limit。
+
+## 🔧 2026-07-31 — 用户第二轮反馈：版面编号 / 题头 / plantstory / 两个去向
+
+`tsc --noEmit` ✅、`npm run build` ✅。**代码未部署**；skill 已写进库（v21.2）。
+
+✅ 上一轮遗留的核验补上了：Dashboard 截图确认 **CPU time limit: 300000 ms**，
+`limits.cpu_ms` 确实生效。
+
+### 1. 分节编号错位（这是「最新资讯还是缺失」的真正原因）
+标准页里**植物简介标的是 `Intro`、不占编号**，所以 I=关键特征、II=典型生境、
+III=植物人文、IV=演化与生态、**V=最新资讯**、VI=博物趣闻博客。
+v21.1 把简介当成了 I，整套编号错一格 —— 于是「最新资讯」虽然渲染出来了，
+在编号体系里仍旧是缺的。现已全部顺延，最新资讯升为正式的 **Section V**
+（它自己那条 `border-top:2px` 一并去掉，否则与 h2.sec 的分隔线撞成双线）。
+
+顺带按标准页对齐了英文名：典型生境 `Typical Habitat`、植物人文 `Plant Humanities`；
+「名录与数据依据」的英文按用户要求改为 **Sources and References**。
+
+### 2. 题头三处
+- 报头中栏：`Ordos Plantspedia / 鄂尔多斯植物精选百科 · Vol. I` → **`内测期草木志 / Plantspedia Vol.I`**
+- 题记改**中英双语**：新增 `.tagline-en` 一行，`tagline_en` 在 schema 里标成必填
+  （字段本来就有，只是渲染器从来没用过）。
+- 学名下那一行从「中国各地俗名」扩成 **中文俗名 · 商品名 · 异名 · 另名**，
+  取值合并 `facts.commonNamesZh`（草稿/名录带来的，可核实）+ `folk_names_zh`（模型补的），
+  逐字去重、去掉与正名重复的那个。
+
+### 3. Section VI 没按 plantstory 走
+**根因不在 prompt 措辞，在于喂给它的材料**：第 4 轮撰稿只拿到 `webResearch3`
+（生态/保护/科研进展），那一路查回来的基本都是综述 —— 而 plantstory 的硬规则是
+「导语必须是当代事件钩子，**文献综述不算**」。等于一边要求先声夺人、一边只发一摞文献。
+
+改法：把上一轮新增的**媒体报道检索结果一并喂给第 4 轮**（`newsForCurio`），
+并注明「叙事里不要写出媒体名/网址，出处由 V 最新资讯那一栏承担」。
+
+prompt 与 schema 同步按 plantstory 收紧：
+- `lead_zh` 150–240 → **180–280 字**，且必须从当代事件切入；>350 字判「钩子过载」。
+- 小标题黑名单扩充（+当代钩子 / 命名与历史 / 分类学 / 生态价值 / 结语）。
+- 新增「证据脚手架下沉」：DOI / 期刊名 / 数据库名 / 媒体名不进正文。
+- 新增「叙事必须完全原创」：前几节只作事实来源，不得整段照搬或改写。
+- 写明 **G1–G5 五道门**，并且 `quality-gate.ts` **真的去数**（全部 warn 级，写进服务端日志）：
+  G1 库名英文原文、G2 破折号 ≤2、G3 连续 5+ 英文单词、G4 直角引号 <20、
+  G5 驱动性问题必须是问句。上一轮那 27 个直角引号是人工数出来的 —— 数得出来的事
+  不该靠人数。
+
+### 4. 「站内已有该物种的内容」两个去向分开
+| 框 | 文案 | 行为 |
+|---|---|---|
+| 🔵 蓝底 | 进一步科普页：{物种名} | **就地展开**在快速识别简介下面，不跳页 |
+| 🟠 橙底 | Skill 创建科普详页：{物种名} | 跳转到独立的 `/plants/$slug` |
+
+新组件 `InlineEnrichedDraft`：拉那份银叶草稿的 `html_content`，用同一套
+`enhanceDraftHtmlForViewing` 渲染在原位，带「单独打开 / 收起」。关分享卡时弹的那个
+面板也改成同一规矩（蓝框点了 `setInlineOpen(true)`，不再 navigate）。
+`lookupSpeciesExisting` 补返回 `latestTitle`，按钮才写得出物种名。
+
+🔴 **「不允许出现莫名其妙的空白区」这条特意做了兜底**：高度只能靠 iframe 内脚本
+postMessage 上来（沙箱无 `allow-same-origin`，父窗口读不到 contentDocument）。
+量到就按内容精确撑；**3 秒还没量到就退成 `70vh` + 可内部滚动**，
+而不是让那 240px 的骨架把正文截断。两条路都不会留空白。
+
+### 5. skill v21.1 → **v21.2**（11,976 字，已写进库，回读逐字一致 ✅）
+新增：编号更正、报头/题记/俗名三条题头要求、Section VI 的
+「导语必须是当代事件钩子」「证据脚手架下沉」「叙事必须原创」「G1–G5 五道门表」，
+§2 各节小标题同步改成新编号。页尾现署 `ccplants v21.2`。
+
+### ⛔ 还差的两步（同上一轮，都要真人做）
+1. 部署（本轮**没动** `wrangler.jsonc`，触发器不会再掉；若仍报 fetch failed，
+   先按 memory 里那条查队列状态，别急着整包重传）。
+2. 重跑朝天委陵菜详页看新版面。⚠️ `runGoldCore` 仍无防重入，跑完删掉旧行。
+
+## 🔧 2026-07-31（续）— 采纳后的条目页：悬空提示 + 两个去向缺失
+
+`tsc --noEmit` ✅、`npm run build` ✅。**未部署。**
+
+### 症状与根因
+「采纳快速识别简介」走的是 `approveDraft`：把草稿的 `html_content` **原样**上传成条目正文。
+而那份 HTML 是 `buildSummaryCardHtml` 的产物，页尾写着
+「— 简介摘要卡（点击「让 AI 生成进一步介绍草稿」可生成含多张配图的完整科普草稿）」。
+那个按钮长在**草稿页**上，条目页根本没有 —— 于是条目页印着一条点不动的指令，
+读者读完摘要就断了路，站内已有的银叶/金叶成品也无从发现。
+
+线上核过：`source=ai_identify` 的 12 个条目里 **3 个**带着这句
+（`argentina-anserina-l-rydb` / `calamagrostis-epigejos-l-roth` / `dianthus-chinensis`）。
+另外 9 个是从**已扩写**的草稿采纳的，正文是全文，没有这个页尾。
+
+### 改法
+1. **改写那句提示**：新增 `rewriteDraftOnlyHints()`（纯字符串，发布路径跑在 Workers 上没有 DOM）。
+   → 「— 简介摘要卡 · 由 AI 快速识别生成，尚未撰写完整正文」
+   **发布时**改（新条目干净）+ **渲染时**也改（存量那 3 条不必跑迁移）。幂等，已单测。
+2. **条目页补上「站内已有该物种的内容」**：把草稿页那一块抽成共用组件
+   `components/species-existing-links.tsx`（`SpeciesExistingLinks` + `InlineEnrichedDraft`），
+   两个页面共用，规矩一致 —— 蓝框就地展开、橙框跳独立详页。
+   `lookupSpeciesExisting` 加 `excludePlantSlug`，否则金叶详页上会出现一个指向自己的按钮。
+   组件的展开态做成**可受控**（`open`/`onOpenChange`）：草稿页关分享卡时弹的那个面板上
+   也有一个蓝框，点它要能把常驻那块展开。
+
+### 本地实测
+- `/plants/calamagrostis-epigejos-l-roth`：正文里那句悬空提示**没有了**、换成新文案 ✅；
+  蓝框「进一步科普页：拂子茅」出现 ✅；点它 URL 不变、就地展开 ✅。
+  没有橙框 —— 正确，该物种只有这一个条目（已被 excludePlantSlug 排除）。
+- `/plants/potentilla-supina`（金叶页）：橙框指向的是**另一行** `potentilla-supina-l`，
+  不是自己 ✅；且如实写「科普详页」而不是「Skill 创建科普详页」（那行 source=ai_identify）。
+
+## 🆕 2026-07-31 — 新增「关于 about / 使用指南 readme」页（/about）
+
+`tsc --noEmit` ✅、新增文件 eslint ✅。**未部署。**
+
+### 决策（与用户逐条确认）
+| 问题 | 定下的 |
+|---|---|
+| 正文存哪 | **`site_config` 的 `about_page` key**，不建表（同金叶 Skill 的套路）；站长就地改、存完即生效、不用重新部署 |
+| 截图 | 公开页我用 `pixelshot` 抓线上站；**登录/编辑态的 5 张留占位框「待补图」**，等用户自己截 |
+| 导航位置 | 「关于 about」放导航最右，**所有人可见**（含未登录）；手机抽屉同位置也加了 |
+| 名录口径 | 用户说的「GTP」= 站内的 **GTS**（全球树木红色名录，BGCI） |
+| 页面结构 | **单页 /about + 左侧目录锚点**，23 节 |
+| 双语 | 中文正文 + 英文小标题 |
+| 权限对照 | **三栏：访客 / 注册用户 / 编辑**（窄屏塌成一行一卡） |
+| 模型名 | 顺手清掉**面向普通用户**的地方，管理员控制台保留 |
+
+### 新增文件
+- `src/lib/about-content.ts` —— 章节模型 + 23 节初稿 + `resolveShots()` + `parseMatrix()`
+- `src/lib/about.functions.ts` —— `getAboutFn`（**公开**，无鉴权中间件）/ `saveAboutFn`、`resetAboutFn`（**仅 OWNER_EMAILS**，刻意不用 assertAdmin —— admin 比站长宽）
+- `src/routes/about.tsx` —— 目录吸顶 + 滚动高亮、逐节编辑（富文本 / HTML 源码 / 矩阵三种）
+- `src/assets/about/*.jpg` —— 11 张截图（含 3 张特写裁剪）
+
+### 🔴 一个必须记住的坑：配图不能存哈希路径
+Vite 打出来的 `/assets/home-a1b2c3.jpg` **下次 build 就换哈希**，存进 site_config 的正文会指向 404。
+所以随站发布的图一律写 `<img data-shot="home">`，渲染前由 `resolveShots()` 换成当下 URL。
+站长在编辑器里自己传的图走 Supabase Storage 绝对 URL，不受影响，两种可混用。
+
+### 模型名清理（4 处，都可 git 单独回退）
+1. `identify-trace.ts` —— 草稿页「识别过程」里 `一线识别模型（gemini-…）`、`二次自动复核（…）` → 去掉括号里的名字。**trace 照常存库**，只是不渲染。
+2. `edit-source.ts` —— `sourceLabel()` 从 `AI · google/gemini-3-flash-preview @ lovable-ai` 改成 **`AI 协作`**；新增 `sourceLabelDetailed()` 保留完整串，仅管理员视角用。`plant_edits.source` 存的原始串**不动**。
+3. `edits.tsx` —— 徽章的 `title=` 悬停提示：管理员看 detailed，其他人看中性文案（否则鼠标一悬就露了）。
+4. `identify-plant.functions.ts` —— 新增 `NO_MODEL_DISCLOSURE`，插进 **3 个小P蛙 persona**：被问「你是什么模型」时不报名字/厂商/版本。顺带让页面助手会指路「关于 about」。
+
+### ⛔ 还差的
+1. **部署**（本轮没动 `wrangler.jsonc`）。
+2. **5 张待补图**（都要登录才截得到）：识别结果页、Log 登录后的修改记录、个人主页叶片统计、小P蛙模型设置面板 + 还可补 admin 后台。占位框已就位，用户截好丢过来直接在 /about 里用富文本编辑器替换即可。
+
+### ✅ 已部署（2026-07-31）
+- 第一次：Version `a82725ac-acce-4ec3-b23f-a17fe949a28a`
+- 第二次（编辑器修正）：Version `a56887b9-3934-4099-878a-4c887ce1e8ee`
+两次都走 `env -u HTTP_PROXY -u HTTPS_PROXY …` + `wrangler deploy`，一次过，队列触发器
+（Producer + plant-jobs Consumer + plant-jobs-dlq Consumer）都还在。
+
+🔴 **部署后发现并修掉的一个真问题**：本来正文默认用 RichEditor（TipTap StarterKit+Image+Link）
+编辑 —— 但它的 schema 里**没有** `<figure>` / `<figcaption>` / `<div class="callout">`，
+站长只要用富文本打开任一节再保存，整节的图注框、提示框、class **会被静默抹平且不可逆**
+（存回 site_config 就覆盖原文了）。改法：
+1. prose 默认改走 **HTML 源码**；富文本降级为手动切换，切之前弹确认框写明会丢版式。
+2. 新增「插入截图」按钮 —— 上传到 `plant-images`（`<uid>/about/…`，同 RichEditor 的压缩），
+   直接往源码光标处塞 `<figure class="shot"><img src="…"><figcaption>` 片段，不经过 TipTap。
+   另有「插入占位框」按钮塞 `figure.shot.todo`。
+3. 插入后的光标位置**不能在 setHtml 之后直接 setSelectionRange** —— 那一下跑在 React 提交
+   新 value 之前，改的是旧内容，随后 value 一换光标就弹到末尾。记成 state、在 effect 里设。
+   实测：插 103 字符片段后 `selectionStart === 103` ✅、textarea 保持 focus ✅。
+
+## 🔧 2026-07-31（续）— 「资深编辑」从头衔做成真权限
+
+`tsc` ✅ · 改动文件 eslint 无新增 ✅ · 已部署 Version `5b27d7e1-b910-412c-b4af-ede00086c8d6`
+
+### 起因
+用户读关于页时问「我目前该如何指定可以采纳他人贡献的资深编辑」。查下去发现**我在关于页写的
+那一行两处都错**，而且底层实现本身就不自洽：
+
+| 项 | 改之前的真实情况 |
+|---|---|
+| `level === "senior"` | `isOwner \|\| gold >= 10` —— 攒够 10 金叶自动升，**不是站长指定**，且**不解锁任何权限** |
+| /edits 的「采纳」按钮 | 只认硬编码 `OWNER_EMAILS` |
+| `plant_edits` UPDATE 的 RLS | 只认 `admin` 角色 —— 与前端判据不一致 |
+| `plant_drafts` UPDATE 的 RLS | 认**任何已批准编辑** → 🔴 识别铜叶谁都能给别人翻倍，「采纳是唯一质量杠杆」这句话在识别这条路上不成立 |
+| /edits 的「撤销」按钮 | `isAdmin`；但客户端直写 `plant_edits` 会被 admin-only RLS 挡 → 非 admin 点了会**第 6 步写进去、第 7 步静默失败**（内容换了、记录没翻） |
+
+### 改法：一道服务端闸门，**不动任何 RLS**
+新增 `src/lib/roles.functions.ts`，全部用 service-role 落库、权限判定写在 TS 里：
+- `setSeniorEditorFn` —— 授予/收回，**仅站长**（admin 也不行，否则权限自我扩散）
+- `listSeniorEditorsFn` / `getMyRolesFn`
+- `setAdoptedFn` —— 采纳，**站长或资深编辑**；取代已删除的客户端 `setAdopted()`
+- `applyRevertFn` —— 撤销的落库部分（DOM 那半必须留在浏览器，`revertEdit` 用 DOMParser）
+
+🔴 **为什么绕开 RLS 而不是改它**：`plant_edits` 的 UPDATE 是 admin-only，要让 moderator 能写
+就得去 dashboard 手工改策略。而这两项操作本就该有服务端闸门 —— 收进 TS 之后，前端判据和
+数据库判据不可能再各说各话。**用户一句 SQL 都不用跑。**
+
+### 角色落在哪
+复用 `app_role` 枚举里一直没用过的 **`moderator`**（`leaves.ts` 的 `SENIOR_ROLE`）——
+加枚举值要跑 DB 迁移，而这里只需要一个空位。站内一律显示「资深编辑」。
+
+### 资深编辑能干什么（用户选定）
+采纳他人贡献 · 撤销他人错误改动 · **银叶不限量**（`silverAvailable = isSenior ? Infinity : …`）。
+金叶仍按攒的算，只有站长无限 —— 整页生成那条链路更贵。
+**没给**审批编辑申请（用户没勾）。
+
+### 指定入口
+`/admin/applications` →「已通过」标签 → 每张卡片上一个「设为资深编辑 / 资深编辑 ✓ 点此取消」
+按钮，**仅站长可见**。页头写明当前有几位。
+
+### 顺带
+- `level` 判据改成 `isOwner || isSenior`，**去掉 `gold >= 10` 自动升**。
+- 关于页三处错误文案已改；三栏对照表加了「银叶不限量」「指定谁当资深编辑」两行。
+- 实测：四个服务端函数无鉴权调用全部 500 拒绝。
+
+## 🔧 2026-07-31（续二）— 四个界面问题（用户截图报的）
+
+`tsc` ✅ · 已部署 Version `a45fd1c6-322f-46ce-a45a-c453cfdff2f0`
+
+### 1. 白色 toast 遮挡导航栏
+**这是 07-29 那次修复的反弹。**当时为躲开右下角常驻的小P蛙，把 sonner 从默认右下挪到了
+`top-center` —— 结果正压在**吸顶导航栏**上。左下角是全站唯一两头都不占的角（导航在顶、
+小P蛙在右下），改成 `bottom-left`。
+
+🔴 移动端另算：sonner 在 `max-width:600px` 下**强制 `width:100%`**（见它自己的 styles，
+`--width` 在那儿完全不起作用），横向躲不开小P蛙浮标 —— 只能纵向抬过去。实测 375×812 下
+浮标占据距底 **96–170px**，故 `mobileOffset.bottom = 11.5rem(184px)`。实测 toast 底边落在 184px ✅。
+
+### 2. 小P蛙「模型设置」下半截被切掉且滚不动
+根因：面板是 `overflow-hidden` 的 flex 列，对话分支和任务动态分支各自套了
+`flex-1 overflow-y-auto`，**唯独设置分支是把 `<XiaoPUserSettings/>` 直接当 flex 子元素扔进去的**，
+于是内容一超高就被齐刷刷切掉、且没有滚动条。补上 `flex-1 min-h-0 overflow-y-auto overscroll-contain px-3 py-3`。
+实测 scrollHeight 1173 / clientHeight 869，能滚到底、保存按钮够得着 ✅。
+
+### 3. 面板宽度可拖（新增）
+左边缘 6px 热区，`pointerdown/move/up` 拖动，双击恢复默认。宽度存 localStorage
+（`xiaop-panel-width`），下限 320px、上限 `视口宽 × 0.6`（再宽就把正文全盖住了）。
+
+🔴 **Tailwind v4 没生成 `md:w-[var(--xiaop-w)]`** —— 面板于是退回 `width:auto`，被内容撑到
+`max-w-[90vw]`（830px 视口下实测成了 747px）。改成给面板挂 `data-xiaop-panel` +
+inline `--xiaop-w`，规则写进 `styles.css` 的 `@media (min-width:768px)` 里。别再试图用
+那个 Tailwind 任意值类。实测拖动 370 → 498（触到 0.6 上限）、松手落盘 ✅。
+
+### 4. 「我的 小P蛙 模型 / 收起」顶到左边框
+`XiaoPUserSettings` 和 `ModelQueueConsole` 的根都没有横向 padding，而外层又没套容器。
+第 2 条补的 `px-3` 一并解决，实测标题距面板左边框 13px ✅。
+
+## 🔧 2026-07-31（续三）— 去掉进度类 toast
+
+`tsc` ✅ · 两个改动文件 eslint 回到基线（0 error / 2 pre-existing warning）✅ ·
+已部署 Version `c2463e61-1764-48d7-81e4-5957f2ac69bd`
+
+用户：「把 toast 去掉，因为现在各项进度都要颜色条和文字信息展示了。」
+
+### 判断依据（先查清才动手）
+全站 328 处 toast：`error 176 / success 123 / loading 10 / message 10 / info 5 / warning 4`。
+其中 **10 处 `toast.loading`** 才是用户截图里那个白框，且 `drafts.$id.tsx` 里那 6 处带
+`duration: Infinity` —— 一跑就是几分钟常驻不走，正压在导航和正文上。
+
+三类 AI 任务（identify / enrich_draft / gold_page）此时已有**两条**反馈通道：
+页内常驻面板（`enrichProg` / `goldProg` / `enrichError` / `goldError`）+ 小P蛙动态流
+（`task_feed` 表存 `running/done/error` 三态，带 phase / progress / error 文本 + 颜色条）。
+toast 是第三条纯重复的，删掉不丢任何信息。
+
+### 改了什么（进度类 toast 现在全站为 0）
+| 位置 | 原来 | 现在 |
+|---|---|---|
+| `drafts.$id.tsx` enrich/gold 轮询 | 6 处 `duration: Infinity` loading + 成功/失败 toast | 全删；成功新增 `enrichDone` 页内绿条（可关），失败仍走 `enrichError` / `goldError` 常驻块 |
+| `drafts.$id.tsx` 分享卡 | loading + 成功 + 失败 toast | 全删；按钮本来就写「生成中…」，失败新增 `cardError` 行内红字 |
+| `camera-identify.tsx` | 3 处 loading（压缩图片 / 等定位） | 新增 `busyText` 状态 + 转圈行，渲染在定位按钮上方 |
+| 顺带 | `jobToastTag()` 成了死代码 | 删除 |
+
+### ⚠️ **没动**的部分（故意的，需用户确认）
+剩下约 315 处 toast 是**离散动作的结果反馈**，不是进度：表单校验（「请填写拒绝理由（至少 5 字）」）、
+保存成功、上传失败、权限不足（「仅站长或资深编辑可采纳」）等。这些**没有第二条显示通道**，
+一并删掉会让用户点了按钮完全没有反应。若用户确认要全部清掉，需要先为错误反馈另建一条通道
+（页内 inline error 或统一的错误区），不能只是删。
+
+## 🔧 2026-07-31（续四）— 「站内已有该物种的内容」改成三色分类
+
+`tsc` ✅ · 本地 5213 实测 ✅ · 线上实测 ✅ · 已部署 Version `426858c8-3b9b-4766-9f24-ec9a60357380`
+
+用户（以假连翘为例）：「科普详页：假连翘 用的橙色框，这是错的，应该用蓝色框、显示为
+『银叶科普』，橙色框应该显示『金叶 skill 创建详页』。这一栏里应该是 x 识别的快速简介卡
+（绿色）、x 创建的银叶科普（蓝色）、x 创建的金叶 skill 创建详页（橙色）。」
+
+### 根因：颜色分的是「草稿 vs 条目」，不是内容来源
+旧逻辑只有两类：蓝框 = 银叶草稿（`plant_drafts._enriched=true`）、橙框 = **一切** `plants` 行。
+于是银叶草稿被采纳收录成的条目也被涂成橙色、写作「科普详页」——它明明是银叶科普。
+假连翘更糟：草稿 `b29a1d3c`（吉木·银叶）已采纳成 `plants/duranta-erecta`，
+**同一份内容蓝框橙框各出现一次**。
+
+### 现在：类别由内容来源判定（`SpeciesExistingKind`）
+| kind | 颜色 | 文案 | 判据 |
+|---|---|---|---|
+| `quick` | 🟢 leaf | x 识别的快速简介卡 | 草稿 `_enriched=false`，或由这种草稿采纳成的条目 |
+| `silver` | 🔵 sky | x 创建的银叶科普 | 草稿 `_enriched=true`，或由这种草稿采纳成的条目 |
+| `gold` | 🟠 amber | x 创建的金叶 skill 创建详页 | `plants.source = gold_oneclick` |
+| `skill` | 🟠 amber | x 创建的 skill 科普详页 | 其余 `plants` 行（编辑手工上传，没花金叶，故不写「金叶」） |
+
+条目 ↔ 草稿的对应靠 `plant_drafts.published_plant_id`。实测全站 257 条 plants 的交叉分布：
+`null|无草稿 224 · ai_identify|银叶草稿 15 · gold_oneclick|无草稿 8 · ai_identify|快速卡 7 ·
+null|银叶草稿 2 · gold_oneclick|快速卡 1`（`gold_oneclick` 优先级最高，哪怕有草稿指过来）。
+
+### 顺带解决的三件事
+1. **去重**：已采纳的草稿由**条目**代表（跳详页才是它的正式家），不再以草稿身份重复一遍。
+2. **条目页不再指向自己**：除了排除本页 slug，还排除**被本页收录的那份来源草稿**（它的正文
+   就是这一页）。假连翘条目页现在只剩一个绿框「宗秀识别的快速简介卡」。
+3. **加上了「x」**：`profiles.display_name`，访客草稿退到 `creator_label`；一次 `.in()` 查完
+   （最多 4 个 id）。
+
+### 🔴 两个门槛不同，是有意的
+常驻那一栏**列出**绿色快速卡；但关分享卡时弹的推荐面板**不为快速卡弹**
+（`offerExistingWork` 判 `items.some(i => i.kind !== "quick")`）——每次识别都会落一条快速卡，
+拿它弹面板等于天天打扰。
+
+### 点击行为（保留用户 07-30 定的规矩，只在「已收录」时例外）
+未收录的银叶草稿 = 唯一就地展开、不跳页的去向；已收录成条目的一律跳详页（那里有评论和修改记录）。
+
+### 改动文件
+- `src/lib/species-existing.functions.ts` — 返回值从 `{drafts, plant}` 改成 `{items: SpeciesExistingItem[]}`；
+  查询不再写死 `_enriched=true`，改用 `enriched:ai_payload->>_enriched` 别名（不必拉回整个 payload）。
+- `src/components/species-existing-links.tsx` — 导出 `SPECIES_EXISTING_STYLE` / `speciesExistingLabel`
+  / `speciesExistingCountSuffix`，按 items 渲染。
+- `src/routes/drafts.$id.tsx` — 推荐面板改成渲染 items（与常驻栏同一套配色）。
+- `src/routes/plants.$slug.tsx` — 只改注释。
+- `.claude/launch.json` — 新增 `dev-alt`（端口 5213），供第二个会话与 5203 并存。
+
+## 🔧 2026-08-01 — 条目页正文下方「大量空白」的真正根因
+
+`tsc` ✅ · 本地 5213 实测 ✅ · 线上实测 ✅ · 已部署 Version `c6094f37-f032-4f6a-87b2-b91909b61b3d`
+
+用户：「plantspedia.club/plants/duranta-erecta 这个页面下还是有大量空白！这个类似问题一直没有解决。」
+
+### 线上实测的数字（不是猜的）
+```
+iframe.style.height = 78378px      ← 还在涨（contentWindow.innerHeight 已 114234）
+.page-wrap 实际高度  = 7322px
+body 计算后 min-height = 78378px   ← 声明值是 min-height:100vh
+```
+**七万像素的空白。**
+
+### 根因：自激循环，且**草稿预览 07-21 就修过，条目页一直漏着**
+1. `sizeIframe` 按 `documentElement.scrollHeight` 设 iframe 高度；
+2. iframe 里的 `100vh` = 父层刚设好的那个 iframe 高度（自引用）；
+3. 模板 `body{min-height:100vh}` → body 至少这么高；
+4. `documentElement.scrollHeight` = body 高 + body margin(8+8) = **上一轮高度 + 16px**；
+5. 写回去 → ResizeObserver 再触发 → 每轮 +16px，永不收敛。
+
+`src/lib/draft-enhance.ts` 里对**草稿预览**早就写死了两条对策（第 23-30 行、96-100 行注释）：
+注入 `html,body{height:auto!important;min-height:0!important;}`、并且「**绝不能用
+documentElement.scrollHeight**，只量 body 内容盒 + 外边距」。**条目页 `plants.$slug.tsx`
+两条都没跟上**——它自己那条 07-24 的注释只修了 `minHeight:60vh` 那一半。
+
+### 改了什么（`src/routes/plants.$slug.tsx`）
+1. 注入的 `<style>` 里加 `html,body{height:auto!important;min-height:0!important;}`。
+2. `sizeIframe` 改量 `body.getBoundingClientRect().height + marginTop + marginBottom`
+   （与视口无关 → 收敛；`documentElement.scrollHeight` 不小于视口高，会导致**内容变矮时
+   永远缩不回去**，这是另一半病根）。
+3. 新增 `lastSizedRef`：与上次差 ≤1px 就不写回，掐掉残余回授；**换文档时归零**
+   （否则新条目量到相近高度会被阈值挡掉、卡在旧高度）。
+
+### 实测（本地 1100×900）
+| 页面 | iframe 高 | 正文实际高 | 内部空白 |
+|---|---|---|---|
+| duranta-erecta（银叶采纳条目） | 5725 | 5717 | 8px（body 下边距） |
+| gaillardia-pulchella-e8d（金叶） | 13309 | 13308 | 1px |
+| menispermum-dauricum（老 skill 页） | 14480 | 14480 | 0 |
+图片加载完会重量一次并收敛（蝙蝠葛实测 13057 → 14480），不会截断正文。
+
+### 影响面
+所有 257 个条目页都走这条渲染路径，凡是模板带 `body{min-height:100vh}` 的都中招 ——
+不是假连翘一页的问题。
+
+## 🔧 2026-08-01（续二）— 已收录档案三色分类 + 绿页默认展开银叶科普
+
+`tsc` ✅ · 本地 + 线上实测 ✅ · 已部署 Version `e5a960b8-3c15-4936-870e-70a6acb183d5`
+
+用户定的分法（与「站内已有该物种的内容」那一栏**同一套配色**）：
+🟢 AI 快速识别 / 🔵 银叶科普 / 🟠 skill 创建详页。
+
+### 判据仍然是「内容来源」，不是表里某一列
+`plants.source` 只能认出金叶一键；采纳流程历史上有的写 `ai_identify`、有的留 null。
+可靠信号是**来源草稿**：`plant_drafts.published_plant_id` 指向该条目、且该草稿 `_enriched`。
+同一条目可能有多份来源草稿（补拍 / 多人识别同一株）——**只要有一份是银叶就算银叶科普**。
+新增 `plantEntryKind()`（lib/plants.ts）+ `fetchPlantSourceKinds()`（lib/drafts.ts，全表小索引，
+当前 25 行，档案列表与条目页共用一个 react-query 缓存）。
+
+### 改了什么
+- `lib/plants.ts`：`PlantEntryKind` / `PLANT_ENTRY_KIND_META` / `plantEntryKind()`；
+  `fetchPlantsMetadata` 的 select 补上 `source`（筛选要用）。
+- `lib/drafts.ts`：`fetchAiPlantIds` → `fetchPlantSourceKinds`（返回 plantId → 有无银叶来源草稿）。
+- `components/plant-kind-badge.tsx`（新）：三色类别标。与 `EntryTypeBadge` 分工——
+  后者是**管理面**口径（金叶一键 / HTML 详页 / AI 识别简略 / 富文本），管理页和个人主页还在用。
+- `routes/plants.index.tsx`：列表行挂徽章；「条目类型」筛选从 `ai/edited` 换成三类；
+  标题不再套方括号（类别由徽章说清楚了）。
+- `routes/plants.$slug.tsx`：HTML 条目页顶栏 + 富文本条目页 header 各挂一个徽章。
+- `components/species-existing-links.tsx`：新增 `defaultOpen`；**绿页默认展开银叶科普**
+  （`defaultOpen` 是异步算出来的，用 ref 补开一次，用户收起后不再强开）。
+
+### 实测
+档案列表三色齐全（假连翘=银叶科普、蕨麻=AI 快速识别、四合木=skill 创建详页）。
+蕨麻条目页：页头「AI 快速识别」绿标 + 蓝框 `aria-expanded=true`，
+下面直接渲染出「鹅绒委陵菜」银叶科普 iframe（7174px）。
+
+### 🔴 用户这次的需求里**还没做**的部分（需要决策，见下）
+1. 合并后**追溯**贡献：现有的是页尾「创建者 / 共建者」+「补充观测」卡片 +「注 N」+ 修改记录，
+   还没有按「识别人 / 生成人 / 创建者」分角色列出来。
+2. **矛盾红框**：完全没有。判定方式、谁能改，都还没定。
+3. 「必然合并」：**数据现状已经满足**——全站 257 条里只有 3 个物种有多条目，且
+   **同类重复为 0**（即每物种最多各一条绿/蓝/橙）。所以要做的不是补合并，而是守住这个不变量。
+
+## 🔧 2026-08-01（续三）— 条目页「分角色贡献」
+
+`tsc` ✅ · lint 新增行 0 error ✅ · 本地 + 线上实测 ✅ · 已部署 Version `e5a960b8-3c15-4936-870e-70a6acb183d5`
+
+用户 08-01 选定：先做分角色追溯，矛盾判定走**结构化字段比对**（下一步）。
+
+### 病灶：一行「最早识别」把所有人都盖掉了
+页尾原来只有「创建者 / 共建者」+「最早识别：某某」。一株被补拍多次、多人识别、
+再由**别人**花银叶生成正文时，除了「最早」那位，其余人在页面上完全看不见。
+
+### 改了什么
+- `identify-plant.functions.ts`：enrich 落库时把 `_enriched_by` / `_enriched_at`
+  写进 `ai_payload`（生成人 = **花掉那枚银叶的人**，草稿页任何登录用户都能点，不一定是识别人）。
+  记 JSON 不加列 —— hosted Supabase 加列要人工跑迁移。存量草稿没有这两个字段。
+- `lib/edits.ts` 新增 `fetchPlantContributors(plantId)`：一次查回所有来源草稿 + 一次批量
+  查显示名，返回 `identify` / `enrich` 两类角色。**存量数据推断出来的生成人标 `inferred`**，
+  页面上注明「（存量数据未记录，按识别人推断）」——不能把推断当成查到的。
+- `routes/plants.$slug.tsx` 页尾换成贡献表：识别人（含次数/地点/时间）· 银叶生成人 ·
+  skill 创建者 · 采纳收录 / 上传 · 合并补充（每条是可点的「注 N」，点了滚到修改记录并高亮）· 共建者。
+
+### 实测
+- 假连翘（银叶科普）：`识别人（2 次识别）：宗秀 · 深圳 · 07/30、吉木 · 东莞 · 07/31` /
+  `银叶生成人：吉木（存量数据未记录，按识别人推断）` / `采纳收录：吉木` /
+  `合并补充（1 次）：注 1 · 吉木 · 08/01` / `共建者：宗秀`。
+  —— 这一页其实是两个人凑出来的，改之前页面上只写「最早识别：吉木」。
+- 天人菊金叶页（skill 创建详页）：`skill 创建者：吉木` / `上传：吉木 · 07/30`。
+
+### 下一步（已确认方向，尚未动手）
+**矛盾红框走结构化字段比对**：只比已有的结构化字段（科属 / IUCN / 花期 / 毒性 / 分布 /
+学名权威），不花 AI token、可复现、误报低；覆盖不到散文正文里的说法，日后可再叠加。
+
+## 🔧 2026-08-01（续四）— 矛盾红框（结构化字段比对）
+
+`tsc` ✅ · 三个新文件 lint 0 error ✅ · 本地 + 线上实测 ✅ · 已部署 Version `e5a960b8-3c15-4936-870e-70a6acb183d5`
+
+### 比什么、怎么比（**不花 AI token**）
+本条目（`plants` 行）× 它的**每一份来源草稿**，比 6 个结构化字段：
+学名 / 科 / 属 / 中文名 / 英文俗名 / 中文俗名。判定一律**从宽，宁可漏报不可误报**：
+- 学名比归一化后的「属+种」（`speciesKey`），命名人后缀差异不算；
+- 科/属/中文名**一方包含另一方就不算**（「禾本科」vs「禾本科 Poaceae」是同一个意思）；
+- 中文名先剥掉「疑似」前缀（那是把握程度，不是异议）；
+- 俗名是多值列表、天然各写各的 → **只有两边都非空且完全无交集**才算矛盾；
+- 任一方为空一律不算（没填 ≠ 有异议）。
+
+### 全站实测：25 个有来源草稿的条目 → 只检出 4 个条目、5 处矛盾，且**全是真的**
+```
+绶草            英文俗名  Chinese Spiranthes  vs  Chinese Ladies' Tresses
+黑沙蒿          中文名    黑沙蒿              vs  鄂尔多斯蒿
+黑沙蒿          英文俗名  Ordos sagebrush     vs  Ordos Wormwood
+阿尔泰狗娃花    英文俗名  Altaic Aster        vs  Altaic Heteropappus
+长裂苦苣菜      中文名    长裂苦苣菜          vs  苣荬菜
+```
+学名/科/属零误报 —— 从宽的规则没有过度开火。一个天天误报的红框，编辑三天就学会无视它。
+
+### 「采用这个」的语义 = **统一口径**（不是只改条目）
+`lib/conflicts.functions.ts` 的 `resolveFieldConflictFn`：条目 **和它所有来源草稿**的该字段
+一起改成选定值，再写一条修改记录（含「合并前各来源说法：…」）。
+🔴 只改条目的话，下次进页面红框原样再来一遍 —— 红框就成了消不掉的噪音。
+🔴 `kind` 用 **`text`**：`plant_edits_kind_check` 很窄，新 kind 会被静默拒绝
+（所有 plant_edits 写入都是 best-effort catch），见 [[plant-edits-kind-constraint]]。
+权限：站长 / 资深编辑 / editor / admin，服务端 service-role 落库，不动 RLS。
+
+### 谁看得见
+红框**所有人可见**（这一页此刻确实有两种说法，藏起来等于替读者做了没依据的决定）；
+「采用」按钮**只给编辑**。未登录时实测只显示说法和来源，无按钮。
+
+### 新增文件
+- `lib/field-conflicts.ts` —— 纯函数检测，前端跑
+- `lib/conflicts.functions.ts` —— 落库（统一口径 + 修改记录）
+- `components/field-conflicts-panel.tsx` —— 红框 UI
+挂在 `plants.$slug.tsx` 两个分支：HTML 条目放正文 iframe **之前**（正文插不进东西，
+而「科属有两种说法」必须在读正文前看到），富文本条目放 header 里。
+
+## 🛡️ 2026-08-01（续五）— 重点保护物种**坐标脱敏**（防盗挖）
+
+用户要的三件事，全部做完并实测：
+1. **所有人**的地图界面都提示「保护物种坐标已进行模糊化处理」；
+2. 命中名录时**分享卡**上的坐标数字显示为橙色 + 括号「（已模糊）」；
+3. **只有站长 / 资深编辑**在点开「只显示重点保护物种」时，看到的是**精确坐标**
+   （为将来把准确数据导出授权给科研机构 / 政府部门留的入口）。
+
+### 核心决定：脱敏必须在**服务端**做
+原先 `fetchGeoSightings()` 是浏览器拿 anon key 直查 `plant_drafts`。那样无论前端怎么
+「模糊」，**精确坐标都已经躺在网络响应里**，开发者工具一开就看见 = 等于没做。
+所以新增 `lib/geo-sightings.functions.ts`，坐标模糊、名录匹配、身份判定全部收进服务端，
+浏览器只拿得到模糊值。两个入口而不是一个 `exact` 开关：
+- `geoSightingsFn` —— 公开、无鉴权，保护物种**恒模糊**（这条路径里根本不存在返回精确值的分支）；
+- `geoSightingsExactFn` —— `requireSupabaseAuth` + `resolveRoles().isSenior`，才给精确值。
+  已实测未登录调用 → `Unauthorized: No authorization header provided`。
+
+### 算法（`lib/protected-coords.ts`）
+定格 + 定点抖动（同 iNaturalist obscured coordinates）：真实点落进 `FUZZ_CELL_DEG=0.05°`
+的格子（鄂尔多斯纬度 ≈ 24 km²），再按记录 id 哈希出格内一个**固定**点。
+两条性质缺一不可：① 对外点与真实点同格（信息损失可量化）；② 同一条记录永远同一个模糊点
+（**否则多刷几次取平均就能还原真实坐标** —— 坐标脱敏最经典的翻车方式）。已实测重复调用结果一致。
+
+⚠️ **踩到并修掉的坑**：hash 原样照抄 conservation.ts 的 djb2，结果 `id:lat` 与 `id:lng`
+两个哈希只差 ~300/2³²，frac 差 ~1.2e-7，乘 0.05° 后被 r6 一舍**完全相等** ——
+线上四条保护记录的模糊点**全部落在格子对角线上**。已加一轮 xorshift-multiply 雪崩 +
+判别词改前缀（`lat:${seed}`）。修完实测 lat/lng 格内偏移互不相关。
+
+### 只模糊坐标不够：地点文字同样要粗化
+`capture_place` 是逆地理编码自由文本，粒度从「鄂尔多斯市」到**整条街道地址**都有。
+坐标模糊到 5 km、旁边写着「XX街道XX号」等于没做。`coarsenPlace()` 砍到区/县/旗一级，
+砍不出来就整个隐去（与 `displayPlace()` 相反：那个解析失败时原样返回，这里解析失败
+恰恰是「这串很可能是精确地址」的信号）。
+
+### 一并堵上的三条旁路（都是同一份精确坐标的出口）
+- **草稿页 `/drafts/:id`** —— 地图气泡就是链到这里的，原样印着 5 位小数 = 刚锁的门开条缝。
+  现按同一规则脱敏（橙色 + 已模糊）；**站长/资深编辑 + 该记录的提交者本人**看精确值。
+- **分享卡** —— 比页面更严：**只要命中名录就模糊，谁生成都一样**。有权看精确坐标
+  ≠ 有权把精确坐标发出去，而卡一旦被截图转发就收不回来了。
+- **详页正文 / 金叶** —— `plant-html-template` 的「拍摄记录」印 5 位小数（≈1 m），
+  `buildDraftContent` 现按名录命中改写成 2 位模糊值 + `（已模糊）`；
+  `gatherVerifiedFacts` 喂给模型的「本次拍摄地点」也先粗化（否则模型照抄进正文）。
+  ⚠️ 只对**此后新生成**的页面生效，历史页面要重新生成才会变。
+
+### UI
+- 面板内黄框声明（所有人，不受任何开关影响）+ 面板收起时地图上的浮动条
+  （移动端多数时间面板是收着的，声明不能跟着消失）。
+- 站长/资深编辑点开「只显示重点保护物种」→ 绿框「🔓 精确坐标模式」，明确写「请勿截图外传」。
+  平时浏览全图看到的仍是模糊值 —— 免得自己截个图发出去就把位置泄了。
+- 气泡里保护物种多一行坐标：模糊=橙色「（已模糊）」，精确=绿色「（精确·仅你可见）」。
+
+### ⚠️ 仍然敞着的口子（需要在 Supabase dashboard 补一刀）
+`plant_drafts` 至今对 anon 有 `GRANT SELECT`（all_migrations.sql:1088）。拿前端 bundle 里的
+anon key 直接打 PostgREST，照样读得到精确 `capture_lat/lng`。**本轮挡住的是本站所有界面，
+挡不住绕开界面直连 API 的人。** 要彻底堵死得把精确坐标移出 anon 可读范围（视图 + 列权限）。
+
+### 新增 / 改动文件
+- 新增 `lib/protected-coords.ts`（算法 + 全站唯一一份文案与橙色 `#ea7317`）
+- 新增 `lib/geo-sightings.functions.ts`（公开 / 精确两个服务端入口）
+- 改 `lib/drafts.ts`（`fetchGeoSightings` 改为代理服务端；`GeoSighting` 加
+  `is_protected/protected_label/coords_fuzzed`）
+- 改 `routes/explore.tsx`、`routes/drafts.$id.tsx`、`lib/share-card.ts`、
+  `lib/identify-plant.functions.ts`
+- 验证：tsc=0；实测公开接口 207 条中 4 条命中名录、全部 `coords_fuzzed:true`、
+  地点粗化到区县级；草稿页与分享卡均为橙色 `(39.41, 109.81)（已模糊）`。
+  **尚未部署**；「精确坐标模式」绿框需站长本人登录后复看。
+
+## 🏷️ 2026-08-01（续六）— 身边地图：按主题标签筛选分布
+
+用户要的：地图上加一个下拉，选某个主题标签（目前只有「圣水草原的植被」），
+只显示该专题下的物种分布。
+
+### 关键决定：走 `fetchTagMembership` 的三表并集，不自己比 `plant_drafts.tags`
+主题标签有**三个来源**（`plant_tags` 关联表 / `plants.tags` / `plant_drafts.tags`），
+只认其中一个就会出现「专题页说有 5 条、地图上只有 3 条」这种对不上账的情况 ——
+那正是 07-24「手动添加的标签下面永远是 0」那个 bug 的由来（见 tags.ts 开头长注释）。
+所以复用同一个 membership 函数，判定为：
+`记录本身挂了标签(草稿) || 它已被采纳、而标签挂在采纳后的条目上`。
+只认前者的话，一个专题**越是做得好（条目都收录了）、地图上反而越空**。
+
+顺带给 tags.ts 加了 `fetchTags()`（只取标签本体、不算计数）——
+地图这边本来就要自己拿 membership，走 `fetchAllTags` 等于把那趟三表分页白跑两遍。
+
+### UI
+- 下拉放在所有开关**之前**：其它几个是「在当前这批点里再挑一挑」，选专题是先决定
+  「看哪一批点」，顺序由粗到细。
+- 只在**真有可选专题时**才渲染（`themeOptions` 只留地图上真有点的标签，按记录数排序）
+  —— 一个永远只有「全部主题」的下拉是纯噪音。
+- ⚠️ `SelectContent` 必须显式 `z-[900]`：Radix 的下拉是 portal 到 body 的，
+  默认 `z-50` 会被面板（z-500）和高德自己的图层压住，点开是一片空白。
+- 选中后正文下方给一行「当前只显示…；含挂在草稿上和已收录条目上的两种」+「清除」。
+- 与 入侵 / 重点保护 / 只看我的 / 地区chip **全部是 AND 组合**（各自独立）。
+
+### 实测（本地 dev）
+- 下拉两项：`全部主题（不筛选）` + `圣水草原的植被 · 7`
+- 选中后：地图聚合圆变成单个「7」，最新识别物种列表换成该专题的物种（拂子茅/猪毛蒿/
+  红豆草黄芪/鹅绒委陵菜/旋覆花/海韭菜）
+- 与「只显示重点保护物种」叠加 → 交集 1 条（绶草），专题选择不被误清
+- 「清除」回到全部主题，地图恢复全部聚合圆
+- tsc=0
+
+### 改动文件
+- `lib/tags.ts` —— 新增 `fetchTags()`，`fetchAllTags` 改为复用它（无行为变化）
+- `routes/explore.tsx` —— `themeTag` 状态、`["explore-tag-index"]` 查询、
+  `inTheme()/themeFilter()`、下拉 UI
+
+### ✅ 已部署
+`38a4a072-c91a-4676-89ed-1c5943cd8fdf`（2026-08-01，plantspedia.club / www）。
+本次一次推上线**两轮**：坐标脱敏（续五）+ 主题标签筛选（续六）。
+线上实测：地图声明在、下拉两项（全部主题 / 圣水草原的植被·7）、选中后地图收敛到 7 条、
+与「只显示重点保护物种」叠加得交集 1 条。
+
+---
+
+## 2026-08-02 — 正名统一：三条链路同源（A→B→C）
+
+### 症状
+草稿 `28c5e133-6358-4cf0-ab72-350c54fa111a`：简介卡标题「疑似长毛棘豆」，
+银叶正文 `<title>绵毛棘豆 Oxytropis lanata`。用户问「哪个才是名录口径」。
+
+### 根因（三条链路对名录态度不同）
+| 链路 | 核对名录？ |
+|---|---|
+| `runQuickIdentifyCore`（快速识别） | ❌ 模型给什么写什么 |
+| `buildDraftContent`（银叶正文） | ✅ 渲染 HTML 前对齐 |
+| `runEnrichCore`（银叶写库） | ❌ `draft.title \|\| meta.title` 又顶回 phase-1 |
+
+锁名的本意是防模型第二轮漂成另一个物种，但它锁的是**字符串**而不是**物种身份**，
+于是唯一合法的改名（名录正名）也被一起挡掉 → 标题与正文打架。
+
+### 改动
+- **A** `identify-plant.functions.ts` `runEnrichCore`：新增 `authoritative` 判据 ——
+  stamp 状态 ∈ {accepted, renamed, synonym} 且 `canonicalKey(stamp.was.scientific_name)
+  === canonicalKey(draft.scientific_name)`（名录裁的正是 phase-1 钉住的那个物种）。
+  满足则 title/学名/科/属/俗名优先取 meta；不满足维持老行为。
+  「疑似」按 phase-1 的 `isTentative` 判定补回前缀（换名不该让疑似变确诊）。
+- **B** 同文件新增 `alignMetaToChecklist(meta, where)`，在**两条出卡分支**的
+  `buildSummaryCardHtml` 之前调用（模型出卡 + Pl@ntNet 兜底）。兜底那条尤其值：
+  title 本来是一串拉丁学名，命中后变成中文正名。代价 1–2 个子请求。
+- **A′** `name-authority.functions.ts` `applyNameAuthority`：
+  ① 送 `checkName` 前 `stripTentativeMarks`（「疑似」是置信度标记，不是名字 ——
+  带着它查名录中文名反查必落空，还会把「疑似长毛棘豆」收进俗名列，线上已有实例）；
+  ② **保留命名人**：名录 `scientific_name` 不含命名人，原样覆盖会削掉 `(Pall.) DC.`。
+  判据「原名以正名开头且 canonicalKey 相同」→ 保留原名；异名换正名/性数错配则采用名录。
+- **C** `scratch/backfill_name_authority.mjs`（新）：拿列上的名字**重查名录**（复用
+  同一份纯函数，不自己写归一化），`--scope stamped|all`、**默认 dry-run**、`--apply` 才写库。
+  不重写 `html_content`：银叶正文本来就是正名；快速卡的 HTML 根本不上屏（页面渲染 React 卡片读列）。
+  回填只改名字**不改疑似状态**（按当前标题有没有前缀决定）。
+
+### dry-run 结果（`--scope stamped`）
+38 份有留痕的草稿 → **13 份待改**、25 份已一致、0 unmatched、0 ambiguous。
+典型：疑似长毛棘豆→疑似绵毛棘豆、鹅绒委陵菜→蕨麻、疑似白香草木樨→疑似白花草木犀、
+百金花→美丽百金花、阿尔泰狗娃花→阿尔泰狗娃花(原变种)（Heteropappus 并入 Aster）、
+Cyperus brevifolius→Kyllinga brevifolia、Cynanchum hancockianum→Vincetoxicum mongolicum。
+
+### 验收
+tsc=0；eslint 无新增（该两文件本就有 100+ 条历史 any/prettier 债）；
+`scratch/name-authority.test.mjs` 25 条断言全过。
+
+### ⚠️ 状态
+**未 --apply、未部署。** 待用户过目 dry-run 清单后再执行这两步。
+识别链路（B）无法在本地 dev 验证（要真照片 + AI key + 写库），只做了静态验收。
+
+---
+
+## 2026-08-03 — 未登录全站「功能消失」：不是功能没了，是页面没水合
+
+### 症状（用户报）
+未登录状态下：AI 识别不可用、首页一直显示「载入中」、手机导航栏右上角折叠点击无响应
+——「看起来像是所有的功能都消失了」。
+
+### 排查
+- 线上 plantspedia.club 用干净浏览器（未登录、手机视口）复测：首页、汉堡菜单、
+  /identify **都正常**。本地 dev 冷启动首屏也复现过一次「载入中」，但重载即好（Vite 冷编译）。
+- 决定性证据在**服务端渲染的 HTML** 里：`curl https://plantspedia.club/` 的输出中，
+  首页正文位置就是 `<p class="text-ink-faint">载入中…</p>`。
+  也就是说 —— **只要客户端 JS 没跑起来，用户看到的就恰好是这三个症状**：
+  首页停在「载入中…」、SSR 出来的按钮（汉堡/标签页）没有事件处理器所以点了没反应、
+  识别页打得开但什么都做不了。三个症状是**同一个根因**，不是三个 bug。
+
+### 根因链
+1. SW 缓存里留着**上一次部署的 HTML 壳**（`ASSETS_TO_CACHE` 里的 `/`，或导航兜底写入的那份）；
+2. 壳里写死 `/assets/index-<旧hash>.js` —— 新部署后这个 chunk 已不存在，
+   实测返回 **404 且 body 是 HTML**（`curl` 验证过），被当模块解析必然失败；
+3. → 整页不水合，变成一张**服务端渲染出来的死图**；
+4. 🔑 **自己好不了**：注册 / 更新 SW 的代码写在 `__root.tsx` 的 `useEffect` 里，
+   不水合就永远执行不到 → 那份坏壳一直发下去。灭火器锁在了着火的屋子里。
+
+### 改动
+- `src/routes/__root.tsx` —— 新增 **水合看门狗**（`HYDRATION_WATCHDOG`），
+  内联普通 script 写进 `<head>`，**刻意不放进 React**（它救的正是 React 没跑起来）。
+  触发后：注销所有 SW + 清空所有 cache + 刷新一次。两条触发路径：
+  ① 水合**之前**同源 `<script>` 加载失败（就是旧 chunk 404 那一下）；
+  ② 兜底轮询：`readyState === complete` 且仍未水合。
+  三道守卫防误伤：水合成功后一律不动（否则会打断正在上传的识别）、
+  第三方脚本失败不算、`sessionStorage` 打点保证一个会话只自愈一次（杜绝刷新循环）。
+  `RootComponent` 的 effect 里打 `window.__PP_HYDRATED__ = true` 作为存活信号。
+- `public/sw.js` —— `CACHE_NAME` v5 → **v6**（activate 会整个删掉旧缓存，这是把线上
+  已经卡住的用户捞回来的路径：页面虽不水合，浏览器每次导航仍会自己重拉 sw.js）；
+  预缓存里**移除 `/` 和 `/explore`** —— install 时抓的 HTML 壳下次部署后必然过期，
+  而它恰好是断网兜底最先端出来的那一份。
+
+### 实测（本地 dev，未登录）
+- 健康页面等 26s：不刷新、不自愈（`navType: navigate`、打点为 null）✅
+- 水合**之后**制造同源 chunk 404：不触发（新守卫生效）✅
+- 临时注释掉水合信号模拟死页：自愈触发 —— 打点已写、埋进去的假缓存被清空、
+  自动 reload 一次、60s 守卫挡住了循环 ✅
+- 手机视口（375×812）汉堡菜单点开正常 ✅
+- tsc=0；eslint：sw.js 报错数 10 → 9（未引入新问题，剩下的是历史 prettier 债）
+
+### ⚠️ 未修（另一条，独立）
+**匿名用户的识别仍走同步老路** `quickIdentifyDraft`（`camera-identify.tsx:646`）。
+登录用户 07-29 已搬进队列，正是为了绕开 Cloudflare 边缘 **100 秒**上限；
+匿名这条被留在原地，识别一慢就必然「Load failed」。代码里自己的注释已经写明这个上限。
+要修需要让队列接受匿名任务（无 userId 的 job + 无动态流的轮询）。
+
+### ⚠️ 状态
+**未部署。** 改动只在本地；线上用户手机上那份坏壳要等这次部署 + SW 升到 v6 才会被清掉。
+
+---
+
+## 2026-08-03（续）— 匿名识别搬进队列 + 未登录同时最多 2 条
+
+### 起因
+上一节收尾时留的那条：匿名用户的识别仍走同步 `quickIdentifyDraft`，整条链挂在一个
+HTTP 请求上 → 必撞 Cloudflare 边缘 100 秒上限。登录用户 07-29 就搬走了，匿名被留在原地。
+用户拍板：**队列接受匿名任务，但未登录最多两条。**
+
+### 设计（三个关口，都在服务端）
+1. **谁是领主** —— 新增 `optionalSupabaseAuth`（`integrations/supabase/auth-optional.ts`）：
+   有 Authorization 就必须验得过（无效令牌照抛，不静默降级成匿名），没有则 `userId=null`。
+   底线与 `requireSupabaseAuth` 一致：**userId 只来自服务端验过的令牌**，前端传的 id 一概不认。
+   匿名的领主 = 浏览器本地取件号（`lib/anon-id.ts`，随机 uuid 存 localStorage）
+   加 `anon:` 前缀（`background-jobs.ts`）—— 前缀是隔离带：与真实用户 uuid 永不相交，
+   于是 `readJob(id, owner)` 那条既有的归属校验一行都不用改。
+2. **上限** —— `countActiveJobs(owner, kind)` 数该领主名下 `running && !isJobStale` 的任务，
+   `ANON_MAX_ACTIVE_JOBS = 2`。**卡在传图之前**：先上传后拒绝的话，那几 MB 的图白传、还留垃圾文件。
+3. **动态流让路** —— `task_feed.user_id` 是 uuid not null，匿名领主一律折成 null
+   （`isAnonOwner`），`upsertTaskFeed` 见 null 即返回。`adoptFeedDraft` / `feedFinish` 同样跳过。
+   不这么做的话每次写库都报类型错、又被 try/catch 吞掉：日志刷屏、功能为零。
+
+### 改动文件
+- 新增 `integrations/supabase/auth-optional.ts`（`auth-middleware.ts` 顶上写着「自动生成勿编辑」，故另起）
+- 新增 `lib/anon-id.ts`
+- `lib/background-jobs.ts` —— `ANON_OWNER_PREFIX` / `anonOwner` / `isAnonOwner` /
+  `ANON_MAX_ACTIVE_JOBS` / `countActiveJobs`（走 jsonb 过滤 `value->>userId`，失败退回全扫）
+- `lib/identify-plant.functions.ts` —— `SubmitInput` 加 `anon_id`；
+  `startQuickIdentifyFn` / `pollJobFn` / `cancelJobFn` 换 `optionalSupabaseAuth` 并接受取件号；
+  `runQueuedJob` 的动态流写入按 `feedOwner` 判空；`quickIdentifyDraft` 的注释改成实话
+  （**前端已不再调用**，只留作脚本/手工重放的同步入口）
+- `lib/poll-job.ts` —— `awaitJob` 的 opts 加 `anonId`，透传给 `pollJobFn`
+- `components/camera-identify.tsx` —— 删掉「登录走队列 / 匿名走同步」的分叉，一律走队列；
+  未登录时带取件号；页面上提前写明「未登录最多同时排 2 条 + 登录入口」
+
+### 实测
+- `scratch/probe_anon_job_cap.mjs`（真库，自带清理）：jsonb 过滤 `value->>userId` ✅ 可用；
+  只数 running（done 不占名额）✅；不串别人的任务 ✅
+- `scratch/probe_anon_job_owner.mjs --seed` + 浏览器实调 `pollJobFn`：
+  正确取件号 → `found:true`（phase/progress 都对）；别人的取件号 → `found:false`；
+  什么都不带 → `found:false` ✅（取件号猜不中就翻不到别人的任务）
+- 浏览器实调 `startQuickIdentifyFn`：满额取件号 → 原文报「未登录状态下最多同时排 2 条
+  识别任务（当前已有 2 条在跑）…」且**照片没有被上传**；不带取件号 → 报「无法认领这次识别任务」✅
+- 未登录识别页渲染出提示行、登录链接指向 `/login` ✅
+- tsc=0；eslint 我的改动范围内 0 报错（该文件另有 4 条 prettier 是上一轮未提交改动留下的）
+- 探针行已全部删除，库里残留 0 条
+
+### ⚠️ 没做 / 已知边界
+- **没跑过真照片的端到端匿名识别**（要花 AI 额度、并在生产库落一份真草稿 + 存储文件）。
+  周边全验了，但「匿名 → 真出草稿」这一趟本身还没实跑。
+- 取件号清掉浏览器存储就会重置 → 上限只防手滑连点，**不是防刷**。真要防刷得靠 IP/Turnstile。
+- 匿名没有动态流，识别中途关掉标签页就**看不到结果了**（草稿照样会生成，只是没入口找回）。
+  登录用户靠小P蛙的通知接回。要补的话是另一件事。
+
+### ⚠️ 状态
+**未部署。** 与上一节的水合看门狗 + SW v6 一起等一次部署。
+
+### ✅ 已部署
+`b1b69435-b3cb-41ae-8f2a-46566c5a9ad9`（2026-08-03，plantspedia.club / www）。
+本次一并推上线**两批**：水合看门狗 + SW v6（未登录「功能全消失」的根治），
+以及匿名识别进队列 + 未登录同时最多 2 条。
+⚠️ 构建打包整个工作区，所以此前未提交的「正名统一（A→B→C）」代码改动**也一并上线了**
+（用户 2026-08-03 明确同意一起部署）；那条链路的 `--apply` 回填脚本仍未执行。
+
+线上实测（未登录、手机视口 375×812）：
+- 看门狗已在 SSR HTML 里，页面正常水合、未误触发自愈（`healMarker` 为 null）
+- **旧的 v5 缓存已被新 SW 删除**（`caches` 只剩 `plantspedia-cache-v6`）—— 这正是把
+  已经卡住的手机捞回来的那条路：页面虽不水合，浏览器每次导航仍会自己重拉 sw.js
+- 首页正常出内容、汉堡菜单点开正常、/identify 显示「未登录最多同时排 2 条」提示
+- 部署后头几秒裸 URL 仍返回旧 HTML（传播延迟，非边缘缓存）；之后三次连测均为新版
