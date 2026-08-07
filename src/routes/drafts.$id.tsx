@@ -52,6 +52,7 @@ import {
   fuzzCoord,
 } from "@/lib/protected-coords";
 import { keepVisualAdvice } from "@/lib/retake-advice";
+import { freshPhotoUrl } from "@/lib/fresh-photo";
 import { LeafIcon } from "@/components/leaf-panel";
 import { SafeImg } from "@/components/safe-img";
 import { TagPicker } from "@/components/tag-picker";
@@ -187,7 +188,9 @@ function DraftPage() {
   const { id } = Route.useParams();
   const navigate = useNavigate();
   const qc = useQueryClient();
-  const { user } = useAuth();
+  // authLoading 是给自动出卡用的：整页加载时登录态要晚一拍才定下来，出卡不能抢在它前面。
+  // 见下面 CARD_WAIT_MS 那一段。
+  const { user, loading: authLoading } = useAuth();
   const approveFn = useServerFn(approvePlantDraft);
   const rejectFn = useServerFn(rejectPlantDraft);
   const saveDraftHtml = useServerFn(saveDraftHtmlContentFn);
@@ -280,6 +283,9 @@ function DraftPage() {
     retakeCount: number;
     /** 画这张卡时草稿的 updated_at，用来发现「卡画完之后草稿又变了」。 */
     stamp: string;
+    /** 画这张卡时用到的叶章数（铜/银/金）。等不及叶子统计就先出卡时它是空的，
+     *  统计到了再据此重画一次 —— 见下面的重画 effect 与 leafKey。 */
+    leavesKey: string;
   } | null>(null);
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const editorRef = useRef<HtmlDocEditorHandle>(null);
@@ -290,6 +296,27 @@ function DraftPage() {
     // SSR loader 已经取过一次（供分享 og:*），拿来当初值：省掉首屏再抓一次 + 空屏闪烁。
     // 读不到时 loader 回 null → 传 undefined，让 useQuery 照常用带登录态的 client 再抓一遍。
     initialData: Route.useLoaderData() ?? undefined,
+    // ⚠️ 这两行是「补拍结果自己倒回去」的正面解药（2026-08-06 实库取证，见 STATE.md）。
+    //
+    // 这一页的数据**会在页面之外被改**：补拍是在 /identify 跑的，跑完把新一轮结果合并回
+    // 同一份草稿。而全局默认是 staleTime 5min + 关掉 focus/reconnect 回查（router.tsx），
+    // 再叠上 `initialData` 没有 initialDataUpdatedAt —— 不管 loader 那份快照多旧，落进
+    // 缓存那一刻都被盖上「此刻新鲜」的戳。于是拿到一份快照之后，客户端 5 分钟内**一次都
+    // 不回查**：A/B 实测（queryFn 里打点）——旧配置下「首屏」和「离开再返回」两处 queryFn
+    // 都一次没跑过；加上下面三行之后两处都跑了。
+    // ⚠️ 量它别用 Resource Timing（`performance.getEntriesByType("resource")`）：
+    // supabase-js 的请求不进那张表，会得出「一个请求都没有」的假象。要在 queryFn 里打点。
+    //
+    // 后果不止是显示旧物种：页面上「去补拍」那个按钮的链接（retake 计数 + 物种名）就是按
+    // 这份快照拼的，点下去等于拿旧结论去带偏新一轮识别 —— 库里真的会被改回去。
+    //
+    // 所以这一份查询单独破例：SSR/loader 的快照照常秒显（不闪空屏），但**每次挂载必回查**
+    // 一次真库。代价是一条按主键读的行查询。
+    staleTime: 0,
+    refetchOnMount: "always",
+    // 从别的 App / 标签页切回来也算「刚才可能发生过别的事」—— 补拍完锁屏、过一会儿再回到
+    // 这一页，是这条链路上很常见的用法。
+    refetchOnWindowFocus: true,
   });
 
   // Query the draft creator's profile to get their avatar
@@ -311,6 +338,8 @@ function DraftPage() {
     queryFn: () => computeLeaves(user!.id, user!.email),
   });
   const goldAvailable = leaves?.goldAvailable ?? 0;
+  /** 卡面上印的那三个数字的指纹。空串 = 出卡时还没拿到统计。 */
+  const leafKey = leaves ? `${leaves.bronze}/${leaves.silver}/${leaves.gold}` : "";
 
   // Discoverer = the person who TOOK the photo (the draft's creator_label), NOT
   // whoever happens to be clicking「生成分享卡」. An editor/admin generating a card
@@ -902,7 +931,11 @@ function DraftPage() {
         lng: cardGeo.lng,
         coordsFuzzed: cardGeo.fuzzed,
         summary: draft.summary || draft.ai_payload?.summary_zh,
-        photoUrl: draft.photo_url,
+        // 刚识别完这一次，照片的字节还在内存里（相机页跳转前留下的），直接画它 ——
+        // 否则要把刚上传上去的同一张图再从云端下载一遍，而存储对象是 no-cache 的，
+        // 每次都真跑一趟网络。拿不到就照常用云端地址（刷新过、或事后手动出卡）。
+        photoUrl: freshPhotoUrl(id) ?? draft.photo_url,
+        photoUrlFallback: draft.photo_url,
         discovererName,
         discovererAvatar: avatarUrl,
         // 名录卡签（重点保护 / 地区名录 / tag…）**故意不传给识别分享卡**：卡签是按物种匹配
@@ -926,6 +959,7 @@ function DraftPage() {
         tentative,
         retakeCount,
         stamp: draftStamp(draft),
+        leavesKey: leafKey,
       });
       setCardUrl((prev) => {
         if (prev) URL.revokeObjectURL(prev);
@@ -1083,13 +1117,17 @@ function DraftPage() {
     }
   };
 
-  // Trigger the in-place HTML editor's save from a prominent top-level button
-  // (the editor's own save sits far below the full-height editing surface).
+  // Trigger the in-place HTML editor's save. 编辑器本身已经没有保存按钮了 ——
+  // 这个顶栏按钮就是草稿正文唯一的提交入口。
   const onSaveEdits = async () => {
     if (!editorRef.current) return;
     setSavingEdits(true);
     try {
-      await editorRef.current.save();
+      // 成功的提示由 handleHtmlSaved 落库后发（"草稿已成功保存并更新"），这里只补
+      // 「压根没改动」这一种它覆盖不到的情况，避免同一次点击弹两条。
+      if (!(await editorRef.current.save())) toast.info("正文没有改动，无需保存");
+    } catch (err) {
+      toast.error("保存失败：" + (err as Error).message);
     } finally {
       setSavingEdits(false);
     }
@@ -1126,6 +1164,29 @@ function DraftPage() {
   // camera flow stamps a sessionStorage flag with the new draft id; we consume it
   // once, waiting until the draft (and, for signed-in users, their leaf stats) have
   // loaded so the card carries the right +N / totals.
+  //
+  // ⏱ 出卡前要等两件事，但**两件都不许死等**，共用下面这一个上限。
+  //
+  // ① 登录态（authLoading）。整页加载时 AuthProvider 是在 effect 里恢复会话的，而子组件的
+  //    effect 比父组件先跑 —— 也就是说**首帧这里的 `user` 必然是 null**。不等它就出卡，
+  //    卡面会按访客画：三个叶章数是空的。而这条路最常走的恰恰是
+  //    「访客点卡上的登录 → 登录后回来领铜叶」：login.tsx 用的是 `window.location.href`
+  //    （整页重载），所以每次都会踩中，用户登录后看到的还是一张没有叶章数的卡。
+  //
+  // ② 叶子统计（leaves）。原来是死等（`if (user && !leaves) return`），于是：
+  //    · computeLeaves 是 7 条并发查询（其中一条拉该用户全部草稿行），慢网上就是白等；
+  //    · 它要是**失败**了，React Query 默认重试 3 次（约 7 秒退避）后 leaves 永远是
+  //      undefined —— 那个 return 就永久生效，卡**再也不弹**。用户 2026-08-06 报的
+  //      「有时候停在已完成界面很久、不弹分享卡」就是这两条。
+  //
+  // 到点还没齐就先把卡画出来，数字后到再重画一次（见下面按 leavesKey 重画的 effect）。
+  // 正常情况下根本用不到这个上限：有缓存会话时登录态在下一拍就定了，叶子统计也就几百毫秒。
+  const CARD_WAIT_MS = 2000;
+  const [cardWaitOver, setCardWaitOver] = useState(false);
+  useEffect(() => {
+    const t = setTimeout(() => setCardWaitOver(true), CARD_WAIT_MS);
+    return () => clearTimeout(t);
+  }, []);
   const autoCardFiredRef = useRef(false);
   useEffect(() => {
     if (autoCardFiredRef.current || !draft) return;
@@ -1134,13 +1195,14 @@ function DraftPage() {
         ? sessionStorage.getItem("plantspedia:justIdentified")
         : null;
     if (flag !== id) return;
-    if (user && !leaves) return; // wait for stats before rendering
+    if (authLoading && !cardWaitOver) return; // 等登录态定下来（否则卡上缺叶章数）
+    if (user && !leaves && !cardWaitOver) return; // 再等叶子统计
     autoCardFiredRef.current = true;
     sessionStorage.removeItem("plantspedia:justIdentified");
     setCardAutoOpened(true);
     void onMakeCard({ silent: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [draft, leaves, user, id]);
+  }, [draft, leaves, cardWaitOver, authLoading, user, id]);
 
   /**
    * 卡还开着，草稿却变了 → 立刻按新数据重画。
@@ -1150,12 +1212,14 @@ function DraftPage() {
    * 任务一收尾草稿被刷新，卡面就与页面上其余部分对不上了 —— 用户 2026-07-30 看到的
    * 「卡上 9 颗星的草木樨状黄芪 + 底下写着疑似、第三次补拍」正是这个。
    */
+  // 叶章数同理：为了尽快出卡，可能是在统计还没到的时候画的（卡上那三个数字会缺）。
+  // 统计一到就补画一次，卡面数字与页面其余部分才对得上。
   useEffect(() => {
     if (!cardUrl || cardBusy || !draft || !cardSnap) return;
-    if (draftStamp(draft) === cardSnap.stamp) return;
+    if (draftStamp(draft) === cardSnap.stamp && leafKey === cardSnap.leavesKey) return;
     void onMakeCard({ silent: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [draft, cardUrl, cardBusy, cardSnap]);
+  }, [draft, cardUrl, cardBusy, cardSnap, leafKey]);
 
   const handleReplaceImage = async (url: string) => {
     if (replaceSlot == null || !draft?.html_content) return;
@@ -1793,7 +1857,6 @@ function DraftPage() {
                   ref={editorRef}
                   htmlUrl={editorHtmlUrl}
                   onSaved={handleHtmlSaved}
-                  persistImmediately={true}
                 />
               </div>
             ) : notEnriched /* 精简摘要卡草稿：正文与上方「简介摘要卡」重复，故不再重复渲染

@@ -13,6 +13,10 @@ import { slugify } from "@/lib/plants";
 import { IUCN_CATEGORIES } from "@/lib/catalogs";
 import { HtmlDocEditor, type HtmlDocEditorHandle, ImageSearchDialog } from "@/components/html-doc-editor";
 import { buildAssetLookupKeys, findLocalAssetRefs, rewriteLocalAssetPaths } from "@/components/plant-editor";
+import { checkNameFn } from "@/lib/name-authority.functions";
+import { alignFieldsToVerdict, needsReview, type NameVerdict } from "@/lib/name-authority";
+import { TagPicker } from "@/components/tag-picker";
+import { fetchAllTags, type TagWithCount } from "@/lib/tags";
 
 export const Route = createFileRoute("/_authenticated/admin/batch-new")({
   component: BatchNewPage,
@@ -31,9 +35,17 @@ type Item = {
   iucnStatus: string;
   habitat: string;
   summary: string;
+  /** 中文俗名 / 异名 / 别名，逗号分隔。名录核对命中的别名会自动并进来。 */
+  commonNamesZh: string;
   tags: string;
+  /** 手动挂的主题标签 #tag（存名字，创建时再换成 tag id 写 plant_tags）。 */
+  tagNames: string[];
   coverUrl: string;
   extracting: boolean;
+  /** 名录核对结论。null = 还没对过 / 对不上。 */
+  nameVerdict: NameVerdict | null;
+  /** 被名录改掉的原值，用于「撤回改名」和展示「X → Y」。 */
+  nameWas: { title: string; scientificName: string } | null;
   creating: boolean;
   createdId: string | null;
 };
@@ -45,6 +57,18 @@ function BatchNewPage() {
   const extractMeta = useServerFn(extractPlantMetaFn);
   const savePlant = useServerFn(savePlantFn);
   const uploadAsset = useServerFn(uploadAssetFn);
+  const checkName = useServerFn(checkNameFn);
+  /** 标签名 → id。TagPicker 给的是名字，savePlant 要的是 id。 */
+  const tagIdByName = useRef<Map<string, string>>(new Map());
+  const syncTagIndex = (tags: TagWithCount[]) => {
+    for (const t of tags) tagIdByName.current.set(t.name, t.id);
+  };
+  // 批量页可能一屏挂十几个 TagPicker，而它只在**首次点开**时才拉表。
+  // 先在这里拉一次填好 name→id 索引：否则用户选了标签却没点开过任何一个选择器的
+  // 那份列表时（比如从别的行选完直接创建），查不到 id，标签就静默丢了。
+  useEffect(() => {
+    fetchAllTags().then(syncTagIndex).catch(() => { /* 拉不到就退回「只存名字」，不挡上传 */ });
+  }, []);
   const fileRef = useRef<HTMLInputElement>(null);
   const folderRef = useRef<HTMLInputElement>(null);
   const [items, setItems] = useState<Item[]>([]);
@@ -205,9 +229,13 @@ function BatchNewPage() {
           iucnStatus: "",
           habitat: "",
           summary: "",
+          commonNamesZh: "",
           tags: "",
+          tagNames: [],
           coverUrl: "",
           extracting: true,
+          nameVerdict: null,
+          nameWas: null,
           creating: false,
           createdId: null,
         });
@@ -252,14 +280,39 @@ function BatchNewPage() {
         toast.error("请选择 .html 文件，或拖入包含 HTML 与图片的文件夹");
         return;
       }
-      const idx = indexImageFiles(imageFiles);
-      // Pre-parse every HTML to resolve refs against the user's selection.
+      // 🔴 **按物种文件夹分组解析，不能只建一个全局索引。**
+      // 一次 ⌘ 多选 5 个物种文件夹时，每个文件夹里往往都有 `images/cover.jpg`、`1.jpg`
+      // 这种同名图 —— 全局索引是按文件名建键的，后写的会覆盖先写的，于是 A 物种的正文
+      // 匹配到 B 物种的照片，而且**不报错**（refs 都「找到」了），发布出去才发现配图串了。
+      // 现在：先按 webkitRelativePath 的顶层目录分组，各自建索引各自解析；
+      // 只有本组里确实找不到时，才退回全局池（HTML 与图片被分散选中的情况）。
+      const topDir = (f: File) => {
+        const rel = ((f as File & { webkitRelativePath?: string }).webkitRelativePath || "").replace(/\\/g, "/");
+        return rel.includes("/") ? rel.split("/")[0] : "";
+      };
+      const globalIdx = indexImageFiles(imageFiles);
+      const idxByDir = new Map<string, Map<string, File>>();
+      for (const f of imageFiles) {
+        const d = topDir(f);
+        const list = idxByDir.get(d);
+        if (list) continue; // 建过了
+        idxByDir.set(d, indexImageFiles(imageFiles.filter((g) => topDir(g) === d)));
+      }
+      const folderCount = new Set(files.map(topDir).filter(Boolean)).size;
+      // Pre-parse every HTML to resolve refs against its OWN folder first.
       const parsed: { file: File; text: string; matched: Map<string, File>; missing: string[] }[] = [];
       for (const f of htmlFiles) {
         const text = await f.text();
         const refs = findLocalAssetRefs(text);
-        const { matched, missing } = resolveRefs(refs, idx);
-        parsed.push({ file: f, text, matched, missing });
+        const own = idxByDir.get(topDir(f));
+        const first = own ? resolveRefs(refs, own) : { matched: new Map<string, File>(), missing: refs };
+        // 本组没命中的，再去全局池碰一次运气。
+        const fallback = first.missing.length ? resolveRefs(first.missing, globalIdx) : { matched: new Map<string, File>(), missing: [] as string[] };
+        const matched = new Map([...first.matched, ...fallback.matched]);
+        parsed.push({ file: f, text, matched, missing: fallback.missing });
+      }
+      if (folderCount > 1) {
+        toast.info(`已识别 ${folderCount} 个文件夹、${htmlFiles.length} 份 HTML —— 配图按各自文件夹分别匹配`);
       }
       const totalMissing = parsed.reduce((n, p) => n + p.missing.length, 0);
       if (totalMissing > 0) {
@@ -386,14 +439,57 @@ function BatchNewPage() {
       }
       const tagsArr = Array.isArray(meta.tags) ? meta.tags.map((t) => String(t).trim()).filter(Boolean) : [];
       const titleStr = typeof meta.title === "string" && meta.title.trim() ? meta.title.trim() : "";
-      const slugStr = (typeof meta.slug === "string" && meta.slug.trim()) || sci;
+      const zhNames = typeof meta.common_names_zh === "string" ? meta.common_names_zh.trim() : "";
+
+      // ── 名录核对：正名 / 异名 / 别名 ──────────────────────────────────────
+      // 纯查表（species_names，12 万行），**不烧模型**，所以每份都对，不设开关。
+      //
+      // 这里**自动改名**（与 plant-editor 的「只提示不改」刻意相反）：那边的名字是
+      // 编辑亲手敲的，改人家写的字要经同意；这边的名字是模型从 HTML 里读出来的，
+      // 模型没有署名权，对齐名录是本分。ambiguous / unmatched 一个字都不动。
+      // applySynonym 打开 —— 「学名是异名、名录已改用新正名」正是这条路要治的情形。
+      const fields = {
+        title: titleStr || null,
+        scientific_name: sci || null,
+        family: rawFamily || null,
+        genus: rawGenus || null,
+        common_names_zh: zhNames || null,
+      };
+      const was = { title: titleStr, scientificName: sci };
+      let verdict: NameVerdict | null = null;
+      try {
+        verdict = await checkName({
+          data: {
+            title: fields.title,
+            scientificName: fields.scientific_name,
+            family: fields.family,
+            genus: fields.genus,
+            commonNamesZh: fields.common_names_zh,
+          },
+        });
+        // ambiguous / latin-fuzzy 命中不可靠 —— 只标注待核，绝不自动改写。
+        if (!needsReview(verdict)) alignFieldsToVerdict(fields, verdict, { applySynonym: true });
+      } catch {
+        /* 核对服务挂了不能挡住录入，保持模型给的名字 */
+      }
+      const renamed =
+        !!verdict &&
+        (fields.title !== (was.title || null) || fields.scientific_name !== (was.scientificName || null));
+
+      // Slug 跟着最终学名走 —— 改了正名还留着旧学名的 slug，URL 会长期指向一个
+      // 名录里已经不存在的名字。
+      const slugStr =
+        (typeof meta.slug === "string" && meta.slug.trim() && !renamed && meta.slug.trim()) ||
+        fields.scientific_name ||
+        sci;
       const cleanedSlug = slugStr ? slugify(slugStr) : "";
       updateItem(key, {
         slug: cleanedSlug && !cleanedSlug.startsWith("p-") ? cleanedSlug : "",
-        scientificName: sci,
+        scientificName: fields.scientific_name ?? "",
         commonNameEn: typeof meta.common_name_en === "string" ? meta.common_name_en.trim() : "",
-        family: rawFamily,
-        genus: rawGenus,
+        family: fields.family ?? "",
+        genus: fields.genus ?? "",
+        commonNamesZh: fields.common_names_zh ?? "",
         habitat: typeof meta.habitat === "string" ? meta.habitat.trim() : "",
         summary: typeof meta.summary === "string" ? meta.summary.trim() : "",
         tags: tagsArr.join(", "),
@@ -403,8 +499,10 @@ function BatchNewPage() {
             ? (meta.iucn_status as string).trim().toUpperCase()
             : "",
         extracting: false,
+        nameVerdict: verdict,
+        nameWas: renamed ? was : null,
       });
-      if (titleStr) updateItem(key, { title: titleStr });
+      if (fields.title) updateItem(key, { title: fields.title });
       // Auto-populate cover with the first <img> from the uploaded HTML so the
       // editor can immediately edit/replace it instead of starting from "no file chosen".
       try {
@@ -426,16 +524,23 @@ function BatchNewPage() {
     setSavingAll(true);
     let ok = 0;
     let fail = 0;
+    // save() 现在会抛错，返回 null 表示「这份没动过」——没动过不是失败，不该计入。
+    let untouched = 0;
     for (const it of items) {
       const handle = editorRefs.current.get(it.key);
       if (!handle) continue;
-      const r = await handle.save();
-      if (r) ok++;
-      else fail++;
+      try {
+        if (await handle.save()) ok++;
+        else untouched++;
+      } catch (err) {
+        console.error("batch html save failed", it.fileName, err);
+        fail++;
+      }
     }
     setSavingAll(false);
     if (fail) toast.error(`完成 ${ok} 个，失败 ${fail} 个`);
-    else toast.success(`已应用 ${ok} 个 HTML 修改`);
+    else if (ok) toast.success(`已应用 ${ok} 个 HTML 修改`);
+    else toast.info(`${untouched} 份正文都没有改动，无需保存`);
   };
 
   const firstImageFromHtml = async (url: string): Promise<string | null> => {
@@ -469,6 +574,7 @@ function BatchNewPage() {
             slug: it.slug.trim() || slugify(it.title) || `p-${Date.now()}`,
             scientific_name: it.scientificName.trim() || null,
             common_name_en: it.commonNameEn.trim() || null,
+            common_names_zh: it.commonNamesZh.trim() || null,
             family: it.family.trim() || null,
             genus: it.genus.trim() || null,
             iucn_status: it.iucnStatus || null,
@@ -484,6 +590,11 @@ function BatchNewPage() {
           },
           editorName,
           editSummary: `${editorName} 通过批量上传创建条目「${it.title.trim()}」（HTML）`,
+          // 手动挂的 #tag → plant_tags。查不到 id 的（索引没拉到）静默跳过，
+          // 不能因为一个标签让整条录入失败。
+          tagIdsToAdd: it.tagNames
+            .map((n) => tagIdByName.current.get(n))
+            .filter((id): id is string => !!id),
         }
       });
       return { ok: true, msg: saveRes.plantId };
@@ -554,7 +665,7 @@ function BatchNewPage() {
               disabled={uploading}
               className="border border-ink px-4 py-2 hover:bg-ink hover:text-background transition-colors disabled:opacity-60 text-sm bg-transparent text-ink"
             >
-              {uploading ? "上传中…" : "+ 选择包含图片的文件夹"}
+              {uploading ? "上传中…" : "+ 选择文件夹（可 ⌘ 多选）"}
             </button>
             <input
               ref={fileRef}
@@ -599,6 +710,10 @@ function BatchNewPage() {
               </p>
               <p className="text-sm max-w-xl mx-auto leading-relaxed px-4 text-ink-faint">
                 当你的页面有本地配图时，请拖入文件夹；或通过下方按钮点击选择上传。
+                <br />
+                <b className="text-ink-soft">一次录入多个物种</b>：在文件夹选择框里按住 ⌘（或 Shift）
+                勾选多个物种文件夹，也可以把多个文件夹一起拖进来。
+                每个文件夹的配图只在**它自己**的正文里匹配，不会串到别的物种上。
               </p>
               <div className="flex flex-wrap justify-center gap-3 mt-3">
                 <button
@@ -687,6 +802,7 @@ function BatchNewPage() {
                     onUpdate={(p) => updateItem(it.key, p)}
                     onRemove={() => removeItem(it.key)}
                     onReExtract={() => { updateItem(it.key, { extracting: true }); runExtract(it.key, it.htmlUrl); }}
+                    onTagsLoaded={syncTagIndex}
                   />
                 ))}
               </div>
@@ -743,6 +859,88 @@ function BulkButtons({
   );
 }
 
+/**
+ * 名录核对结论条。四种状态四种口气：
+ *  · 已改名（renamed / synonym 且真的动了字）→ 朱红，写清「X → Y」，给一个撤回按钮；
+ *  · 待人工核对（ambiguous / latin-fuzzy）→ 琥珀，**没有自动改**，请编辑自己定；
+ *  · 名录里没有（unmatched）→ 灰，只说明，不是错；
+ *  · 与名录一致（accepted）→ 绿，一行带过。
+ * 别名单独列出来 —— 「异名」有权威依据、「别名」是民间叫法，这个区分不能糊在一起。
+ */
+function NameCheckNote({
+  item,
+  onUpdate,
+}: {
+  item: Item;
+  onUpdate: (p: Partial<Item>) => void;
+}) {
+  const v = item.nameVerdict!;
+  const review = needsReview(v);
+  const renamed = !!item.nameWas;
+  const tone = renamed
+    ? "border-vermilion/60 bg-vermilion/5 text-ink"
+    : review
+      ? "border-amber-500/60 bg-amber-500/5 text-ink"
+      : v.status === "accepted"
+        ? "border-emerald-600/50 bg-emerald-600/5 text-ink-soft"
+        : "border-rule bg-paper-deep/30 text-ink-faint";
+  const groups = new Map<string, string[]>();
+  for (const a of v.aliases) {
+    const g = groups.get(a.kind);
+    if (g) g.push(a.name);
+    else groups.set(a.kind, [a.name]);
+  }
+  return (
+    <div className={`col-span-2 border ${tone} px-2 py-1.5 text-[11px] leading-relaxed`}>
+      <div className="flex items-start justify-between gap-2">
+        <span className="font-semibold">
+          {renamed
+            ? "已按《中国植物物种名录 2026》改为正名"
+            : review
+              ? "名录对不上唯一一条 —— 未自动改名，请人工核对"
+              : v.status === "accepted"
+                ? "与 2026 名录一致"
+                : "名录里查无此名（境外种 / 新拟名？）—— 未改动"}
+        </span>
+        {renamed && (
+          <button
+            type="button"
+            onClick={() =>
+              onUpdate({
+                title: item.nameWas!.title,
+                scientificName: item.nameWas!.scientificName,
+                nameWas: null,
+              })
+            }
+            className="shrink-0 underline hover:text-vermilion"
+            title="改回 AI 从原 HTML 里读出的名字"
+          >
+            撤回改名
+          </button>
+        )}
+      </div>
+      {renamed && (
+        <div className="mt-0.5 font-mono">
+          {item.nameWas!.title || "—"} <i>{item.nameWas!.scientificName}</i>
+          {" → "}
+          <b className="text-vermilion">{item.title}</b> <i>{item.scientificName}</i>
+        </div>
+      )}
+      {groups.size > 0 && (
+        <div className="mt-0.5">
+          {[...groups.entries()].map(([k, names]) => (
+            <span key={k} className="mr-2">
+              <span className="text-ink-faint">{k}：</span>
+              {names.join("、")}
+            </span>
+          ))}
+        </div>
+      )}
+      {v.note && <div className="mt-0.5 text-ink-faint">{v.note}</div>}
+    </div>
+  );
+}
+
 function BatchCard({
   item,
   compact,
@@ -750,6 +948,7 @@ function BatchCard({
   onUpdate,
   onRemove,
   onReExtract,
+  onTagsLoaded,
 }: {
   item: Item;
   compact: boolean;
@@ -757,6 +956,7 @@ function BatchCard({
   onUpdate: (p: Partial<Item>) => void;
   onRemove: () => void;
   onReExtract: () => void;
+  onTagsLoaded: (tags: TagWithCount[]) => void;
 }) {
   const inputCls =
     "w-full border border-ink px-2 py-1 bg-transparent text-xs focus:outline-none focus:border-vermilion";
@@ -872,6 +1072,7 @@ function BatchCard({
           <span className="label text-[10px]">学名</span>
           <input value={item.scientificName} onChange={(e) => onUpdate({ scientificName: e.target.value })} className={inputCls} />
         </label>
+        {item.nameVerdict && <NameCheckNote item={item} onUpdate={onUpdate} />}
         <label>
           <span className="label text-[10px]">科 Family</span>
           <input value={item.family} onChange={(e) => onUpdate({ family: e.target.value })} className={inputCls} />
@@ -898,9 +1099,31 @@ function BatchCard({
           <input value={item.habitat} onChange={(e) => onUpdate({ habitat: e.target.value })} className={inputCls} />
         </label>
         <label className="col-span-2">
-          <span className="label text-[10px]">标签</span>
+          <span className="label text-[10px]">中文俗名 / 异名 · 别名</span>
+          <input
+            value={item.commonNamesZh}
+            onChange={(e) => onUpdate({ commonNamesZh: e.target.value })}
+            className={inputCls}
+            placeholder="名录核对命中的异名 / 别名会自动填在这里，逗号分隔"
+          />
+        </label>
+        <label className="col-span-2">
+          <span className="label text-[10px]">特征词（进搜索与卡签，不建专题）</span>
           <input value={item.tags} onChange={(e) => onUpdate({ tags: e.target.value })} className={inputCls} />
         </label>
+        {/* 主题标签 #tag —— 与上面那栏「特征词」不是一回事：这一栏决定条目出现在
+            哪些 /tags 专题页，且**只能从已建好的标签里选**（自由输入会长出
+            「盐生植物 / 盐生 / 耐盐植物」三个各挂两条的僵尸标签，专题页就废了）。 */}
+        <div className="col-span-2 border border-rule p-2 bg-paper-deep/20">
+          <p className="label text-[10px] mb-1.5">主题标签 #tag（决定进哪些专题页）</p>
+          <TagPicker
+            allowCreate
+            compact
+            value={item.tagNames}
+            onTagsLoaded={onTagsLoaded}
+            onChange={(names) => onUpdate({ tagNames: names })}
+          />
+        </div>
         <label className="col-span-2">
           <span className="label text-[10px]">Slug</span>
           <input value={item.slug} onChange={(e) => onUpdate({ slug: e.target.value })} className={inputCls} placeholder="自动生成" />
@@ -1005,7 +1228,6 @@ function BatchCard({
             ref={setEditorRef}
             htmlUrl={item.htmlUrl}
             plantId={item.createdId}
-            persistImmediately={false}
             onSaved={(newUrl) => onUpdate({ htmlUrl: newUrl })}
           />
         </div>

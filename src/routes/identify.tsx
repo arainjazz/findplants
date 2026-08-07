@@ -6,7 +6,7 @@ import { SiteHeader, SiteFooter } from "@/components/site-header";
 import { CameraIdentify } from "@/components/camera-identify";
 import { ModelQueueConsole } from "@/components/model-queue-console";
 import { DraftCard } from "@/components/draft-card";
-import { fetchPendingDrafts } from "@/lib/drafts";
+import { fetchDraftById, fetchPendingDrafts } from "@/lib/drafts";
 import { checkKeyHealthFn, type KeyHealth } from "@/lib/key-health.functions";
 import { displayPlace } from "@/lib/editor-stats";
 import { useAuth } from "@/hooks/use-auth";
@@ -785,9 +785,35 @@ function AdminModelPanel() {
 function IdentifyPage() {
   const { user } = useAuth();
   const { retake, st, ss, nmp, md, pick } = Route.useSearch();
+
+  // ── 补拍横幅上的物种名与「第几次补拍」，以草稿行为准，不以 URL 为准 ─────────────
+  //
+  // URL 里那三个参数（retake / st / ss）是草稿页拼链接**那一刻**的快照。用户从历史里回到
+  // 上一条补拍 URL（很常见：看完银叶页连按两次返回），横幅就会理直气壮地写着上上轮的物种、
+  // 上上轮的次数 —— 用户 2026-08-06 报的「卡又变回疑似高大一枝黄花」就有这一环。
+  // 服务端已经不信这些值了（见 identify-plant.functions.ts 的补拍上下文覆盖），
+  // 这里把**显示**也拉回同一个事实源，免得页面说的和真正会发生的事不一致。
+  //
+  // 复用 ["draft", md] 这个 key：草稿页用的就是它，且已配成每次挂载必回查。
+  const { data: mergeTarget } = useQuery({
+    queryKey: ["draft", md ?? ""],
+    queryFn: () => fetchDraftById(md!),
+    enabled: !!md,
+    staleTime: 0,
+    refetchOnMount: "always",
+  });
+
   const retakeCtx =
     retake && retake > 0
-      ? { count: retake, title: st, sci: ss, advice: nmp, mergeDraftId: md, pick: pick === 1 }
+      ? {
+          count: mergeTarget ? (mergeTarget.retake_count ?? 0) + 1 : retake,
+          title: mergeTarget?.title ?? st,
+          sci: mergeTarget?.scientific_name ?? ss,
+          // 补拍建议同理：草稿里那份是最新一轮识别写下的，URL 里那份可能是上上轮的。
+          advice: mergeTarget?.ai_payload?.needs_more_photos_zh ?? nmp,
+          mergeDraftId: md,
+          pick: pick === 1,
+        }
       : null;
 
   const { data: role = null } = useQuery({

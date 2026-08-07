@@ -603,3 +603,88 @@ export function formatFamily(v: NameVerdict): string {
 export function needsReview(v: NameVerdict): boolean {
   return v.status === "ambiguous" || v.matchedBy === "latin-fuzzy";
 }
+
+// ── 按判定改写字段（纯函数，客户端也能用）────────────────────────────────────
+
+/** 一份内容里与名字有关的字段。识别草稿的 AiMeta、金叶的 VerifiedFacts、
+ *  编辑提交的表单都能塞进这个形状。 */
+export type NamedFields = {
+  title?: string | null;
+  scientific_name?: string | null;
+  family?: string | null;
+  genus?: string | null;
+  common_names_zh?: string | null;
+};
+
+/**
+ * **把字段就地对齐到名录正名**，返回是否真的改了东西。
+ *
+ * 从 `applyNameAuthority`（服务端）里抽出来的纯逻辑 —— 批量录入页要在**浏览器里**
+ * 拿 `checkNameFn` 的结论直接改表单，不能把服务端那半也拖进来。两边共用这一份，
+ * 「保留命名人」这类判据只有一处实现。
+ *
+ * 改写规则：
+ *  · `accepted` / `renamed` → 采用名录的中文正名、学名、科属；原名进 aliases。
+ *  · `synonym` → **只有 `applySynonym` 打开时才改**。默认关闭是为了不动
+ *    AI 识别 / 银叶 / 金叶那三条既有链路的行为（它们一直是「异名不自动换」）；
+ *    批量录入页显式打开，因为「学名变更时自动换成 2026 正名」正是那条路要的。
+ *  · `ambiguous` / `unmatched` → 一个字都不改。
+ */
+export function alignFieldsToVerdict(
+  fields: NamedFields,
+  verdict: NameVerdict,
+  opts?: { applySynonym?: boolean },
+): boolean {
+  const applies =
+    verdict.status === "accepted" ||
+    verdict.status === "renamed" ||
+    (verdict.status === "synonym" && !!opts?.applySynonym);
+  if (!applies) return false;
+
+  let changed = false;
+  if (verdict.acceptedZh && fields.title !== verdict.acceptedZh) {
+    fields.title = verdict.acceptedZh;
+    changed = true;
+  }
+  // 名录的 scientific_name 是**不含命名人**的（命名人在 author 列）。原样覆盖会把
+  // 「Oxytropis lanata (Pall.) DC.」削成「Oxytropis lanata」——AI_META_SCHEMA 明写着
+  // 学名含命名人，站内条目页也是这么展示的，白丢一段信息。
+  // 判据：**原学名以名录正名开头**（且归一化后同名）→ 多出来的那截就是命名人，保留原样；
+  // 否则（异名换正名、性数错配、变音符/斜体污染）一律采用名录的写法。
+  if (verdict.acceptedLa && fields.scientific_name !== verdict.acceptedLa) {
+    const orig = (fields.scientific_name ?? "").trim();
+    const keepAuthor =
+      !!orig &&
+      canonicalKey(orig) === canonicalKey(verdict.acceptedLa) &&
+      orig.toLowerCase().startsWith(verdict.acceptedLa.toLowerCase());
+    if (!keepAuthor) {
+      fields.scientific_name = verdict.acceptedLa;
+      changed = true;
+    }
+  }
+  const fam = verdict.familyZh && verdict.familyLa ? `${verdict.familyZh} ${verdict.familyLa}` : null;
+  if (fam && fields.family !== fam) {
+    fields.family = fam;
+    changed = true;
+  }
+  const gen = verdict.genusZh && verdict.genusLa ? `${verdict.genusZh} ${verdict.genusLa}` : null;
+  if (gen && fields.genus !== gen) {
+    fields.genus = gen;
+    changed = true;
+  }
+  // 别名并入俗名，保住可搜索性 —— 换正名不能让老名字变成搜不到的死名。
+  if (verdict.aliases.length) {
+    const existing = (fields.common_names_zh ?? "")
+      .split(/[,，、;；]/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const merged = [...existing];
+    for (const a of verdict.aliases) if (!merged.includes(a.name)) merged.push(a.name);
+    const joined = merged.join(", ");
+    if (joined !== (fields.common_names_zh ?? "")) {
+      fields.common_names_zh = joined;
+      changed = true;
+    }
+  }
+  return changed;
+}

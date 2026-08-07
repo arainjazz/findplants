@@ -2,7 +2,7 @@ import { createFileRoute, Link, notFound, useNavigate } from "@tanstack/react-ro
 import { compressImage, extForMime } from "@/lib/image-compress";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 import { SiteHeader, SiteFooter } from "@/components/site-header";
 import { XiaoPAgentPanel } from "@/components/draft-agent-panel";
@@ -27,6 +27,7 @@ import { ImageSearchDialog } from "@/components/html-doc-editor";
 import { ReplaceImageFlow } from "@/components/replace-image-flow";
 import { ShareButton } from "@/components/share-button";
 import { ShareCardButton } from "@/components/share-card-button";
+import { AdminExportButton } from "@/components/admin-export-button";
 import { RegistryChips } from "@/components/registry-chips";
 import { NameAuthorityNote, readNameStamp } from "@/components/name-authority-badge";
 import { useRegistryChips } from "@/lib/use-registry-chips";
@@ -64,6 +65,53 @@ export const Route = createFileRoute("/plants/$slug")({
   },
   component: PlantDetail,
 });
+
+/**
+ * 把上传的整页 HTML 加工成条目页 iframe 里那份 srcDoc：注入自适应 CSS + 转发编辑标记
+ * 右键的小脚本，并改写只在草稿页说得通的提示语。纯函数，无状态。
+ */
+function buildViewerDoc(text: string): string {
+  // Inject responsive-image CSS so original fixed-width <img> tags scale to viewport.
+  const css = `<style>img,video,iframe{max-width:100%!important;height:auto!important;}body{overflow-x:hidden;}` +
+    // 🔴 iframe 自适应高度的**前提条件**（与草稿预览同一条，见 draft-enhance.ts 的
+    // VIEWER_STYLE）：模板给 body 写了 min-height:100vh —— 独立成页时是对的，但在
+    // iframe 里 100vh = 父层刚按上一次量到的值设好的 iframe 高度，于是 body 至少这么高，
+    // 再加 margin 量回去就又高一点，ResizeObserver 持续触发、永不收敛。
+    // 假连翘条目页实测：正文只有 7338px，iframe 却涨到 78378px 且还在长，下面裂出
+    // 七万像素的空白（2026-08-01 用户反馈）。草稿预览 07-21 就修了，条目页一直漏着。
+    `html,body{height:auto!important;min-height:0!important;}` +
+    // 合并进来的「补充观测」卡片限宽居中，其配图限高，避免在模板内容列之外被撑满整页。
+    `.merged-observation{max-width:680px!important;margin-left:auto!important;margin-right:auto!important;}` +
+    `.merged-observation figure{max-width:420px!important;margin-left:0!important;}` +
+    `.merged-observation img{max-height:360px!important;max-width:100%!important;width:auto!important;height:auto!important;object-fit:contain;}` +
+    // 入侵警示卡片头部在窄屏换行，避免「入侵等级」徽章被 overflow:hidden 裁掉（修复存量条目）。
+    `@media(max-width:640px){.invasive-card .ic-head{flex-wrap:wrap!important;gap:8px 12px!important;padding:14px 16px!important;}.invasive-card .ic-head h2{font-size:19px!important;}.invasive-card .ic-badge{margin-left:0!important;order:3!important;flex-basis:100%!important;white-space:normal!important;}}` +
+    // 图片相框修复：ccplants skill 页把每张图写死成 4:3/16:9 相框 + object-fit:cover 裁剪。
+    // 改为按图片原始比例完整显示、不裁剪，仅设一个最大高度防止超高竖图占满屏。
+    // 保留 .broken 占位框的固定尺寸（否则空图会塌成一条线）。
+    `.img-slot:not(.broken),.img-slot.habitat-photo:not(.broken){aspect-ratio:auto!important;height:auto!important;overflow:visible!important;}` +
+    `.img-slot:not(.broken) img{position:static!important;width:100%!important;height:auto!important;max-height:80vh!important;object-fit:contain!important;}` +
+    `</style>`;
+  // Forward right-click on edit markers to the parent page.
+  const script = `<script>document.addEventListener('contextmenu',function(e){var t=e.target;var m=t&&t.closest&&t.closest('.lov-edit-mark');if(!m)return;e.preventDefault();var id=m.getAttribute('data-edit-id');if(!id)return;var r=m.getBoundingClientRect();parent.postMessage({type:'lov-edit-mark-ctx',editId:id,x:r.left+r.width,y:r.top+r.height},'*');});</script>`;
+  const inject = css + script;
+  // 摘要卡页尾那句「点击『让 AI 生成进一步介绍草稿』」在条目页上是**点不动的**
+  // （按钮长在草稿页）。发布路径已经改写掉，这里再改一次是为了存量条目 ——
+  // 2026-07-31 线上 12 个 ai_identify 条目里有 3 个带着它，不必为此跑迁移。
+  // 真正的去路由下面那块「站内已有该物种的内容」提供。
+  let processed = rewriteDraftOnlyHints(text);
+  try {
+    const parsed = new DOMParser().parseFromString(text, "text/html");
+    const ec = parsed.body?.querySelector("section.editor-comments [data-comments-body]");
+    if (ec) {
+      ec.innerHTML = embedVideosInHtml(ec.innerHTML);
+      processed = "<!DOCTYPE html>\n" + parsed.documentElement.outerHTML;
+    }
+  } catch {/* fall through */}
+  return /<\/head>/i.test(processed)
+    ? processed.replace(/<\/head>/i, `${inject}</head>`)
+    : `${inject}${processed}`;
+}
 
 function PlantDetail() {
   const { slug } = Route.useParams();
@@ -165,69 +213,28 @@ function PlantDetail() {
 
   // Fetch HTML content for srcdoc rendering (so relative refs / fonts work without host CORS issues)
   const [htmlDoc, setHtmlDoc] = useState<string | null>(null);
-  useEffect(() => {
-    if (plant?.content_type === "html" && plant.html_url) {
-      fetch(plant.html_url)
-        .then((r) => r.text())
-        .then((text) => {
-          // Inject responsive-image CSS so original fixed-width <img> tags scale to viewport.
-          const css = `<style>img,video,iframe{max-width:100%!important;height:auto!important;}body{overflow-x:hidden;}` +
-            // 🔴 iframe 自适应高度的**前提条件**（与草稿预览同一条，见 draft-enhance.ts 的
-            // VIEWER_STYLE）：模板给 body 写了 min-height:100vh —— 独立成页时是对的，但在
-            // iframe 里 100vh = 父层刚按上一次量到的值设好的 iframe 高度，于是 body 至少这么高，
-            // 再加 margin 量回去就又高一点，ResizeObserver 持续触发、永不收敛。
-            // 假连翘条目页实测：正文只有 7338px，iframe 却涨到 78378px 且还在长，下面裂出
-            // 七万像素的空白（2026-08-01 用户反馈）。草稿预览 07-21 就修了，条目页一直漏着。
-            `html,body{height:auto!important;min-height:0!important;}` +
-            // 合并进来的「补充观测」卡片限宽居中，其配图限高，避免在模板内容列之外被撑满整页。
-            `.merged-observation{max-width:680px!important;margin-left:auto!important;margin-right:auto!important;}` +
-            `.merged-observation figure{max-width:420px!important;margin-left:0!important;}` +
-            `.merged-observation img{max-height:360px!important;max-width:100%!important;width:auto!important;height:auto!important;object-fit:contain;}` +
-            // 入侵警示卡片头部在窄屏换行，避免「入侵等级」徽章被 overflow:hidden 裁掉（修复存量条目）。
-            `@media(max-width:640px){.invasive-card .ic-head{flex-wrap:wrap!important;gap:8px 12px!important;padding:14px 16px!important;}.invasive-card .ic-head h2{font-size:19px!important;}.invasive-card .ic-badge{margin-left:0!important;order:3!important;flex-basis:100%!important;white-space:normal!important;}}` +
-            // 图片相框修复：ccplants skill 页把每张图写死成 4:3/16:9 相框 + object-fit:cover 裁剪。
-            // 改为按图片原始比例完整显示、不裁剪，仅设一个最大高度防止超高竖图占满屏。
-            // 保留 .broken 占位框的固定尺寸（否则空图会塌成一条线）。
-            `.img-slot:not(.broken),.img-slot.habitat-photo:not(.broken){aspect-ratio:auto!important;height:auto!important;overflow:visible!important;}` +
-            `.img-slot:not(.broken) img{position:static!important;width:100%!important;height:auto!important;max-height:80vh!important;object-fit:contain!important;}` +
-            `</style>`;
-          // Forward right-click on edit markers to the parent page.
-          const script = `<script>document.addEventListener('contextmenu',function(e){var t=e.target;var m=t&&t.closest&&t.closest('.lov-edit-mark');if(!m)return;e.preventDefault();var id=m.getAttribute('data-edit-id');if(!id)return;var r=m.getBoundingClientRect();parent.postMessage({type:'lov-edit-mark-ctx',editId:id,x:r.left+r.width,y:r.top+r.height},'*');});</script>`;
-          const inject = css + script;
-          // 摘要卡页尾那句「点击『让 AI 生成进一步介绍草稿』」在条目页上是**点不动的**
-          // （按钮长在草稿页）。发布路径已经改写掉，这里再改一次是为了存量条目 ——
-          // 2026-07-31 线上 12 个 ai_identify 条目里有 3 个带着它，不必为此跑迁移。
-          // 真正的去路由下面那块「站内已有该物种的内容」提供。
-          let processed = rewriteDraftOnlyHints(text);
-          try {
-            const parsed = new DOMParser().parseFromString(text, "text/html");
-            const ec = parsed.body?.querySelector("section.editor-comments [data-comments-body]");
-            if (ec) {
-              ec.innerHTML = embedVideosInHtml(ec.innerHTML);
-              processed = "<!DOCTYPE html>\n" + parsed.documentElement.outerHTML;
-            }
-          } catch {/* fall through */}
-          const injected = /<\/head>/i.test(processed)
-            ? processed.replace(/<\/head>/i, `${inject}</head>`)
-            : `${inject}${processed}`;
-          setHtmlDoc(injected);
-        })
-        .catch(() => setHtmlDoc(null));
-    }
-  }, [plant?.html_url, plant?.content_type]);
-
   // Collect images + section headings from the HTML page (cover picker + 小P蛙标注范围).
   const [rawHtml, setRawHtml] = useState<string | null>(null);
-  useEffect(() => {
-    if (!plant?.html_url) { setPageImages([]); setPageSections([]); setRawHtml(null); return; }
-    fetch(plant.html_url).then((r) => r.text()).then((text) => {
-      setRawHtml(text);
+
+  /**
+   * 把一份正文 HTML 装进页面：iframe 的 srcDoc、换图流程用的原始 HTML、封面选择器的
+   * 图片清单、小P蛙的标注范围，**一次全刷**。
+   *
+   * 为什么要能被直接调用，而不是只跟着 `plant.html_url` 的 effect 走：小P蛙换完图时
+   * 新 HTML 已经在手里了，等「上传 → 改库 → 失效缓存 → 重新拉取 → effect 再跑」这一圈
+   * 回来才更新，中间这段时间屏幕上还是旧图 —— 用户看到的就是「提示替换成功、画面没变」
+   * （2026-08-07 反馈）。有新正文就当场贴上去，那一圈照跑，只是不再是唯一的路。
+   */
+  const applyPageHtml = useCallback((text: string, baseUrl?: string | null) => {
+    setRawHtml(text);
+    setHtmlDoc(buildViewerDoc(text));
+    try {
       const doc = new DOMParser().parseFromString(text, "text/html");
       const srcs: string[] = [];
       doc.querySelectorAll("img").forEach((img) => {
         const s = img.getAttribute("src");
         if (!s) return;
-        try { srcs.push(new URL(s, plant.html_url!).href); } catch { srcs.push(s); }
+        try { srcs.push(baseUrl ? new URL(s, baseUrl).href : s); } catch { srcs.push(s); }
       });
       setPageImages(Array.from(new Set(srcs)));
       const secs: { label: string; value: string }[] = [];
@@ -237,8 +244,35 @@ function PlantDetail() {
         if (t && t.length <= 40 && !seen.has(t)) { seen.add(t); secs.push({ label: t, value: t }); }
       });
       setPageSections(secs.slice(0, 20));
-    }).catch(() => { setPageImages([]); setPageSections([]); });
-  }, [plant?.html_url]);
+    } catch {
+      /* 解析不了就只更新正文，图片清单保持原样 */
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!plant?.html_url) {
+      setRawHtml(null);
+      setPageImages([]);
+      setPageSections([]);
+      if (plant?.content_type === "html") setHtmlDoc(null);
+      return;
+    }
+    let cancelled = false;
+    const url = plant.html_url;
+    fetch(url)
+      .then((r) => r.text())
+      .then((text) => {
+        if (cancelled) return;
+        applyPageHtml(text, url);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setHtmlDoc(null);
+        setPageImages([]);
+        setPageSections([]);
+      });
+    return () => { cancelled = true; };
+  }, [plant?.html_url, plant?.content_type, applyPageHtml]);
 
   useEffect(() => {
     if (!coverMenu) return;
@@ -730,6 +764,9 @@ function PlantDetail() {
               {entryKind && <PlantKindBadge kind={entryKind} />}
             </p>
             <div className="flex items-center gap-2">
+              {/* 导出（HTML / PDF / 长图 PNG）。就近摆在分享卡左边 —— 它和分享卡是同一类
+                  「把这一页带走」的动作，原先挂在全站导航里找不着也说不通。 */}
+              {isAdmin && <AdminExportButton />}
               {shareCardNode}
               <ShareButton title={plant.title} summary={plant.summary} />
               {canEdit && (
@@ -836,16 +873,21 @@ function PlantDetail() {
             onClose={() => setXiaopImg(null)}
             onDone={async (newHtml, oldUrl, newUrl) => {
               const ctx = xiaopImg;
+              const prevHtml = rawHtml;
               setXiaopImg(null);
+              // 先上屏、再落库。新正文此刻就在手里，没有任何理由让用户对着旧图等一圈
+              // 「上传→改库→失效缓存→重新拉取」——「提示替换成功但画面没变」就是这么来的。
+              applyPageHtml(newHtml, plant.html_url);
               try {
                 await persistPlantHtml(
                   newHtml,
-                  rawHtml,
+                  prevHtml,
                   `小P蛙换图（${ctx?.instruction || "手动"}）：${oldUrl} → ${newUrl}`,
                 );
                 toast.success("配图已替换并保存");
-                navigate({ to: "/plants/$slug", params: { slug: plant.slug } });
               } catch (e) {
+                // 落库失败就把画面退回去，别让人以为已经保存了。
+                if (prevHtml) applyPageHtml(prevHtml, plant.html_url);
                 toast.error(e instanceof Error ? e.message : "替换失败，请重试");
               }
             }}
@@ -900,6 +942,7 @@ function PlantDetail() {
         <div className="flex items-center justify-between">
           <Link to="/" className="label hover:text-vermilion">← 返回首页</Link>
           <div className="flex items-center gap-2">
+            {isAdmin && <AdminExportButton />}
             {shareCardNode}
             <ShareButton title={plant.title} summary={plant.summary} />
           </div>

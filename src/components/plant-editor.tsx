@@ -20,7 +20,11 @@ import { useAuth } from "@/hooks/use-auth";
 import { slugify, visibleBodyText, type Plant } from "@/lib/plants";
 import { toast } from "sonner";
 import { RichEditor } from "@/components/rich-editor";
-import { HtmlDocEditor, ImageSearchDialog } from "@/components/html-doc-editor";
+import {
+  HtmlDocEditor,
+  ImageSearchDialog,
+  type HtmlDocEditorHandle,
+} from "@/components/html-doc-editor";
 import { IUCN_CATEGORIES } from "@/lib/catalogs";
 import {
   fetchAllTags,
@@ -44,6 +48,8 @@ export function PlantEditor({ initial }: Props) {
   const checkName = useServerFn(checkNameFn);
   const htmlInputRef = useRef<HTMLInputElement>(null);
   const htmlFolderInputRef = useRef<HTMLInputElement>(null);
+  /** 在线正文编辑器。「保存修改」会先让它把正文写成新 HTML，再存字段。 */
+  const htmlEditorRef = useRef<HtmlDocEditorHandle>(null);
   const hydratedDraftRef = useRef(false);
   const draftKey = `plant-editor-draft:${initial?.id ?? "new"}`;
 
@@ -722,14 +728,29 @@ export function PlantEditor({ initial }: Props) {
     const finalSlug = slug.trim() || slugify(title);
     if (contentType === "html" && !htmlUrl) return toast.error("请上传 HTML 文件");
 
-    // If user never touched the cover and we have an HTML doc, fall back to its first image.
-    let resolvedCover = coverUrl;
-    if (!resolvedCover && !coverEdited.current && contentType === "html" && htmlUrl) {
-      resolvedCover = (await firstImageFromHtml(htmlUrl)) ?? "";
-      if (resolvedCover) setCoverUrl(resolvedCover);
+    setSaving(true);
+
+    // ① 先把在线编辑器里的正文改动写成新 HTML 文件。
+    // 从前这是编辑器自带的另一个按钮（「应用修改并替换 HTML 文件」），得先点它再点这里，
+    // 两下做的是一件事，还会在修改记录里各留一条流水（2026-08-07 用户反馈）。
+    // 没有改动时 save() 返回 null，不会白传一份一样的文件。
+    let finalHtmlUrl = htmlUrl;
+    if (contentType === "html" && htmlEditorRef.current?.isDirty()) {
+      try {
+        const saved = await htmlEditorRef.current.save();
+        if (saved) finalHtmlUrl = saved.url;
+      } catch (err) {
+        setSaving(false);
+        return toast.error("正文保存失败：" + (err as Error).message);
+      }
     }
 
-    setSaving(true);
+    // ② If user never touched the cover and we have an HTML doc, fall back to its first image.
+    let resolvedCover = coverUrl;
+    if (!resolvedCover && !coverEdited.current && contentType === "html" && finalHtmlUrl) {
+      resolvedCover = (await firstImageFromHtml(finalHtmlUrl)) ?? "";
+      if (resolvedCover) setCoverUrl(resolvedCover);
+    }
 
     const editorName =
       (user.user_metadata?.full_name as string | undefined) ||
@@ -758,7 +779,7 @@ export function PlantEditor({ initial }: Props) {
             cover_url: resolvedCover || null,
             content_type: contentType,
             rich_content: contentType === "rich" ? richContent : null,
-            html_url: contentType === "html" ? htmlUrl : null,
+            html_url: contentType === "html" ? finalHtmlUrl : null,
             tags: tags
               .split(",")
               .map((t) => t.trim())
@@ -1117,26 +1138,14 @@ export function PlantEditor({ initial }: Props) {
             {htmlUrl && (
               <div className="mt-5 pt-5 border-t border-rule">
                 <p className="label mb-3">在线编辑此 HTML</p>
+                {/* onSaved 只负责把新文件地址同步回本地 state；写库交给下面那次
+                    savePlant（它同一趟把 html_url 和所有字段一起提交）。以前这里
+                    自己也 update 一次 plants，等于同一个保存动作打两次库。 */}
                 <HtmlDocEditor
+                  ref={htmlEditorRef}
                   htmlUrl={htmlUrl}
                   plantId={initial?.id ?? null}
-                  persistImmediately={!!initial}
-                  onSaved={async (url, commentsCount) => {
-                    setHtmlUrl(url);
-                    if (!initial) return;
-                    const { error } = await supabase
-                      .from("plants")
-                      .update({ html_url: url, content_type: "html" })
-                      .eq("id", initial.id);
-                    if (error) {
-                      toast.error("自动保存失败，请点底部“保存修改”重试：" + error.message);
-                      return;
-                    }
-                    qc.invalidateQueries({ queryKey: ["plant-by-id", initial.id] });
-                    qc.invalidateQueries({ queryKey: ["plant", initial.slug] });
-                    qc.invalidateQueries({ queryKey: ["plants"] });
-                    qc.invalidateQueries({ queryKey: ["home"] });
-                  }}
+                  onSaved={(url) => setHtmlUrl(url)}
                 />
               </div>
             )}

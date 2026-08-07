@@ -44,6 +44,10 @@ export type ShareCardData = {
   coordsFuzzed?: boolean;
   summary?: string | null;
   photoUrl: string;
+  /** `photoUrl` 取不出图时再试的地址。识别完当场出卡会把 photoUrl 指向内存里那份刚拍的
+   *  blob（省掉重新下载），这里放云端地址兜底：万一那个 object URL 已经失效，
+   *  也不至于画出一张没有照片的卡。 */
+  photoUrlFallback?: string | null;
   /** 识别者显示名：注册用户名，或访客时为「小P蛙」。 */
   discovererName: string;
   /** 识别者头像 URL（圆形显示）。 */
@@ -541,7 +545,11 @@ export async function renderShareCard(data: ShareCardData): Promise<Blob> {
   ctx.fillRect(0, 0, W, H);
 
   const [photo, logo, badgeBronze, badgeSilver, badgeGold, avatar] = await Promise.all([
-    loadImage(data.photoUrl),
+    loadImage(data.photoUrl).then((img) =>
+      img || !data.photoUrlFallback || data.photoUrlFallback === data.photoUrl
+        ? img
+        : loadImage(data.photoUrlFallback),
+    ),
     loadImage(xiaopLogoUrl),
     loadImage(leafBronzeUrl),
     loadImage(leafSilverUrl),

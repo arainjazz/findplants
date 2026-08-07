@@ -21,8 +21,6 @@ type Props = {
   /** Plant id to attach edit history to. Null for new (unsaved) plants. */
   plantId?: string | null;
   onSaved: (newUrl: string, commentsCount: number) => void | Promise<void>;
-  /** When true, toast indicates the change has been persisted to the database. */
-  persistImmediately?: boolean;
 };
 
 const COMMENTS_MARKER_CLASS = "editor-comments";
@@ -41,10 +39,17 @@ export type AppliedEditMark = {
 };
 
 export type HtmlDocEditorHandle = {
-  /** Imperatively trigger save. Resolves true on success, false on error. */
-  save: () => Promise<boolean>;
+  /**
+   * Serialize the edited doc, upload it and hand back the new public URL.
+   * Returns null when nothing was touched (caller keeps the URL it already has).
+   * **Throws** on failure — the caller owns the error message, because this now
+   * runs as the first half of the host form's single「保存修改」action.
+   */
+  save: () => Promise<{ url: string; commentsCount: number } | null>;
   /** True while a save is currently running. */
   isSaving: () => boolean;
+  /** True when the body or the editor comments have been changed since load. */
+  isDirty: () => boolean;
 };
 
 type ImgTarget = { src: string; alt: string; el: HTMLImageElement };
@@ -59,7 +64,7 @@ type MenuState = ({ x: number; y: number } & ImgTarget) | null;
  * The Editor Comments block uses RichEditor and is appended on save.
  */
 export const HtmlDocEditor = forwardRef<HtmlDocEditorHandle, Props>(function HtmlDocEditor(
-  { htmlUrl, plantId, onSaved, persistImmediately },
+  { htmlUrl, plantId, onSaved },
   ref,
 ) {
   const { user } = useAuth();
@@ -68,6 +73,8 @@ export const HtmlDocEditor = forwardRef<HtmlDocEditorHandle, Props>(function Htm
   const replaceFileRef = useRef<HTMLInputElement>(null);
   const activeImgRef = useRef<HTMLImageElement | null>(null);
   const dirtyBlocksRef = useRef<Map<HTMLElement, DirtyInfo>>(new Map());
+  /** 载入时页面里原有的评论正文 —— 用来判断「评论改过没有」。 */
+  const baseCommentsRef = useRef("");
 
   const [loading, setLoading] = useState(true);
   const [docText, setDocText] = useState<string>("");
@@ -133,6 +140,7 @@ export const HtmlDocEditor = forwardRef<HtmlDocEditorHandle, Props>(function Htm
           extracted = (inner?.innerHTML ?? "").trim();
           existing.remove();
         }
+        baseCommentsRef.current = extracted;
         setCommentsHtml(extracted);
         setCommentsVersion((v) => v + 1);
         setDocText("<!DOCTYPE html>\n" + doc.documentElement.outerHTML);
@@ -209,6 +217,8 @@ export const HtmlDocEditor = forwardRef<HtmlDocEditorHandle, Props>(function Htm
            注意：本 style 块在保存时会被剔除（见 onSave 里对 lov-editor-runtime-style 的处理），
            所以这些规则只作用于编辑视图，不会污染存进库的正文。 */
         img{height:auto!important;max-width:100%!important;}
+        /* 刚换过的图闪一圈红框（见 flashImage）。随本 style 块一起在保存时被剔除。 */
+        .${FLASH_CLASS}{outline:3px solid #c0392b!important;outline-offset:3px;}
       `;
       (idoc.head ?? idoc.documentElement).appendChild(s);
     }
@@ -231,16 +241,15 @@ export const HtmlDocEditor = forwardRef<HtmlDocEditorHandle, Props>(function Htm
       // nearest figure/block and find an img/svg inside it. This handles
       // edit-mark overlays, <figcaption> clicks, and other wrappers that
       // would otherwise miss the image entirely.
+      //
+      // ⚠️ 往上退到容器里找图时，必须挑**离鼠标最近的那张**，不能拿 querySelector 的
+      // 第一张。一个 section 里有好几张图时，「第一张」几乎注定不是用户右键的那张 ——
+      // 于是换掉的是别处那张图，眼前这张纹丝不动，但提示写着「已替换」
+      // （2026-08-07 用户反馈的第二类成因）。
       let img =
         (target?.closest?.("img,svg") as HTMLElement | null) ??
-        ((target?.closest?.("figure,picture,a") as HTMLElement | null)?.querySelector?.(
-          "img,svg",
-        ) as HTMLElement | null) ??
-        null;
-      if (!img) {
-        const block = nearestBlock(target);
-        img = (block?.querySelector?.("img,svg") as HTMLElement | null) ?? null;
-      }
+        nearestImageIn(target?.closest?.("figure,picture,a") ?? null, e.clientX, e.clientY);
+      if (!img) img = nearestImageIn(nearestBlock(target), e.clientX, e.clientY);
       if (!img) return;
       e.preventDefault();
       // Get position in parent viewport coords.
@@ -343,6 +352,25 @@ export const HtmlDocEditor = forwardRef<HtmlDocEditorHandle, Props>(function Htm
     // Snapshot the host block BEFORE we mutate the image.
     snapshotBlock(nearestBlock(el));
     const isNewSrc = el.getAttribute("src") !== src;
+    if (isNewSrc) {
+      // 🔴 **先拆掉所有会压过 src 的东西，再写 src**，否则新图根本不会被显示出来
+      // ——「提示替换成功、画面纹丝不动」的第一类成因（2026-08-07 用户反馈）：
+      //   · srcset / sizes 存在时浏览器**优先**按 srcset 挑图，src 只是后备；
+      //   · <picture> 里任一 <source> 命中，img 的 src 同样被无视。
+      el.removeAttribute("srcset");
+      el.removeAttribute("sizes");
+      const picture = el.closest("picture");
+      if (picture) picture.querySelectorAll("source").forEach((s) => s.remove());
+      // 第二类成因：ccplants 模板给每张图挂了
+      // `onerror="this.parentElement.classList.add('broken')"`，而 CSS 里
+      // `.img-slot.broken img{display:none}`。新图只要有一次没加载出来（网络抖动、
+      // 存储对象刚落地），这个 onerror 就会把它永久藏起来，且再也不会自己恢复。
+      // 换图之后这个兜底已经没有意义（图是编辑刚挑的），直接摘掉。
+      el.removeAttribute("onerror");
+      (el as HTMLImageElement).onerror = null;
+      // 懒加载会让「刚换的图要滚到才出现」，在编辑器里就是「没换成功」。
+      el.removeAttribute("loading");
+    }
     el.setAttribute("src", src);
     if (alt !== undefined) el.setAttribute("alt", alt);
     if (isNewSrc) {
@@ -352,17 +380,24 @@ export const HtmlDocEditor = forwardRef<HtmlDocEditorHandle, Props>(function Htm
       el.style.width = "";
       el.style.height = "auto";
       el.style.maxWidth = "100%";
+      // 兜底解除隐藏：图槽历史上可能被 onerror / 模板写成 display:none 或 hidden。
+      if (el.style.display === "none") el.style.display = "";
+      el.removeAttribute("hidden");
       // 清掉宿主图槽的**失败态**。`.img-slot.broken` 带 aspect-ratio:4/3（premium-page.ts），
       // 那是给「图挂了、空槽会塌成一条线」用的占位框。换上新图后若不摘掉这个类，新图就被
       // 困在 4:3 里按固定比例显示 —— 这正是「编辑器里比例不跟着变、进预览才恢复」的原因
       // （预览走 enhanceDraftHtmlForViewing，编辑器 srcDoc 用的是原始 HTML，没有那层中和 CSS）。
       // 属性/内联样式清除对 CSS 类规则无效，必须显式摘类。
-      const slot = el.closest(".img-slot");
+      // 注意 `.broken` 也可能挂在 figure 之外的祖先容器上，故两处都摘。
+      const slot = el.closest(".img-slot") ?? el.parentElement;
       if (slot) slot.classList.remove("broken", "no-organ");
       // 草稿模板的空槽（`<img class="sec-img" hidden src="">` + 一行「暂无该物种的…公开
       // 照片」）：右键换图时是通过 figure 找到那个隐藏 img 的，换上真图后必须把缺图标记
       // 和那句说明一起摘掉 —— 否则新配图下面还挂着「暂无照片」（2026-07-26 用户反馈）。
       clearMissingOrganMarkers(el);
+      // 换的是哪一张，必须让人**看见**。图可能在视口外（右键菜单是浮在父页面上的，
+      // iframe 自己不会跟着滚），不滚过去的话换成功了也像没反应。
+      flashImage(el);
     }
     markDirty(el, "image");
     // Trigger a synthetic input event so caching effect picks it up.
@@ -423,11 +458,21 @@ export const HtmlDocEditor = forwardRef<HtmlDocEditorHandle, Props>(function Htm
     }
   };
 
+  /** 正文或评论动过没有 —— 没动就不必重传一份一模一样的 HTML 到存储桶。 */
+  const isDirtyNow = () =>
+    dirtyBlocksRef.current.size > 0 || commentsHtml !== baseCommentsRef.current;
+
   // Save: serialize iframe + append comments + upload as new HTML ------------
-  const onSave = async () => {
-    if (!user) return toast.error("请先登录");
+  //
+  // 由宿主表单的「保存修改」调用（见 plant-editor.tsx）——本组件不再有自己的保存按钮。
+  // 从前两个按钮做同一件事：先点「应用修改并替换 HTML 文件」，再点「保存修改」，
+  // 于是修改记录里一次编辑留下两条「我按了保存」的流水（2026-08-07 用户反馈）。
+  // 失败**抛出**而不是自己弹 toast：宿主要靠异常决定要不要中止整次保存。
+  const runSave = async (): Promise<{ url: string; commentsCount: number } | null> => {
+    if (!user) throw new Error("请先登录");
     const idoc = iframeRef.current?.contentDocument;
-    if (!idoc) return toast.error("编辑器未就绪");
+    if (!idoc) throw new Error("编辑器未就绪");
+    if (!isDirtyNow()) return null;
     setSaving(true);
     try {
       // Stamp [N] edit markers (right-aligned, with hover tooltip) onto the
@@ -461,22 +506,10 @@ export const HtmlDocEditor = forwardRef<HtmlDocEditorHandle, Props>(function Htm
         }
       }
 
-      // Always log a top-level html_save row (even when no per-block markers)
-      // so every save action is visible in the audit trail.
-      if (plantId) {
-        await supabase.from("plant_edits").insert({
-          plant_id: plantId,
-          editor_id: user.id,
-          editor_name: editorName,
-          kind: "html_save",
-          marker_n: 0,
-          source: "html_editor",
-          summary:
-            applied.length > 0
-              ? `${editorName} 保存了 HTML 修改（${applied.length} 处标记）`
-              : `${editorName} 保存了 HTML（评论 / 元数据）`,
-        });
-      }
+      // ⛔️ 这里**不再**写「XX 保存了 HTML 修改（N 处标记）」那条 html_save 流水。
+      // 它记的是「有人按了保存」，不是内容改了什么：marker_n=0、没有 before/after，
+      // 撤销按钮点下去只会报「找不到该修改对应的内容块」。真正的内容改动由上面那批
+      // 带 before_html / after_html 的逐块标记行记录，「注 N」与撤销也都靠它们。
 
       // Strip any pre-existing comments block in the live doc, then append fresh.
       const docClone = idoc.cloneNode(true) as Document;
@@ -488,6 +521,9 @@ export const HtmlDocEditor = forwardRef<HtmlDocEditorHandle, Props>(function Htm
       // 用 querySelector 而非 getElementById：后者在 cloneNode 出来的 Document 上不保证
       // 可靠（ID 缓存未必随克隆重建）。漏删一次，这段 CSS 就被永久写进正文。
       docClone.querySelector("#lov-editor-runtime-style")?.remove();
+      // 换图时的高亮 class 只是编辑期的视觉提示（规则住在上面那块被剔除的样式表里），
+      // 但 class 名本身会跟着 outerHTML 存进库 —— 保存前统一摘掉。
+      docClone.querySelectorAll(`.${FLASH_CLASS}`).forEach((e) => e.classList.remove(FLASH_CLASS));
       docClone.body.removeAttribute("contenteditable");
       const commentsBlock = buildCommentsSection(commentsHtml, docClone);
       docClone.body.appendChild(commentsBlock);
@@ -503,12 +539,11 @@ export const HtmlDocEditor = forwardRef<HtmlDocEditorHandle, Props>(function Htm
       if (error) throw error;
       const url = supabase.storage.from("plant-html").getPublicUrl(path).data.publicUrl;
       sessionStorage.removeItem(cacheKey);
-      await onSaved(url, countComments(commentsHtml));
-      toast.success(
-        persistImmediately ? "HTML 已更新并保存" : "HTML 已更新（请记得点下方“保存修改”提交）",
-      );
-    } catch (err) {
-      toast.error((err as Error).message);
+      const commentsCount = countComments(commentsHtml);
+      // 保存成功 = 这份内容成了新的基线，下一次「没改动」才判得准。
+      baseCommentsRef.current = commentsHtml;
+      await onSaved(url, commentsCount);
+      return { url, commentsCount };
     } finally {
       setSaving(false);
     }
@@ -516,20 +551,18 @@ export const HtmlDocEditor = forwardRef<HtmlDocEditorHandle, Props>(function Htm
 
   const hasComments = useMemo(() => stripHtml(commentsHtml).trim().length > 0, [commentsHtml]);
 
+  // 句柄本身建一次就够，但它调用的闭包必须**永远是最新那份** —— 从前 deps 只有 [saving]，
+  // 于是 save() 里捞到的 commentsHtml / plantId 都停在句柄创建那一刻，评论改了也存不进去。
+  const liveRef = useRef({ runSave, isDirtyNow, saving });
+  liveRef.current = { runSave, isDirtyNow, saving };
   useImperativeHandle(
     ref,
     () => ({
-      save: async () => {
-        try {
-          await onSave();
-          return true;
-        } catch {
-          return false;
-        }
-      },
-      isSaving: () => saving,
+      save: () => liveRef.current.runSave(),
+      isSaving: () => liveRef.current.saving,
+      isDirty: () => liveRef.current.isDirtyNow(),
     }),
-    [saving],
+    [],
   );
 
   return (
@@ -693,19 +726,14 @@ export const HtmlDocEditor = forwardRef<HtmlDocEditorHandle, Props>(function Htm
         </p>
       </section>
 
-      <div className="flex items-center gap-3">
-        <button
-          type="button"
-          onClick={onSave}
-          disabled={saving || loading}
-          className="border border-ink px-4 py-2 hover:bg-ink hover:text-background transition-colors disabled:opacity-60"
-        >
-          {saving ? "生成中…" : "应用修改并替换 HTML 文件"}
-        </button>
-        <span className="text-xs text-ink-faint">
-          原 HTML 排版会完整保留，仅文字 / 图片改动会被写入。
-        </span>
-      </div>
+      {/* 这里从前有个「应用修改并替换 HTML 文件」按钮。它和页面底部的「保存修改」做的
+          是同一件事，用户得连点两下、修改记录里也留下两条「我按了保存」的流水
+          （2026-08-07 反馈）。现在统一由底部那个按钮一次搞定。 */}
+      <p className="text-xs text-ink-faint">
+        {saving
+          ? "正在写入正文…"
+          : "正文改动会随页面底部的「保存修改」一起提交；原 HTML 排版完整保留，仅文字 / 图片改动会被写入。"}
+      </p>
     </div>
   );
 });
@@ -936,6 +964,42 @@ function buildCommentsSection(commentsHtml: string, doc: Document) {
 
 function stripHtml(html: string) {
   return html.replace(/<[^>]+>/g, "").replace(/&nbsp;/g, " ");
+}
+
+/** 容器里离 (x, y) 最近的 img/svg。容器为空或没有图时返回 null。 */
+function nearestImageIn(root: Element | null, x: number, y: number): HTMLElement | null {
+  if (!root) return null;
+  const list = Array.from(root.querySelectorAll("img,svg")) as HTMLElement[];
+  if (list.length <= 1) return list[0] ?? null;
+  let best: HTMLElement | null = null;
+  let bestDist = Infinity;
+  for (const cand of list) {
+    const r = cand.getBoundingClientRect();
+    // 点在矩形内 → 距离 0；否则取到矩形边的距离。
+    const dx = Math.max(r.left - x, 0, x - r.right);
+    const dy = Math.max(r.top - y, 0, y - r.bottom);
+    const d = dx * dx + dy * dy;
+    if (d < bestDist) {
+      bestDist = d;
+      best = cand;
+    }
+  }
+  return best;
+}
+
+const FLASH_CLASS = "lov-img-flash";
+
+/** 滚到刚换的那张图并闪一圈红框 —— 让「换成功了」在屏幕上看得见。
+ *  用 class 而不是内联样式：这条规则住在保存时会被剔除的编辑器样式表里，
+ *  class 本身也在序列化前统一摘掉（见 onSave），不会渗进存库的正文。 */
+function flashImage(el: HTMLElement) {
+  try {
+    el.scrollIntoView({ behavior: "smooth", block: "center" });
+    el.classList.add(FLASH_CLASS);
+    setTimeout(() => el.classList.remove(FLASH_CLASS), 1400);
+  } catch {
+    /* 纯提示，失败无所谓 */
+  }
 }
 
 function escapeAttr(value: string) {

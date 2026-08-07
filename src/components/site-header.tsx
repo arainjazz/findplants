@@ -5,7 +5,6 @@ import { useAuth } from "@/hooks/use-auth";
 import { isCurrentUserAdmin } from "@/lib/edits";
 import { fetchMyNotifications, countUnseen } from "@/lib/notifications";
 import { supabase } from "@/integrations/supabase/client";
-import { AdminExportButton } from "@/components/admin-export-button";
 import logoUrl from "@/assets/logo.png";
 import aiIdentifyIcon from "@/assets/ai-identify-logo.png";
 
@@ -223,7 +222,9 @@ export function SiteHeader() {
           {user && <Link to="/admin" className="hover:text-vermilion transition-colors">添加/编辑内容</Link>}
           {/* 关于 —— 对所有人可见（含未登录）。这是给新访客看的介绍页，藏在登录后面等于白做。 */}
           <Link to="/about" className="hover:text-vermilion transition-colors" activeProps={{ className: "font-semibold" }}>关于 about</Link>
-          {user && isAdmin && <AdminExportButton />}
+          {/* 「保存」（导出 HTML / PDF / 长图）**不再挂在导航栏** —— 它导的是「当前这一页
+              正文」，是条目页上的动作，摆在全站导航里既误导又占位。现在长在条目详情页
+              分享卡按钮的左边（见 routes/plants.$slug.tsx）。 */}
         </nav>
 
         {/* Login / logout — always visible */}

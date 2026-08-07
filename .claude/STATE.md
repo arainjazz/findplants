@@ -1,6 +1,50 @@
 # Plantspedia — Working State  (single source of truth)
 
-_Last updated: 2026-08-02 — by Claude（**名字三处不一致，一次修到同源**。用户报：草稿
+_Last updated: 2026-08-07（续）— by Claude（**批量录入三修**：① 多选文件夹上传——真正坏的不是
+选不中（`webkitdirectory`+`multiple` 早就有），而是**所有文件夹的图汇成一个全局索引**、按文件名
+建键，多选时 A 物种匹配到 B 物种的 `cover.jpg` 且**不报错**；改为按顶层目录分组各自解析。
+② AI 抽取新增 `common_names_zh` 字段（三处 schema 都加），并接《中国植物物种名录 2026》
+自动改正名 —— `renamed`/`synonym` 自动改（模型给的名字没有署名权），`ambiguous`/`unmatched`
+一字不动，别名并入俗名、slug 跟新学名走；改写逻辑抽成纯函数 `alignFieldsToVerdict` 与服务端共用。
+**顺带发现既有缺口：`applyNameAuthority` 原本整个漏掉了 `synonym`**——这正是线上躺着
+`Acer ginnala Maxim.`（2026 正名 茶条槭 *Acer tataricum* subsp. *ginnala*）的原因；本轮只在
+批量页开了这个开关，AI 识别/银叶/金叶三条链路没动，等用户定。③ 每行加 TagPicker 手动挂已有 #tag。
+tsc=0、build 过、既有 25 条断言全过、8 个真实物种改名验证全对。**⚠️ 未部署未提交；批量页 UI 因
+登不进后台没在真实页面上点过。** 详见文末本轮小节。）_
+_上一轮：2026-08-07 — by Claude（**条目详页 / HTML 编辑器六修**，全部按用户报的症状逐条治：
+① 右键换图「提示成功但画面不变」——**三个独立成因**：`srcset`/`<picture><source>` 压过 `src`；
+ccplants 模板给每张图写了 `onerror="parentElement.classList.add('broken')"`，配上
+`.img-slot.broken img{display:none}`，新图只要闪失一次就被永久藏起来；右键落在图外时回退取的是
+**容器里第一张图**（改成取离光标最近的一张）。② 「保存」导出按钮从导航栏挪到条目详页分享卡左边。
+③ **PDF 排版错乱的根因不是 CSS，是 `snapshotHtmlDocument` 里 `return snapshot(...)` 漏了 await** ——
+`finally` 抢先把 iframe 摘掉，html2canvas 才开跑，必抛 `Document is not attached to a window`
+（PDF 与长图 PNG **一起**坏的，用户只报了 PDF）；叠加 `nav,header,footer{display:none!important}`
+把条目自己的封面题图和版权页脚一并删掉。改为整页渲染成图 → 按空白行智能切页 → jsPDF 逐页贴，
+所见即所得，不再走 Paged.js + `window.print()`。④ 导出改用 `showSaveFilePicker` 真弹保存路径框
+（**必须在点击后的第一个 await 就问**，晚了用户手势过期必抛 `NotAllowedError`）。
+⑤ 「应用修改并替换 HTML 文件」删除，与底部「保存修改」合并成一个动作。⑥ 删掉两条纯记账的
+`plant_edits`（`html_save`、savePlantFn 更新分支的 `kind:"text"`）—— 它们 `marker_n=0`、无
+before/after，点「撤销」必然报「找不到该修改对应的内容块」。tsc=0、改动文件 ESLint 零新增、
+浏览器实测（PDF 出 9 页、版面正确）。**顺带查明：全仓 `npm run lint` 有 6 万条既有 prettier
+问题、跑一趟 7 分钟，不是可用的验收关卡** —— 以后只查自己动过的文件并滤掉 prettier。
+**⚠️ 未部署、未提交。** 详见文件最下方本轮小节。）_
+_上一轮：2026-08-06 — by Claude（**只诊断、没改代码**：用户报「补拍成苏门白酒草，返回后
+卡又变回高大一枝黄花」+「分享卡有时迟迟不弹」。实库取证：同一份草稿 `c57b62a5` 08-05 跑了
+**三次**识别（一枝黄花 → 苏门白酒草 → 又被覆盖回一枝黄花），而 `retake_count` 只有 1 ——
+证明第三次是拿**旧快照**提交的。根因 A：草稿页 `initialData: useLoaderData()` + 全局
+staleTime 5min + 关掉 focus/reconnect 回查 ⇒ 拿到快照后**客户端一次都不回查**（本地实测
+往返一趟 plant_drafts 请求数 = 0）；根因 B：补拍把 `retake/st/ss` 烤进 /identify 的 URL，
+服务端原样信任 —— 旧学名被拼进 prompt 当「上一轮判断」给模型下锚，retake_count 也被写回旧值，
+于是**库里真的倒回去了**；根因 C：分享卡前串了 5 段串行等待（3s 轮询 + 路由 loader +
+被删缓存的 leaves 全量重算 + 2.5s 头像 + 226KB 原图重下），leaves 查询失败时那张卡**永远不弹**。
+**五修已按用户指示逐个实施**：① 草稿页每次挂载必回查；② 补拍上下文由服务端按草稿行现读、
+/identify 横幅同源；③ 出卡不再死等叶子统计（原来失败即永不弹卡）；
+④ 分享卡复用本地 blob（实测 2ms vs 云端重下 2651ms）；⑤ 出卡先等登录态定下来
+（整页加载首帧 user 必为 null，旧判据会抢跑，登录用户拿到的是没有叶章数的访客版卡）。
+tsc=0、eslint 无新增、已本地实测。
+**✅ 已部署 Version `d9da9bc9`（17:0x CST），线上 chunk 与生产行为均已核验；⚠️ 未提交**
+（deploy 打包的是工作树）。服务端那半没跑真实识别验证。详见文件最下方本轮小节。）_
+_上一轮：2026-08-02 — by Claude（**名字三处不一致，一次修到同源**。用户报：草稿
 `28c5e133`（Oxytropis lanata）快速识别简介卡写「疑似长毛棘豆」，银叶正文写「绵毛棘豆」。
 根因不是模型漂移，是三条链路对名录态度不同：① 快速识别**完全不核对**；② `buildDraftContent`
 核对了（正文因此是正名）；③ `runEnrichCore` 的锁名 `draft.title || meta.title` 又把正名顶回去 ——
@@ -49,6 +93,26 @@ _Read this FIRST and update it LAST, every session._
 
 ## 🚨 部署真相（以 Cloudflare 为准，不以本文件的小节标签为准）
 
+**⬆️ 最新：线上版本 = `477aa475-e076-474a-a1b3-8007ff5f9393`，2026-08-07 部署**
+（本日两轮共九项：详页/HTML 编辑器六修 + 批量录入三修。一次过，没撞代理。）
+**上线核验（已做）**：`plantspedia.club` HTTP 200；逐个拉线上 chunk 验新代码 ——
+`admin.batch-new-D7buN99c.js` 含 `common_names_zh` / `applySynonym` / `tagIdsToAdd` /
+`nameVerdict`（②③ 全在）；`plants._slug-D-_qOR_Y.js` 含 `showSaveFilePicker`（导出按钮已挪到详页）；
+`site-header-D11-NpQz.js` **不含** `showSaveFilePicker`（确认是「移走」不是「多了一份」）；
+新增独立 chunk `jspdf.es.min-CM3sLmX1.js`（386KB）—— jspdf 此前是装了没用的依赖，
+它出现在线上就是 PDF 改成「渲染成图 + 逐页贴」那条路已生效的铁证。
+**⚠️ 仍未提交**（`wrangler deploy` 打包的是工作树）。
+
+<details><summary>历史（2026-08-06 那一版）</summary>
+
+**线上版本 = `d9da9bc9-4d7e-4601-9e2f-9333af7611d2`，2026-08-06 17:0x CST 部署**
+（本轮五修 + 此前工作树里已有的一切；`wrangler deploy` 打包整个工作树，所以那三份未跟踪的
+`.claude/MCP-PLAN.md` / `mcp/` / `package-lock.json` 也在树里 —— 但 Vite 只打进被 import 的东西，
+`mcp/` 没有入口引用，不进 bundle）。核验见文件最下方本轮小节。
+**⚠️ 这一版是带着未提交改动上线的**，与「git 里有什么」不一致。
+
+<details><summary>历史（2026-07-26 那一版）</summary>
+
 **线上版本 = `0ae81b77-11ce-455c-bfc7-2dd59d1cd82e`，2026-07-26 18:41 CST 部署。**
 本次把积压的三轮全部推上线，**至此工作树与线上一致，没有未部署的改动**。
 （上一版是 `adf3316b` 07-25 15:11；07-25 还有一次 `b9755785` 12:15，那两次都没记进本文件 ——
@@ -94,6 +158,10 @@ find src supabase *.ts *.jsonc -newermt "<那个时间>" -type f   # 晚于它�
 **未纳入该提交**（归属待定，仍是未跟踪状态）：`mcp/`、`.workbuddy/`、`.claude/MCP-PLAN.md`、
 `package-lock.json`（本仓用 bun.lock，多一份 npm 锁文件容易打架）。
 **未 push**：`main` 现在领先 `origin/main` 15 个提交（用户历来只在本地提交，不推 GitHub）。
+
+</details>
+
+</details>
 
 ## 🆕 2026-07-21（续16）两个线上报错的定位与修复
 - **① 「添加新项目内容报错：permission denied for function has_role」——已修（待控制台执行）。**
@@ -7180,3 +7248,306 @@ draft_reject 7 / draft_image 5 / draft_text 2 —— 正是当初被静默吞掉
 `geo-sightings.functions.ts:85` 与 `tags.ts:103` 都带 `.neq("status","rejected")`，
 所以这三条观察记录会**从「身边物种地图」和主题标签计数里消失**。
 照片和草稿本身还在，只是不再出现在那两处聚合里。
+
+---
+
+## 2026-08-06 —— 「补拍结果自己倒回去」+「分享卡迟迟不弹」根因定位（只诊断，未改代码）
+
+用户报两件事：① 二次识别成「疑似苏门白酒草」、顺着匹配到银叶页点进去，**返回时快速识别卡
+又变回「疑似高大一枝黄花」**；② 有时候识别跑到「已完成」界面会停很久，分享卡迟迟不弹。
+
+### 铁证（实库，草稿 `c57b62a5-8425-4233-b65b-20fc4180b1d7`）
+`ai_usage_logs` 里同一份草稿有 **三次** quick_identify：
+
+| 时间(UTC) | 结论 | 说明 |
+|---|---|---|
+| 08-05 15:56:54 | 疑似高大一枝黄花 | 首次识别，建卡 |
+| 08-05 15:59:08 | **疑似苏门白酒草** | 补拍#1，已真的写进库（用户看到的就是它） |
+| 08-05 16:04:41 | 疑似高大一枝黄花 | 又一次识别，把上一条**覆盖回去** |
+
+现状：`retake_count = 1`、`user_photos` 3 张、`_identify_trace` = `{primaryEngine: plantnet,
+primaryLabel: "Erigeron sumatrensis", primaryPct: 26, review.action: "override"}`。
+→ **三次识别、计数只有 1**，说明第三次提交时客户端带的 `retake_count` 还是 1（= 相信
+retake_count 仍为 0 的那份旧快照）；而 Pl@ntNet 这次判的正是苏门白酒草，是模型把它 override
+回了一枝黄花 —— 因为 prompt 里被塞了旧快照的「上一轮倾向判断为疑似高大一枝黄花」。
+
+### 根因 A：草稿页拿到一份快照后，客户端**永不回查**
+- `router.tsx:9-12` 全局 `staleTime 5min` + `refetchOnWindowFocus:false` + `refetchOnReconnect:false`
+- `drafts.$id.tsx:287-293` `initialData: Route.useLoaderData()`，**没有 initialDataUpdatedAt**
+  → 无论 loader 数据多旧，落进缓存那一刻都被盖上「此刻新鲜」的戳，5 分钟内不再回查。
+- 本地实测（dev 5203）：草稿页 → 首页 → 返回，`plant_drafts` 的请求数 = **0**。
+  唯一的刷新路径是本页动作里显式 `invalidateQueries(["draft", id])` 或硬刷新。
+
+### 根因 B：补拍上下文写死在 URL 里，回退/旧快照 = 原样重放
+`drafts.$id.tsx:977-989` `goRetake()` 把当前快照烤进链接：
+`/identify?retake=<count+1>&st=<标题>&ss=<学名>&nmp=<建议>&md=<草稿id>`；
+`camera-identify.tsx:601-604` 原样提交，服务端**从不回读草稿真实状态**：
+- `identify-plant.functions.ts:3480-3483` 把 st/ss 拼进 system prompt「上一轮倾向判断为…」→ 直接给模型下锚；
+- `identify-plant.functions.ts:5107` 用客户端传来的值覆盖 `retake_count`（铜叶 = 1+retake_count，也一并算少了）。
+
+A + B 叠起来就是用户看到的「不稳定」：页面倒回旧物种 → 那个补拍按钮的链接本身也是旧的 →
+新一轮识别被旧结论带偏 → **库里真的被改回去了**。（第三次识别是从旧草稿页点补拍、还是从
+历史里那条 `retake=1` 的 /identify URL 再拍，两者产生的请求完全一样，无法从数据分辨；
+但根因同一个：旧快照被当成事实重放。）
+
+### 根因 C：分享卡弹出前串了 5 段**串行**等待
+job 一 done 之后依次是：
+1. 轮询粒度 3s（`poll-job.ts:12`），`awaitJob` 先把「已完成 100%」推给覆盖层再返回；
+2. `navigate` 触发路由 loader `fetchDraftById`（`drafts.$id.tsx:81`），识别页停在「已完成」等它；
+3. `camera-identify.tsx:722` 刚把 `["leaves"]` 缓存删掉，而自动出卡被 `drafts.$id.tsx:1137`
+   的 `if (user && !leaves) return` 卡住 → 必须等一次**完整重算**：`leaves.ts:147` 7 条并发查询，
+   其中 `identifyBronze` 拉该用户**全部草稿行**；
+4. 头像 `Promise.race` 最多再等 2.5s（`drafts.$id.tsx:867-883`）；
+5. `renderShareCard` 重新下载原图（实测 226KB、`cache-control: no-cache`），CORS 失败还要走
+   Worker 代理转 base64 再下一遍（`share-card.ts:173-200`）。
+
+**「有时候干脆不弹」的解释**：leaves 查询失败时 React Query 默认 retry 3 次（约 7s 退避），
+仍失败则 `leaves` 永远是 undefined → 那个 `return` 永久生效 → 卡再也不弹（`justIdentified`
+标记此时还没被消费，所以刷新一次还能补弹）。
+
+### 四修（已实施，tsc=0 / eslint 与改动前同为 106 条既有问题、无新增 / 已本地实测）
+
+**① 草稿页每次挂载必回查**（`drafts.$id.tsx`）
+`["draft", id]` 单独配 `staleTime: 0` + `refetchOnMount: "always"` + `refetchOnWindowFocus: true`。
+SSR/loader 的快照照常秒显，背后必回查一次真库。
+A/B 实测（queryFn 里打点）：旧配置下「首屏」和「离开再返回」两处 queryFn **一次都没跑**；
+加上之后两处都跑了。
+> ⚠️ 量这件事**别用 Resource Timing**（`performance.getEntriesByType("resource")`）——
+> supabase-js 的请求不进那张表，会得出「一个请求都没有」的假象（本轮先踩了一次）。
+
+**② 补拍上下文以草稿行为准**（`identify-plant.functions.ts` + `identify.tsx`）
+- 服务端：合并模式下那次 `select` 顺带取 `retake_count, title, scientific_name`，
+  用 `retake_count + 1` 和草稿当前结论**覆盖**客户端传来的 `retake_count / species_hint`。
+  读失败则退回客户端值（老行为），不至于让补拍整个跑不成。
+- 客户端：`/identify` 有 `md` 时按 `["draft", md]` 现读草稿，补拍横幅的物种名、
+  「第几次补拍」、上一轮建议**全部改用库里的值**，URL 参数只作兜底。
+  实测：URL 故意写成 `retake=1&st=疑似苏门白酒草&nmp=旧建议`，横幅照样显示
+  「正在补拍复核『疑似高大一枝黄花』（第二次补拍）」+ 真实建议。
+
+**③ 出卡不再死等叶子统计**（`drafts.$id.tsx` + `camera-identify.tsx`）
+- 自动出卡的 `if (user && !leaves) return` 改成**最多等 1.2 秒**（`leafWaitOver`）。
+  原来是死等：computeLeaves 慢就白等，**失败**则重试 3 次后 leaves 永远 undefined ——
+  那张卡再也不弹（这就是「有时候不弹」）。
+- `goToDraft` 里 leaves 从 `removeQueries` 改 `invalidateQueries`：旧值先用来出卡，
+  新值到了由 `cardSnap.leavesKey` 触发重画一次卡面。
+
+**④ 分享卡复用本地照片**（新增 `lib/fresh-photo.ts`）
+相机页跳转前把刚提交的 blob 挂进内存单槽，草稿页出卡时优先画它；
+`ShareCardData` 新增 `photoUrlFallback`（云端地址）兜底，object URL 万一失效也不会出无图卡。
+浏览器实测同一张 231KB 照片：**本地 blob 2ms vs 云端重下 2651ms**
+（存储对象带 `cache-control: no-cache`，每次都真跑网络）。
+
+**⑤ 出卡先等登录态定下来**（`drafts.$id.tsx`，用户追加要求）
+AuthProvider 是在 effect 里恢复会话的，而**子组件的 effect 比父组件先跑** → 整页加载时
+草稿页首帧的 `user` 必然是 null。旧判据 `if (user && !leaves) return` 在 user 为 null 时
+直接放行，于是卡在「还不知道有没有登录」的那一帧就画好了：登录用户拿到的是一张**按访客
+画的卡**（三个叶章数是空的）。而最常走这条路的恰恰是「访客点卡上的登录 → 登录后回来领铜叶」——
+`login.tsx:31` 用的是 `window.location.href`（整页重载），所以每次都会踩中。
+
+改法：把 `authLoading` 也纳入判据，和叶子统计**共用一个 2 秒上限**（原来的 1.2s 计时器
+升级成 `cardWaitOver`），任何一段卡住都不会把卡永远拖住。
+实测（effect 里打点）：整页加载第一遍 `authLoading=true → 不出卡`，第二遍
+`authLoading=false → 出卡`，正是旧代码抢跑的那一帧被挡住了。
+
+### ✅ 已部署 —— Version `d9da9bc9-4d7e-4601-9e2f-9333af7611d2`（2026-08-06 17:0x CST）
+
+`npm run build`（3.98s）+ `wrangler deploy` 一次过。
+**代理那道坎的补充经验**：上一次 `wrangler deployments list` 报 `fetch failed`，是因为我只清了
+**大写**的 `HTTP_PROXY/HTTPS_PROXY`，而 shell 里**大小写两套都设了**（`http_proxy` 也在）。
+把两套都清掉之后 deploy 一次成功：
+```
+env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy \
+  ./node_modules/.bin/wrangler deploy
+```
+
+**上线核验（已做）**：
+- `plantspedia.club` HTTP 200。
+- 拉线上 chunk 逐个验新代码：`/assets/drafts._id-Bf-YdGOm.js` 含 `refetchOnMount:"always"`（①）、
+  `photoUrlFallback`（④）、`leavesKey`（③）；`/assets/identify-aQtCyI9p.js` 含
+  `refetchOnMount:"always"`（②客户端半）；独立 chunk `/assets/fresh-photo-BulssOxB.js` 里
+  就是 ④ 的实现（单槽 + `revokeObjectURL` + 10 分钟上限）。
+  （`cardWaitOver`/`rememberFreshPhoto` 这类**标识符**会被压掉、grep 不到，别据此判定没上线；
+  能留下的是**对象属性名**。）
+- **生产行为验证**：故意用一条过期 URL 打开线上
+  `/identify?retake=1&st=疑似苏门白酒草&nmp=旧建议&md=c57b62a5…`，
+  横幅照样显示「正在补拍复核『疑似高大一枝黄花』（第二次补拍）」+ 库里的真实建议 —— ② 生效。
+
+### 还没做的事
+- **没提交**：这一版是带着未提交改动上线的（`wrangler deploy` 打包整个工作树）。
+- 服务端那半（②的覆盖逻辑、③的时序）只做了代码复核与类型检查，**没有跑真实识别验证** ——
+  跑一次要真烧模型调用并改动用户草稿，等用户决定。
+- ⑤ 只能验到「登录态定了才出卡」这一步：本机无法登录，**没验证登录用户的卡上叶章数**。
+- 顺带观察到但**没查根因**：连开几次自动出卡，卡上作者头像**偶尔是灰圈**（同一份草稿，
+  多数时候正常）。两个嫌疑：profiles 查询没赶上 `onMakeCard` 里那个 2.5s race，
+  或头像图本身 `loadImage` 失败。真要治，可把头像 URL 也纳入 `cardSnap` 指纹让它迟到后重画
+  （重画机制③已经有了）。**与本轮五修无关**：改动前后都能复现。
+
+取证脚本：`scratch/_probe_c57.mjs`（只读）。
+
+---
+
+## 2026-08-07 — 条目详页 / HTML 编辑器六修（导出、换图、保存合并、日志清理）
+
+用户一条消息报了六个症状，逐条治。**没有一个是「按用户猜的地方」修的** —— PDF 那条尤其，
+症状是「排版错乱」，真凶是一句漏掉的 `await`。
+
+### ① 右键换图：提示「已替换」但画面不变（三个独立成因）
+
+`src/components/html-doc-editor.tsx`
+
+| 成因 | 为什么会藏住新图 | 修法 |
+|---|---|---|
+| `srcset` / `<picture><source>` | 浏览器优先用 `srcset`/`<source>`，改 `src` 视觉上**完全无效** | `replaceActiveSrc` 里清 `srcset`/`sizes`，并删掉父 `<picture>` 里的 `<source>` |
+| 模板的 `onerror` | premium-page.ts 给每张图写死 `onerror="this.parentElement.classList.add('broken')"`，而 CSS 有 `.img-slot.broken img{display:none}` —— 新图**加载失败一次就被永久藏起来**，槽里显示「图片待补」 | 换图时摘掉 `onerror` 属性，改挂我们自己的 handler：失败只 toast，不再把图藏掉 |
+| 右键回退取错图 | 点在图外（figcaption / 相框留白）时，`nearestBlock(target).querySelector("img")` 取的是**容器里第一张**图 —— 用户看着 B 图右键，程序换的是 A 图 | 回退时按 `getBoundingClientRect()` 算**离光标最近**的那张 |
+
+另外补了两件让「换没换成」一眼可见的事：换完 `scrollIntoView` + 闪一圈朱红描边（1.2s，
+`lov-img-flash`，保存前会被剥掉）；空槽（`.img-slot.broken` 里**根本没有 `<img>`**，
+premium-page 就是这么生成的）现在会**现建一个 `<img>`**，以前右键这种槽菜单都弹不出来。
+
+条目详页那条链路（小P蛙换图，`src/routes/plants.$slug.tsx`）另有一处：换完 `persistPlantHtml`
+之后只 `invalidateQueries` + `navigate` 到同一个 slug（**同参数导航是 no-op**），要等一整趟
+「重新查库 → 重新 fetch html_url」才刷新。现在抽出 `buildViewerDoc(text)`，换完**直接拿手上的
+新 HTML 刷 iframe**，不等往返。
+
+### ② 「保存」导出按钮：导航栏 → 条目详页分享卡左边
+
+`site-header.tsx` 移除 `AdminExportButton`（连 import）；`plants.$slug.tsx` 在 `shareCardNode`
+**左侧**渲染，html 与富文本两个分支都加。权限沿用原来的 `isAdmin`，没动。
+
+### ③ PDF 排版错乱 —— 真凶是漏掉的 `await`
+
+```js
+// admin-export-button.tsx，坏的版本
+try   { ...; return snapshot(doc.body, scale); }   // ← 没 await
+finally { iframe.remove(); }                        // ← 先跑，iframe 已经没了
+```
+`finally` 在 Promise 返回时立即执行，html2canvas 真正开跑时 iframe 已经从 DOM 上摘掉，
+必抛 `Document is not attached to a window`。**PDF 和长图 PNG 是一起坏的**，用户只报了 PDF。
+
+叠加第二个成因：为了藏站点 chrome 写的
+`nav, header, footer, button {display:none!important}` —— 条目 HTML **自己**的
+`<header>`（封面题图）和 `<footer>`（版权页脚）被一并删掉，于是「排版错乱」。
+
+**改法**：丢掉 Paged.js + `window.print()` 这条易碎路径（作者 CSS 一复杂就崩，还要用户在
+打印对话框里手动选边距/缩放/背景图形），改成所见即所得三步：
+整页 html2canvas 渲染 → 按纸张高度**智能切页** → jsPDF 逐页贴图。
+切页会在目标边界上方 8% 范围内找**整行同色的空白行**下刀，避免把文字拦腰截断；
+预览直接显示切好的页图（就是最终 PDF 的样子），纸张/方向/页边距/缩放/每张纸页数/页眉页脚全保留。
+
+顺带修掉一处英文串字距丢失：`letter-spacing` 在 html2canvas 下渲染偏差，改为渲染前显式保留。
+
+### ④ 长图 PNG 不弹保存路径框
+
+`a[download]` 直接落到浏览器默认下载目录。改用 File System Access API 的
+`showSaveFilePicker`，不支持时回退老路径。**关键约束**：必须在点击后的**第一个 await**
+就把句柄要到手 —— html2canvas 一跑就是几秒，用户手势（transient activation）过期后再问
+必抛 `NotAllowedError`。所以流程是「先问路径 → 再渲染 → 再写入」，HTML / MD / PDF / ZIP 同样处理。
+
+### ⑤ 两个保存按钮合并成一个
+
+`HtmlDocEditor` 删掉自己的「应用修改并替换 HTML 文件」按钮，改为暴露命令式接口
+`save() → {url, commentsCount} | null` 与 `isDirty()`；`plant-editor.tsx` 的底部「保存修改」
+先存正文再存字段。**顺手修了一个潜伏的 stale closure**：原来的 `useImperativeHandle` 依赖
+只写了 `[saving]`，`save()` 会抓到旧一轮的 `commentsHtml` —— 改成走 ref 每帧刷新。
+没改动时 `isDirty()` 为 false，**不再每次保存都往 storage 里丢一份新 HTML**。
+
+### ⑥ 保存动作不再写进「修改记录」
+
+删掉两条**纯记账**的 `plant_edits`：
+- `html_save`（html-doc-editor 的每次保存 + savePlantFn 创建分支那条「保存/上传了 HTML 文件」）
+- savePlantFn **更新**分支那条 `kind:"text"` 的「XX 编辑修改了条目「YY」」
+
+它们 `marker_n=0`、没有 `before_html`/`after_html`，而 `revertEdit` 要靠 marker 或 `block_path`
+定位 —— 点「撤销」**必然**报「找不到该修改对应的内容块」。删掉等于同时拿掉一个坏按钮。
+**保留**带 before/after 的逐块标记行（正文里的「注 N」和真正能用的撤销靠的是它）。
+
+### 验证
+- `tsc --noEmit` = 0。
+- **`npm run lint` 不是本仓可用的关卡**（这一轮才发现）：全仓 `eslint .` 有
+  **60055 条既有问题**，99% 是 `prettier/prettier` 格式项，跑一趟要 7 分钟以上。
+  以后别拿「lint 绿」当验收标准，改成**只看自己动过的文件、且滤掉 prettier**：
+  ```
+  npx eslint <改动的文件…> | grep -v prettier/prettier
+  ```
+- 按上面这条查本轮改动：**零新增**。admin-export-button.tsx（本轮重写）已 `prettier --write`
+  过，现在 0 error；其余报出来的 `no-explicit-any`（plant-editor 452/601-625、
+  identify-plant.functions 各处）经 `git diff -U0` 逐个核对，**全在我的 hunk 之外**，是既有的。
+- 浏览器实测：PDF 导出正常出 9 页、封面题图与页脚都在、切页没有拦腰截断。
+- **没验到的**：右键换图那三条要真人登录后台才能点，本机登不进去 —— 改的是确定性的
+  DOM 行为（清 srcset / 摘 onerror / 就近取图），但**没在真实编辑器里点过一次**。
+
+### 还没做的事
+- **未部署、未提交**。
+- 会话后半段本机对 `~/Desktop/plantspedia` 失去读权限（macOS TCC），STATE 与全仓 lint
+  都是权限恢复后补的 —— 恢复办法：系统设置 → 隐私与安全性 → 完全磁盘访问权限 → 打开对应
+  app，**并重启该 app**（TCC 授权在进程启动时定，改开关不影响已在跑的进程）。
+
+---
+
+## 2026-08-07（续）— 批量录入三修：多选文件夹 / 名录正名 / 手动 #tag
+
+### ① 多选文件夹上传 —— 真正坏的是**配图串图**，不是选不中
+
+`webkitdirectory` + `multiple` 早就写在 input 上了（⌘/Shift 在 Chromium 下能勾多个文件夹），
+但 `processPickedFiles` 把**所有选中文件夹的图片汇成一个全局索引**，而索引是按文件名建键的。
+一次多选 5 个物种包、每包里都有 `images/cover.jpg` 时，后写的覆盖先写的 ——
+A 物种的正文匹配到 B 物种的照片，**而且不报错**（refs 全都「找到」了），发布出去才看见串图。
+
+改法：按 `webkitRelativePath` 顶层目录分组，各组建各组的索引、各自解析；本组找不到才退回
+全局池（HTML 与图片被分散选中的情况）。多于一个文件夹时提示「已识别 N 个文件夹」。
+按钮文案改成「+ 选择文件夹（可 ⌘ 多选）」，空态说明写清多选与「配图不会串到别的物种」。
+
+### ② AI 识别接《中国植物物种名录 2026》
+
+**抽取端**：`extractPlantMetaFn` 新增 `common_names_zh` 字段（prompt + Gemini responseSchema +
+openai-compat tool schema 三处都加），让模型把页面上写明的 别名/俗名/又名/土名/异名/旧称/
+蒙古语名 收上来。plant-editor 的 `applyExtractedMeta` 早就在读这个字段了 —— 一直是空的，
+因为抽取器根本没返回过。
+
+**核对端**：批量页 `runExtract` 在抽取后调 `checkNameFn`（纯查表 `species_names` 12 万行，
+**不烧模型**），然后：
+- `renamed` / `synonym` → **自动改成名录正名**（与 plant-editor「只提示不改」刻意相反：
+  那边的名字是编辑亲手敲的，这边是模型从 HTML 里读的，模型没有署名权）；
+- `ambiguous` / `latin-fuzzy` → 一个字不改，标「待人工核对」；
+- `unmatched` → 只说明，不是错；
+- 别名并入中文俗名（换正名不能让老名字变成搜不到的死名），slug 跟着新学名走。
+每行下面新增一条核对结论（改名的给「撤回改名」按钮，按 异名/别名 分类列出）。
+
+**重构**：`applyNameAuthority` 里的改写逻辑抽成纯函数 `alignFieldsToVerdict`
+（放 `name-authority.ts`，客户端可用），服务端那份改为调它 —— 「保留命名人」这类判据只剩一处实现。
+新增 `opts.applySynonym`：**默认关**（AI 识别 / 银叶 / 金叶三条既有链路行为不变），批量页显式开。
+
+> ⚠️ **顺带发现的既有缺口**：`applyNameAuthority` 原本只处理 `accepted`/`renamed`，
+> **`synonym` 整个漏掉**了 —— 而「学名是异名、名录已改用新正名」正是最该自动换的一类。
+> 这就是为什么线上 157 条没留痕的条目里躺着 `Acer ginnala Maxim.`（2026 正名是
+> 茶条槭 *Acer tataricum* subsp. *ginnala*）。本轮只在批量页打开了这个开关，
+> **另外三条链路没动** —— 要不要一起开，等用户定。
+
+### ③ 批量页每条加「手动添加已有 #tag」
+
+原来每行只有一个自由输入的「标签」（其实是**特征词**，进搜索与卡签，不建专题）。
+现在拆成两栏：特征词照旧；下面挂 `TagPicker`（与 plant-editor / 草稿卡同一个组件，
+只能从已建标签里选，编辑可就地新建），创建时经 `savePlant` 的 `tagIdsToAdd` 写 `plant_tags`。
+父组件 mount 时先拉一次全表填 name→id 索引 —— TagPicker 只在首次点开时才拉，
+不预拉的话「在 A 行点开选过、B 行直接创建」那种用法会查不到 id、标签静默丢掉。
+
+### 验证
+- `tsc --noEmit` = 0；`npm run build` 通过（4.26s，确认没有把服务端模块拖进客户端 bundle）。
+- 既有离线断言 `scratch/name-authority.test.mjs` **25 条全过**（确认抽函数没改行为）。
+- **真实数据验证** `scratch/_verify_batch_rename.mjs`（只读，镜像了服务端 `fetchCandidates`
+  的两段式捞法）：8 个物种全部判定正确 ——
+  科马罗夫白前→华北白前 *Vincetoxicum mongolicum*、珍珠猪毛菜→珍珠柴 *Caroxylon passerinum*、
+  桃叶卫矛→白杜 *Euonymus maackii*、距果沙芥→斧翅沙芥 *Pugionium dolabratum*、
+  酸浆→酸浆(原变种) *Alkekengi officinarum* var. *officinarum*、茶条枫→茶条槭
+  *Acer tataricum* subsp. *ginnala*；鄂尔多斯蒿→黑沙蒿（只改中文名，**命名人 Krasch. 原样保留**，
+  证明 keepAuthor 判据有效）；夏栎 accepted 不动。
+- 改动文件 ESLint 零新增（报出的 `no-explicit-any` 用 `git diff -U0` 核过，全在 hunk 外）。
+- **没验到的**：批量页 UI 在 `_authenticated` 后面，本机登不进去 —— 三处改动的**渲染**
+  没在真实页面上看过（逻辑与类型都验了，但没点过一次）。
+
+### 还没做的事
+- 未部署、未提交。
+- `applyNameAuthority` 的 `synonym` 缺口只在批量页绕开了，AI 识别 / 银叶 / 金叶三条链路照旧。
+- 线上 157 条无留痕条目仍未回填（回填是纯查表，零 token；需要一个针对 `plants` 的脚本，
+  现有 `scratch/backfill_name_authority.mjs` 打的是草稿表）。

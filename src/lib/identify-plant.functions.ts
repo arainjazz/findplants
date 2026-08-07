@@ -4645,8 +4645,10 @@ async function runQuickIdentifyCore(
     retakeCount: 0,
   };
 
-  const retakeCount = data.retake_count ?? 0;
-  const speciesHint =
+  // ⚠️ 客户端传来的补拍上下文只是**默认值**：合并模式下，下面会用草稿行里的真实状态覆盖它们。
+  // 理由见那段覆盖逻辑的注释（2026-08-06，用户实报事故）。
+  let retakeCount = data.retake_count ?? 0;
+  let speciesHint =
     data.species_hint_title || data.species_hint_sci
       ? { title: data.species_hint_title, sci: data.species_hint_sci }
       : null;
@@ -4660,7 +4662,7 @@ async function runQuickIdentifyCore(
     try {
       const { data: prev } = await (supabaseAdmin as any)
         .from("plant_drafts")
-        .select("user_photos, photo_url")
+        .select("user_photos, photo_url, retake_count, title, scientific_name")
         .eq("id", data.merge_draft_id)
         .maybeSingle();
       if (prev) {
@@ -4668,9 +4670,28 @@ async function runQuickIdentifyCore(
           ? (prev.user_photos as string[]).filter(Boolean)
           : [];
         priorPhotos = up.length ? up : prev.photo_url ? [prev.photo_url as string] : [];
+
+        // ── 补拍上下文以**草稿行**为准，不信客户端 ──────────────────────────────
+        //
+        // 2026-08-06 用户实报的事故：同一份草稿 c57b62a5 连跑三轮识别
+        // （一枝黄花 → 苏门白酒草 → 又被改回一枝黄花），而库里 retake_count 只有 1。
+        // 成因是补拍的上下文被烤进了 /identify 的 URL（retake / st / ss），而这两个值
+        // 一旦来自旧快照（页面没回查、或从历史里回到上一条补拍 URL），就会被原样重放：
+        //   · st/ss 会被拼进 system prompt 的「上一轮倾向判断为…」→ 给模型下了错锚，
+        //     这一轮 Pl@ntNet 判的明明是 Erigeron sumatrensis，模型仍 override 回旧结论；
+        //   · retake_count 被写回旧值 → 补拍次数不再累加（铜叶 = 1 + retake_count 也算少了），
+        //     第 3 次强制收口那条硬保证同样失效。
+        //
+        // 草稿行才是这两件事的唯一权威：补拍就是「在这份草稿上再来一轮」，
+        // 那么「第几轮」= 它现在的 retake_count + 1，「上一轮判断」= 它现在的结论。
+        retakeCount = (Number(prev.retake_count) || 0) + 1;
+        const prevTitle = (prev.title ?? "").toString().trim();
+        const prevSci = (prev.scientific_name ?? "").toString().trim();
+        speciesHint = prevTitle || prevSci ? { title: prevTitle, sci: prevSci } : null;
       }
     } catch (e) {
-      console.warn("[QuickIdentify] prior user_photos load failed (migration pending?):", e);
+      // 读不到就退回客户端传来的值（老行为）—— 补拍不该因为这一次读失败整个跑不成。
+      console.warn("[QuickIdentify] prior draft load failed (migration pending?):", e);
     }
   }
   // 地名只是识别的辅助提示，最多等它 4s —— Nominatim 偶发很慢/无响应，不该拖住出卡。
@@ -9246,6 +9267,14 @@ export const extractPlantMetaFn = createServerFn({ method: "POST" })
 - scientific_name：拉丁学名（含命名人，如 "Butomus umbellatus L."）。找不到留空。
 - common_name_en：英文俗名 / common name（例如 "Flowering rush"）。优先取页面中明确标注的 common name / English name；
   若同时给出多个，挑选最常用的一个；找不到留空字符串。
+- common_names_zh：**该物种的其它中文叫法**，逗号分隔的一串。把页面里明确标注为
+  别名 / 俗名 / 又名 / 土名 / 异名 / 旧称 / 民族语名（蒙古语名等）的名字都收进来，
+  例如 "水葱, 花蔺草, 呼伦-哈布哈"。规则：
+  ① **不要**把 title 里那个正名重复写进来；② 只收页面上真有的，绝不推测或编造；
+  ③ 拉丁异名（如 "Triglochin maritimum"）也可以收，与中文名并列即可；
+  ④ 找不到就返回空字符串。
+  （注：这里只负责「页面上写了什么」；哪个是名录正名、哪些算异名，由本站的
+  《中国植物物种名录 2026》核对环节判定，不需要你来定。）
 - slug：基于「拉丁学名」生成的 URL 友好字符串。**必须只包含 ASCII 小写字母、数字、连字符**，
   绝对禁止出现任何中文、空格或其他 Unicode 字符（例如正确："butomus-umbellatus"；错误："花蔺-butomus"）。
   若无法从拉丁学名生成合法 ASCII slug，则返回空字符串。
@@ -9275,6 +9304,7 @@ export const extractPlantMetaFn = createServerFn({ method: "POST" })
           title: { type: "string" },
           scientific_name: { type: "string" },
           common_name_en: { type: "string" },
+          common_names_zh: { type: "string" },
           slug: { type: "string" },
           family: { type: "string" },
           genus: { type: "string" },
@@ -9287,6 +9317,7 @@ export const extractPlantMetaFn = createServerFn({ method: "POST" })
           "title",
           "scientific_name",
           "common_name_en",
+          "common_names_zh",
           "slug",
           "family",
           "genus",
@@ -9375,6 +9406,7 @@ export const extractPlantMetaFn = createServerFn({ method: "POST" })
                     scientific_name: { type: "string" },
                     title: { type: "string" },
                     common_name_en: { type: "string" },
+                    common_names_zh: { type: "string" },
                     slug: { type: "string" },
                     family: { type: "string" },
                     genus: { type: "string" },
@@ -9387,6 +9419,7 @@ export const extractPlantMetaFn = createServerFn({ method: "POST" })
                     "title",
                     "scientific_name",
                     "common_name_en",
+                    "common_names_zh",
                     "slug",
                     "family",
                     "genus",
@@ -9588,28 +9621,15 @@ export const savePlantFn = createServerFn({ method: "POST" })
             summary: `${editorName} 创建了同名分支条目（保留各自详情页，原条目 id=${payload.parent_id}）`,
           });
         }
-        if (payload.content_type === "html") {
-          await supabaseAdmin.from("plant_edits").insert({
-            plant_id: plantId,
-            editor_id: dbAuthorId,
-            editor_name: editorName,
-            kind: "html_save",
-            marker_n: 0,
-            source: "plant_editor",
-            summary: `${editorName} 保存/上传了 HTML 文件`,
-          });
-        }
-      } else if (editSummary) {
-        await supabaseAdmin.from("plant_edits").insert({
-          plant_id: plantId,
-          editor_id: dbAuthorId,
-          editor_name: editorName,
-          kind: "text",
-          marker_n: 0,
-          source: "plant_editor",
-          summary: editSummary,
-        });
+        // ⛔️ 这里不再补一条「XX 保存/上传了 HTML 文件」的 html_save 行：上面那条 create
+        // 已经写明了这是一条 HTML 条目，再来一条只是把「创建」这一件事拆成两行日志，
+        // 而且 html_save 不属于 CREATE_KINDS，会掉进「修改记录」里 —— 一条刚建好、
+        // 谁都没改过的条目，修改记录里却已经躺着一行。
       }
+      // ⛔️ 更新分支同理不再写「XX 编辑修改了条目「某某」」那条 kind:"text" 流水。
+      // 它记的是「有人按了保存」，不是改了什么：marker_n=0、没有 before/after，
+      // 撤销点下去只会报「找不到该修改对应的内容块」（2026-08-07 用户反馈）。
+      // 真正的内容改动由 html-doc-editor 写的逐块标记行记录，「注 N」和撤销都靠那些行。
     }
 
     if (plantId) {

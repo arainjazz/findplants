@@ -7,6 +7,7 @@ import { awaitJob, rememberJob, forgetJob } from "@/lib/poll-job";
 import { getAnonId } from "@/lib/anon-id";
 import { findDraftByPhotoHash } from "@/lib/species-existing.functions";
 import { keepVisualAdvice } from "@/lib/retake-advice";
+import { rememberFreshPhoto } from "@/lib/fresh-photo";
 import { explainError, isNetworkError } from "@/lib/explain-error";
 import { useAuth } from "@/hooks/use-auth";
 import { toast } from "sonner";
@@ -713,13 +714,21 @@ export function CameraIdentify({
   /** 成功收尾：清缓存 → 标记「刚识别完」→ 跳转。正常路径与断线自愈路径共用，
    *  免得自愈少做一步（比如忘了清缓存）而出现「跳过去还是旧草稿」这种二次 bug。 */
   const goToDraft = (draftId: string) => {
-    // 补拍合并回同一份草稿时，/drafts/$id 会命中 React Query 缓存（staleTime=5min、
-    // 不 refetchOnWindowFocus）→ 页面渲染的是**补拍前**的旧草稿：retake_count 还是 0、
-    // ai_payload 还是上一轮的「疑似」。分享卡是 draft 一到就自动生成的，于是「本轮铜叶 +N」
-    // 按 N=1 画出去、关卡后的补拍横幅也倒回「第一次补拍」。必须先把缓存丢掉，让页面拿新数据。
-    // leaves 同理：本轮铜叶刚变，叶章统计不能用旧值。
+    // 补拍合并回同一份草稿时，/drafts/$id 会命中 React Query 缓存 → 页面渲染的是**补拍前**
+    // 的旧草稿：retake_count 还是 0、ai_payload 还是上一轮的「疑似」。分享卡是 draft 一到就
+    // 自动生成的，于是「本轮铜叶 +N」按 N=1 画出去、关卡后的补拍横幅也倒回「第一次补拍」。
+    // 先把缓存丢掉，让页面拿新数据。（草稿页那一份现在还额外配了 refetchOnMount:"always"，
+    // 两道保险：这里是「立刻正确」，那里是「以后每次进来都正确」。）
     qc.removeQueries({ queryKey: ["draft", draftId] });
-    if (user?.id) qc.removeQueries({ queryKey: ["leaves", user.id] });
+    // ⚠️ 叶子统计用 invalidate 而**不是** remove：remove 会让草稿页那个「等叶子到了再出卡」
+    // 的判据从零开始等一次完整重算（computeLeaves 是 7 条并发查询，其中一条要拉该用户的
+    // 全部草稿行）—— 这正是用户 2026-08-06 报的「停在已完成界面很久才弹分享卡」的一段。
+    // invalidate 保留旧值可立刻出卡，新值到了再由草稿页重画一次卡面（见 cardSnap.leavesKey）。
+    if (user?.id) qc.invalidateQueries({ queryKey: ["leaves", user.id] });
+
+    // 把刚提交的那张照片留在内存里 —— 草稿页出卡时直接画它，省掉「再从云端把同一张图
+    // 下载一遍」那一段等待（存储对象是 no-cache 的，每次都会真跑网络）。见 lib/fresh-photo.ts。
+    rememberFreshPhoto(draftId, capturedBlobRef.current);
 
     // Signal the draft page to auto-open the share card as the first screen.
     try {

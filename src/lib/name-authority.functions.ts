@@ -1,10 +1,12 @@
 import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 import {
+  alignFieldsToVerdict,
   buildLookup,
   canonicalKey,
   resolveName,
   type ChecklistEntry,
+  type NamedFields,
   type NameInput,
   type NameVerdict,
 } from "./name-authority";
@@ -110,15 +112,7 @@ export async function checkName(input: NameInput): Promise<NameVerdict> {
   }
 }
 
-/** 一份内容里与名字有关的字段。识别草稿的 AiMeta、金叶的 VerifiedFacts、
- *  编辑提交的表单都能塞进这个形状。 */
-export type NamedFields = {
-  title?: string | null;
-  scientific_name?: string | null;
-  family?: string | null;
-  genus?: string | null;
-  common_names_zh?: string | null;
-};
+export type { NamedFields };
 
 /** 写进内容里的核对留痕。存 `ai_payload._name_authority`，供页面渲染别名与「待核对」提示。 */
 export type NameAuthorityStamp = {
@@ -163,53 +157,9 @@ export async function applyNameAuthority(
     family: fields.family ?? null,
   };
 
-  let changed = false;
-  if (verdict.status === "accepted" || verdict.status === "renamed") {
-    if (verdict.acceptedZh && fields.title !== verdict.acceptedZh) {
-      fields.title = verdict.acceptedZh;
-      changed = true;
-    }
-    // 名录的 scientific_name 是**不含命名人**的（命名人在 author 列）。原样覆盖会把
-    // 「Oxytropis lanata (Pall.) DC.」削成「Oxytropis lanata」——AI_META_SCHEMA 明写着
-    // 学名含命名人，站内条目页也是这么展示的，白丢一段信息。
-    // 判据：**原学名以名录正名开头**（且归一化后同名）→ 多出来的那截就是命名人，保留原样；
-    // 否则（异名换正名、性数错配、变音符/斜体污染）一律采用名录的写法。
-    if (verdict.acceptedLa && fields.scientific_name !== verdict.acceptedLa) {
-      const orig = (fields.scientific_name ?? "").trim();
-      const keepAuthor =
-        !!orig &&
-        canonicalKey(orig) === canonicalKey(verdict.acceptedLa) &&
-        orig.toLowerCase().startsWith(verdict.acceptedLa.toLowerCase());
-      if (!keepAuthor) {
-        fields.scientific_name = verdict.acceptedLa;
-        changed = true;
-      }
-    }
-    const fam = verdict.familyZh && verdict.familyLa ? `${verdict.familyZh} ${verdict.familyLa}` : null;
-    if (fam && fields.family !== fam) {
-      fields.family = fam;
-      changed = true;
-    }
-    const gen = verdict.genusZh && verdict.genusLa ? `${verdict.genusZh} ${verdict.genusLa}` : null;
-    if (gen && fields.genus !== gen) {
-      fields.genus = gen;
-      changed = true;
-    }
-    // 别名并入俗名，保住可搜索性
-    if (verdict.aliases.length) {
-      const existing = (fields.common_names_zh ?? "")
-        .split(/[,，、;；]/)
-        .map((s) => s.trim())
-        .filter(Boolean);
-      const merged = [...existing];
-      for (const a of verdict.aliases) if (!merged.includes(a.name)) merged.push(a.name);
-      const joined = merged.join(", ");
-      if (joined !== (fields.common_names_zh ?? "")) {
-        fields.common_names_zh = joined;
-        changed = true;
-      }
-    }
-  }
+  // 改写规则见 `alignFieldsToVerdict`（纯函数，与批量录入页共用同一份判据）。
+  // 这里不开 applySynonym：AI 识别 / 银叶 / 金叶 三条链路的既有行为是「异名不自动换」。
+  const changed = alignFieldsToVerdict(fields, verdict);
 
   return {
     verdict,
