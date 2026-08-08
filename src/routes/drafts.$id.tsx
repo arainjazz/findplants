@@ -9,6 +9,13 @@ import { ReplaceImageFlow } from "@/components/replace-image-flow";
 import { XiaoPAgentPanel } from "@/components/draft-agent-panel";
 import { userModelArg } from "@/lib/xiaop-user-model";
 import {
+  applyImagePlan,
+  listSectionSlots,
+  summarizeChanges,
+  type ImagePlanItem,
+  type PlanPhoto,
+} from "@/lib/xiaop-image-plan";
+import {
   enhanceDraftHtmlForViewing,
   replaceImageInDraftHtml,
   stripStaleMissingNotes,
@@ -652,6 +659,13 @@ function DraftPage() {
     });
     return secs.slice(0, 21);
   }, [draft?.html_content]);
+
+  // 小P蛙换图方案要用的图槽清单（纯字符串扫描，不碰 DOM）。只用来在**执行之前**
+  // 把「第 1 张 → Section II」翻译成人话，真正的替换在 onImagePlanApply 里重算一次。
+  const imageSlots = useMemo(
+    () => listSectionSlots(draft?.html_content || ""),
+    [draft?.html_content],
+  );
 
   useEffect(() => {
     return () => {
@@ -2019,9 +2033,17 @@ function DraftPage() {
                 canApply={isEditor && draft.status !== "approved"}
                 isRegistered={!!user}
                 scopes={pageSections}
-                ask={async (question, history, scope) => {
+                imageSlots={imageSlots}
+                ask={async (question, history, scope, refPhotoCount) => {
                   const res = (await askAgent({
-                    data: { draftId: id, question, scope, history, userModel: userModelArg() },
+                    data: {
+                      draftId: id,
+                      question,
+                      scope,
+                      history,
+                      refPhotoCount,
+                      userModel: userModelArg(),
+                    },
                   })) as {
                     reply: string;
                     canEdit: boolean;
@@ -2079,6 +2101,36 @@ function DraftPage() {
                 onImageReplace={(query, instruction) =>
                   setXiaopImg({ query: query || draft.scientific_name || draft.title, instruction })
                 }
+                onImagePlanApply={async (plan: ImagePlanItem[], photos: PlanPhoto[]) => {
+                  const before = draft.html_content || "";
+                  if (!before) throw new Error("这份草稿还没有正文，无从换图。");
+                  const res = applyImagePlan(before, plan, photos);
+                  const { changes, skipped } = res;
+                  // 草稿模板的空槽旁边挂着一句「暂无该物种的…公开照片」。填上图之后那句话
+                  // 就成了「图旁边写着没有图」——三条换图路径共用这个清理（见 draft-enhance.ts）。
+                  const html = stripStaleMissingNotes(res.html);
+                  const reasons = skipped.map((s) => s.reason);
+                  // 一处都没换成就别写库 —— 存一份一模一样的 HTML、再记一条「换了 0 处」，
+                  // 只会在修改记录里留一条没法撤销也没意义的流水。
+                  if (!changes.length) return { changed: 0, skipped: reasons };
+                  await saveDraftHtml({ data: { draftId: id, html } });
+                  logDraftEdit({
+                    data: {
+                      draftId: id,
+                      kind: "draft_image",
+                      summary: `小P蛙按方案换图（${changes.length} 处）：${summarizeChanges(changes)}`.slice(
+                        0,
+                        500,
+                      ),
+                      beforeHtml: before,
+                      afterHtml: html,
+                      source: "xiaop_agent",
+                    },
+                  }).catch(() => {});
+                  qc.invalidateQueries({ queryKey: ["draft", id] });
+                  qc.invalidateQueries({ queryKey: ["draft-edits", id] });
+                  return { changed: changes.length, skipped: reasons };
+                }}
               />
             }
             {xiaopImg && draft.html_content && (

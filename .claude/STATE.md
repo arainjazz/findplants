@@ -1,6 +1,24 @@
 # Plantspedia — Working State  (single source of truth)
 
-_Last updated: 2026-08-07（续）— by Claude（**批量录入三修**：① 多选文件夹上传——真正坏的不是
+_Last updated: 2026-08-08 — by Claude（**一修 / 一更正 / 一未做**。
+① **已修**：小P蛙自称「系统仅向我传输了纯文本、没附照片」—— 不是模型没视觉，是
+`xiaopVisionUrls` 在限定 scope 时**真的一张图都没送**：访客实拍照存在 `plant_drafts` 的**列**里
+（photo_url / user_photos），旧代码只在**无 scope** 分支才用它，而「拍摄记录」讨论的正是那张照片；
+叠加「标题找到了但那节没图 → 只判 `frag != null`，空数组照送、连整页回退都不触发」。
+已改为 scope 沾「照片/拍摄/实拍/观测/图片/配图」就把访客原图垫最前、抽不到图退回整页，
+并新增 `visitorUrls` 收 `user_photos`。
+② **更正**：上一轮把批量上传按钮写成「可 ⌘ 多选文件夹」是**错的** —— macOS 上浏览器的目录
+选择框只能选一个，`multiple` 对它不生效，是平台行为。真能用的是「多个文件夹一起拖进去」和
+「重复点、条目累加」（本来就累加）。文案已改成实话，别再试图用 `multiple` 解决。
+③ **已修**：小P蛙对「用第一张和第六张替换 section II / V 的配图」只回「已为您提交申请」然后
+什么都没发生 —— 它把「我已受理」当成了动作本身，而系统里根本没有承接这种**批量定位方案**的
+东西（原先只有「搜图后手动挑一张」）。四步全部补齐：新建纯函数层
+`src/lib/xiaop-image-plan.ts`（两套模板 + 裸 img 混合结构都认，署名随图一起换）、
+服务端加 `imagePlan` schema/解析/提示词（并**明令禁止**它说「已提交/已受理」）、
+面板出「按方案替换」按钮、草稿页与条目页两个宿主落地。
+离线断言 `scratch/xiaop-image-plan.test.mjs` **25 条全过**（含两份真实页面 fixture）。
+tsc=0、四个新改文件 ESLint 零问题。）_
+_上一轮：2026-08-07（续）— by Claude（**批量录入三修**：① 多选文件夹上传——真正坏的不是
 选不中（`webkitdirectory`+`multiple` 早就有），而是**所有文件夹的图汇成一个全局索引**、按文件名
 建键，多选时 A 物种匹配到 B 物种的 `cover.jpg` 且**不报错**；改为按顶层目录分组各自解析。
 ② AI 抽取新增 `common_names_zh` 字段（三处 schema 都加），并接《中国植物物种名录 2026》
@@ -7551,3 +7569,182 @@ openai-compat tool schema 三处都加），让模型把页面上写明的 别�
 - `applyNameAuthority` 的 `synonym` 缺口只在批量页绕开了，AI 识别 / 银叶 / 金叶三条链路照旧。
 - 线上 157 条无留痕条目仍未回填（回填是纯查表，零 token；需要一个针对 `plants` 的脚本，
   现有 `scratch/backfill_name_authority.mjs` 打的是草稿表）。
+
+---
+
+## 2026-08-08 — 小P蛙看不到照片（已修）／文件夹多选（更正认知）／换图指令不执行（未做）
+
+### ✅ 已修：小P蛙说「系统仅向我传输了纯文本，没有附照片」
+
+用户实测：审「拍摄记录」时小P蛙自称拿不到访客实拍照，只能靠文字描述推断。
+**不是模型没有视觉能力，也不是提示词问题** —— 是 `xiaopVisionUrls`（identify-plant.functions.ts）
+在**限定 scope** 时两个缺陷叠加，真的一张图都没送进去：
+
+1. **访客实拍照被整个丢掉**。它存在 `plant_drafts.photo_url` / `user_photos` **列**里，
+   正文 HTML 未必有对应 `<img>`；而「拍摄记录」讨论的恰恰就是那张照片，
+   按 scope 抽 HTML 片段必然抽空。旧代码里 `coverUrl` 只在**无 scope** 分支才用。
+2. **抽到 0 张图时不回退**。旧代码只判 `frag != null` —— 标题找到了、但那一节里没有图
+   （空图槽 / 图在标题范围之外），就把空数组送进去了。**比标题没找到还糟**，
+   因为「没找到」反而会触发整页回退，而「找到了但没图」不会。
+
+于是提示词落到 `（本次未能附上照片，仅能依据文本判断，请说明这一点）` 分支 —— 模型如实照说，
+用户看到的就是那句话。
+
+**改法**：`xiaopVisionUrls` 新增 `visitorUrls` 参数（收 `user_photos`）；scope 只要沾
+`/照片|拍摄|实拍|观测|图片|配图/` 就把访客原图垫在最前；scoped 抽不到图时退回整页。
+无 scope 分支也统一走 `visitorShots`。`askDraftAgentFn` 调用处补传 `user_photos`。tsc=0。
+
+### ⚠️ 更正：批量上传的文件夹「⌘/Shift 多选」——浏览器根本不支持
+
+上一轮我把按钮写成「可 ⌘ 多选」是**错的，误导了用户**。macOS 上 Chrome/Safari 的目录选择框
+（`webkitdirectory`）**只能选一个文件夹**，`multiple` 属性对目录选择器不生效 —— 平台行为，
+不是本站限制。上一轮真正修好的是**另一个** bug（多文件夹时配图按文件名串到别的物种上）。
+
+页面文案已改成实话，两条真能用的路：① **多个物种文件夹一起拖进上传框**（这条支持多选）；
+② 重复点「选择文件夹」逐个加，`finalizeBatch` 是 `setItems(prev => [...prev, ...next])`，
+**本来就累加不覆盖**。以后别再试图用 `multiple` 解决这件事。
+
+### ✅ 已修：小P蛙只答应换图、不真执行
+
+用户实测：说「用第一张和第六张替换文中 section II 和 section V 的配图」，小P蛙回
+「已为您提交申请…」然后**什么也没发生** —— 它把「我已受理」当成了动作本身，
+而系统里根本没有承接这个方案的东西。当前只有 `imageEdit` + `imageQuery`（调起搜图让人**手动**挑一张），
+没有「第 N 张 → section X」这种**批量定位方案**的表达能力。
+
+补的是一整条链，四步**都已完成**（下面保留原始设计，因为每一条都对应一个踩过的坑）：
+
+1. **纯函数库** `src/lib/xiaop-image-plan.ts`（可离线测）：
+   - `listSectionSlots(html)` → `[{ section: "II", label, src, index }]`，
+     按 `h2.sec` 里 `<span class="num">` 的罗马数字分组（生成端见 premium-page.ts:935），
+     图槽是 `figure.img-slot > img`；注意 `.img-slot.broken` **里根本没有 `<img>`**
+     （premium-page.ts:667-668），空槽要能被表达出来才可替换。
+   - `applyImagePlan(html, plan, photos)` → `{ html, changes: [{section, oldUrl, newUrl}] }`。
+2. **服务端**（identify-plant.functions.ts，`askDraftAgentFn` / `askPlantAgentFn` 两处）：
+   schema + 提示词加 `imagePlan: [{ photo: number, section: string }]`；
+   并**明确禁止**它说「已提交申请 / 已受理」—— 只能说「方案如下，请点按钮执行」。
+   `parseAgentReply` / `harvestImageIntent` 要一并认这个字段。
+3. **面板** `draft-agent-panel.tsx`：消息带 `imagePlan` 且该轮有参考图库时，
+   出「按方案替换（N 处）」按钮 → 新 prop `onImagePlanApply(plan, photos)`。
+4. **两个宿主**：`drafts.$id.tsx` 与 `plants.$slug.tsx` —— 落地 → 存 HTML → 写 plant_edits。
+   条目页那半可复用现成的 `persistPlantHtml`。
+
+**实现里三个只有对着真实页面才照得出来的坑**（手写 fixture 全都测不出）：
+- **草稿正文是混合结构**：访客实拍照裹在一个光 `<div class="img-slot">` 里，五张分节配图却是
+  裸的 `<img class="sec-img">`。原先「一个 img-slot 都没找到才走裸 img 兜底」的写法，
+  被那一个槽整个挡掉 —— 全页 6 张图只认出 1 张。改成**增量**收集。
+- **裸 `<img>` 槽要就地改写**：不分流的话会把它当"容器开标签"、判定"里面没有图"，
+  于是在它**前面**再插一张 —— 页面上凭空多一张、旧图纹丝不动。
+- **属性正则必须按引号种类配对**：模板里 `onerror="…add('broken')"` 的值内部带单引号，
+  写成 `["'][^"']*["']` 会在第一个 `'` 处截断，摘 onerror 时留下半截 `broken')"`，属性表当场坏掉。
+
+另外两条设计决定：**署名随图一起换**（拿不到新署名宁可整条摘掉，也不把新照片署到别人名下）；
+**从后往前改写**，否则前一次改写的长度变化会把后面所有槽的下标带偏。
+
+### 状态
+- 本轮改动六个文件：新增 `src/lib/xiaop-image-plan.ts`；改
+  `identify-plant.functions.ts`、`draft-agent-panel.tsx`、`drafts.$id.tsx`、
+  `plants.$slug.tsx`、`admin.batch-new.tsx`。
+- 验证：tsc=0；离线断言 25 条全过；四个新改文件 ESLint 零问题
+  （`identify-plant.functions.ts` 报的 `no-explicit-any` 经 `git diff -U0` 核过全在 hunk 外）。
+- **没验到的**：小P蛙那条链要真人登录 + 真实模型调用才能端到端跑，本机 Node fetch 不认代理
+  （见上一轮），**没在真实对话里点过一次「按方案替换」**。纯函数层是拿真实页面测过的。
+
+---
+
+## 2026-08-08（续）— 小P蛙换图指令：四步链路已打通（未提交、未部署）
+
+上一节列的四步全部做完。核心思路没变：**模型只出方案，落地由客户端确定性执行**
+（零 token、100% 可预期），编辑点一下「按方案替换（N 处）」才生效。
+
+### ① 纯函数库 `src/lib/xiaop-image-plan.ts`（新增，可离线测）
+`listSectionSlots(html)` → 按章节归位的图槽清单；`applyImagePlan(html, plan, photos)`
+→ `{ html, changes, skipped }`；另有 `slotsForSection` / `describePlanItem` / `summarizeChanges`。
+
+**⚠️ 线上有三套模板，不是一套**（原计划只写了一套，实测才发现）：
+
+| | 章节标记 | 图槽 |
+|---|---|---|
+| A. ccplants / 批量录入 | `<div class="sec-rule"><span class="sec-num"><i>II</i></span>…<h2>典型生境</h2>` | `<div class="img-slot" data-slot-name="…">` |
+| B. premium-page.ts | `<h2 class="sec"><span class="num">II</span><span>典型生境</span>` | `<figure class="img-slot" data-label="…">`；空槽是 `<div class="img-slot broken">`，**里面没有 `<img>`** |
+| C. 草稿正文（drafts.$id 这一半） | 同 A 的 `sec-rule`/`sec-num` | **混合**：实拍照裹在光 `<div class="img-slot">` 里，五张分节配图是**裸 `<img class="sec-img">`**（外面只有 `<figure class="sec-figure">`）；空位是 `hidden src=""` |
+
+章节标识 `II` / `2` / `二` / `第二节` / `Section II` / `典型生境` / 图槽名 都认。
+
+**四个只有拿真实产物跑才照得出来的坑（都已修，都进了断言）：**
+1. **属性正则不能写 `["'][^"']*["']`** —— 模板里 `onerror="…classList.add('broken')"` 的值
+   自带单引号，那种写法在第一个 `'` 处截断，摘 onerror 时留下半截 `broken')"` 挂在 `<img>` 上，
+   属性表当场坏掉。改成按引号种类配对的 `attrPattern()`。
+   （手写 fixture 照不出来 —— 断言只查了「onerror 三个字没了」。现在改成比对**整个标签**。）
+2. **裸 `<img>` 槽不能走容器分支** —— 否则会把 `<img>` 本身当"开标签"、发现"容器里没有图"，
+   于是在它**前面**再插一张：页面凭空多一张图，旧图纹丝不动。
+3. **裸 img 的收集必须是增量的，不能是「一个 img-slot 都没有才扫」** —— 模板 C 是混合的，
+   那一个光 img-slot 会把兜底整个挡掉，全页 6 张图只认出 1 张。
+4. **有编号的章节标记出现过，就只认有编号的** —— feat-card / 博物趣闻里满是 `<h3>`，
+   全当章节的话 Section I 会被切碎，「换 Section I 的图」当场失灵。
+
+**顺手补的一件正确性的事**：换图**连署名一起换**。premium-page 的图槽带
+`.img-credit`（摄影者/许可证）和 `.img-note`（关于这一张的降级说明）。只换 src 不动它们，
+新照片就被明明白白署到另一个摄影者名下 —— 比不署名更糟（这些照片多是 CC BY-NC）。
+拿不到新署名时**宁可整条摘掉**。`PlanPhoto` 因此带上 `credit`，面板从 `PlantImgHit.credit` 透传。
+
+### ② 服务端（`identify-plant.functions.ts`）
+- `AgentReply` 加 `imagePlan: [{photo, section, slot?}]`；`parseImagePlan()` 容忍
+  各种键名/字符串数字；严格 JSON、宽松正则、纯散文三条解析路径都认。
+- 两处 schema（`askDraftAgentFn` / `askPlantAgentFn`）加 `imagePlan` 并列入 `required`。
+- 共用提示词 `IMAGE_PLAN_RULE(refPhotoCount)`，**明令禁止**说「已提交申请 / 已受理 /
+  已安排替换」——那正是这次 bug 的现象（把「我已受理」当成了动作本身）。
+- 新增输入 `refPhotoCount`：服务端不可能知道对话里摆着几张参考图（图是面板自己去
+  iNaturalist/GBIF 取的），不告诉模型它就会凭空编方案。为 0 时提示词直接要求 imagePlan 留空。
+- `harvestImageIntent`：**有 imagePlan 时它独占这一轮的按钮**（清掉 canEdit/imageEdit）——
+  否则编辑面对两个按钮，点错那个就走上「让模型重写整页 HTML」这条最贵最不准的路。
+  `harvestEditIntent` 同理加了守卫。页面级那只（落不了地）强制 `imagePlan: []`。
+
+### ③ 面板（`draft-agent-panel.tsx`）
+- `ChatMsg.imagePlan` + `planApplying` / `planResult`（**与文字改写的 applying/applied 分开**，
+  一条消息两者都可能有，共用标记会互相把对方的按钮点没）。
+- 新 prop `onImagePlanApply(plan, photos)` + `imageSlots`（宿主算好的图槽清单，
+  只用于**点之前**把方案翻译成人话）。按钮：「按方案替换（N 处）」，执行后照实显示
+  「已替换 M 处并保存」+ 每条没换成的原因 —— 绝不替它宣称"已完成"。
+- 「第一张/第六张」数的是**最近一组已加载出来的参考图**（从该消息往回找），
+  摊平必须走 `dedupGroups` —— 屏幕上就是它渲染的（去重 + 每组截断 6 张都在里面），
+  不走它就会「用户数的第 6 张 ≠ 程序取的第 6 张」。
+
+### ④ 两个宿主
+- `drafts.$id.tsx`：`applyImagePlan` → `stripStaleMissingNotes` → `saveDraftHtml` →
+  `logDraftEdit(kind: draft_image, before/after)` → 失效缓存。
+- `plants.$slug.tsx`：同上，先 `applyPageHtml` 上屏再 `persistPlantHtml`（写 `ai_page_edit`，
+  带 before/after 可撤销）；落库失败把画面退回去。
+- 两边都**一处都没换成就不写库** —— 存一份一模一样的 HTML 只会在修改记录里留一条
+  没法撤销也没意义的流水。
+- 两边都接 `stripStaleMissingNotes`：草稿模板空槽旁边挂着「暂无该物种的…公开照片」，
+  填上图后那句话就成了「图旁边写着没有图」（draft-enhance.ts 里那个函数本来就是为
+  三条换图路径准备的，这是第三条）。
+
+### 验证
+- `tsc --noEmit` = 0；`npm run build` 通过（4.11s）。
+- **离线断言 25 条全过**：`node --experimental-strip-types scratch/xiaop-image-plan.test.mjs`
+  —— 三套模板 + 空槽填图 + 署名替换 + 多处替换不错位 + 指不到时如实退回 + 各种章节写法。
+  两份真实产物做 fixture：`scratch/_sample_page.html`（模板 A，18 槽）、
+  `scratch/_sample_draft_page.html`（模板 C，6 槽，本轮从线上抓的）。
+- **拿生成端真实产出跑一遍**：`scratch/xiaop-image-plan.render-check.mjs`
+  （premium-page.ts 是无扩展名 import，node 的 strip-types 解析不了，跑法见文件头的 esbuild 命令）。
+  单引号那个 bug 就是它照出来的 —— 手写 fixture 一个都没照出来。**以后这类字符串改写，
+  必须拿生成端的真实输出跑，不能只信自己手写的 fixture。**
+- **浏览器实测**（dev 5203，线上蒺藜页 `/plants/tribulus-terrestris-l`，模板 C）：
+  在页面里 `import('/src/lib/xiaop-image-plan.ts')` 直接跑真实正文 ——
+  6 个槽全部认出、`section: "II"` 命中「形态特征」、空槽被填上、
+  「暂无该物种的生境公开照片」一并消失、**只有指到的两处 src 变了**。
+  再把结果装进 iframe 量渲染结果：两张新图 `naturalWidth` = 900 / 1024（真下载到了）、
+  `display:block`、`visibility:visible`、尺寸 322×429 / 322×242，页面 `<img>` 总数仍是 6
+  （没有多插一张）。**这一步直接推翻了 2026-08-07 那个「提示已替换、画面纹丝不动」的失败模式。**
+- 改动文件 ESLint **零新增**（用 `git diff -U0` 逐条核对，报出来的都在 hunk 之外）。
+
+### 没验到的 / 还没做
+- **整条链路没跑过一次真模型**：模型到底会不会按格式吐 `imagePlan`、会不会仍旧嘴上说
+  「已提交申请」，只有真人登录后发一句「用第一张和第六张替换 section II 和 section V 的配图」
+  才知道。本机登不进后台（老问题），且跑一次要真烧模型调用。**这是下一步该做的第一件事。**
+- 面板上那个按钮的**渲染**没在真实对话里看过（要登录 + 一轮真回复）。
+- 参考图是**外链**（iNaturalist / GBIF / 维基共享）直接写进正文，没有转存到自己的桶 ——
+  与现有的 `ReplaceImageFlow` 搜图选图行为一致（那条路也是外链），所以没改；
+  但两条路以后要不要一起转存，是个悬着的问题。
+- **未提交、未部署**（上一次部署仍是 `477aa475`）。

@@ -575,6 +575,10 @@ function describeHttpAiError(tag: string, httpStatus: number, body: string): AiE
   return new AiError(code, `${head}。${detail}`);
 }
 
+/** 一条「把参考图第 N 张放进某一节」的换图意向。执行在客户端（lib/xiaop-image-plan.ts），
+ *  这里只负责把模型的意向原样接出来。 */
+type ImagePlanItem = { photo: number; section: string; slot?: number };
+
 type AgentReply = {
   reply: string;
   canEdit: boolean;
@@ -583,7 +587,28 @@ type AgentReply = {
   imageQuery: string;
   showImages: boolean;
   imageQueries: string[];
+  imagePlan: ImagePlanItem[];
 };
+
+/** 容忍各种键名/字符串数字的 imagePlan 解析。指不到 section 的条目直接丢 —— 一个
+ *  没有目标的方案项在面板上只会变成一行「没找到」，不如不出现。 */
+function parseImagePlan(raw: unknown): ImagePlanItem[] {
+  if (!Array.isArray(raw)) return [];
+  const out: ImagePlanItem[] = [];
+  for (const it of raw) {
+    if (!it || typeof it !== "object") continue;
+    const r = it as Record<string, unknown>;
+    const photo = Number(r.photo ?? r.index ?? r.n ?? r.image ?? r.photoIndex);
+    const section = String(r.section ?? r.sec ?? r.target ?? r.chapter ?? "").trim();
+    if (!Number.isFinite(photo) || photo < 1 || !section) continue;
+    const slotRaw = Number(r.slot ?? r.slotIndex ?? r.nth);
+    const item: ImagePlanItem = { photo: Math.round(photo), section };
+    if (Number.isFinite(slotRaw) && slotRaw >= 1) item.slot = Math.round(slotRaw);
+    out.push(item);
+    if (out.length >= 12) break;
+  }
+  return out;
+}
 
 /** Tolerantly parse a 小P agent response into {reply,canEdit,editInstruction}.
  *  Relay / reasoning models often answer in prose or return slightly malformed /
@@ -615,6 +640,7 @@ function parseAgentReply(raw: string): AgentReply {
           showImages:
             rec.showImages === true || rec.showImages === "true" || rec.show_images === true,
           imageQueries,
+          imagePlan: parseImagePlan(rec.imagePlan ?? rec.image_plan),
         };
       }
     }
@@ -637,6 +663,23 @@ function parseAgentReply(raw: string): AgentReply {
     const imageQueries = iqsM
       ? [...iqsM[1].matchAll(/"((?:[^"\\]|\\.)*)"/g)].map((m) => unesc(m[1]).trim()).filter(Boolean)
       : [];
+    // imagePlan 是唯一的数组-of-对象字段：先按 JSON 试，不行就逐个对象抠 photo/section。
+    const ipM = txt.match(/"image_?[Pp]lan"\s*:\s*(\[[\s\S]*?\])/);
+    let imagePlan: ImagePlanItem[] = [];
+    if (ipM) {
+      try {
+        imagePlan = parseImagePlan(JSON.parse(ipM[1]));
+      } catch {
+        imagePlan = parseImagePlan(
+          [...ipM[1].matchAll(/\{[^{}]*\}/g)].map((o) => {
+            const photo = Number(o[0].match(/"photo"\s*:\s*"?(\d+)"?/)?.[1] ?? NaN);
+            const section = o[0].match(/"section"\s*:\s*"((?:[^"\\]|\\.)*)"/)?.[1] ?? "";
+            const slot = Number(o[0].match(/"slot"\s*:\s*"?(\d+)"?/)?.[1] ?? NaN);
+            return { photo, section: unesc(section), slot };
+          }),
+        );
+      }
+    }
     return {
       reply: unesc(replyM[1]).trim(),
       canEdit: canM ? canM[1].toLowerCase() === "true" : false,
@@ -645,6 +688,7 @@ function parseAgentReply(raw: string): AgentReply {
       imageQuery: iqM ? unesc(iqM[1]).trim() : "",
       showImages: siM ? siM[1].toLowerCase() === "true" : false,
       imageQueries,
+      imagePlan,
     };
   }
   // Pure prose (or unparseable) — show the model's text as the reply.
@@ -656,13 +700,21 @@ function parseAgentReply(raw: string): AgentReply {
     imageQuery: "",
     showImages: false,
     imageQueries: [],
+    imagePlan: [],
   };
 }
 
 /** Some models (esp. relay/reasoning) only PROMISE to show reference photos in prose
  *  ("我再调出几组参考图…") without setting showImages/imageQueries. Detect that promise
  *  and harvest Latin binomials from the reply so the photos actually get shown. */
-function harvestImageIntent(r: AgentReply): AgentReply {
+function harvestImageIntent(input: AgentReply): AgentReply {
+  // 有换图方案时它**独占**这一轮的可执行按钮：`canEdit` 那条路会把整页 HTML 丢给模型
+  // 重写（applyDraftAgentEditFn），而模型改一个 src 会顺手改坏别处；`imageEdit` 那条路
+  // 是「调起搜图让人手动挑一张」，跟已经点名了第几张的方案是两回事。留着只会让编辑
+  // 面对两个按钮、点错一个就走上最贵最不准的那条路。
+  const r: AgentReply = input.imagePlan.length
+    ? { ...input, canEdit: false, editInstruction: "", imageEdit: false }
+    : input;
   if (r.showImages && (r.imageQueries.length || r.imageQuery)) {
     return r.imageQueries.length ? r : { ...r, imageQueries: [r.imageQuery] };
   }
@@ -687,7 +739,8 @@ function harvestImageIntent(r: AgentReply): AgentReply {
  *  enable the edit and use the editor's own request as the instruction. The editor
  *  still has to click 采纳 — this only makes the button show up. */
 function harvestEditIntent(r: AgentReply, question: string): AgentReply {
-  if (r.imageEdit || r.showImages) return r;
+  // 换图方案已经是一条可执行的路了，别再顺手给它挂一个「让模型重写整页」的按钮。
+  if (r.imageEdit || r.showImages || r.imagePlan.length) return r;
   if (r.canEdit && r.editInstruction) return r;
   const EDIT_RE =
     /(修改|订正|更正|改写|调整|修正|替换|更换|更新|补充|删除|去掉|加上|改成|换成|改为|应为|应该是|把.*改)/;
@@ -7371,16 +7424,33 @@ function xiaopVisionUrls(opts: {
   html: string;
   baseUrl?: string;
   scope?: string;
+  /** 访客实拍原图（草稿是 photo_url，条目是 cover_url）。 */
   coverUrl?: string | null;
+  /** 访客补拍的其余原图（plant_drafts.user_photos）。与 coverUrl 同等对待。 */
+  visitorUrls?: string[] | null;
 }): string[] {
-  const { html, baseUrl, scope, coverUrl } = opts;
+  const { html, baseUrl, scope, coverUrl, visitorUrls } = opts;
+  const visitorShots = [...(coverUrl ? [coverUrl] : []), ...((visitorUrls ?? []) as string[])].filter(
+    Boolean,
+  );
   let urls: string[];
   if (scope) {
     const frag = sectionHtmlForScope(html, scope);
-    // Heading not found → don't go blind; fall back to the whole page.
-    urls = frag != null ? allHtmlImageUrls(frag, baseUrl) : allHtmlImageUrls(html, baseUrl);
+    const scoped = frag != null ? allHtmlImageUrls(frag, baseUrl) : [];
+    // 🔴 两条都会让小P蛙**瞎着上**，然后回一句「系统只给了我纯文本」（2026-08-08 用户实测）：
+    //  ① 「拍摄记录」这类范围，讨论的就是**访客那张实拍照** —— 它是 plant_drafts 的列
+    //     （photo_url / user_photos），正文 HTML 里未必有对应 <img>，按 scope 抽片段必然抽空；
+    //  ② 标题找到了、但那一节里一张图都没有（空图槽 / 图在标题之外），旧代码只判 `frag != null`，
+    //     于是 urls = [] 就这么送进去了 —— 比标题没找到还糟，因为它连回退都不触发。
+    // 现在：凡是范围沾「照片 / 拍摄 / 实拍 / 观测」，一律把访客原图垫在最前；
+    // 抽不到图时退回整页（而不是空手上阵）。
+    const wantsShotPhotos = /照片|拍摄|实拍|观测|图片|配图/.test(scope);
+    urls =
+      wantsShotPhotos || scoped.length === 0
+        ? [...visitorShots, ...(scoped.length ? scoped : allHtmlImageUrls(html, baseUrl))]
+        : scoped;
   } else {
-    urls = [...(coverUrl ? [coverUrl] : []), ...allHtmlImageUrls(html, baseUrl)];
+    urls = [...visitorShots, ...allHtmlImageUrls(html, baseUrl)];
   }
   const seen = new Set<string>();
   const out: string[] = [];
@@ -8211,8 +8281,32 @@ const AskDraftAgentInput = z.object({
     .array(z.object({ role: z.enum(["user", "assistant"]), text: z.string() }))
     .max(24)
     .optional(),
+  /** 对话里当前摆着几张联网参考图。服务端不可能知道（图是面板自己去 iNaturalist/GBIF
+   *  取的），但模型必须知道「第几张」这个编号有没有对应物，才不会凭空编一个方案出来。 */
+  refPhotoCount: z.number().int().min(0).max(48).optional(),
   userModel: UserModelInput,
 });
+
+/**
+ * 换图方案（imagePlan）在两只小P蛙里共用的一段提示词。
+ *
+ * 之所以要专门写「不许说已提交/已受理」：用户 2026-08-08 实测，让它「用第一张和第六张
+ * 替换 section II 和 section V 的配图」，它回「已为您提交申请…」然后什么也没发生 ——
+ * 它把「我已受理」当成了动作本身。模型这边只该产出**方案**，真正的落地由客户端的
+ * lib/xiaop-image-plan.ts 确定性执行，编辑点一下按钮才生效。
+ */
+const IMAGE_PLAN_RULE = (refPhotoCount: number) =>
+  `- 如果编辑指名道姓要「把第 N 张（参考图）放到某一节 / 换掉某一节的配图」，把这些对应关系逐条写进 imagePlan 数组：
+  每个元素形如 {"photo": 1, "section": "II"} —— photo 是**参考图的序号，从 1 开始**，按对话里图片展示的先后顺序数；
+  section 写章节号（"Intro" / "I" / "II" … / "VI"）或该节的中文标题（如"典型生境"）；同一节有多张配图时可加 "slot": 2 指定第几张。
+  ${
+    refPhotoCount > 0
+      ? `本轮对话里现在摆着 **${refPhotoCount} 张**参考图，编号 1–${refPhotoCount}；编号超出这个范围就是没有的图，不要写进方案。`
+      : `⚠️ 本轮对话里**目前一张参考图都没有**，photo 编号无从指起。这种情况下 imagePlan 必须留空数组，先用 showImages/imageQueries 把参考图调出来给编辑看，再谈换哪一张。`
+  }
+- 🔴 **绝对不要说「已为您提交申请」「已受理」「已安排替换」「稍后生效」这类话** —— 你没有权限自己动手，说了就是骗人（编辑等了半天什么也没发生）。
+  给出 imagePlan 时，reply 里只说「方案如下：第 1 张 → Section II 的配图……请点下方的『按方案替换』按钮执行」，把决定权交回编辑。
+`;
 
 /** Record one 小P chat turn's token cost as a `chat` row in ai_usage_logs. Awaited
  *  (Workers isolates tear down after the response) and best-effort (a logging failure
@@ -8285,6 +8379,8 @@ export const askDraftAgentFn = createServerFn({ method: "POST" })
           html: draftHtml,
           scope: data.scope,
           coverUrl: draft.photo_url,
+          // 补拍的其余原图也要送 —— 「拍摄记录」那一节展示的往往不止封面那一张。
+          visitorUrls: ((draft as { user_photos?: string[] | null }).user_photos ?? []) as string[],
         });
     const photos = await fetchInlineImages(visionUrls);
 
@@ -8303,17 +8399,18 @@ ${NO_MODEL_DISCLOSURE.trimEnd()}
 - 如果编辑的诉求是一处「可以直接落地到草稿里的具体修改」（例如订正学名、改写某段、调整养护数值、修正错别字等），
   把 canEdit 设为 true，并在 editInstruction 里用一句中文精确描述要对草稿做的改动（具体到改哪里、改成什么）。
   **你可以直接落地这些文字改动**——编辑只需点一下「采纳并保存」，就由你改写并保存，不要说"交给技术同事/他人执行"。
-- 如果诉求是「更换 / 增补配图」（图片不对、不清晰、需要更合适的照片），把 canEdit 设为 true、imageEdit 设为 true，
+- 如果诉求是「更换 / 增补配图」（图片不对、不清晰、需要更合适的照片），**且还没指定用哪一张**，把 canEdit 设为 true、imageEdit 设为 true，
   imageQuery 给出一个好的图片搜索词（通常用拉丁学名），editInstruction 说明要替换哪张图。系统会调起站内"在线搜图"
   让编辑挑选图片后自动替换，所以同样不要说交给别人。
+${IMAGE_PLAN_RULE(data.refPhotoCount ?? 0).trimEnd()}
 - 如果编辑想「看该物种的网络参考照片来比对鉴定」，把 showImages 设为 true，并把要展示的物种放进 imageQueries 数组
   （每个元素一个搜索词，**优先拉丁学名**）。**对比多个物种时，imageQueries 要包含每一个物种**，例如要比对两个种就写
   ["Tribulus terrestris","Tripodion tetraphyllum"]。系统会联网（iNaturalist / GBIF / 维基共享）按每个词分别取若干照片、
   分组显示在对话里。**你具备这个能力，不要说"我无法联网/无法发图"**；reply 里正常说明你将给出参考图即可。
-- 如果只是答疑、讨论或信息不足以落地，上述布尔全部设为 false，editInstruction 留空、imageQueries 用空数组。
+- 如果只是答疑、讨论或信息不足以落地，上述布尔全部设为 false，editInstruction 留空、imageQueries 与 imagePlan 用空数组。
 - 如果准确回答需要【最新网络信息】（如某物种最新的保护级别/最新研究进展/新闻/时效性数据/市场行情等，且你的内置知识可能过时或不确定），把 needsWebSearch 设为 true，并在 webQuery 里给出一个简洁的检索词（可用拉丁学名）；**同时在 reply 中先给出基于你现有知识的初步回答，并明确说明「正在为你联网查询最新信息...」**，系统会自动联网并让你用真实结果更新答案。纯植物学常识不必联网，needsWebSearch 设为 false、webQuery 留空。
 回答控制在简明范围内，不要长篇大论。
-【输出格式·务必严格】只返回一个 JSON 对象，键名固定为：reply（字符串，你的中文回答）、canEdit（布尔）、editInstruction（字符串）、imageEdit（布尔）、imageQuery（字符串）、showImages（布尔）、imageQueries（字符串数组）、needsWebSearch（布尔）、webQuery（字符串）。不要用 response 等其它键名，不要加 markdown 代码块或多余文字。`;
+【输出格式·务必严格】只返回一个 JSON 对象，键名固定为：reply（字符串，你的中文回答）、canEdit（布尔）、editInstruction（字符串）、imageEdit（布尔）、imageQuery（字符串）、showImages（布尔）、imageQueries（字符串数组）、imagePlan（对象数组，元素形如 {"photo":1,"section":"II"}）、needsWebSearch（布尔）、webQuery（字符串）。不要用 response 等其它键名，不要加 markdown 代码块或多余文字。`;
 
     const contents: { role: "user" | "model"; parts: { text: string }[] }[] = [
       {
@@ -8361,6 +8458,26 @@ ${NO_MODEL_DISCLOSURE.trimEnd()}
           description:
             "若 showImages 为 true，要展示的每个物种的搜索词（优先拉丁学名）；对比多个物种时含每一个；否则空数组",
         },
+        imagePlan: {
+          type: "array",
+          description:
+            "换图方案：编辑点名「用第 N 张参考图换掉某一节的配图」时逐条列出；否则空数组。不要在 reply 里声称已经替换完成。",
+          items: {
+            type: "object",
+            properties: {
+              photo: { type: "integer", description: "参考图序号，从 1 开始，按对话里展示的顺序" },
+              section: {
+                type: "string",
+                description: '章节号或章节中文标题，如 "II" / "典型生境"',
+              },
+              slot: {
+                type: "integer",
+                description: "该节内第几张配图（从 1 开始）；不确定就省略",
+              },
+            },
+            required: ["photo", "section"],
+          },
+        },
         needsWebSearch: {
           type: "boolean",
           description: "回答是否需要最新网络信息（时效性数据/最新研究/新闻等）",
@@ -8378,6 +8495,7 @@ ${NO_MODEL_DISCLOSURE.trimEnd()}
         "imageQuery",
         "showImages",
         "imageQueries",
+        "imagePlan",
         "needsWebSearch",
         "webQuery",
       ],
@@ -8669,9 +8787,9 @@ ${NO_MODEL_DISCLOSURE.trimEnd()}
       overrideSequence: toOverrideSlots(data.userModel),
     });
     await logChatUsage(ans, { draftTitle: data.pageTitle ?? data.path, label: "小P对话（页面）" });
-    // 这条通道落不了地，无论模型怎么说都不给「采纳并保存」按钮。
+    // 这条通道落不了地，无论模型怎么说都不给「采纳并保存」/「按方案替换」按钮。
     const parsed = harvestImageIntent(parseAgentReply(ans.text));
-    return { ...parsed, canEdit: false, editInstruction: "", imageEdit: false };
+    return { ...parsed, canEdit: false, editInstruction: "", imageEdit: false, imagePlan: [] };
   });
 
 const AskPlantAgentInput = z.object({
@@ -8682,6 +8800,8 @@ const AskPlantAgentInput = z.object({
     .array(z.object({ role: z.enum(["user", "assistant"]), text: z.string() }))
     .max(24)
     .optional(),
+  /** 见 AskDraftAgentInput 里同名字段。 */
+  refPhotoCount: z.number().int().min(0).max(48).optional(),
   userModel: UserModelInput,
 });
 
@@ -8718,12 +8838,13 @@ ${NO_MODEL_DISCLOSURE.trimEnd()}
     }
 - 如果编辑的诉求是一处「可以直接落地到页面里的具体修改」，把 canEdit 设为 true，并在 editInstruction 里用一句中文精确描述要做的改动（具体到改哪里、改成什么）；范围已限定时，改动只应涉及该范围。
   **你可以直接落地这些文字改动**——编辑点一下「采纳并保存」即由你改写并保存上线，不要说"交给技术同事/他人执行"。
-- 如果诉求是「更换 / 增补配图」，把 canEdit 设为 true、imageEdit 设为 true，imageQuery 给出图片搜索词（通常用拉丁学名），
+- 如果诉求是「更换 / 增补配图」**且还没指定用哪一张**，把 canEdit 设为 true、imageEdit 设为 true，imageQuery 给出图片搜索词（通常用拉丁学名），
   editInstruction 说明要替换哪张图。系统会调起站内"在线搜图"让编辑挑图后自动替换，同样不要说交给别人。
+${IMAGE_PLAN_RULE(data.refPhotoCount ?? 0).trimEnd()}
 - 如果编辑想「看该物种的网络参考照片来比对」，把 showImages 设为 true，把要展示的物种放进 imageQueries 数组（优先拉丁学名）；
   **对比多个物种时 imageQueries 要含每一个**（如 ["Tribulus terrestris","Tripodion tetraphyllum"]）。系统会联网按每个词分别取照片分组显示。
   **你具备这个能力，不要说"我无法联网/无法发图"**。
-- 否则上述布尔全部设为 false、editInstruction 留空、imageQueries 用空数组。
+- 否则上述布尔全部设为 false、editInstruction 留空、imageQueries 与 imagePlan 用空数组。
 - 如果准确回答需要【最新网络信息】（如某物种最新的保护级别/最新研究进展/新闻/时效性数据等，且你的内置知识可能过时），把 needsWebSearch 设为 true 并在 webQuery 给出简洁检索词（可用拉丁学名）；纯常识不必联网，设 false、webQuery 留空。
 回答简明。
 【输出格式·务必严格】只返回一个 JSON 对象，键名固定为：reply（字符串）、canEdit（布尔）、editInstruction（字符串）、imageEdit（布尔）、imageQuery（字符串）、showImages（布尔）、imageQueries（字符串数组）、needsWebSearch（布尔）、webQuery（字符串）。不要用 response 等其它键名，不要加 markdown 代码块或多余文字。`;
@@ -8755,6 +8876,26 @@ ${NO_MODEL_DISCLOSURE.trimEnd()}
         imageQuery: { type: "string" },
         showImages: { type: "boolean" },
         imageQueries: { type: "array", items: { type: "string" } },
+        imagePlan: {
+          type: "array",
+          description:
+            "换图方案：编辑点名「用第 N 张参考图换掉某一节的配图」时逐条列出；否则空数组。不要在 reply 里声称已经替换完成。",
+          items: {
+            type: "object",
+            properties: {
+              photo: { type: "integer", description: "参考图序号，从 1 开始，按对话里展示的顺序" },
+              section: {
+                type: "string",
+                description: '章节号或章节中文标题，如 "II" / "典型生境"',
+              },
+              slot: {
+                type: "integer",
+                description: "该节内第几张配图（从 1 开始）；不确定就省略",
+              },
+            },
+            required: ["photo", "section"],
+          },
+        },
         needsWebSearch: { type: "boolean" },
         webQuery: { type: "string" },
       },
@@ -8766,6 +8907,7 @@ ${NO_MODEL_DISCLOSURE.trimEnd()}
         "imageQuery",
         "showImages",
         "imageQueries",
+        "imagePlan",
         "needsWebSearch",
         "webQuery",
       ],

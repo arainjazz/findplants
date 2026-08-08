@@ -7,6 +7,12 @@ import { useTaskFeed } from "@/lib/use-task-feed";
 import { searchPlantImages, type PlantImgHit } from "@/components/html-doc-editor";
 import { XiaoPUserSettings } from "@/components/xiaop-user-settings";
 import { getUserModel, type XiaoPUserModel } from "@/lib/xiaop-user-model";
+import {
+  describePlanItem,
+  type ImagePlanItem,
+  type PlanPhoto,
+  type SectionSlot,
+} from "@/lib/xiaop-image-plan";
 import { toast } from "sonner";
 
 // ── 桌面端面板宽度 ───────────────────────────────────────────────────────────
@@ -45,9 +51,15 @@ type ChatMsg = {
   imageEdit?: boolean;
   imageQuery?: string;
   showImages?: boolean;
+  /** 「用第 N 张换掉某一节的配图」——由宿主确定性执行，不经过大模型改写。 */
+  imagePlan?: ImagePlanItem[];
   refGroups?: { query: string; images?: PlantImgHit[]; loading: boolean }[];
   applying?: boolean;
   applied?: boolean;
+  /** 换图方案的进行中/已完成状态，与文字改写的 applying/applied 分开记 ——
+   *  一条消息理论上两者都可能有，共用一个标记会互相把对方的按钮点没。 */
+  planApplying?: boolean;
+  planResult?: { changed: number; skipped: string[] };
 };
 
 export type AgentAskResult = {
@@ -58,6 +70,7 @@ export type AgentAskResult = {
   imageQuery?: string;
   showImages?: boolean;
   imageQueries?: string[];
+  imagePlan?: ImagePlanItem[];
 };
 export type AgentHistory = { role: "assistant" | "user"; text: string }[];
 
@@ -85,7 +98,7 @@ function saveChat(key: string | undefined, messages: ChatMsg[]) {
       window.sessionStorage.removeItem(chatStore(key));
       return;
     }
-    const slim = messages.map(({ applying: _applying, ...m }) => m);
+    const slim = messages.map(({ applying: _a, planApplying: _p, ...m }) => m);
     window.sessionStorage.setItem(chatStore(key), JSON.stringify(slim));
   } catch {
     /* quota / serialization issues are non-fatal — chat just won't persist */
@@ -111,6 +124,8 @@ export function XiaoPAgentPanel({
   ask,
   apply,
   onImageReplace,
+  onImagePlanApply,
+  imageSlots,
   storageKey,
   isRegistered = true,
   registerAsPageAgent = true,
@@ -118,9 +133,27 @@ export function XiaoPAgentPanel({
   greetingTitle?: string | null;
   canApply: boolean;
   scopes?: { label: string; value: string }[];
-  ask: (question: string, history: AgentHistory, scope?: string) => Promise<AgentAskResult>;
+  ask: (
+    question: string,
+    history: AgentHistory,
+    scope?: string,
+    /** 对话里当前摆着几张参考图 —— 服务端不可能自己知道（图是本面板去取的），
+     *  但模型得知道「第几张」有没有对应物，才不会凭空编一个方案。 */
+    refPhotoCount?: number,
+  ) => Promise<AgentAskResult>;
   apply: (instruction: string, scope?: string) => Promise<void>;
   onImageReplace?: (query: string, instruction: string) => void;
+  /**
+   * 执行一份换图方案（确定性，不烧 token）。宿主负责落地 → 存库 → 记日志，
+   * 返回真实换了几处、哪些没换成 —— 面板照实显示，绝不替它宣称"已完成"。
+   */
+  onImagePlanApply?: (
+    plan: ImagePlanItem[],
+    photos: PlanPhoto[],
+  ) => Promise<{ changed: number; skipped: string[] }>;
+  /** 当前正文里的图槽清单（宿主用 listSectionSlots 算好传进来），
+   *  只用于**点按钮之前**把方案翻译成人话、并标出指不到的那几条。 */
+  imageSlots?: SectionSlot[];
   /** Persist this page's conversation under this key so it survives leaving and
    *  re-entering the page (per-page memory). Omit to keep chat ephemeral. */
   storageKey?: string;
@@ -294,8 +327,10 @@ export function XiaoPAgentPanel({
     seqRef.current++;
     setSending(false);
     setMessages((prev) => {
-      const wasApplying = prev.some((m) => m.applying);
-      const out = prev.map((m) => (m.applying ? { ...m, applying: false } : m));
+      const wasApplying = prev.some((m) => m.applying || m.planApplying);
+      const out = prev.map((m) =>
+        m.applying || m.planApplying ? { ...m, applying: false, planApplying: false } : m,
+      );
       out.push({
         id: uid(),
         role: "agent" as const,
@@ -331,7 +366,12 @@ export function XiaoPAgentPanel({
     setInput("");
     setSending(true);
     try {
-      const res = await ask(q, history.slice(-24), scope || undefined);
+      const res = await ask(
+        q,
+        history.slice(-24),
+        scope || undefined,
+        refPhotosAt(messages.length - 1).length,
+      );
       if (seqRef.current !== mySeq) return; // stopped — discard this reply
       const agentId = uid();
       // Dedup queries case-insensitively so the same species isn't shown twice.
@@ -363,6 +403,7 @@ export function XiaoPAgentPanel({
           imageEdit: res.imageEdit,
           imageQuery: res.imageQuery,
           showImages: res.showImages,
+          imagePlan: res.imagePlan?.length ? res.imagePlan : undefined,
           refGroups: wantImages ? queries.map((query) => ({ query, loading: true })) : undefined,
         },
       ]);
@@ -413,6 +454,51 @@ export function XiaoPAgentPanel({
     );
   };
 
+  /**
+   * 「第一张 / 第六张」到底数的是哪一批图 —— 从第 `idx` 条消息往回找**最近一组已加载
+   * 出来的参考图**，按屏幕上的显示顺序摊平。
+   *
+   * 为什么不是「本条消息自带的图」：用户先让小P蛙调出一组参考图（那是上一条消息），
+   * 再说「用第一张换掉 section II」（这一条消息通常不带图）。他数的是眼前那一批。
+   * 摊平必须走 dedupGroups —— 屏幕上就是它渲染的，去重和每组截断 6 张都在里面，
+   * 不走它就会出现「用户数的第 6 张 ≠ 程序取的第 6 张」这种最难查的错位。
+   */
+  const refPhotosAt = (idx: number): PlanPhoto[] => {
+    for (let i = Math.min(idx, messages.length - 1); i >= 0; i--) {
+      const groups = messages[i]?.refGroups;
+      if (!groups?.length || !groups.some((g) => g.images?.length)) continue;
+      return dedupGroups(groups).flatMap((g) =>
+        (g.images ?? []).map((im) => ({ url: im.full, title: im.title, credit: im.credit })),
+      );
+    }
+    return [];
+  };
+
+  const doApplyPlan = async (msg: ChatMsg) => {
+    const plan = msg.imagePlan;
+    if (!plan?.length || !onImagePlanApply) return;
+    const photos = refPhotosAt(messages.findIndex((m) => m.id === msg.id));
+    if (!photos.length) {
+      toast.error("对话里已经没有参考图了，请先让小P蛙调出参考图再执行方案。");
+      return;
+    }
+    const mySeq = ++seqRef.current;
+    setMessages((prev) => prev.map((m) => (m.id === msg.id ? { ...m, planApplying: true } : m)));
+    try {
+      const res = await onImagePlanApply(plan, photos);
+      if (seqRef.current !== mySeq) return;
+      if (res.changed > 0) toast.success(`已替换 ${res.changed} 处配图并保存。`);
+      else toast.error("一处都没能替换，见方案下方的说明。");
+      setMessages((prev) =>
+        prev.map((m) => (m.id === msg.id ? { ...m, planApplying: false, planResult: res } : m)),
+      );
+    } catch (e) {
+      if (seqRef.current !== mySeq) return;
+      toast.error(e instanceof Error ? e.message : "替换失败，请重试");
+      setMessages((prev) => prev.map((m) => (m.id === msg.id ? { ...m, planApplying: false } : m)));
+    }
+  };
+
   const doApply = async (msg: ChatMsg) => {
     if (!msg.editInstruction) return;
     const mySeq = ++seqRef.current;
@@ -439,7 +525,7 @@ export function XiaoPAgentPanel({
   };
 
   const scopeLabel = scopes?.find((s) => s.value === scope)?.label;
-  const busy = sending || messages.some((m) => m.applying);
+  const busy = sending || messages.some((m) => m.applying || m.planApplying);
 
   return (
     <>
@@ -737,6 +823,62 @@ export function XiaoPAgentPanel({
                             参考照片来自 iNaturalist / GBIF /
                             维基共享，点击在本页预览，仅供比对鉴定。
                           </p>
+                        </div>
+                      )}
+                      {/* 换图方案 —— 小P蛙只出方案，落地由编辑点这个按钮触发。
+                          从前它会回一句「已为您提交申请」然后什么也不发生
+                          （2026-08-08 用户实测），根因就是系统里没有承接方案的东西。 */}
+                      {m.role === "agent" && m.imagePlan && m.imagePlan.length > 0 && (
+                        <div className="mt-2 pt-2 border-t border-rule/40">
+                          <p className="text-[11px] font-semibold text-ink-soft mb-1">
+                            换图方案（{m.imagePlan.length} 处）
+                          </p>
+                          <ul className="text-[11px] text-ink-faint space-y-0.5 mb-1.5">
+                            {m.imagePlan.map((it, i) => (
+                              <li key={i}>· {describePlanItem(it, imageSlots ?? [])}</li>
+                            ))}
+                          </ul>
+                          {canApply && onImagePlanApply ? (
+                            m.planResult ? (
+                              <div className="space-y-0.5">
+                                <span
+                                  className={`inline-flex items-center gap-1 text-[11px] font-semibold ${
+                                    m.planResult.changed > 0 ? "text-leaf-deep" : "text-vermilion"
+                                  }`}
+                                >
+                                  <CheckIcon className="w-3.5 h-3.5" /> 已替换{" "}
+                                  {m.planResult.changed} 处并保存
+                                </span>
+                                {m.planResult.skipped.map((s, i) => (
+                                  <p key={i} className="text-[11px] text-vermilion">
+                                    · 未替换：{s}
+                                  </p>
+                                ))}
+                              </div>
+                            ) : (
+                              <button
+                                onClick={() => void doApplyPlan(m)}
+                                disabled={m.planApplying}
+                                className="inline-flex items-center gap-1 text-[11px] font-semibold border border-leaf text-leaf-deep px-2.5 py-1 rounded-full hover:bg-leaf hover:text-background transition-colors cursor-pointer disabled:opacity-60"
+                              >
+                                {m.planApplying ? (
+                                  <>
+                                    <span className="w-3 h-3 rounded-full border-2 border-leaf/30 border-t-leaf animate-spin" />
+                                    替换中…
+                                  </>
+                                ) : (
+                                  <>
+                                    <ImageIcon className="w-3.5 h-3.5" /> 按方案替换（
+                                    {m.imagePlan.length} 处）
+                                  </>
+                                )}
+                              </button>
+                            )
+                          ) : (
+                            <span className="text-[11px] text-ink-faint">
+                              登录为编辑后可一键执行
+                            </span>
+                          )}
                         </div>
                       )}
                       {m.role === "agent" && m.canEdit && (

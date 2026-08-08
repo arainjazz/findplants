@@ -665,7 +665,7 @@ function BatchNewPage() {
               disabled={uploading}
               className="border border-ink px-4 py-2 hover:bg-ink hover:text-background transition-colors disabled:opacity-60 text-sm bg-transparent text-ink"
             >
-              {uploading ? "上传中…" : "+ 选择文件夹（可 ⌘ 多选）"}
+              {uploading ? "上传中…" : "+ 选择文件夹（可重复点，累加）"}
             </button>
             <input
               ref={fileRef}
@@ -711,9 +711,13 @@ function BatchNewPage() {
               <p className="text-sm max-w-xl mx-auto leading-relaxed px-4 text-ink-faint">
                 当你的页面有本地配图时，请拖入文件夹；或通过下方按钮点击选择上传。
                 <br />
-                <b className="text-ink-soft">一次录入多个物种</b>：在文件夹选择框里按住 ⌘（或 Shift）
-                勾选多个物种文件夹，也可以把多个文件夹一起拖进来。
-                每个文件夹的配图只在**它自己**的正文里匹配，不会串到别的物种上。
+                <b className="text-ink-soft">一次录入多个物种</b>：浏览器的文件夹对话框
+                <b className="text-ink-soft">只能选一个文件夹</b>（目录选择器会忽略 ⌘/Shift 多选，
+                这是浏览器行为，不是本站的限制）。两条可行的路：
+                ① <b className="text-ink-soft">把多个物种文件夹一起拖进这个框</b>——这条支持多选；
+                ② 重复点「选择文件夹」逐个添加，条目会<b className="text-ink-soft">累加</b>，不会互相覆盖。
+                无论哪条，每个文件夹的配图都只在<b className="text-ink-soft">它自己</b>的正文里匹配，
+                不会串到别的物种上。
               </p>
               <div className="flex flex-wrap justify-center gap-3 mt-3">
                 <button
@@ -730,7 +734,7 @@ function BatchNewPage() {
                   disabled={uploading}
                   className="border border-ink px-5 py-2 hover:bg-ink hover:text-background transition-colors text-sm font-medium bg-background text-ink"
                 >
-                  + 选择包含图片的文件夹
+                  + 选择文件夹（可重复点，累加）
                 </button>
               </div>
             </div>

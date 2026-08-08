@@ -8,6 +8,13 @@ import { SiteHeader, SiteFooter } from "@/components/site-header";
 import { XiaoPAgentPanel } from "@/components/draft-agent-panel";
 import { askPlantAgentFn, applyPlantAgentEditFn } from "@/lib/identify-plant.functions";
 import { userModelArg } from "@/lib/xiaop-user-model";
+import {
+  applyImagePlan,
+  listSectionSlots,
+  summarizeChanges,
+  type ImagePlanItem,
+  type PlanPhoto,
+} from "@/lib/xiaop-image-plan";
 import { fetchPlantBySlug, fetchAuthor, plantEntryKind } from "@/lib/plants";
 import { fetchPlantSourceKinds } from "@/lib/drafts";
 import { PlantKindBadge } from "@/components/plant-kind-badge";
@@ -18,7 +25,7 @@ import { FieldConflictsPanel } from "@/components/field-conflicts-panel";
 import { EditLogSection } from "@/components/edit-log-section";
 import { PlantComments } from "@/components/plant-comments";
 import { embedVideosInHtml } from "@/lib/embed";
-import { rewriteDraftOnlyHints } from "@/lib/draft-enhance";
+import { rewriteDraftOnlyHints, stripStaleMissingNotes } from "@/lib/draft-enhance";
 import {
   SpeciesExistingLinks,
   useSpeciesExistingForPlant,
@@ -429,11 +436,53 @@ function PlantDetail() {
     question: string,
     history: { role: "assistant" | "user"; text: string }[],
     scope?: string,
+    refPhotoCount?: number,
   ) => {
     if (!plant) throw new Error("页面未加载");
     return (await askPlantAgent({
-      data: { plantId: plant.id, question, scope, history, userModel: userModelArg() },
+      data: {
+        plantId: plant.id,
+        question,
+        scope,
+        history,
+        refPhotoCount,
+        userModel: userModelArg(),
+      },
     })) as { reply: string; canEdit: boolean; editInstruction: string };
+  };
+
+  // 小P蛙换图方案要用的图槽清单（只用于执行前把方案翻译成人话；执行时会重算一次）。
+  const imageSlots = useMemo(() => listSectionSlots(rawHtml || ""), [rawHtml]);
+
+  /**
+   * 执行一份换图方案：纯字符串改写 → 先上屏 → 再落库 → 记一条可撤销的修改记录。
+   * 「先上屏」和 ReplaceImageFlow 那条路同一个理由：新正文已经在手里，没道理让编辑
+   * 对着旧图等一圈「上传 → 改库 → 失效缓存 → 重新拉取」（2026-08-07 反馈）。
+   */
+  const applyXiaoPImagePlan = async (plan: ImagePlanItem[], photos: PlanPhoto[]) => {
+    if (!plant || !user) throw new Error("请先登录");
+    const before = rawHtml;
+    if (!before) throw new Error("这一页的正文还没加载完，请稍候重试。");
+    const res = applyImagePlan(before, plan, photos);
+    const { changes, skipped } = res;
+    // 草稿派生的条目正文里带「暂无该物种的…公开照片」空槽说明，填上图后必须一并摘掉
+    // （线上 draft-*.html 那批就是这个模板）。见 draft-enhance.ts。
+    const html = stripStaleMissingNotes(res.html);
+    const reasons = skipped.map((s) => s.reason);
+    if (!changes.length) return { changed: 0, skipped: reasons };
+    applyPageHtml(html, plant.html_url);
+    try {
+      await persistPlantHtml(
+        html,
+        before,
+        `小P蛙按方案换图（${changes.length} 处）：${summarizeChanges(changes)}`,
+      );
+    } catch (e) {
+      // 落库失败就把画面退回去，别让人以为已经保存了。
+      applyPageHtml(before, plant.html_url);
+      throw e;
+    }
+    return { changed: changes.length, skipped: reasons };
   };
 
   // Persist a new page HTML: upload to the plant-html bucket, repoint the plant,
@@ -858,11 +907,13 @@ function PlantDetail() {
             canApply={true}
             isRegistered={!!user}
             scopes={pageSections}
+            imageSlots={imageSlots}
             ask={askXiaoP}
             apply={applyXiaoP}
             onImageReplace={(query, instruction) =>
               setXiaopImg({ query: query || plant.scientific_name || plant.title, instruction })
             }
+            onImagePlanApply={applyXiaoPImagePlan}
           />
         )}
         {xiaopImg && rawHtml && (
