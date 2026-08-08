@@ -111,7 +111,18 @@ _Read this FIRST and update it LAST, every session._
 
 ## 🚨 部署真相（以 Cloudflare 为准，不以本文件的小节标签为准）
 
-**⬆️ 最新：线上版本 = `477aa475-e076-474a-a1b3-8007ff5f9393`，2026-08-07 部署**
+**⬆️ 最新：线上版本 = `cd2a1f23-c737-4b5a-aace-688bfd203f0e`，2026-08-08 部署**
+（小P蛙看得见照片 + 换图指令真能执行 + 文件夹多选文案更正；提交 `6da9bd7`，**这次是先提交后部署**。）
+**上线核验（已做）**：`plantspedia.club` HTTP 200；`index-9VVjPdsm.js` 拉下来 1212559 字节、
+与本地 dist 一模一样，含 `imagePlan` / `按方案替换` / `indexInSection` / `sectionLabel` / `img-credit`；
+worker bundle 的 `identify-plant.functions-*.js` 含 `user_photos` / `已受理`（提示词禁令）/ `实拍`。
+⚠️ **Cloudflare 静态资源有传播延迟**：部署完 1～2 分钟内拉新 chunk 会拿到 **SPA HTML 外壳**
+（status 200、content-type 还写着 text/javascript，5131 字节），看起来像「新代码没上线」。
+**别据此判定部署失败** —— 等一会儿重取，或先用 `size_download` 与本地 dist 字节数比对。
+
+<details><summary>历史（2026-08-07 那一版）</summary>
+
+**线上版本 = `477aa475-e076-474a-a1b3-8007ff5f9393`，2026-08-07 部署**
 （本日两轮共九项：详页/HTML 编辑器六修 + 批量录入三修。一次过，没撞代理。）
 **上线核验（已做）**：`plantspedia.club` HTTP 200；逐个拉线上 chunk 验新代码 ——
 `admin.batch-new-D7buN99c.js` 含 `common_names_zh` / `applySynonym` / `tagIdsToAdd` /
@@ -176,6 +187,8 @@ find src supabase *.ts *.jsonc -newermt "<那个时间>" -type f   # 晚于它�
 **未纳入该提交**（归属待定，仍是未跟踪状态）：`mcp/`、`.workbuddy/`、`.claude/MCP-PLAN.md`、
 `package-lock.json`（本仓用 bun.lock，多一份 npm 锁文件容易打架）。
 **未 push**：`main` 现在领先 `origin/main` 15 个提交（用户历来只在本地提交，不推 GitHub）。
+
+</details>
 
 </details>
 
