@@ -103,6 +103,56 @@ export function isTentative(meta: {
 }
 
 /**
+ * 「疑似」被**人**签字解除的留痕。两种，都存在 `plant_drafts.ai_payload` 里：
+ *
+ *   · `_editor_diagnosis` —— 编辑采纳时写下的诊断意见（approvePlantDraft 写入）；
+ *   · `_xiaop_id_fix`     —— 编辑用小P蛙动了这份草稿的**定名**（applyDraftAgentEditFn 写入）。
+ *
+ * 有其一 = 已经有人对着这张照片重新定过种，全站从此不按疑似渲染（标题、简介卡、
+ * 补拍横幅、待审名单上的角标、采纳闸门）。
+ *
+ * ⚠️ 判据必须收在这里。这三处从前各写各的（草稿页一段内联正则、待审卡一段、服务端闸门
+ * 一段），加一种解除方式就要改三处，漏一处就是「页面上没有疑似两个字、点采纳却被拦下来
+ * 说这是疑似」——2026-08-09 用户报的正是这一条。
+ */
+export type TentativeResolution = {
+  kind: "diagnosis" | "xiaop_fix";
+  at?: string;
+  byName?: string;
+} | null;
+
+export function tentativeResolution(aiPayload: unknown): TentativeResolution {
+  const p = (aiPayload ?? {}) as Record<string, unknown>;
+  const pick = (v: unknown) => (v ?? {}) as { at?: unknown; by_name?: unknown };
+  if (p._editor_diagnosis) {
+    const d = pick(p._editor_diagnosis);
+    return { kind: "diagnosis", at: d.at?.toString(), byName: d.by_name?.toString() };
+  }
+  if (p._xiaop_id_fix) {
+    const f = pick(p._xiaop_id_fix);
+    return { kind: "xiaop_fix", at: f.at?.toString(), byName: f.by_name?.toString() };
+  }
+  return null;
+}
+
+/**
+ * 一份**草稿**到底还算不算疑似 ＝ `isTentative` 的判据 − 已被签字解除的。
+ * 摘要按「列优先、payload 兜底」取，与服务端闸门一直以来的口径一致。
+ */
+export function isDraftTentative(
+  aiPayload: unknown,
+  row: { title?: unknown; summary?: unknown },
+): boolean {
+  if (tentativeResolution(aiPayload)) return false;
+  const p = (aiPayload ?? {}) as { identification_confidence?: unknown; summary_zh?: unknown };
+  return isTentative({
+    identification_confidence: p.identification_confidence,
+    summary_zh: (row.summary ?? "").toString() || p.summary_zh,
+    title: row.title,
+  });
+}
+
+/**
  * 草稿 / 条目**标题**字段该怎么写。
  *
  * 疑似结果必须显式写成「疑似X」—— 草稿卡、列表、分享卡标题读的都是这个字段，

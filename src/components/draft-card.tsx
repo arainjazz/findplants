@@ -2,22 +2,17 @@ import { Link } from "@tanstack/react-router";
 import type { PlantDraft } from "@/lib/drafts";
 import { displayPlace } from "@/lib/editor-stats";
 import { SafeImg } from "@/components/safe-img";
-import { isTentative } from "@/lib/tentative";
+import { isDraftTentative } from "@/lib/tentative";
 
 /**
  * 这条在待审名单里是不是还挂着「疑似」。
  *
- * 判据与草稿页、分享卡同源（lib/tentative.ts）＋ 一条：编辑已经写过诊断意见的不再算疑似。
+ * 判据与草稿页、分享卡、服务端采纳闸门同源（lib/tentative.ts 的 isDraftTentative：
+ * isTentative 的三条信号，减去已被人签字解除的 —— 编辑写过诊断意见、或已用小P蛙复核过定名）。
  * 标出来是给审稿人看的 —— 疑似的那几条采纳时会被要求先填诊断意见，先知道比点下去才知道好。
  */
-function isDraftTentative(d: PlantDraft): boolean {
-  const p = (d.ai_payload ?? {}) as { identification_confidence?: unknown; _editor_diagnosis?: unknown };
-  if (p._editor_diagnosis) return false;
-  return isTentative({
-    identification_confidence: p.identification_confidence,
-    summary_zh: d.summary ?? "",
-    title: d.title,
-  });
+function draftIsTentative(d: PlantDraft): boolean {
+  return isDraftTentative(d.ai_payload, { title: d.title, summary: d.summary });
 }
 
 /**
@@ -112,7 +107,7 @@ export function DraftCard({
                 </span>
               );
             })()}
-            {isDraftTentative(d) && (
+            {draftIsTentative(d) && (
               <span
                 title="AI 未能确诊到种。编辑采纳这一条时，需先填写诊断意见，采纳后「疑似」字样消除"
                 className="text-[9px] font-semibold px-1.5 py-0.5 rounded-sm border leading-none bg-amber-500/15 text-amber-700 border-amber-500/45"

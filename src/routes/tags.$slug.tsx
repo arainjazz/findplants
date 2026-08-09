@@ -70,7 +70,12 @@ async function fetchByTagName(
       .from("plant_drafts")
       .select("id,title,scientific_name,family,photo_url,status")
       .contains("tags", [name])
-      .neq("status", "rejected"),
+      .neq("status", "rejected")
+      // 与 fetchTagMembership 同一条规矩：已经收录成条目的不是「待审草稿」。
+      // 这条路上条目是按 `plants.tags` 反查的，采纳时条目继承了同一批词，
+      // 所以摘掉草稿不会让它从名单上消失，只是不再重复算一遍。
+      .neq("status", "approved")
+      .is("published_plant_id", null),
   ]);
   return {
     plants: (p.data ?? []) as TaggedPlant[],

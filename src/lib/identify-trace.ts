@@ -1,5 +1,5 @@
 import { speciesKey } from "./plants";
-import { isTentative } from "./tentative";
+import { isTentative, type TentativeResolution } from "./tentative";
 
 // ─── 识别过程痕迹与「综合可信度%」 ────────────────────────────────────────────
 // 单独成纯函数模块（与 tentative.ts 同样的理由）：识别链路要模型调用 + 登录才跑得起来，
@@ -34,6 +34,16 @@ const CONF_TIER_BASE: Record<string, number> = { high: 90, medium: 70, low: 45 }
 const PN_MEANINGFUL_PCT = 30;
 
 /**
+ * 编辑用小P蛙**复核并改掉定名**之后给的加分（百分点）。
+ *
+ * 为什么值这么多：整条链路上除了 Pl@ntNet 那个分数，其余全是模型自评；一个有采纳权的
+ * 编辑对着照片把种名重新定过一遍，是这里唯一的**人类证据**，比二次自动复核（+5，同样
+ * 是模型）强一个量级。它同时也解除了「疑似」——两件事必须给出同一个数，否则又回到
+ * 「页面上不写疑似了、星数却还按疑似压着」的自相矛盾。
+ */
+const XIAOP_FIX_BONUS = 20;
+
+/**
  * 综合可信度%。**刻意不让模型自己报这个数** —— 模型自评只有 high/medium/low 三档，
  * 直接映射成百分比是假精度。这里只用两个真实信号，并把依据一并显示出来：
  *  ① Pl@ntNet 的 score —— 整条链路上**唯一非模型自评**的客观数字；
@@ -60,10 +70,18 @@ export function computeIdentifyConfidence(
    * 参数收成对象、并在下面把档位钳到 low，是为了让「疑似」在全站**只有一个判据**。
    */
   final: { identification_confidence?: unknown; summary_zh?: unknown; title?: unknown },
+  /**
+   * 「疑似」是否已被人签字解除（`tentativeResolution(ai_payload)` 的结果）。
+   * 传了 `xiaop_fix` 就**不再按疑似压档**，并在依据里记一条 +20 —— 见 XIAOP_FIX_BONUS。
+   * 出卡链路调用时没有这个参数：识别刚跑完，还谈不上复核。
+   */
+  resolution?: TentativeResolution,
 ): { pct: number; basis: string } {
   const rawConf = (final.identification_confidence ?? "").toString();
+  const xiaopFixed = resolution?.kind === "xiaop_fix";
   // 疑似 = 模型在说「我没把握」。无论它把这句话写在哪个字段里，档位一律按 low 计。
-  const tentative = isTentative(final);
+  // 已被小P蛙复核改名的除外：那句「我没把握」已经有人替它拿定主意了。
+  const tentative = isTentative(final) && !xiaopFixed;
   const finalConf = tentative ? "low" : rawConf;
   const base = CONF_TIER_BASE[finalConf] ?? 45;
   const tierZh =
@@ -96,6 +114,15 @@ export function computeIdentifyConfidence(
   } else {
     pct = base;
     basis = `${tierZh}；本次无 Pl@ntNet 客观分可参照`;
+  }
+
+  // 人复核过的那一笔加在最后：它与 Pl@ntNet 那几种情形是独立的两件事，摞在一起才说得清
+  // 「机器算到这里，人又在这上面签了个字」。
+  if (xiaopFixed) {
+    pct += XIAOP_FIX_BONUS;
+    basis +=
+      `；编辑已用小P蛙复核定名${resolution?.byName ? `（${resolution.byName}）` : ""}` +
+      `、「疑似」已解除 +${XIAOP_FIX_BONUS}`;
   }
   return { pct: Math.max(5, Math.min(99, pct)), basis };
 }

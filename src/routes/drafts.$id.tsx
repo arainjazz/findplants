@@ -29,7 +29,7 @@ import {
   pickDraftCardFields,
   type DraftCardFields,
 } from "@/lib/draft-card-fields";
-import { stripTentativeMarks } from "@/lib/tentative";
+import { stripTentativeMarks, isDraftTentative, tentativeResolution } from "@/lib/tentative";
 import { fetchDraftById } from "@/lib/drafts";
 import { fetchEditsForDraft } from "@/lib/edits";
 import { EditLogSection } from "@/components/edit-log-section";
@@ -405,14 +405,20 @@ function DraftPage() {
         | undefined
     )?._editor_diagnosis ?? null;
 
+  /**
+   * 「疑似」是不是已经被人签字解除，以及是谁解的（诊断意见 / 小P蛙定名复核）。
+   * 可信度那张卡也要用它 —— 小P蛙复核过的 +20，见 identify-trace.ts。
+   */
+  const tentativeResolved = tentativeResolution(draft?.ai_payload);
+
   // 「疑似」单一判定：低置信度，或摘要/标题本身以「疑似」开头（模型偶尔 confidence 写
   // medium 却在正文说疑似）。标题、正文提示、分享卡、补拍激活都以它为准。
-  // 编辑已给出诊断意见的，一律不再算疑似 —— 这正是「采纳后疑似字样消除」那一条。
-  const draftTentative =
-    !editorDiagnosis &&
-    (draft?.ai_payload?.identification_confidence === "low" ||
-      /^\s*疑似/.test((draft?.summary || draft?.ai_payload?.summary_zh || "").trim()) ||
-      /^\s*（?\s*疑似/.test((draft?.title || "").trim()));
+  // 已签字解除的一律不再算疑似 —— 这正是「采纳后疑似字样消除」那一条，以及「编辑已用
+  // 小P蛙把定名复核改过一遍之后，采纳不必再填一遍意见」。
+  const draftTentative = isDraftTentative(draft?.ai_payload, {
+    title: draft?.title,
+    summary: draft?.summary,
+  });
 
   // 补拍建议：滤掉「摸一摸 / 闻一闻」这类拍不出来的条目 —— 库里的旧草稿存的还是 prompt
   // 加禁令之前的文案，照搬出来会让用户白跑一趟（他们只能回传照片）。滤空则不显示横幅。
@@ -457,6 +463,7 @@ function DraftPage() {
       summary_zh: draft?.summary || draft?.ai_payload?.summary_zh,
       title: draft?.title,
     },
+    tentativeResolved,
   );
   const traceStepList = traceSteps(traceForView);
 
@@ -1593,6 +1600,22 @@ function DraftPage() {
                             —— {editorDiagnosis.by_name || "编辑"} ·{" "}
                             {(editorDiagnosis.at || "").slice(0, 10)} 复核采纳。本条目的定种以此
                             意见为准；下方「识别过程」栏保留 AI 初判的原始记录。
+                          </p>
+                        </div>
+                      )}
+                      {/* 小P蛙定名复核 —— 编辑在**采纳之前**就把这一条的定名改定了，「疑似」
+                          就此解除。与上面那段诊断意见同理，必须在这里用 React 画：快速识别档
+                          的 html_content 不上屏。不写出来，页面上就只是「疑似两个字凭空消失」，
+                          谁在什么时候凭什么定的一概看不出来 —— 那正是这个项目一贯不允许的。 */}
+                      {!editorDiagnosis?.text && tentativeResolved?.kind === "xiaop_fix" && (
+                        <div className="mt-3 rounded-xl border border-leaf-deep/35 bg-leaf-deep/[0.05] px-4 py-2.5">
+                          <p className="text-[13px] leading-relaxed text-ink-soft">
+                            <span className="font-semibold text-leaf-deep">定名已复核</span>
+                            {" —— "}
+                            {tentativeResolved.byName || "编辑"}
+                            {tentativeResolved.at ? ` · ${tentativeResolved.at.slice(0, 10)}` : ""}
+                            {" 用小P蛙改定了本条的定名，AI 初判的「疑似」就此解除"}
+                            （综合可信度 +20，依据见下方「识别过程」栏）。采纳收录时不再要求另填诊断意见。
                           </p>
                         </div>
                       )}

@@ -60,6 +60,8 @@ import {
   stripTentativePrefix,
   stripTentativeMarks,
   isTentative,
+  isDraftTentative,
+  tentativeResolution,
   draftTitleFor,
   sanitizeSpeciesName,
 } from "./tentative";
@@ -7013,17 +7015,16 @@ export const approvePlantDraft = createServerFn({ method: "POST" })
     const dateStr = String(draft.created_at || "").slice(0, 10);
 
     // ── 「疑似」闸门：没有诊断意见就不许采纳 ──────────────────────────────────
-    // 判据与全站同源（lib/tentative.ts 的 isTentative：低置信度 / 摘要开头写着疑似 /
-    // 名字上标着疑似，三者任一）。**闸门必须在服务端**：前端那个弹窗只是引导，
-    // 真正保证「库里不会出现一条没人签字的疑似条目」的是这里。
+    // 判据与全站同源（lib/tentative.ts 的 isDraftTentative：低置信度 / 摘要开头写着疑似 /
+    // 名字上标着疑似，三者任一，**减去**已被人签字解除的）。**闸门必须在服务端**：
+    // 前端那个弹窗只是引导，真正保证「库里不会出现一条没人签字的疑似条目」的是这里。
+    //
+    // 签字有两种，都算数（见 tentativeResolution）：采纳时写的诊断意见，以及**采纳之前**
+    // 编辑已经用小P蛙把定名复核改过一遍。后者是 2026-08-09 补的：编辑明明刚在小P蛙里把
+    // 这一条定成了正名，点采纳却还被拦下来「请说明你据以定种的依据」——同一件事要人做两遍。
     const payload = (draft.ai_payload ?? {}) as Record<string, unknown>;
-    const tentative =
-      !payload._editor_diagnosis &&
-      isTentative({
-        identification_confidence: payload.identification_confidence,
-        summary_zh: draft.summary || (payload.summary_zh as string | undefined),
-        title: draft.title,
-      });
+    const resolution = tentativeResolution(payload);
+    const tentative = isDraftTentative(payload, { title: draft.title, summary: draft.summary });
     const diagnosis = (data.diagnosis ?? "").trim();
     if (tentative && diagnosis.length < DIAGNOSIS_MIN) {
       throw new Error(
@@ -7043,11 +7044,17 @@ export const approvePlantDraft = createServerFn({ method: "POST" })
      *     好让草稿页和已发布条目页看到的是同一份东西。
      * ⚠️ **不动 `identification_confidence`**：那一列是叶子结算的输入
      *     （lib/leaves.ts：疑似恒 +1），改它等于顺手改了识别人的铜叶数。
+     *
+     * 没有诊断意见、但疑似已由小P蛙复核解除的那一路也要有补丁 —— 只做 ②（洗字样）。
+     * `publishTitle`/`publishSummary` 读的就是这份补丁：不给的话，条目页上会留着一个
+     * 卡面早就不显示的「疑似」。
      */
+    const cleanTitle = stripTentativeMarks(draft.title) || draft.title;
+    const cleanSummary = stripTentativePrefix(draft.summary ?? "") || draft.summary;
     const draftAdoptPatch: Record<string, unknown> | null = diagNote
       ? {
-          title: stripTentativeMarks(draft.title) || draft.title,
-          summary: stripTentativePrefix(draft.summary ?? "") || draft.summary,
+          title: cleanTitle,
+          summary: cleanSummary,
           html_content: applyEditorDiagnosis(String(draft.html_content || ""), diagNote),
           ai_payload: {
             ...payload,
@@ -7059,7 +7066,9 @@ export const approvePlantDraft = createServerFn({ method: "POST" })
             },
           },
         }
-      : null;
+      : resolution?.kind === "xiaop_fix"
+        ? { title: cleanTitle, summary: cleanSummary }
+        : null;
 
     // ═══ 合并分支：编辑在弹窗点了「确认合并」→ 把本次观测并入已有条目 ═══
     if (data.mergeTargetId) {
@@ -7287,7 +7296,14 @@ ${diagNote ? editorDiagnosisHtml(diagNote) : ""}
         // plant_edits.kind 上挂着很窄的 CHECK 约束，新值会被静默拒收（见 STATE.md）。
         summary:
           `审核通过 AI 草稿 #${draft.id.slice(0, 8)}（提交者：${draft.creator_label}）` +
-          (diagNote ? `｜编辑诊断意见：${diagNote.text.slice(0, 300)}` : ""),
+          (diagNote
+            ? `｜编辑诊断意见：${diagNote.text.slice(0, 300)}`
+            : resolution?.kind === "xiaop_fix"
+              ? // 这一条是「凭什么免填诊断意见就采纳了」的唯一凭据，必须进修改记录。
+                `｜疑似已由小P蛙定名复核解除（${resolution.byName ?? "编辑"}${
+                  resolution.at ? " · " + resolution.at.slice(0, 10) : ""
+                }）`
+              : ""),
         source,
       },
     ]);
@@ -8666,7 +8682,8 @@ const ApplyDraftAgentEditInput = z.object({
 export const applyDraftAgentEditFn = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .inputValidator((input) => ApplyDraftAgentEditInput.parse(input))
-  .handler(async ({ data }) => {
+  .handler(async ({ data, context }) => {
+    const { userId } = context;
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     const { data: draft } = await supabaseAdmin
       .from("plant_drafts")
@@ -8696,6 +8713,32 @@ export const applyDraftAgentEditFn = createServerFn({ method: "POST" })
     // ── 简介卡：改字段，不改 HTML ─────────────────────────────────────────────
     if (data.scope === DRAFT_CARD_SCOPE || liteCardDraft) {
       const before = pickDraftCardFields(draft as Record<string, unknown>);
+
+      // ── 这一趟算不算「定名复核」 ────────────────────────────────────────────
+      // 背景（2026-08-09 用户报）：卡上的中文名是要过 `sanitizeSpeciesName` 的，而它会把
+      // 「疑似」两个字剥掉（提示词第 3 条也要求模型别把它写进名字）。于是**任何一次**改摘要
+      // 的操作，都会顺手把标题上的「疑似」抹平 —— 页面上从此看不见疑似二字，
+      // `isTentative` 却仍认 `identification_confidence: "low"`，编辑点「采纳识别」还是被
+      // 拦下来要诊断意见。一个动作两种结论，这正是要根除的那类不一致。
+      //
+      // 拆成两种情形分别处理：
+      //  · 这一趟**确实是冲着定名去的**（换了种名/学名，或指令里就在说疑似、正名、学名）
+      //    → 算一次人工复核：解除疑似，并在可信度里记 +20（见 identify-trace.ts）。
+      //  · 只是改摘要、改俗名 → 把「疑似」标记**原样补回标题**（与 alignMetaToChecklist
+      //    同一手法），别让一次文字润色悄悄改掉这份草稿的定性。
+      const wasTentative = isDraftTentative(draft.ai_payload, {
+        title: draft.title,
+        summary: draft.summary,
+      });
+      /** 指令本身在说定名的事。编辑说「去掉疑似」「学名改成 X」时名字未必变，但意图很明确。 */
+      const idIntent = /疑似|定名|正名|改名|学名|中文名|物种名|定种|确诊|不是.*而是/.test(
+        data.instruction,
+      );
+      /** 名字**本身**变了（剥掉「疑似」标记再比 —— 标记的有无不算改名）。 */
+      const nameRedetermined = (f: DraftCardFields) =>
+        stripTentativeMarks(f.title) !== stripTentativeMarks(before.title) ||
+        stripTentativeMarks(f.scientific_name) !== stripTentativeMarks(before.scientific_name);
+      const isIdReview = (f: DraftCardFields) => wasTentative && (idIntent || nameRedetermined(f));
       /**
        * 第 2 条是这一档的关键（2026-08-09 用户报「小P蛙改不动快速识别卡正文」）：
        * 卡上那七项里，用户口中的「正文」就是【摘要】。旧提示词没说这件事，还叠了一句
@@ -8770,6 +8813,10 @@ export const applyDraftAgentEditFn = createServerFn({ method: "POST" })
         next.family = next.family.slice(0, 60);
         next.genus = next.genus.slice(0, 60);
         next.summary = next.summary.slice(0, 2000);
+        // 不是冲着定名去的那一趟：把 sanitizeSpeciesName 顺手剥掉的「疑似」补回去。
+        // 放在这里（而不是写库前）是为了让下面的 diffDraftCard 看到真实改动 ——
+        // 否则「只把疑似抹了」会被当成一处改动记进修改记录，实际什么也没改。
+        if (wasTentative && !isIdReview(next)) next.title = before.title;
         return next;
       };
 
@@ -8794,12 +8841,42 @@ export const applyDraftAgentEditFn = createServerFn({ method: "POST" })
               `小P蛙两次都没能把这条指令落到「${DRAFT_CARD_SCOPE}」上。这份草稿目前只有这张卡，能改的是：${DRAFT_CARD_ITEMS}（摘要就是卡上的正文）。若你要换照片、改识别地点或标签，请用卡片上对应的入口；若要新增章节、成篇正文，请先点「让 AI 生成进一步介绍草稿」。也可以把话说得更直接，例如「把摘要改写为……」。`
             : `小P蛙两次都没有改动简介卡的任何字段。请把要改的那一项和改成什么说得更具体些，例如「把摘要改写为……」「把学名改成 Oxytropis lanata」。`,
         );
+      // ── 定名复核：写下留痕，全站据此解除「疑似」──────────────────────────────
+      // 留痕（而不是「看标题上还有没有疑似两个字」）才判得准：置信度那一列**不能动**
+      // （叶子结算读它，见 approvePlantDraft 的注释），所以解除必须另有其名。
+      const idReview = isIdReview(after);
+      if (idReview) {
+        // 标题已经过 sanitize（不带疑似）；摘要开头那句「疑似……」也要一并摘掉，
+        // 否则采纳后条目正文里还留着它，与卡面又对不上。改完重算 diff，
+        // 好让修改记录写的就是真正落库的那份。
+        after.summary = stripTentativePrefix(after.summary) || after.summary;
+        changes = diffDraftCard(before, after);
+      }
+      const payloadPatch: Record<string, unknown> = {};
+      if (idReview) {
+        const { data: prof } = await supabaseAdmin
+          .from("profiles")
+          .select("display_name")
+          .eq("id", userId)
+          .maybeSingle();
+        payloadPatch.ai_payload = {
+          ...((draft.ai_payload ?? {}) as Record<string, unknown>),
+          _xiaop_id_fix: {
+            instruction: data.instruction.slice(0, 500),
+            from: { title: before.title, scientific_name: before.scientific_name },
+            to: { title: after.title, scientific_name: after.scientific_name },
+            by: userId,
+            by_name: prof?.display_name ?? "编辑",
+            at: new Date().toISOString(),
+          },
+        };
+      }
       const { error: upErr } = await supabaseAdmin
         .from("plant_drafts")
-        .update(after)
+        .update({ ...after, ...payloadPatch })
         .eq("id", data.draftId);
       if (upErr) throw new Error(`简介卡保存失败：${upErr.message}`);
-      return { card: { before, after, changes } };
+      return { card: { before, after, changes, idReview } };
     }
 
     const original = draft.html_content || "";

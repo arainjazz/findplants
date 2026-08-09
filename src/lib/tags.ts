@@ -93,14 +93,20 @@ export async function fetchTagMembership(tags: Tag[]): Promise<Map<string, TagMe
   };
 
   type TagArrayRow = { id: string; tags: string[] | null };
+  /** 草稿还要多带两列，好把「已经收录成条目的」从待审里摘出去 —— 见下面那段。 */
+  type DraftTagRow = TagArrayRow & { status: string | null; published_plant_id: string | null };
   const [links, plants, drafts] = await Promise.all([
     pageAll<{ tag_id: string; plant_id: string }>((from, to) =>
       supabase.from("plant_tags").select("tag_id,plant_id").range(from, to),
     ),
     pageAll<TagArrayRow>((from, to) => supabase.from("plants").select("id,tags").range(from, to)),
     // 被否掉的草稿不该算进任何专题。
-    pageAll<TagArrayRow>((from, to) =>
-      supabase.from("plant_drafts").select("id,tags").neq("status", "rejected").range(from, to),
+    pageAll<DraftTagRow>((from, to) =>
+      supabase
+        .from("plant_drafts")
+        .select("id,tags,status,published_plant_id")
+        .neq("status", "rejected")
+        .range(from, to),
     ),
   ]);
 
@@ -109,9 +115,30 @@ export async function fetchTagMembership(tags: Tag[]): Promise<Map<string, TagMe
     const id = resolve(n);
     if (id) byId.get(id)!.plants.add(p.id);
   }
-  for (const d of drafts) for (const n of d.tags ?? []) {
-    const id = resolve(n);
-    if (id) byId.get(id)!.drafts.add(d.id);
+  /**
+   * 🔴 **已经收录成正式条目的草稿不是「待审草稿」**（2026-08-09 用户报：#阳台杂草 上
+   * 「已收录 4 个物种 · 另有 8 条待审草稿」，而那 8 条里有 4 条就是上面刚列过的那 4 个
+   * 条目 —— 同一株植物在一页上出现两次，下半截还写着「尚未收录为正式条目」）。
+   * 从前这里只滤掉 `rejected`，采纳后草稿行**仍然留在库里**（`status='approved'` +
+   * `published_plant_id`），标签也还挂在它身上，于是永远算作待审。
+   *
+   * 改成按草稿的归宿分流，而不是简单丢弃：
+   *  · 有 `published_plant_id` → 记到**它的条目**头上。采纳那一路条目本来就继承了
+   *    `tags`（Set 去重，不会多出一份）；**并入已有条目**那一路目标条目未必挂着这个
+   *    标签，只有这里能把标签接上，丢掉就等于这条观测从专题里消失了。
+   *    金叶详页那一路（草稿仍 pending 但已有正式页）同理，算已收录才对。
+   *  · `approved` 却查不到条目（历史脏数据）→ 两边都不算。它已经不待审了，
+   *    继续列在待审里只会误导。
+   */
+  for (const d of drafts) {
+    const published = d.published_plant_id || null;
+    if (!published && d.status === "approved") continue;
+    for (const n of d.tags ?? []) {
+      const id = resolve(n);
+      if (!id) continue;
+      if (published) byId.get(id)!.plants.add(published);
+      else byId.get(id)!.drafts.add(d.id);
+    }
   }
 
   return new Map(
