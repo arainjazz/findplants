@@ -175,6 +175,109 @@ export function rewriteDraftOnlyHints(html: string): string {
   );
 }
 
+// ─── 编辑诊断意见（「疑似」草稿被采纳时必填）─────────────────────────────────
+//
+// 规则（用户 2026-08-08 定的）：AI 判为「疑似」的草稿进了待审名单之后，编辑**必须**先写
+// 一段诊断意见才能采纳；意见要随条目一起发布进正文；发布出来的条目上不再挂「疑似」字样。
+//
+// 三个函数都是**纯字符串**实现（不用 DOMParser）：采纳发布跑在 Cloudflare Workers 上，
+// 那里没有 DOM；而草稿页渲染时也要用同一套，两边必须给出一模一样的结果。
+
+/** 正文里那块诊断意见的锚点。用它做幂等：同一份 HTML 反复处理不会插出第二块。 */
+export const EDITOR_DIAGNOSIS_MARK = "data-editor-diagnosis";
+
+const escHtml = (s: string) =>
+  String(s ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+
+/** 「疑似」前缀 / 后缀（与 lib/tentative.ts 同一套判据，这里只作用在 HTML 文本上）。 */
+const TENT_PREFIX = /^(\s*)(?:[（(]\s*)?疑似(?:\s*[)）])?\s*/;
+
+/**
+ * 把正文里表示**结论**的那几处「疑似」字样摘掉。
+ *
+ * 只动结论面（`<title>` / `<h1>` / 图片 alt / 开头那段摘要），**不动**下方「识别过程」
+ * 那一栏里各模型自评的措辞 —— 那是当时发生过的事实记录，改掉就成了伪造留痕；诊断意见块
+ * 里那句「最终定种以本意见为准」已经把两者的关系说清楚了。
+ */
+export function stripTentativeFromHtml(html: string): string {
+  if (!html || !html.includes("疑似")) return html;
+  let out = html;
+  // ① <title> 与所有 <h1>：标题里的「疑似X」→「X」，顺带摘掉「疑似」专用的红色。
+  out = out.replace(/<(title|h1)\b([^>]*)>([\s\S]*?)<\/\1>/gi, (_m, tag, attrs, inner) => {
+    const cleanAttrs = String(attrs).replace(/\s*;?\s*color\s*:\s*#c8452f\s*;?/gi, (hit) =>
+      hit.trim().endsWith(";") && hit.trim().startsWith(";") ? ";" : "",
+    );
+    return `<${tag}${cleanAttrs}>${String(inner).replace(TENT_PREFIX, "$1")}</${tag}>`;
+  });
+  // ② 图片 alt（摘要卡把标题原样写进了每张图的 alt）。
+  out = out.replace(/\salt\s*=\s*"([^"]*)"/gi, (m, v) => {
+    const cleaned = String(v).replace(TENT_PREFIX, "$1");
+    return cleaned === v ? m : ` alt="${cleaned}"`;
+  });
+  // ③ 开头那段摘要：只处理**第一个**以「疑似」起头的段落 —— 那是本条的结论。
+  //    正文里「疑似某某种」这类正常表述不动（那是植物学描述，不是结论）：所以还要挡一道
+  //    「疑似」后面紧跟 种/类/物种/近似 的情况 —— 剥掉会把「疑似种的区分要点」写成
+  //    「种的区分要点」，把话说坏。挡下的段落不算数，继续往后找真正的结论段。
+  let done = false;
+  out = out.replace(/<p\b([^>]*)>(\s*(?:[（(]\s*)?疑似[\s\S]*?)<\/p>/gi, (m, attrs, inner) => {
+    if (done) return m;
+    const stripped = String(inner).replace(TENT_PREFIX, "$1");
+    if (/^\s*(?:种|类|物种|近似|同属)/.test(stripped)) return m;
+    done = true;
+    return `<p${attrs}>${stripped}</p>`;
+  });
+  return out;
+}
+
+/** 诊断意见块本身。独立导出，草稿页预览与服务端发布共用同一份排版。 */
+export function editorDiagnosisHtml(d: {
+  text: string;
+  editorName: string;
+  date: string;
+}): string {
+  const paras = String(d.text || "")
+    .split(/\n{1,}/)
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((s) => `<p style="margin:0 0 .5em">${escHtml(s)}</p>`)
+    .join("");
+  return (
+    `\n<section ${EDITOR_DIAGNOSIS_MARK}="1" style="max-width:680px;margin:1.6rem auto 0;padding:1rem 1.1rem;` +
+    `border:1px solid #2d6a4f;border-left-width:5px;border-radius:8px;background:#2d6a4f0f;` +
+    `font-size:.95em;line-height:1.75;color:#25402f">` +
+    `<p style="margin:0 0 .5em;font-weight:700;color:#2d6a4f">编辑诊断意见</p>` +
+    paras +
+    `<p style="margin:.6em 0 0;font-size:.85em;color:#5d6b60">` +
+    `—— ${escHtml(d.editorName)} · ${escHtml(d.date)} 复核采纳。` +
+    `本条目的定种以此意见为准；下方「识别过程」栏保留 AI 初判的原始记录。</p>` +
+    `</section>`
+  );
+}
+
+/**
+ * 采纳「疑似」草稿时对正文做的全部加工：摘掉结论上的「疑似」+ 把诊断意见插进正文。
+ *
+ * 插入位置按文档形态择优：整页文档插在 `</body>` 前；摘要卡那种裸 `<div>` 插在最后一个
+ * `</div>` 前（这样它落在限宽容器**里**，不会通栏）；都没有就直接接在末尾。
+ */
+export function applyEditorDiagnosis(
+  html: string,
+  d: { text: string; editorName: string; date: string },
+): string {
+  const body = stripTentativeFromHtml(String(html || ""));
+  if (!String(d.text || "").trim()) return body;
+  if (body.includes(EDITOR_DIAGNOSIS_MARK)) return body; // 幂等：已经插过就不再插
+  const block = editorDiagnosisHtml(d);
+  if (/<\/body>/i.test(body)) return body.replace(/<\/body>/i, `${block}\n</body>`);
+  const lastDiv = body.lastIndexOf("</div>");
+  if (lastDiv >= 0) return body.slice(0, lastDiv) + block + body.slice(lastDiv);
+  return body + block;
+}
+
 /** Inject responsive CSS + the click-to-replace runtime into a draft document. */
 export function enhanceDraftHtmlForViewing(html: string): string {
   if (!html) return html;
@@ -227,4 +330,48 @@ export function replaceImageInDraftHtml(html: string, slot: number, newUrl: stri
   } catch {
     return html;
   }
+}
+
+/**
+ * 这份正文是**完整 HTML 文档**还是一段**片段**？
+ *
+ * 「快速识别简介卡」那一档的 `plant_drafts.html_content` 是
+ * `buildSummaryCardHtml` 吐的一个裸 `<div>`；「采纳快速识别简介」还会把同一段片段
+ * 原样发布成条目正文，所以线上的 `plants` 里也躺着这种页面
+ * （STATE 2026-07-31：`source=ai_identify` 的 12 条里有 3 条）。
+ *
+ * 小P蛙的两条改写通道从前在**进出两头**都硬卡 `</html>`：进来报「HTML 不完整，
+ * 无法自动修改」，出去报「小P 生成的内容不完整」—— 于是这一类正文根本改不了
+ * （2026-08-08 用户实测报的就是前一条）。
+ */
+export function isFullHtmlDoc(html: string): boolean {
+  return /<html[\s>]/i.test(html);
+}
+
+/**
+ * 收下模型改写后的 HTML：剥掉 markdown 围栏，并按**原文的形态**校验/还原 ——
+ * 原文是完整文档就必须还是完整文档；原文是片段，而模型（很常见）好心包了一整篇
+ * `<html><body>…`，就把 `<body>` 里的内容取回来，免得片段被塞进正文后嵌套出一个
+ * 文档套文档的畸形结构。
+ *
+ * 形态不对时抛错，**不做静默降级** —— 半截 HTML 存进去比报错糟得多。
+ */
+export function normalizeRewrittenHtml(raw: string, fullDoc: boolean): string {
+  let html = raw.trim();
+  if (html.startsWith("```")) {
+    html = html
+      .replace(/^```html\s*/i, "")
+      .replace(/^```\s*/, "")
+      .replace(/```$/, "")
+      .trim();
+  }
+  const incomplete = new Error("小P 生成的内容不完整，请重试或换种说法。");
+  if (fullDoc) {
+    if (!/<\/html>/i.test(html)) throw incomplete;
+    return html;
+  }
+  const body = html.match(/<body\b[^>]*>([\s\S]*?)<\/body>/i);
+  html = body ? body[1].trim() : html.replace(/<!DOCTYPE[^>]*>/i, "").trim();
+  if (!html.includes("<")) throw incomplete;
+  return html;
 }

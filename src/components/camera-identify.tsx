@@ -8,6 +8,7 @@ import { getAnonId } from "@/lib/anon-id";
 import { findDraftByPhotoHash } from "@/lib/species-existing.functions";
 import { keepVisualAdvice } from "@/lib/retake-advice";
 import { rememberFreshPhoto } from "@/lib/fresh-photo";
+import { cleanDraftForDisplay, type PlantDraft } from "@/lib/drafts";
 import { explainError, isNetworkError } from "@/lib/explain-error";
 import { useAuth } from "@/hooks/use-auth";
 import { toast } from "sonner";
@@ -645,7 +646,7 @@ export function CameraIdentify({
       // 刚落一条绿色动态，让小P蛙上的角标立刻更新，不等下一轮轮询。
       if (user?.id) qc.invalidateQueries({ queryKey: ["task-feed"] });
       toast.success("已生成简介摘要卡，正在跳转…");
-      goToDraft(draftId);
+      goToDraft(draftId, outcome.draft);
     } catch (e) {
       // ── 断线自愈 ────────────────────────────────────────────────────────────
       // 识别是个**有副作用的写操作**：服务端跑完就把草稿写进库了。而网络层失败只说明
@@ -712,14 +713,25 @@ export function CameraIdentify({
   };
 
   /** 成功收尾：清缓存 → 标记「刚识别完」→ 跳转。正常路径与断线自愈路径共用，
-   *  免得自愈少做一步（比如忘了清缓存）而出现「跳过去还是旧草稿」这种二次 bug。 */
-  const goToDraft = (draftId: string) => {
+   *  免得自愈少做一步（比如忘了清缓存）而出现「跳过去还是旧草稿」这种二次 bug。
+   *
+   *  `freshRow` = 轮询在「完成」那一拍顺手带回来的草稿行（见 pollJobFn）。有它就直接
+   *  喂进缓存：草稿页的 loader 命中缓存 → 少一趟浏览器→Supabase 的往返，分享卡早那么多
+   *  出来。没有（断线自愈路径 / 读取失败）就照旧清缓存、让页面自己去查。 */
+  const goToDraft = (draftId: string, freshRow?: unknown) => {
     // 补拍合并回同一份草稿时，/drafts/$id 会命中 React Query 缓存 → 页面渲染的是**补拍前**
     // 的旧草稿：retake_count 还是 0、ai_payload 还是上一轮的「疑似」。分享卡是 draft 一到就
     // 自动生成的，于是「本轮铜叶 +N」按 N=1 画出去、关卡后的补拍横幅也倒回「第一次补拍」。
     // 先把缓存丢掉，让页面拿新数据。（草稿页那一份现在还额外配了 refetchOnMount:"always"，
     // 两道保险：这里是「立刻正确」，那里是「以后每次进来都正确」。）
+    //
+    // ⚠️ 喂缓存**只能喂刚从服务端读回来的这一行**（它比任何本地缓存都新，因此不会重演
+    // 「补拍结果被旧快照顶回去」那个 bug）；喂之前照样先删，保证不会与旧值混在一起。
     qc.removeQueries({ queryKey: ["draft", draftId] });
+    if (freshRow && typeof freshRow === "object" && (freshRow as { id?: string }).id === draftId) {
+      // 与 fetchDraftById 同一套显示层清洗，缓存里那份和自己查回来的那份必须长得一样。
+      qc.setQueryData(["draft", draftId], cleanDraftForDisplay(freshRow as PlantDraft));
+    }
     // ⚠️ 叶子统计用 invalidate 而**不是** remove：remove 会让草稿页那个「等叶子到了再出卡」
     // 的判据从零开始等一次完整重算（computeLeaves 是 7 条并发查询，其中一条要拉该用户的
     // 全部草稿行）—— 这正是用户 2026-08-06 报的「停在已完成界面很久才弹分享卡」的一段。

@@ -13,6 +13,21 @@
 /** 小P蛙「讨论范围」里代表简介卡的 scope 值。服务端据此切到「改列」而不是「改 HTML」。 */
 export const DRAFT_CARD_SCOPE = "快速识别简介卡";
 
+/** 卡上可改的那几项，写进提示词用（客户端下拉、服务端两条提示词共用一句话）。 */
+export const DRAFT_CARD_ITEMS = "中文名（标题）、拉丁学名、中文俗名/商品名、英文俗名、科、属、摘要";
+
+/**
+ * 这份草稿是不是「只有简介卡」的那一档 —— 快速识别跑完就有，用户还没点
+ * 「让 AI 生成进一步介绍草稿」。
+ *
+ * 判据只能是 `ai_payload._enriched === false`，与草稿页的 `notEnriched`、列表卡的
+ * `draftTier` 同源。**绝不能用「html_content 非空」**：快速识别也会把摘要卡片段写进
+ * html_content（见 buildSummaryCardHtml），用长度判会把所有快速草稿错认成银叶。
+ */
+export function isLiteCardDraft(aiPayload: unknown): boolean {
+  return (aiPayload as { _enriched?: unknown } | null)?._enriched === false;
+}
+
 export type DraftCardFields = {
   title: string;
   scientific_name: string;

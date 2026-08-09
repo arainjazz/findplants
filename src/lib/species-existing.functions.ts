@@ -33,6 +33,25 @@ const Input = z.object({
  */
 export type SpeciesExistingKind = "quick" | "silver" | "gold" | "skill";
 
+/** 一类里的**其中一份**。份数 >1 时按钮下会展开成一行一份的列表。 */
+export type SpeciesExistingEntry = {
+  title: string;
+  /** 显示名：登录用户取 `profiles.display_name`，访客草稿退到 `creator_label`。 */
+  author: string | null;
+  /** 尚未收录的草稿去向。`kind=silver` 时就地展开，其余跳草稿页。 */
+  draftId?: string;
+  /** 已收录条目去向（跳详页）。与 `draftId` 二选一。 */
+  slug?: string;
+  /** ISO 时间串；列表里只显示到「日」。 */
+  createdAt: string | null;
+  /** 拍摄地点。`plants` 没有这一列 —— 采纳来的条目借它来源草稿的 `capture_place`。 */
+  place: string | null;
+  /** 缩略图。条目取 `cover_url`，为空时退到来源草稿的 `photo_url`。 */
+  thumb: string | null;
+  /** true = 已收录条目（跳详页），false = 未收录草稿。 */
+  published: boolean;
+};
+
 export type SpeciesExistingItem = {
   kind: SpeciesExistingKind;
   title: string;
@@ -45,6 +64,14 @@ export type SpeciesExistingItem = {
   /** 同类共几份 / 出自几位用户（>1 时按钮上缀一句）。 */
   count: number;
   userCount: number;
+  /**
+   * 这一类下的**全部**份数（顺序即展示顺序），`entries[0]` 就是上面那几个代表字段。
+   *
+   * 从前只返回代表这一条，`count` 却报的是全组数量 —— 于是按钮上写着「共 2 份」，
+   * 第二份却没有任何入口点得到（用户 2026-08-09 报的：拂子茅 4 份内容只有 2 个入口）。
+   * 这个列表就是那个缺掉的入口。
+   */
+  entries: SpeciesExistingEntry[];
 };
 
 export type SpeciesExisting = {
@@ -112,7 +139,7 @@ export const lookupSpeciesExisting = createServerFn({ method: "POST" })
         (supabaseAdmin as any)
           .from("plant_drafts")
           .select(
-            "id, title, created_by, creator_label, scientific_name, created_at, published_plant_id, enriched:ai_payload->>_enriched",
+            "id, title, created_by, creator_label, scientific_name, created_at, capture_place, photo_url, published_plant_id, enriched:ai_payload->>_enriched",
           )
           .ilike("scientific_name", `${genus}%`)
           .order("created_at", { ascending: false })
@@ -121,7 +148,7 @@ export const lookupSpeciesExisting = createServerFn({ method: "POST" })
           // id 用来和草稿的 published_plant_id 对上（判断这一行是不是采纳来的）；
           // author_id 用来写「谁创建的」；created_at 决定同类里挑哪一份当代表。
           .from("plants")
-          .select("id, slug, title, scientific_name, source, created_at, author_id")
+          .select("id, slug, title, scientific_name, source, created_at, author_id, cover_url")
           .ilike("scientific_name", `${genus}%`)
           .order("created_at", { ascending: false })
           .limit(300),
@@ -133,6 +160,9 @@ export const lookupSpeciesExisting = createServerFn({ method: "POST" })
         created_by: string | null;
         creator_label: string | null;
         scientific_name: string | null;
+        created_at: string | null;
+        capture_place: string | null;
+        photo_url: string | null;
         published_plant_id: string | null;
         enriched: string | null;
       };
@@ -142,7 +172,9 @@ export const lookupSpeciesExisting = createServerFn({ method: "POST" })
         title: string;
         scientific_name: string | null;
         source: string | null;
+        created_at: string | null;
         author_id: string | null;
+        cover_url: string | null;
       };
 
       const drafts: DraftRow[] = (draftRes?.data ?? []).filter(
@@ -179,6 +211,18 @@ export const lookupSpeciesExisting = createServerFn({ method: "POST" })
         );
       }
 
+      // plants 没有 capture_place，封面也可能是空的 —— 采纳来的条目就借它**来源草稿**的
+      // 拍摄地点与照片。列表里要靠这两样把同物种的几份区分开（多半是不同地点拍的）。
+      const fromSourceDraft = new Map<string, { place: string | null; thumb: string | null }>();
+      for (const d of drafts) {
+        if (!d.published_plant_id) continue;
+        const cur = fromSourceDraft.get(d.published_plant_id);
+        fromSourceDraft.set(d.published_plant_id, {
+          place: cur?.place || d.capture_place || null,
+          thumb: cur?.thumb || d.photo_url || null,
+        });
+      }
+
       type Raw = {
         kind: SpeciesExistingKind;
         title: string;
@@ -186,6 +230,10 @@ export const lookupSpeciesExisting = createServerFn({ method: "POST" })
         slug?: string;
         userId: string | null;
         label: string | null;
+        createdAt: string | null;
+        place: string | null;
+        thumb: string | null;
+        published: boolean;
       };
       const raws: Raw[] = [];
       // 条目在前、草稿在后：同一类里优先拿**已发布的条目**当代表（那是这份内容的正式家）。
@@ -199,7 +247,18 @@ export const lookupSpeciesExisting = createServerFn({ method: "POST" })
                 ? "silver"
                 : "quick"
               : "skill";
-        raws.push({ kind, title: p.title, slug: p.slug, userId: p.author_id, label: null });
+        const src = fromSourceDraft.get(p.id);
+        raws.push({
+          kind,
+          title: p.title,
+          slug: p.slug,
+          userId: p.author_id,
+          label: null,
+          createdAt: p.created_at ?? null,
+          place: src?.place ?? null,
+          thumb: p.cover_url || src?.thumb || null,
+          published: true,
+        });
       }
       for (const d of visibleDrafts) {
         raws.push({
@@ -208,15 +267,20 @@ export const lookupSpeciesExisting = createServerFn({ method: "POST" })
           draftId: d.id,
           userId: d.created_by,
           label: d.creator_label,
+          createdAt: d.created_at ?? null,
+          place: d.capture_place ?? null,
+          thumb: d.photo_url ?? null,
+          published: false,
         });
       }
 
-      const heads: Raw[] = [];
+      // 每一类**整组**都带回去（不再只留 group[0]）—— 前端点开「共 N 份」时要逐份列出来。
+      const groups: Raw[][] = [];
       const items: SpeciesExistingItem[] = [];
       for (const kind of KIND_ORDER) {
         const group = raws.filter((r) => r.kind === kind);
         if (!group.length) continue;
-        heads.push(group[0]);
+        groups.push(group);
         items.push({
           kind,
           title: group[0].title,
@@ -225,25 +289,36 @@ export const lookupSpeciesExisting = createServerFn({ method: "POST" })
           slug: group[0].slug,
           count: group.length,
           userCount: new Set(group.map((g) => g.userId).filter(Boolean)).size,
+          entries: group.map((g) => ({
+            title: g.title,
+            author: null,
+            draftId: g.draftId,
+            slug: g.slug,
+            createdAt: g.createdAt,
+            place: g.place,
+            thumb: g.thumb,
+            published: g.published,
+          })),
         });
       }
 
-      // 「x 创建的」里的 x。一次查完（最多 4 个 id），访客草稿没有 created_by → 退到 creator_label。
-      const ids = [...new Set(heads.map((h) => h.userId).filter(Boolean))] as string[];
+      // 「x 创建的」里的 x。**每一份**都要（列表里靠作者+时间区分两份），一次查完；
+      // 访客草稿没有 created_by → 退到 creator_label。
+      const ids = [...new Set(raws.map((r) => r.userId).filter(Boolean))] as string[];
+      const nameById = new Map<string, string>();
       if (ids.length) {
         const { data: profs } = await (supabaseAdmin as any)
           .from("profiles")
           .select("id, display_name")
           .in("id", ids);
-        const nameById = new Map<string, string>();
         for (const p of profs ?? []) if (p.display_name) nameById.set(p.id, p.display_name);
-        items.forEach((it, i) => {
-          const h = heads[i];
-          it.author = (h.userId ? nameById.get(h.userId) : null) || h.label || null;
-        });
-      } else {
-        items.forEach((it, i) => (it.author = heads[i].label || null));
       }
+      const nameOf = (r: Raw) => (r.userId ? nameById.get(r.userId) : null) || r.label || null;
+      items.forEach((it, i) => {
+        const group = groups[i];
+        it.author = nameOf(group[0]);
+        it.entries.forEach((e, j) => (e.author = nameOf(group[j])));
+      });
 
       return { items };
     } catch (e) {

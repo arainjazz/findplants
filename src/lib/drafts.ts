@@ -6,7 +6,7 @@ import { stripInlineMarkdown, markdownEmphasisToHtml } from "./strip-markdown";
  * `*Ficus lyrata*`）。写入端已修，但存量数据只能在读取时就地清 —— 纯文本字段去星号，
  * 正文 HTML 里的 `*Latin*` 转 <em>。新识别的草稿本就干净，再清一遍是幂等的。
  */
-function cleanDraftForDisplay(d: PlantDraft): PlantDraft {
+export function cleanDraftForDisplay(d: PlantDraft): PlantDraft {
   const s = (v: string | null | undefined) => (v == null ? v : stripInlineMarkdown(v));
   d.title = stripInlineMarkdown(d.title);
   d.scientific_name = s(d.scientific_name) ?? null;

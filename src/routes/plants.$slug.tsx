@@ -42,6 +42,17 @@ import { supabase } from "@/integrations/supabase/client";
 import { FolderOpen, Link2, Image as ImageIcon, Globe } from "lucide-react";
 
 export const Route = createFileRoute("/plants/$slug")({
+  /**
+   * `?from=<tagSlug>` = 读者是从某个标签的物种名单点进来的。这一页据此在顶上给一条
+   * 「← 返回 #标签 名单」，好让人看完一条再回名单看下一条（用户 2026-08-08 的要求：
+   * 「读者可以点击名单跳到介绍页，也可以返回标签名单」）。
+   * ⚠️ 只声明 from 这一个**可选**键。别图省事写成 `{...search, from}` —— 那样返回类型
+   * 带上索引签名，TanStack 会把 `search` 判成这条路由的**必填**属性，全站二十多处
+   * `<Link to="/plants/$slug">` 当场全部类型报错。这一页本来也没有别的查询参数。
+   */
+  validateSearch: (search: Record<string, unknown>): { from?: string } => ({
+    from: typeof search.from === "string" ? search.from.slice(0, 120) : undefined,
+  }),
   loader: async ({ params }) => {
     return fetchPlantBySlug(params.slug);
   },
@@ -638,6 +649,30 @@ function PlantDetail() {
     <RegistryChips chips={registryChipList} linkTags />
   ) : null;
 
+  /**
+   * 「← 返回 #标签 名单」—— 只有从标签名单点进来（`?from=<tagSlug>`）时才出现。
+   * 标签名优先取卡签里那一枚（库里的真名），取不到再把 slug 解码回来兜底。
+   */
+  const fromTag = (Route.useSearch() as { from?: string }).from || null;
+  const backToTagNode = fromTag ? (
+    <Link
+      to="/tags/$slug"
+      params={{ slug: fromTag }}
+      className="label text-emerald-700 hover:text-vermilion whitespace-nowrap"
+    >
+      ← 返回 #
+      {registryChipList.find((c) => c.slug === fromTag)?.label ??
+        (() => {
+          try {
+            return decodeURIComponent(fromTag);
+          } catch {
+            return fromTag;
+          }
+        })()}{" "}
+      名单
+    </Link>
+  ) : null;
+
   const fmtDate = (ts: string) => {
     try {
       return new Date(ts).toLocaleDateString("zh-CN", { year: "numeric", month: "2-digit", day: "2-digit" });
@@ -807,7 +842,10 @@ function PlantDetail() {
         <SiteHeader />
         <div className="border-b border-ink/30 bg-paper-deep/40">
           <div className="mx-auto max-w-6xl px-6 py-3 flex items-center justify-between text-sm">
-            <Link to="/" className="label hover:text-vermilion">← 返回首页</Link>
+            <span className="flex items-center gap-3">
+              {backToTagNode}
+              <Link to="/" className="label hover:text-vermilion">← 返回首页</Link>
+            </span>
             <p className="label flex items-center gap-2">
               {plant.scientific_name || plant.title}
               {entryKind && <PlantKindBadge kind={entryKind} />}
@@ -991,7 +1029,10 @@ function PlantDetail() {
       <SiteHeader />
       <main className="mx-auto max-w-3xl px-6 py-12 flex-1 w-full">
         <div className="flex items-center justify-between">
-          <Link to="/" className="label hover:text-vermilion">← 返回首页</Link>
+          <span className="flex items-center gap-3">
+            {backToTagNode}
+            <Link to="/" className="label hover:text-vermilion">← 返回首页</Link>
+          </span>
           <div className="flex items-center gap-2">
             {isAdmin && <AdminExportButton />}
             {shareCardNode}

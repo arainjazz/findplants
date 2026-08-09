@@ -63,13 +63,23 @@ import {
   draftTitleFor,
   sanitizeSpeciesName,
 } from "./tentative";
-import { rewriteDraftOnlyHints, stripStaleMissingNotes } from "./draft-enhance";
+import {
+  isFullHtmlDoc,
+  normalizeRewrittenHtml,
+  rewriteDraftOnlyHints,
+  stripStaleMissingNotes,
+  applyEditorDiagnosis,
+  editorDiagnosisHtml,
+} from "./draft-enhance";
 import {
   DRAFT_CARD_SCOPE,
+  DRAFT_CARD_ITEMS,
   DRAFT_CARD_FIELD_KEYS,
   DRAFT_CARD_FIELD_LABELS,
+  type DraftCardFields,
   diffDraftCard,
   draftCardToText,
+  isLiteCardDraft,
   pickDraftCardFields,
 } from "./draft-card-fields";
 import { stripModelChatter } from "./model-chatter";
@@ -5999,9 +6009,34 @@ export const pollJobFn = createServerFn({ method: "POST" })
     const rec = await readJob(data.jobId, owner);
     if (!rec) return { found: false as const };
     const queued = isJobQueued(rec);
+    // ── 识别刚跑完的那一趟轮询，把草稿行**一并带回去** ────────────────────────
+    // 出卡链路上原本串着一段纯粹的白等：轮询说「done」→ 前端 navigate 去 /drafts/$id →
+    // 路由 loader 从浏览器再往 Supabase 跑一趟把这行读回来 → 才有 draft、才能画卡。
+    // 那一趟的字节这里顺手就能给（Worker 离库近，且这本来就是同一份数据），
+    // 前端拿到后直接把 react-query 缓存喂上，loader 命中缓存、一次都不用再往返。
+    // 只在「本次轮询正好看到完成」时带；跑着的时候什么都不多传，轮询包大小不变。
+    let draft: import("./drafts").PlantDraft | null = null;
+    if (rec.status === "done" && rec.kind === "quick_identify") {
+      const id = (rec.result as { draftId?: string } | null)?.draftId;
+      if (id) {
+        try {
+          const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+          const { data: row } = await supabaseAdmin
+            .from("plant_drafts")
+            .select("*")
+            .eq("id", id)
+            .maybeSingle();
+          // 只回给任务的主人（owner 上面已校验过），与前端自己去读那一行的可见范围一致。
+          draft = (row as import("./drafts").PlantDraft | null) ?? null;
+        } catch {
+          /* 读不到就当没这条捷径 —— 前端照常自己去查，行为与改动前完全一样 */
+        }
+      }
+    }
     return {
       found: true as const,
       status: rec.status,
+      draft,
       // 排队中就照实说。原来这里会把 createJob 写的初始文案（「已排队，正在启动…」）
       // 一直显示成在跑，用户看着进度条纹丝不动、以为卡死了。
       phase: queued ? "排队中：前面还有任务，轮到它就会开始…" : rec.phase,
@@ -6914,7 +6949,16 @@ export const gbifChinaOccurrencesFn = createServerFn({ method: "POST" })
 const ApproveInput = z.object({
   draftId: z.string().uuid(),
   mergeTargetId: z.string().uuid().optional(),
+  /**
+   * 编辑的**诊断意见**。草稿被 AI 判为「疑似」时这是**硬性必填**（见下方 DIAGNOSIS_MIN）：
+   * 一个还没定种的结论不该单靠点一下按钮就变成正式条目，得有人签字说明凭什么定成这个种。
+   * 非疑似草稿留空即可，行为与从前完全一致。
+   */
+  diagnosis: z.string().max(4000).optional(),
 });
+
+/** 诊断意见的最短长度。够写下「凭哪个特征定成这个种」的一句话，挡得住「.」这种敷衍。 */
+const DIAGNOSIS_MIN = 8;
 
 export const approvePlantDraft = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
@@ -6968,6 +7012,55 @@ export const approvePlantDraft = createServerFn({ method: "POST" })
     const placeStr = draft.capture_place || "未知地点";
     const dateStr = String(draft.created_at || "").slice(0, 10);
 
+    // ── 「疑似」闸门：没有诊断意见就不许采纳 ──────────────────────────────────
+    // 判据与全站同源（lib/tentative.ts 的 isTentative：低置信度 / 摘要开头写着疑似 /
+    // 名字上标着疑似，三者任一）。**闸门必须在服务端**：前端那个弹窗只是引导，
+    // 真正保证「库里不会出现一条没人签字的疑似条目」的是这里。
+    const payload = (draft.ai_payload ?? {}) as Record<string, unknown>;
+    const tentative =
+      !payload._editor_diagnosis &&
+      isTentative({
+        identification_confidence: payload.identification_confidence,
+        summary_zh: draft.summary || (payload.summary_zh as string | undefined),
+        title: draft.title,
+      });
+    const diagnosis = (data.diagnosis ?? "").trim();
+    if (tentative && diagnosis.length < DIAGNOSIS_MIN) {
+      throw new Error(
+        `这份草稿的 AI 结论是「疑似」：请先填写诊断意见（至少 ${DIAGNOSIS_MIN} 字，说明你据以定种的依据），再采纳。`,
+      );
+    }
+    /** 本次采纳的诊断意见（非疑似草稿也允许写，写了就一并收进正文）。 */
+    const diagNote = diagnosis
+      ? { text: diagnosis, editorName, date: new Date().toISOString().slice(0, 10) }
+      : null;
+
+    /**
+     * 采纳时**写回草稿行**的补丁。两件事：
+     *  ① 诊断意见存进 `ai_payload._editor_diagnosis`（jsonb，不必加列）——草稿页据此
+     *     知道「这条已经有人签字了」，从此不再按疑似渲染（标题、正文提示、分享卡、补拍横幅）；
+     *  ② 标题 / 摘要 / 正文里的「疑似」字样一并摘掉，并把意见收进草稿正文，
+     *     好让草稿页和已发布条目页看到的是同一份东西。
+     * ⚠️ **不动 `identification_confidence`**：那一列是叶子结算的输入
+     *     （lib/leaves.ts：疑似恒 +1），改它等于顺手改了识别人的铜叶数。
+     */
+    const draftAdoptPatch: Record<string, unknown> | null = diagNote
+      ? {
+          title: stripTentativeMarks(draft.title) || draft.title,
+          summary: stripTentativePrefix(draft.summary ?? "") || draft.summary,
+          html_content: applyEditorDiagnosis(String(draft.html_content || ""), diagNote),
+          ai_payload: {
+            ...payload,
+            _editor_diagnosis: {
+              text: diagNote.text,
+              by: dbUserId,
+              by_name: editorName,
+              at: new Date().toISOString(),
+            },
+          },
+        }
+      : null;
+
     // ═══ 合并分支：编辑在弹窗点了「确认合并」→ 把本次观测并入已有条目 ═══
     if (data.mergeTargetId) {
       const { data: target } = await supabaseAdmin
@@ -6983,7 +7076,11 @@ export const approvePlantDraft = createServerFn({ method: "POST" })
       //    直接返回，杜绝重复合并把先前的卡片读-改-写冲掉（用户双击「确认合并」曾导致注1丢失）。
       const { data: claimed } = await supabaseAdmin
         .from("plant_drafts")
-        .update({ status: "approved", published_plant_id: target.id })
+        .update({
+          status: "approved",
+          published_plant_id: target.id,
+          ...(draftAdoptPatch ?? {}),
+        })
         .eq("id", draft.id)
         .neq("status", "approved")
         .select("id");
@@ -7014,7 +7111,9 @@ export const approvePlantDraft = createServerFn({ method: "POST" })
           kind: "merge",
           marker_n: markerN,
           source: "draft_merge",
-          summary: `补充观测：由 ${identifierName} 于 ${placeStr}（${dateStr}）识别，经 ${editorName} 采纳并入本条目`,
+          summary:
+            `补充观测：由 ${identifierName} 于 ${placeStr}（${dateStr}）识别，经 ${editorName} 采纳并入本条目` +
+            (diagNote ? `｜诊断意见：${diagNote.text.slice(0, 300)}` : ""),
         })
         .select("id")
         .single();
@@ -7040,6 +7139,7 @@ export const approvePlantDraft = createServerFn({ method: "POST" })
   <h3 style="font-size:1.15em;color:#c0392b;margin:0 0 .75rem;">补充观测记录<a class="lov-edit-mark" data-edit-id="${editRow.id}" data-edit-n="${markerN}" style="margin-left:6px;display:inline-block;font-size:10px;line-height:1;padding:2px 5px;background:#c0392b;color:#fff;border-radius:3px;cursor:pointer;text-decoration:none;font-weight:600;vertical-align:super;">注</a></h3>
   ${photoImg}
   <p style="margin:0;color:#333;font-size:.95em;">识别人：${esc(identifierName)} · 地点：${esc(placeStr)}${coord} · 时间：${esc(dateStr)}</p>
+${diagNote ? editorDiagnosisHtml(diagNote) : ""}
 </section>`;
       // 幂等兜底：目标 HTML 若已含本草稿卡片则不重复追加。
       const mergedHtml = targetHtml.includes(`data-draft-id="${draft.id}"`)
@@ -7110,9 +7210,15 @@ export const approvePlantDraft = createServerFn({ method: "POST" })
     const htmlPath = `${dbUserId}/draft-${draft.id}.html`;
     // rewriteDraftOnlyHints：摘要卡页尾那句「点击『让 AI 生成进一步介绍草稿』」只在草稿页
     // 上成立 —— 那个按钮不在条目页上。发布时就改写掉，别把一条点不动的指令印到正式条目上。
-    const publishHtml = rewriteDraftOnlyHints(
+    // applyEditorDiagnosis：把编辑的诊断意见收进正文，同时摘掉结论上的「疑似」字样
+    // （标题 / 首段摘要 / 图片 alt；「识别过程」栏保留 AI 初判的原始记录）。
+    const cleanedHtml = rewriteDraftOnlyHints(
       stripStaleMissingNotes(String(draft.html_content || "")),
     );
+    const publishHtml = diagNote ? applyEditorDiagnosis(cleanedHtml, diagNote) : cleanedHtml;
+    // 条目的标题与摘要同样不该再挂「疑似」—— 列表页、检索、分享卡读的都是这两列。
+    const publishTitle = (draftAdoptPatch?.title as string) ?? draft.title;
+    const publishSummary = (draftAdoptPatch?.summary as string) ?? draft.summary;
     const blob = new Blob([publishHtml], { type: "text/html" });
     const { error: upErr } = await supabaseAdmin.storage
       .from("plant-html")
@@ -7125,13 +7231,13 @@ export const approvePlantDraft = createServerFn({ method: "POST" })
       .from("plants")
       .insert({
         slug,
-        title: draft.title,
+        title: publishTitle,
         scientific_name: draft.scientific_name,
         common_name_en: draft.common_name_en,
         common_names_zh: draft.common_names_zh,
         family: draft.family,
         genus: draft.genus,
-        summary: draft.summary,
+        summary: publishSummary,
         cover_url: draft.photo_url,
         content_type: "html",
         html_url: htmlUrl,
@@ -7145,10 +7251,10 @@ export const approvePlantDraft = createServerFn({ method: "POST" })
       .single();
     if (pErr) throw new Error(`收录失败：${pErr.message}`);
 
-    // Update draft status.
+    // Update draft status（并把诊断意见写回草稿本身，见 draftAdoptPatch）。
     await supabaseAdmin
       .from("plant_drafts")
-      .update({ status: "approved", published_plant_id: plant.id })
+      .update({ status: "approved", published_plant_id: plant.id, ...(draftAdoptPatch ?? {}) })
       .eq("id", draft.id);
 
     // Editor display name
@@ -7176,7 +7282,12 @@ export const approvePlantDraft = createServerFn({ method: "POST" })
         editor_name: prof?.display_name ?? "编辑",
         kind: "draft_approve",
         marker_n: 0,
-        summary: `审核通过 AI 草稿 #${draft.id.slice(0, 8)}（提交者：${draft.creator_label}）`,
+        // 诊断意见一并进修改记录 —— 正文里那块是给读者看的，这里是给「谁在什么时候
+        // 凭什么把一条疑似定成了这个种」留档的。kind 仍用既有的 draft_approve：
+        // plant_edits.kind 上挂着很窄的 CHECK 约束，新值会被静默拒收（见 STATE.md）。
+        summary:
+          `审核通过 AI 草稿 #${draft.id.slice(0, 8)}（提交者：${draft.creator_label}）` +
+          (diagNote ? `｜编辑诊断意见：${diagNote.text.slice(0, 300)}` : ""),
         source,
       },
     ]);
@@ -8354,15 +8465,25 @@ export const askDraftAgentFn = createServerFn({ method: "POST" })
     const { data: draft } = await supabaseAdmin
       .from("plant_drafts")
       .select(
-        "title,scientific_name,html_content,photo_url,user_photos,summary,common_names_zh,common_name_en,family,genus",
+        "title,scientific_name,html_content,photo_url,user_photos,summary,common_names_zh,common_name_en,family,genus,ai_payload",
       )
       .eq("id", data.draftId)
       .maybeSingle();
     if (!draft) throw new Error("草稿不存在");
 
+    /**
+     * 「只有简介卡」的那一档。**对话这一侧过去完全不知道这件事**（连 ai_payload 都没
+     * select），于是把那段不上屏的摘要卡片段当成「草稿正文纯文本」喂了进去 ——
+     * 小P蛙自然以为有正文，开口就是「我在正文里补一段…」，editInstruction 也照这个写。
+     * 可落地那一侧只认卡上七项，于是每次都以「这条指令没有落到卡上的任何一项」收场
+     * （2026-08-09 用户报的正是这一条）。这里把实情告诉它。
+     */
+    const liteCard = isLiteCardDraft((draft as { ai_payload?: unknown }).ai_payload);
     // 简介卡这个 scope 不在 html_content 里（是 plant_drafts 的列），所以图片喂用户自己
     // 拍的那几张（卡上显示的正是它们），文本另外附一份卡面快照。
-    const cardScope = data.scope === DRAFT_CARD_SCOPE;
+    // 只有简介卡的草稿：**整份草稿就是这张卡**（正文 iframe 在草稿页上根本不渲染），
+    // 所以编辑选没选范围都按卡来喂图、喂文、立规矩。
+    const cardScope = data.scope === DRAFT_CARD_SCOPE || liteCard;
     const cardFields = pickDraftCardFields(draft as Record<string, unknown>);
 
     // Scope-aware vision: an annotated section → only THAT section's images; the
@@ -8385,11 +8506,13 @@ export const askDraftAgentFn = createServerFn({ method: "POST" })
     const photos = await fetchInlineImages(visionUrls);
 
     const docText = htmlToText(draftHtml);
-    const scopeLine = cardScope
-      ? `编辑本轮把讨论范围限定在【${DRAFT_CARD_SCOPE}】—— 就是草稿页顶部那张卡：中文名（标题）、拉丁学名、中文俗名/商品名、英文俗名、科、属、摘要。它不在下面的正文 HTML 里，而是草稿自己的字段。请只围绕这几项回答与建议；提出修改时，说清要改哪一项、改成什么。`
-      : data.scope
-        ? `编辑本轮把讨论范围限定在草稿的「${data.scope}」部分。请只围绕这一处回答与建议。`
-        : "本轮未限定范围，针对整份草稿回答。";
+    const scopeLine = liteCard
+      ? `这份草稿**只有「${DRAFT_CARD_SCOPE}」、没有正文**（用户还没点「让 AI 生成进一步介绍草稿」）。卡上就这几项：${DRAFT_CARD_ITEMS} —— 其中【摘要】就是这张卡的正文。所以：要补充、改写、精简内容，一律落到【摘要】里；**不要**提议「在正文里新增一段 / 改第 N 节 / 调整排版」，这一档没有那些东西可改。`
+      : cardScope
+        ? `编辑本轮把讨论范围限定在【${DRAFT_CARD_SCOPE}】—— 就是草稿页顶部那张卡：${DRAFT_CARD_ITEMS}。它不在下面的正文 HTML 里，而是草稿自己的字段。请只围绕这几项回答与建议；提出修改时，说清要改哪一项、改成什么。`
+        : data.scope
+          ? `编辑本轮把讨论范围限定在草稿的「${data.scope}」部分。请只围绕这一处回答与建议。`
+          : "本轮未限定范围，针对整份草稿回答。";
     const system = `你是「小P蛙」，Plantspedia（鄂尔多斯植物百科）的双语审稿助手，性格友好、专业、简洁。
 编辑正在审核一份由 AI 生成的植物科普草稿，可能对其中内容有疑问。${scopeLine}你的职责：
 - 用【中文】回答编辑关于该草稿的问题，必要时给出基于植物学常识的核对与修改建议；${data.scope ? "范围已限定时，回答与改动只应涉及该部分；" : ""}
@@ -8399,6 +8522,8 @@ ${NO_MODEL_DISCLOSURE.trimEnd()}
 - 如果编辑的诉求是一处「可以直接落地到草稿里的具体修改」（例如订正学名、改写某段、调整养护数值、修正错别字等），
   把 canEdit 设为 true，并在 editInstruction 里用一句中文精确描述要对草稿做的改动（具体到改哪里、改成什么）。
   **你可以直接落地这些文字改动**——编辑只需点一下「采纳并保存」，就由你改写并保存，不要说"交给技术同事/他人执行"。
+${liteCard ? `- 这一档能落地的只有卡上那七项，所以 editInstruction **必须**写成「把〈某一项〉改成/改写为……」的形式（例如「把摘要改写为：…」「把拉丁学名改成 Oxytropis lanata」）。写成「在正文中补充…」「新增一节…」的指令一律执行不了，会白白报错；确实需要成篇正文时，就在 reply 里请编辑先点「让 AI 生成进一步介绍草稿」，并把 canEdit 设为 false。
+- 这一档卡上的照片就是访客自己拍的那几张，站内搜图换不掉它们：**imageEdit 与 imagePlan 一律为 false / 空数组**；照片不理想时请编辑去「补拍」。（给参考图比对鉴定不受此限，showImages 照常可用。）\n` : ""}
 - 如果诉求是「更换 / 增补配图」（图片不对、不清晰、需要更合适的照片），**且还没指定用哪一张**，把 canEdit 设为 true、imageEdit 设为 true，
   imageQuery 给出一个好的图片搜索词（通常用拉丁学名），editInstruction 说明要替换哪张图。系统会调起站内"在线搜图"
   让编辑挑选图片后自动替换，所以同样不要说交给别人。
@@ -8421,8 +8546,12 @@ ${IMAGE_PLAN_RULE(data.refPhotoCount ?? 0).trimEnd()}
               `【待审草稿：${draft.title}${draft.scientific_name ? "（" + draft.scientific_name + "）" : ""}】\n` +
               // 简介卡快照始终附上：即使范围是整页，编辑也常问「卡上的学名对不对」。
               `以下是${DRAFT_CARD_SCOPE}（草稿字段，不在正文 HTML 里）：\n${draftCardToText(cardFields)}\n\n` +
-              (cardScope ? "本轮讨论范围就是上面这张卡；下面的正文仅供参考。\n" : "") +
-              `以下是草稿正文纯文本：\n${docText}`,
+              (liteCard
+                ? // 这一档**不能**把下面那段叫「正文」：它是摘要卡渲染出来的文字，页面上并不
+                  // 显示（草稿页 notEnriched 分支是 `? null :`），改它也谁都看不见。
+                  `⚠️ 这份草稿到此为止 —— **没有正文**。下面这段只是上面那张卡渲染出来的文字（含识别过程留痕），仅供你参考，它不是可编辑的正文：\n${docText}`
+                : (cardScope ? "本轮讨论范围就是上面这张卡；下面的正文仅供参考。\n" : "") +
+                  `以下是草稿正文纯文本：\n${docText}`),
           },
         ],
       },
@@ -8516,6 +8645,12 @@ ${IMAGE_PLAN_RULE(data.refPhotoCount ?? 0).trimEnd()}
     return harvestImageIntent(parseAgentReply(ans.text));
   });
 
+/** 给改写提示词的第 3 条规则：完整文档要求完整返回，片段要求仍旧返回片段。 */
+const htmlShapeRule = (fullDoc: boolean): string =>
+  fullDoc
+    ? "3. 输出必须是【完整且合法】的 HTML 文档：以 <!DOCTYPE html> 或 <html 开头，以 </html> 结尾。"
+    : "3. 你收到的是一段 HTML **片段**（不是完整文档）。请返回**同样形态的片段**：不要包 <!DOCTYPE>／<html>／<head>／<body>，也不要另加外层容器。";
+
 const ApplyDraftAgentEditInput = z.object({
   draftId: z.string(),
   instruction: z.string().min(1).max(2000),
@@ -8536,23 +8671,55 @@ export const applyDraftAgentEditFn = createServerFn({ method: "POST" })
     const { data: draft } = await supabaseAdmin
       .from("plant_drafts")
       .select(
-        "status,html_content,title,scientific_name,summary,common_names_zh,common_name_en,family,genus",
+        "status,html_content,ai_payload,title,scientific_name,summary,common_names_zh,common_name_en,family,genus",
       )
       .eq("id", data.draftId)
       .maybeSingle();
     if (!draft) throw new Error("草稿不存在");
     if (draft.status === "approved") throw new Error("已收录的草稿不可再修改");
 
+    /**
+     * 「快速识别简介卡」这一档的草稿（`ai_payload._enriched === false`）：
+     * 它的 `html_content` 是 `buildSummaryCardHtml` 吐的一个**裸 `<div>` 片段**，
+     * 而且**根本不上屏** —— 草稿页上是 `notEnriched ? null : <iframe>`
+     * （drafts.$id.tsx:1876）。用户看到的全部内容都来自 `plant_drafts` 的**列**。
+     *
+     * 所以这一档**无论选了什么讨论范围**，改动都只能走字段路：
+     *   · 走 HTML 路要真烧一次长文重写，改到的却是一段谁也看不见的片段；
+     *   · 而且那段片段是照列渲染出来的，改它等于让两边对不上；
+     *   · 更直接的是，旧代码在入口硬卡 `</html>`，片段必然撞上
+     *     「草稿 HTML 不完整，无法自动修改」——这一档从来就改不了
+     *     （2026-08-08 用户实测报的正是这一条）。
+     */
+    const liteCardDraft = isLiteCardDraft(draft.ai_payload);
+
     // ── 简介卡：改字段，不改 HTML ─────────────────────────────────────────────
-    if (data.scope === DRAFT_CARD_SCOPE) {
+    if (data.scope === DRAFT_CARD_SCOPE || liteCardDraft) {
       const before = pickDraftCardFields(draft as Record<string, unknown>);
-      const cardSystem = `你是「小P」，植物百科草稿的字段编辑器。你会收到一张「${DRAFT_CARD_SCOPE}」的当前内容和一条修改指令。
+      /**
+       * 第 2 条是这一档的关键（2026-08-09 用户报「小P蛙改不动快速识别卡正文」）：
+       * 卡上那七项里，用户口中的「正文」就是【摘要】。旧提示词没说这件事，还叠了一句
+       * 「不确定就一律保留原值」—— 于是「把正文写详细些」「开头那句改一下」这类指令，
+       * 模型对着一份没有 body 字段的 JSON 一想「这里没有正文」，七项全部原样照抄，
+       * 落到 diff 上就是零改动、报错收场。事实性内容仍要守（第 5 条只收紧到**事实**）。
+       */
+      const cardSystem = `你是「小P」，植物百科草稿的字段编辑器。你会收到一张「${DRAFT_CARD_SCOPE}」的当前内容和一条修改指令。${liteCardDraft ? "这张卡就是这份草稿的全部内容" : "本轮的改动范围就是这张卡"}，可改的只有：${DRAFT_CARD_ITEMS}。
 严格遵守：
 1. 只改指令要求改的字段，其余字段**原样照抄**（一个字都不要动，包括标点）。
-2. 拉丁学名只写「属名 + 种加词」（可含 subsp./var.），不要作者名、不要中文；中文名不要带「疑似」二字。
-3. 摘要保持原有语气与长度量级（150–260 字的中文导语），不要改成形态罗列，不要编造事实。
-4. 不确定的内容一律保留原值，宁可不改也不要猜。
-5. 只返回 JSON 对象，键固定为：title、scientific_name、common_names_zh、common_name_en、family、genus、summary，全部为字符串（无内容用空字符串）。不要 markdown 代码块、不要解释。`;
+2. ${
+        liteCardDraft
+          ? // 这一档没有正文，用户口中的「正文」指的就是卡上的摘要 —— 不说破这件事，
+            // 模型对着一份没有 body 字段的 JSON 就会判定「无处可改」，七项原样返回。
+            "**卡上的【摘要】就是这份草稿的正文**（这份草稿没有别的正文）。凡是「改正文 / 改这段话 / 开头那句 / 补充一句 / 写详细些 / 精简一点 / 语气自然些 / 加上花期和用途」这类指令，一律落到【摘要】上 —— 不要因为指令说的是「正文」就判定无处可改。"
+          : // 这份草稿另有正文（编辑是专门把范围限定到卡上才走到这里的）：卡上的摘要是那段
+            // 导语，别把成篇正文的内容往里灌。
+            "卡上的【摘要】是这张卡的那段中文导语。「改摘要 / 改导语 / 这段话写详细些」这类指令落到【摘要】上；若指令明明白白是在说草稿正文里的某一节，那不属于这张卡，保持七项不动。"
+      }
+3. 拉丁学名只写「属名 + 种加词」（可含 subsp./var.），不要作者名、不要中文；中文名不要带「疑似」二字。
+4. 摘要保持中文导语的体裁与量级（约 150–260 字）：可按指令增删改写，但不要变成形态罗列，也不要编造事实。
+5. 拿不准的**事实**（学名、科属、产地、物候数据）宁可保留原值也不要猜；但「怎么写」的指令（改写、扩写、精简、换语气、调整措辞）该改就改。
+6. 只有当这条指令与上面七项**确实全都无关**时（例如要求换照片、改识别地点/时间、改标签、或要新增一整节正文），才把七项原样返回。
+7. 只返回 JSON 对象，键固定为：title、scientific_name、common_names_zh、common_name_en、family、genus、summary，全部为字符串（无内容用空字符串）。不要 markdown 代码块、不要解释。`;
       const cardSchema = {
         type: "object",
         properties: Object.fromEntries(
@@ -8563,46 +8730,70 @@ export const applyDraftAgentEditFn = createServerFn({ method: "POST" })
         ),
         required: [...DRAFT_CARD_FIELD_KEYS],
       };
-      const { text: cardTxt } = await xiaopTextCall({
-        contents: [
-          {
-            role: "user",
-            parts: [
-              {
-                text: `修改指令：${data.instruction}\n\n当前${DRAFT_CARD_SCOPE}内容：\n${draftCardToText(before)}\n\n请按指令返回修改后的完整 JSON（未涉及的字段原样照抄）。`,
-              },
-            ],
-          },
-        ],
-        system: cardSystem,
-        schema: cardSchema,
-        maxRetry: 2,
-        overrideSequence: toOverrideSlots(data.userModel),
-      });
-      let parsed: Record<string, unknown>;
-      try {
-        parsed = JSON.parse(cleanJson(cardTxt)) as Record<string, unknown>;
-      } catch {
-        throw new Error("小P 返回的简介卡内容无法解析，请重试或换种说法。");
+      const cardAsk = `修改指令：${data.instruction}\n\n当前${DRAFT_CARD_SCOPE}内容：\n${draftCardToText(before)}\n\n请按指令返回修改后的完整 JSON（未涉及的字段原样照抄）。`;
+      /** 跑一趟字段改写。`nudge` 非空时，把「上一趟原样返回」摆回对话里再追问一次。 */
+      const runCard = async (nudge?: string): Promise<DraftCardFields> => {
+        const { text: cardTxt } = await xiaopTextCall({
+          contents: [
+            { role: "user", parts: [{ text: cardAsk }] },
+            ...(nudge
+              ? [
+                  { role: "model" as const, parts: [{ text: JSON.stringify(before) }] },
+                  { role: "user" as const, parts: [{ text: nudge }] },
+                ]
+              : []),
+          ],
+          system: cardSystem,
+          schema: cardSchema,
+          maxRetry: 2,
+          overrideSequence: toOverrideSlots(data.userModel),
+        });
+        let parsed: Record<string, unknown>;
+        try {
+          parsed = JSON.parse(cleanJson(cardTxt)) as Record<string, unknown>;
+        } catch {
+          throw new Error("小P 返回的简介卡内容无法解析，请重试或换种说法。");
+        }
+        // 只接受**字符串**字段：模型漏字段、或给了 null/对象，都按「没提这一项」处理，
+        // 用原值补齐 —— 决不能因为模型少说一句就把学名/摘要清空。
+        const provided = Object.fromEntries(
+          Object.entries(parsed).filter(([, v]) => typeof v === "string"),
+        );
+        const next = pickDraftCardFields({ ...before, ...provided });
+        // 形状闸门：名称字段有过「模型把一整段元话语塞进 title」的先例（见 tentative.ts），
+        // 这里按名称/摘要各自的合理量级封顶，清成空则退回原值。
+        const capName = (v: string, fallback: string) => sanitizeSpeciesName(v) || fallback;
+        next.title = capName(next.title, before.title);
+        next.scientific_name = capName(next.scientific_name, before.scientific_name);
+        next.common_names_zh = next.common_names_zh.slice(0, 200);
+        next.common_name_en = next.common_name_en.slice(0, 200);
+        next.family = next.family.slice(0, 60);
+        next.genus = next.genus.slice(0, 60);
+        next.summary = next.summary.slice(0, 2000);
+        return next;
+      };
+
+      let after = await runCard();
+      let changes = diffDraftCard(before, after);
+      // 一趟没动不算结论。模型把「正文」理解成「卡上没有的东西」的概率不低，挑明了再问
+      // 一次几乎都能落到摘要上；两趟都不动，才是真的落不到这张卡上。
+      if (!changes.length) {
+        after = await runCard(
+          `你把七项原样返回了 —— 等于这条指令没有执行。请重新判断：它能不能落到卡上的某一项？${
+            liteCardDraft
+              ? "特别是【摘要】，它就是这份草稿的正文，「改正文 / 补充 / 改写 / 精简 / 换语气」都应该改它。"
+              : "特别是【摘要】那段导语。"
+          }\n· 能落地：现在就改，返回改动后的完整 JSON。\n· 确实无关（要换照片、改识别地点/时间、改标签${liteCardDraft ? "，或要新增一整节正文" : "，或说的是草稿正文里的某一节"}）：再原样返回一次。`,
+        );
+        changes = diffDraftCard(before, after);
       }
-      // 只接受**字符串**字段：模型漏字段、或给了 null/对象，都按「没提这一项」处理，
-      // 用原值补齐 —— 决不能因为模型少说一句就把学名/摘要清空。
-      const provided = Object.fromEntries(
-        Object.entries(parsed).filter(([, v]) => typeof v === "string"),
-      );
-      const after = pickDraftCardFields({ ...before, ...provided });
-      // 形状闸门：名称字段有过「模型把一整段元话语塞进 title」的先例（见 tentative.ts），
-      // 这里按名称/摘要各自的合理量级封顶，清成空则退回原值。
-      const capName = (v: string, fallback: string) => sanitizeSpeciesName(v) || fallback;
-      after.title = capName(after.title, before.title);
-      after.scientific_name = capName(after.scientific_name, before.scientific_name);
-      after.common_names_zh = after.common_names_zh.slice(0, 200);
-      after.common_name_en = after.common_name_en.slice(0, 200);
-      after.family = after.family.slice(0, 60);
-      after.genus = after.genus.slice(0, 60);
-      after.summary = after.summary.slice(0, 2000);
-      const changes = diffDraftCard(before, after);
-      if (!changes.length) throw new Error("小P 这次没有改动简介卡的任何字段。");
+      if (!changes.length)
+        throw new Error(
+          liteCardDraft
+            ? // 这一档整份草稿就是那张卡，得说清能改的是什么、不能改的该去哪儿改。
+              `小P蛙两次都没能把这条指令落到「${DRAFT_CARD_SCOPE}」上。这份草稿目前只有这张卡，能改的是：${DRAFT_CARD_ITEMS}（摘要就是卡上的正文）。若你要换照片、改识别地点或标签，请用卡片上对应的入口；若要新增章节、成篇正文，请先点「让 AI 生成进一步介绍草稿」。也可以把话说得更直接，例如「把摘要改写为……」。`
+            : `小P蛙两次都没有改动简介卡的任何字段。请把要改的那一项和改成什么说得更具体些，例如「把摘要改写为……」「把学名改成 Oxytropis lanata」。`,
+        );
       const { error: upErr } = await supabaseAdmin
         .from("plant_drafts")
         .update(after)
@@ -8612,17 +8803,19 @@ export const applyDraftAgentEditFn = createServerFn({ method: "POST" })
     }
 
     const original = draft.html_content || "";
-    if (!/<\/html>/i.test(original)) throw new Error("草稿 HTML 不完整，无法自动修改。");
+    if (!original.trim())
+      throw new Error("这份草稿还没有正文，无法改写。请先生成正文，或改用「快速识别简介卡」。");
+    const fullDoc = isFullHtmlDoc(original);
 
     const scopeLine = data.scope
       ? `本次修改只针对草稿的「${data.scope}」部分，其余部分一律原样保留。`
       : "按指令在整份草稿范围内修改，未涉及的内容一律原样保留。";
-    const system = `你是「小P」，植物百科页面的 HTML 编辑器。你会收到一份完整的 HTML 文档和一条修改指令。
+    const system = `你是「小P」，植物百科页面的 HTML 编辑器。你会收到${fullDoc ? "一份完整的 HTML 文档" : "一段 HTML 片段"}和一条修改指令。
 ${scopeLine}
 严格遵守：
 1. 只按指令修改相关内容，其余所有文字、结构、版式、class、内联样式 (style/CSS)、<script>、图片 src 一律原样保留。
 2. 不要改动 <head>、<style>、<script>，不要重排版式，不要新增/删除区块（除非指令明确要求）。
-3. 输出必须是【完整且合法】的 HTML 文档：以 <!DOCTYPE html> 或 <html 开头，以 </html> 结尾。
+${htmlShapeRule(fullDoc)}
 4. 只输出 HTML 本身，不要 markdown 代码块、不要任何解释或前后缀文字。`;
 
     const contents: { role: "user" | "model"; parts: { text: string }[] }[] = [
@@ -8630,7 +8823,7 @@ ${scopeLine}
         role: "user",
         parts: [
           {
-            text: `修改指令：${data.instruction}\n\n以下是完整 HTML 文档，请按指令返回修改后的完整 HTML：\n${original}`,
+            text: `修改指令：${data.instruction}\n\n以下是${fullDoc ? "完整 HTML 文档" : "HTML 片段"}，请按指令返回修改后的${fullDoc ? "完整 HTML" : "片段"}：\n${original}`,
           },
         ],
       },
@@ -8642,18 +8835,7 @@ ${scopeLine}
       maxRetry: 2,
       overrideSequence: toOverrideSlots(data.userModel),
     });
-    let html = txt.trim();
-    if (html.startsWith("```")) {
-      html = html
-        .replace(/^```html\s*/i, "")
-        .replace(/^```\s*/, "")
-        .replace(/```$/, "")
-        .trim();
-    }
-    if (!/<\/html>/i.test(html)) {
-      throw new Error("小P 生成的内容不完整，请重试或换种说法。");
-    }
-    return { html };
+    return { html: normalizeRewrittenHtml(txt, fullDoc) };
   });
 
 // ─── 小P 已发布详情页助手 (editor-only) ──────────────────────────────────────
@@ -8939,17 +9121,19 @@ export const applyPlantAgentEditFn = createServerFn({ method: "POST" })
   .inputValidator((input) => ApplyPlantAgentEditInput.parse(input))
   .handler(async ({ data }) => {
     const { html: original } = await fetchPlantPageText(data.plantId);
-    if (!/<\/html>/i.test(original)) throw new Error("页面 HTML 不完整，无法自动修改。");
+    if (!original.trim()) throw new Error("这一页没有可改写的正文。");
+    // 「采纳快速识别简介」发布出来的条目，正文就是一段 `<div>` 片段（不是完整文档）。
+    const fullDoc = isFullHtmlDoc(original);
 
     const scopeLine = data.scope
       ? `本次修改只针对：「${data.scope}」，页面其余部分一律原样保留。`
       : "按指令在整页范围内修改，未涉及的内容一律原样保留。";
-    const system = `你是「小P蛙」，植物百科页面的 HTML 编辑器。你会收到一份完整的 HTML 文档和一条修改指令。
+    const system = `你是「小P蛙」，植物百科页面的 HTML 编辑器。你会收到${fullDoc ? "一份完整的 HTML 文档" : "一段 HTML 片段"}和一条修改指令。
 ${scopeLine}
 严格遵守：
 1. 只按指令修改相关内容，其余所有文字、结构、版式、class、内联样式 (style/CSS)、<script>、data-* 属性、图片 src 一律原样保留。
 2. 不要改动 <head>、<style>、<script>，不要重排版式，不要新增/删除区块（除非指令明确要求），尤其要保留页面里的 data-edit-id / lov-edit-mark 等编辑标记。
-3. 输出必须是【完整且合法】的 HTML 文档：以 <!DOCTYPE html> 或 <html 开头，以 </html> 结尾。
+${htmlShapeRule(fullDoc)}
 4. 只输出 HTML 本身，不要 markdown 代码块、不要任何解释。`;
 
     const contents: ChatContents = [
@@ -8957,7 +9141,7 @@ ${scopeLine}
         role: "user",
         parts: [
           {
-            text: `修改指令：${data.instruction}\n\n以下是完整 HTML 文档，请按指令返回修改后的完整 HTML：\n${original}`,
+            text: `修改指令：${data.instruction}\n\n以下是${fullDoc ? "完整 HTML 文档" : "HTML 片段"}，请按指令返回修改后的${fullDoc ? "完整 HTML" : "片段"}：\n${original}`,
           },
         ],
       },
@@ -8969,16 +9153,7 @@ ${scopeLine}
       maxRetry: 2,
       overrideSequence: toOverrideSlots(data.userModel),
     });
-    let html = txt.trim();
-    if (html.startsWith("```")) {
-      html = html
-        .replace(/^```html\s*/i, "")
-        .replace(/^```\s*/, "")
-        .replace(/```$/, "")
-        .trim();
-    }
-    if (!/<\/html>/i.test(html)) throw new Error("小P 生成的内容不完整，请重试或换种说法。");
-    return { html, oldHtml: original };
+    return { html: normalizeRewrittenHtml(txt, fullDoc), oldHtml: original };
   });
 
 // ─── Admin: 小P model config CRUD (key `xiaop_model_config`) ─────────────────

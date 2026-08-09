@@ -121,6 +121,8 @@ export function XiaoPAgentPanel({
   greetingTitle,
   canApply,
   scopes,
+  defaultScope = "",
+  allScopeLabel = "整页 · 全文",
   ask,
   apply,
   onImageReplace,
@@ -133,6 +135,14 @@ export function XiaoPAgentPanel({
   greetingTitle?: string | null;
   canApply: boolean;
   scopes?: { label: string; value: string }[];
+  /** 范围下拉的初始值（默认 "" = 整页）。宿主知道「这一页只有一处能改」时传那一处。 */
+  defaultScope?: string;
+  /**
+   * 「整页 · 全文」那一项的文案；传 `null` 就**不出这一项**。
+   * 只有简介卡的草稿必须传 null —— 那一档整页就是那张卡，多摆一个「整页」，编辑选了
+   * 它就等于什么都没选，服务端只能替他猜（这正是「改不动简介卡正文」的入口之一）。
+   */
+  allScopeLabel?: string | null;
   ask: (
     question: string,
     history: AgentHistory,
@@ -179,7 +189,12 @@ export function XiaoPAgentPanel({
   const [messages, setMessages] = useState<ChatMsg[]>(() => loadChat(storageKey));
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
-  const [scope, setScope] = useState("");
+  const [scope, setScope] = useState(defaultScope);
+  // 宿主的默认范围可能比面板晚定下来（草稿还在加载 / 刚生成完正文那一刻这一档就变了）。
+  // 只在**值真的变了**的时候跟一次：挂载那次是同值写入，不会覆盖编辑自己的选择。
+  useEffect(() => {
+    setScope(defaultScope);
+  }, [defaultScope]);
   const [preview, setPreview] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const [userModel, setUserModelState] = useState<XiaoPUserModel | null>(null);
@@ -737,7 +752,7 @@ export function XiaoPAgentPanel({
                     onChange={(e) => setScope(e.target.value)}
                     className="w-full text-xs bg-background border border-rule/70 rounded-lg px-2 py-1.5 outline-none focus:border-leaf cursor-pointer"
                   >
-                    <option value="">整页 · 全文</option>
+                    {allScopeLabel !== null && <option value="">{allScopeLabel}</option>}
                     {scopes.map((s) => (
                       <option key={s.value} value={s.value}>
                         {s.label}

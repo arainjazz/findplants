@@ -83,10 +83,26 @@ import { useRegistryChips } from "@/lib/use-registry-chips";
 import { toast } from "sonner";
 
 export const Route = createFileRoute("/drafts/$id")({
+  /** `?from=<tagSlug>` = 从某个标签的名单点进来的，页顶给一条回名单的路。
+   *  只声明这一个可选键，理由见 plants.$slug 的同款注释。 */
+  validateSearch: (search: Record<string, unknown>): { from?: string } => ({
+    from: typeof search.from === "string" ? search.from.slice(0, 120) : undefined,
+  }),
   // 分享草稿链接时也出「植物照片 + Plantspedia草木志·名称 + 简介」，而不是站点默认那句
   // （og:* 要在 SSR 时就写进 <head>，抓取器/微信才读得到；见 plants.$slug 同款注释）。
   // loader 用匿名 client 走 SSR，读不到（RLS / 不存在）就回落默认，绝不阻塞页面。
-  loader: async ({ params }) => {
+  //
+  // ⏱ 客户端跳转时**先看 react-query 缓存**：loader 是会挡住导航的（跑完才渲染这一页），
+  // 而识别刚跑完那一跳，相机页已经把服务端顺手带回的那一行喂进了缓存（见 camera-identify
+  // 的 goToDraft）。不看缓存就等于再从浏览器往 Supabase 跑一趟同一行 —— 用户 2026-08-06
+  // 报的「深度分析完成后很久才出分享卡」，这是其中一段串行等待。
+  // 缓存里那份可能不是最新的（比如几分钟前看过这份草稿），但下面的 useQuery 配了
+  // `refetchOnMount:"always"`，挂载后必回查一次真库，所以它只影响首帧和 <head>。
+  loader: async ({ params, context }) => {
+    const cached = (
+      context as { queryClient?: { getQueryData: (k: unknown[]) => unknown } }
+    ).queryClient?.getQueryData?.(["draft", params.id]);
+    if (cached) return cached as Awaited<ReturnType<typeof fetchDraftById>>;
     try {
       return await fetchDraftById(params.id);
     } catch {
@@ -181,6 +197,10 @@ type MergePrompt = {
 
 /** 草稿作者的公开档案（分享卡上的头像来源）。抽成独立函数是因为 useQuery **和**
  *  出卡那一刻都要用它：出卡不能只读 useQuery 的当前值，见 onMakeCard 里的说明。 */
+/** 诊断意见的最短长度。**必须与 identify-plant.functions.ts 的 DIAGNOSIS_MIN 一致** ——
+ *  服务端那道才是真闸门，这里只是别让编辑写完才吃报错。 */
+const DIAGNOSIS_MIN = 8;
+
 const creatorProfileKey = (uid: string) => ["profile", uid] as const;
 async function fetchCreatorProfile(uid: string) {
   const { data } = await supabase
@@ -193,6 +213,8 @@ async function fetchCreatorProfile(uid: string) {
 
 function DraftPage() {
   const { id } = Route.useParams();
+  /** 从哪个标签名单点进来的（`?from=<tagSlug>`）——决定页顶那条「返回名单」出不出现。 */
+  const fromTag = (Route.useSearch() as { from?: string }).from || null;
   const navigate = useNavigate();
   const qc = useQueryClient();
   // authLoading 是给自动出卡用的：整页加载时登录态要晚一拍才定下来，出卡不能抢在它前面。
@@ -257,6 +279,13 @@ function DraftPage() {
     taskFeed.rows.find(
       (r) => r.kind === "identify" && r.draftId === id && r.status === "running",
     ) ?? null;
+  // ── 疑似草稿的「编辑诊断意见」──────────────────────────────────────────────
+  // 打开 = 编辑点了「采纳识别」而这条还是疑似结论。写满 DIAGNOSIS_MIN 字才放行；
+  // 意见会随采纳一起收进条目正文，并让全站的「疑似」字样消失（服务端 approvePlantDraft）。
+  const [diagOpen, setDiagOpen] = useState(false);
+  const [diagText, setDiagText] = useState("");
+  /** 撞上「同物种已有条目」时，合并那一步要把同一段意见再发一次。 */
+  const diagnosisRef = useRef("");
   const [goldConfirm, setGoldConfirm] = useState(false);
   const [goldBusy, setGoldBusy] = useState(false);
   const [goldError, setGoldError] = useState<string | null>(null);
@@ -293,6 +322,9 @@ function DraftPage() {
     /** 画这张卡时用到的叶章数（铜/银/金）。等不及叶子统计就先出卡时它是空的，
      *  统计到了再据此重画一次 —— 见下面的重画 effect 与 leafKey。 */
     leavesKey: string;
+    /** 画这张卡时用到的头像地址（没有就是空串）。同样是「等不到就先出卡、到了再补画」，
+     *  所以出卡那一刻的头像等待被砍短了也不会真的丢掉头像。 */
+    avatarKey: string;
   } | null>(null);
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const editorRef = useRef<HtmlDocEditorHandle>(null);
@@ -362,12 +394,25 @@ function DraftPage() {
   const notEnriched =
     (draft?.ai_payload as { _enriched?: boolean } | undefined)?._enriched === false;
 
+  /**
+   * 编辑采纳这条疑似识别时写下的诊断意见（服务端 approvePlantDraft 写进 ai_payload）。
+   * 有它 = 已经有人签字定种了，全站从此不再按「疑似」渲染这份草稿。
+   */
+  const editorDiagnosis =
+    (
+      draft?.ai_payload as
+        | { _editor_diagnosis?: { text?: string; by_name?: string; at?: string } }
+        | undefined
+    )?._editor_diagnosis ?? null;
+
   // 「疑似」单一判定：低置信度，或摘要/标题本身以「疑似」开头（模型偶尔 confidence 写
   // medium 却在正文说疑似）。标题、正文提示、分享卡、补拍激活都以它为准。
+  // 编辑已给出诊断意见的，一律不再算疑似 —— 这正是「采纳后疑似字样消除」那一条。
   const draftTentative =
-    draft?.ai_payload?.identification_confidence === "low" ||
-    /^\s*疑似/.test((draft?.summary || draft?.ai_payload?.summary_zh || "").trim()) ||
-    /^\s*（?\s*疑似/.test((draft?.title || "").trim());
+    !editorDiagnosis &&
+    (draft?.ai_payload?.identification_confidence === "low" ||
+      /^\s*疑似/.test((draft?.summary || draft?.ai_payload?.summary_zh || "").trim()) ||
+      /^\s*（?\s*疑似/.test((draft?.title || "").trim()));
 
   // 补拍建议：滤掉「摸一摸 / 闻一闻」这类拍不出来的条目 —— 库里的旧草稿存的还是 prompt
   // 加禁令之前的文案，照搬出来会让用户白跑一趟（他们只能回传照片）。滤空则不显示横幅。
@@ -644,9 +689,20 @@ function DraftPage() {
   // （2026-07-26 用户反馈）。服务端见到这个 scope 会切到「改字段」而不是「改 HTML」。
   const pageSections = useMemo(() => {
     const secs: { label: string; value: string }[] = [
-      { label: `${DRAFT_CARD_SCOPE}（名称 · 科属 · 俗名 · 摘要）`, value: DRAFT_CARD_SCOPE },
+      {
+        // 只有简介卡的那一档：这张卡**就是**整份草稿，标签要照实说，别让人以为
+        // 另有一份「全文」可选（下面还会把「整页 · 全文」那一项整个撤掉）。
+        label: notEnriched
+          ? `${DRAFT_CARD_SCOPE}（本草稿全部内容 · 摘要即正文）`
+          : `${DRAFT_CARD_SCOPE}（名称 · 科属 · 俗名 · 摘要）`,
+        value: DRAFT_CARD_SCOPE,
+      },
     ];
     const html = draft?.html_content;
+    // 精简摘要卡这一档：html_content 是一段**不上屏**的片段（见上面 notEnriched 那处
+    // `? null :` 的注释），从里面扫出来的小标题在页面上根本找不到对应的东西 ——
+    // 列出来只会诱导编辑去选一个「改了也看不见」的范围。这一档只提供简介卡。
+    if (notEnriched) return secs;
     if (!html || typeof window === "undefined") return secs;
     const doc = new DOMParser().parseFromString(html, "text/html");
     const seen = new Set<string>();
@@ -658,7 +714,7 @@ function DraftPage() {
       }
     });
     return secs.slice(0, 21);
-  }, [draft?.html_content]);
+  }, [draft?.html_content, notEnriched]);
 
   // 小P蛙换图方案要用的图槽清单（纯字符串扫描，不碰 DOM）。只用来在**执行之前**
   // 把「第 1 张 → Section II」翻译成人话，真正的替换在 onImagePlanApply 里重算一次。
@@ -768,12 +824,14 @@ function DraftPage() {
     }
   };
 
-  const onApprove = async () => {
+  const onApprove = async (diagnosis?: string) => {
     setBusy(true);
     try {
-      const res = await approveFn({ data: { draftId: id } });
+      const res = await approveFn({ data: { draftId: id, diagnosis } });
       // 同物种已有条目 → 服务端返回 conflict（未写库），弹窗让编辑决定是否合并。
       if (res && (res as { conflict?: boolean }).conflict) {
+        // 合并那一步要重发一次同样的诊断意见（服务端两条分支各写各的正文），先记下来。
+        diagnosisRef.current = diagnosis ?? "";
         setMergePrompt(res as MergePrompt);
         return;
       }
@@ -782,6 +840,8 @@ function DraftPage() {
       qc.invalidateQueries({ queryKey: ["home-drafts"] });
       qc.invalidateQueries({ queryKey: ["draft", id] });
       qc.invalidateQueries({ queryKey: ["tag-membership"] });
+      // 专题页（/tags/$slug）与地图共用这一份三源并集，收录会改变它 —— 一起作废。
+      qc.invalidateQueries({ queryKey: ["explore-tag-index"] });
       // ⚠️ **采纳后刻意留在本页**，不再 navigate 去 /plants/$slug。
       // 原来一采纳就跳走，于是编辑眼里「简介摘要卡、可信度星、卡签、以及最重要的
       // 『使用金叶创建详页』按钮全部凭空消失，还多出一大片空白」—— 其实什么都没坏，
@@ -797,8 +857,15 @@ function DraftPage() {
   };
 
   // 编辑「采纳识别」= 先标记采纳（识别用户该枚识别铜叶 ×2，即 +2 效果），再审核通过并收录本站。
-  const onAdoptApprove = async () => {
+  //
+  // ⚠️ 结论是「疑似」时**先拦一道**：必须由编辑写下诊断意见才能往下走（服务端 approvePlantDraft
+  // 里有同一道闸门，那里才是真正管用的一道；这里只是把要求提前告诉人，别让他点完才吃报错）。
+  const onAdoptApprove = async (diagnosis?: string) => {
     if (!user || !draft) return;
+    if (draftTentative && (diagnosis ?? "").trim().length < DIAGNOSIS_MIN) {
+      setDiagOpen(true);
+      return;
+    }
     try {
       // 采纳只有站长/资深编辑做得了（服务端闸门）。普通编辑点这个按钮时，
       // **收录照常、采纳那一笔被拒** —— 于是按钮对他就等价于「审核通过收录」。
@@ -808,20 +875,28 @@ function DraftPage() {
     } catch {
       /* 采纳标记失败（权限不足）不阻断收录 */
     }
-    await onApprove();
+    await onApprove(diagnosis);
   };
 
   const onConfirmMerge = async () => {
     if (!mergePrompt) return;
     setBusy(true);
     try {
-      const res = await approveFn({ data: { draftId: id, mergeTargetId: mergePrompt.target.id } });
+      const res = await approveFn({
+        data: {
+          draftId: id,
+          mergeTargetId: mergePrompt.target.id,
+          diagnosis: diagnosisRef.current || undefined,
+        },
+      });
       setMergePrompt(null);
       toast.success("已合并到已有条目，并作为「补充观测」记入页尾");
       qc.invalidateQueries({ queryKey: ["home-all"] });
       qc.invalidateQueries({ queryKey: ["home-drafts"] });
       qc.invalidateQueries({ queryKey: ["draft", id] });
       qc.invalidateQueries({ queryKey: ["tag-membership"] });
+      // 专题页（/tags/$slug）与地图共用这一份三源并集，收录会改变它 —— 一起作废。
+      qc.invalidateQueries({ queryKey: ["explore-tag-index"] });
       // 同 onApprove：留在本页，去向用横幅给。
       setApprovedSlug((res as { slug: string }).slug);
     } catch (e) {
@@ -905,8 +980,10 @@ function DraftPage() {
       // 头像**在出卡这一刻现取**，不能直接读 creatorProfile 的当前值：识别完这张卡是自动弹的
       // （见下方 autoCardFiredRef 那个 effect），它只等 draft + 叶子统计，profiles 那条查询
       // 常常还在飞 —— 于是同一个人有时有头像、有时是灰圆（2026-07-23 用户反馈）。
-      // ensureQueryData 命中缓存就同步返回，没缓存才真发一次请求；2.5 秒拿不到就按无头像出卡
+      // ensureQueryData 命中缓存就同步返回，没缓存才真发一次请求；到点拿不到就按无头像出卡
       // —— 少一个头像可以接受，卡出不来不行。
+      // ⏱ 上限 2.5s → 0.9s（2026-08-08）：这一段是串在「出卡」前面的，等满就是白等那么久。
+      // 砍短不会真丢头像 —— 头像后到时下面那个重画 effect 会按 avatarKey 再画一次。
       const avatarUrl = await (async (): Promise<string | null> => {
         if (creatorProfile) return creatorProfile.avatar_url || null;
         const uid = draft.created_by;
@@ -917,7 +994,7 @@ function DraftPage() {
               queryKey: creatorProfileKey(uid),
               queryFn: () => fetchCreatorProfile(uid),
             }),
-            new Promise<null>((r) => setTimeout(() => r(null), 2500)),
+            new Promise<null>((r) => setTimeout(() => r(null), 900)),
           ]);
           return p?.avatar_url || null;
         } catch {
@@ -974,6 +1051,7 @@ function DraftPage() {
         retakeCount,
         stamp: draftStamp(draft),
         leavesKey: leafKey,
+        avatarKey: avatarUrl ?? "",
       });
       setCardUrl((prev) => {
         if (prev) URL.revokeObjectURL(prev);
@@ -1194,12 +1272,25 @@ function DraftPage() {
   //      「有时候停在已完成界面很久、不弹分享卡」就是这两条。
   //
   // 到点还没齐就先把卡画出来，数字后到再重画一次（见下面按 leavesKey 重画的 effect）。
-  // 正常情况下根本用不到这个上限：有缓存会话时登录态在下一拍就定了，叶子统计也就几百毫秒。
-  const CARD_WAIT_MS = 2000;
-  const [cardWaitOver, setCardWaitOver] = useState(false);
+  //
+  // ⚠️ 两件事的上限**不一样**，这是 2026-08-08 拆开的：
+  //  · 登录态（AUTH_WAIT_MS）值得多等 —— 抢在它前面出的是一张「访客版」卡，三个叶章数
+  //    整个是空的，差别很大；而它在有缓存会话时下一拍就定了，2 秒的上限几乎碰不到。
+  //  · 叶子统计（LEAVES_WAIT_MS）不值得等满 —— 从 /identify 跳过来时这条查询**必然是冷的**
+  //    （全站只有本页在用 ["leaves"]），于是那 2 秒每次都要老老实实等掉，而缺的只是卡角上
+  //    的三个数字，统计一到下面的 effect 立刻重画一次就补上了。用户报的「深度分析完成后
+  //    很久才出分享卡」，这是最后一段。
+  const AUTH_WAIT_MS = 2000;
+  const LEAVES_WAIT_MS = 500;
+  const [authWaitOver, setAuthWaitOver] = useState(false);
+  const [leavesWaitOver, setLeavesWaitOver] = useState(false);
   useEffect(() => {
-    const t = setTimeout(() => setCardWaitOver(true), CARD_WAIT_MS);
-    return () => clearTimeout(t);
+    const a = setTimeout(() => setAuthWaitOver(true), AUTH_WAIT_MS);
+    const l = setTimeout(() => setLeavesWaitOver(true), LEAVES_WAIT_MS);
+    return () => {
+      clearTimeout(a);
+      clearTimeout(l);
+    };
   }, []);
   const autoCardFiredRef = useRef(false);
   useEffect(() => {
@@ -1209,14 +1300,14 @@ function DraftPage() {
         ? sessionStorage.getItem("plantspedia:justIdentified")
         : null;
     if (flag !== id) return;
-    if (authLoading && !cardWaitOver) return; // 等登录态定下来（否则卡上缺叶章数）
-    if (user && !leaves && !cardWaitOver) return; // 再等叶子统计
+    if (authLoading && !authWaitOver) return; // 等登录态定下来（否则卡上缺叶章数）
+    if (user && !leaves && !leavesWaitOver) return; // 再等叶子统计（等不到就先出卡，后到再重画）
     autoCardFiredRef.current = true;
     sessionStorage.removeItem("plantspedia:justIdentified");
     setCardAutoOpened(true);
     void onMakeCard({ silent: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [draft, leaves, cardWaitOver, authLoading, user, id]);
+  }, [draft, leaves, authWaitOver, leavesWaitOver, authLoading, user, id]);
 
   /**
    * 卡还开着，草稿却变了 → 立刻按新数据重画。
@@ -1226,14 +1317,20 @@ function DraftPage() {
    * 任务一收尾草稿被刷新，卡面就与页面上其余部分对不上了 —— 用户 2026-07-30 看到的
    * 「卡上 9 颗星的草木樨状黄芪 + 底下写着疑似、第三次补拍」正是这个。
    */
-  // 叶章数同理：为了尽快出卡，可能是在统计还没到的时候画的（卡上那三个数字会缺）。
-  // 统计一到就补画一次，卡面数字与页面其余部分才对得上。
+  // 叶章数、头像同理：为了尽快出卡，可能是在它们还没到的时候画的（卡上那三个数字会缺、
+  // 头像是个灰圆）。谁先到就补画一次，卡面与页面其余部分才对得上。
   useEffect(() => {
     if (!cardUrl || cardBusy || !draft || !cardSnap) return;
-    if (draftStamp(draft) === cardSnap.stamp && leafKey === cardSnap.leavesKey) return;
+    const avatarKey = creatorProfile?.avatar_url || "";
+    if (
+      draftStamp(draft) === cardSnap.stamp &&
+      leafKey === cardSnap.leavesKey &&
+      avatarKey === cardSnap.avatarKey
+    )
+      return;
     void onMakeCard({ silent: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [draft, cardUrl, cardBusy, cardSnap, leafKey]);
+  }, [draft, cardUrl, cardBusy, cardSnap, leafKey, creatorProfile?.avatar_url]);
 
   const handleReplaceImage = async (url: string) => {
     if (replaceSlot == null || !draft?.html_content) return;
@@ -1272,6 +1369,24 @@ function DraftPage() {
           <>
             <div className="mx-auto max-w-5xl px-6 pt-6 flex flex-col gap-4 border-b border-rule/40 pb-6">
               <div className="flex flex-wrap items-center gap-3 text-sm w-full">
+                {/* 从标签名单点进来的，先给一条回名单的路（读者多半要接着看下一条）。 */}
+                {fromTag && (
+                  <Link
+                    to="/tags/$slug"
+                    params={{ slug: fromTag }}
+                    className="label text-emerald-700 hover:text-vermilion"
+                  >
+                    ← 返回 #
+                    {(() => {
+                      try {
+                        return decodeURIComponent(fromTag);
+                      } catch {
+                        return fromTag;
+                      }
+                    })()}{" "}
+                    名单
+                  </Link>
+                )}
                 <Link to="/identify" className="label hover:text-vermilion">
                   ← 返回 AI 识别
                 </Link>
@@ -1315,13 +1430,19 @@ function DraftPage() {
                   {draft.status === "pending" && !isEditing && (
                     <>
                       <button
-                        onClick={onAdoptApprove}
+                        onClick={() => onAdoptApprove()}
                         disabled={busy}
-                        title="审核通过并收录本站 · 识别用户该枚识别铜叶 ×2（+2 枚铜叶）"
+                        title={
+                          draftTentative
+                            ? "这条是「疑似」结论：点击后需先填写诊断意见，才能采纳并收录"
+                            : "审核通过并收录本站 · 识别用户该枚识别铜叶 ×2（+2 枚铜叶）"
+                        }
                         className="bg-ink text-background px-4 py-1.5 text-xs hover:bg-vermilion transition-colors disabled:opacity-60 cursor-pointer inline-flex items-center gap-1.5 font-semibold"
                       >
                         <LeafIcon tier="bronze" size={13} />
-                        <span>{busy ? "处理中…" : "采纳识别"}</span>
+                        <span>
+                          {busy ? "处理中…" : draftTentative ? "采纳识别（需诊断意见）" : "采纳识别"}
+                        </span>
                       </button>
                       <button
                         onClick={onReject}
@@ -1333,6 +1454,12 @@ function DraftPage() {
                       </button>
                       <span className="text-[10px] text-ink-faint w-full sm:w-auto sm:ml-1">
                         采纳识别 = 审核通过并收录本站，识别用户 +2 枚铜叶；驳回后银叶自动退还。
+                        {draftTentative && (
+                          <b className="text-vermilion">
+                            {" "}
+                            本条为「疑似」：须先填写诊断意见，采纳后该意见收进条目正文、「疑似」字样消除。
+                          </b>
+                        )}
                       </span>
                     </>
                   )}
@@ -1451,6 +1578,23 @@ function DraftPage() {
                       <NameAuthorityNote stamp={nameStamp} className="mt-2" />
                       {registryChipList.length > 0 && (
                         <RegistryChips chips={registryChipList} className="mt-2.5" />
+                      )}
+                      {/* 编辑诊断意见 —— 疑似草稿被采纳时留下的那段签字。
+                          必须在这里用 React 画一份：快速识别档的 html_content **不上屏**
+                          （下面是 `notEnriched ? null : <iframe>`），只写进正文的话，
+                          这一档的用户永远看不到它（识别过程那一栏当年就踩过同一个坑）。 */}
+                      {editorDiagnosis?.text && (
+                        <div className="mt-3 rounded-xl border-l-4 border border-leaf-deep/45 bg-leaf-deep/[0.06] px-4 py-3">
+                          <p className="text-sm font-semibold text-leaf-deep">编辑诊断意见</p>
+                          <p className="mt-1.5 text-sm text-ink-soft leading-relaxed whitespace-pre-line">
+                            {editorDiagnosis.text}
+                          </p>
+                          <p className="mt-2 text-[11px] text-ink-faint">
+                            —— {editorDiagnosis.by_name || "编辑"} ·{" "}
+                            {(editorDiagnosis.at || "").slice(0, 10)} 复核采纳。本条目的定种以此
+                            意见为准；下方「识别过程」栏保留 AI 初判的原始记录。
+                          </p>
+                        </div>
                       )}
                       {/* #3 定种存疑提示：与标题同源（showTentativeOnCard）。一旦补拍升出疑似
                        （medium/high 且正文不再以「疑似」开头），或用户已用银叶生成完整草稿，
@@ -1956,7 +2100,7 @@ function DraftPage() {
                       </span>
                     ) : (
                       <button
-                        onClick={onAdoptApprove}
+                        onClick={() => onAdoptApprove()}
                         disabled={busy}
                         title="确认草稿内容与你的实地观察一致 → 采纳识别并收录为已收录条目（识别人 +2 枚铜叶）"
                         className="inline-flex items-center gap-2 border-2 border-leaf-deep bg-leaf-deep/10 text-leaf-deep px-8 py-3 text-base font-bold rounded-full hover:bg-leaf-deep hover:text-background transition-colors disabled:opacity-60 cursor-pointer"
@@ -1983,6 +2127,12 @@ function DraftPage() {
                         <>
                           仅编辑可见。点击即<strong>采纳</strong>这份草稿并将其收录为已收录条目
                           （识别人该枚识别铜叶 ×2）。
+                          {draftTentative && (
+                            <b className="text-vermilion">
+                              {" "}
+                              本条 AI 结论为「疑似」，点击后需先填写诊断意见。
+                            </b>
+                          )}
                         </>
                       )}
                     </p>
@@ -2033,6 +2183,10 @@ function DraftPage() {
                 canApply={isEditor && draft.status !== "approved"}
                 isRegistered={!!user}
                 scopes={pageSections}
+                // 只有简介卡的草稿：默认就选中那张卡，并且**不给**「整页 · 全文」这一项 ——
+                // 这一档没有正文，选「整页」既指不到东西，又让服务端只能替编辑猜意图。
+                defaultScope={notEnriched ? DRAFT_CARD_SCOPE : ""}
+                allScopeLabel={notEnriched ? null : "整页 · 全文"}
                 imageSlots={imageSlots}
                 ask={async (question, history, scope, refPhotoCount) => {
                   const res = (await askAgent({
@@ -2187,6 +2341,69 @@ function DraftPage() {
         )}
       </main>
       <SiteFooter />
+
+      {/* ── 疑似草稿的采纳闸门：先写诊断意见 ──────────────────────────────────
+          为什么要拦：AI 说「疑似」= 它没定下来种。这样一条如果一点按钮就进了正式档案，
+          档案里就多了一条**没有任何人为它背书**的物种记录。所以采纳这一步改成：编辑
+          写下据以定种的依据（看到了什么特征、和哪个近似种怎么区分），意见随条目一起
+          发布进正文，条目上的「疑似」字样也在这一刻消除。 */}
+      {diagOpen && (
+        <div
+          className="fixed inset-0 z-[75] bg-black/60 flex items-center justify-center p-4"
+          onClick={() => !busy && setDiagOpen(false)}
+        >
+          <div
+            className="bg-background border border-ink shadow-xl w-full max-w-lg p-6"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 className="label text-vermilion mb-1">采纳前请填写诊断意见</h3>
+            <p className="text-sm text-ink-soft mb-3 leading-relaxed">
+              这份草稿的 AI 结论是
+              <strong className="text-vermilion">「疑似</strong>
+              <strong className="text-vermilion">
+                {(draft?.title || "").replace(/^\s*（?\s*疑似\s*）?/, "")}」
+              </strong>
+              。请写明你据以定种的依据（看到了哪些特征、与哪些近似种如何区分）。
+              这段意见会作为
+              <strong>「编辑诊断意见」</strong>
+              收录进条目正文，采纳后条目上的「疑似」字样一并消除。
+            </p>
+            <textarea
+              value={diagText}
+              onChange={(e) => setDiagText(e.target.value)}
+              rows={5}
+              autoFocus
+              placeholder="例：叶背密被白色星状毛、萼筒无腺点，与同属的 XX 区分明确，可定为本种。"
+              className="w-full border border-rule bg-paper-deep/20 px-3 py-2 text-sm leading-relaxed focus:outline-none focus:border-ink resize-y"
+            />
+            <p className="text-[11px] text-ink-faint mt-1">
+              至少 {DIAGNOSIS_MIN} 字（当前 {diagText.trim().length} 字）。
+              意见连同你的署名与日期一起写进正文，可在条目页「修改记录」里追溯。
+            </p>
+            <div className="flex flex-wrap justify-end gap-2 mt-4">
+              <button
+                onClick={() => setDiagOpen(false)}
+                disabled={busy}
+                className="border border-rule text-ink-faint px-4 py-2 text-sm hover:border-ink hover:text-ink transition-colors cursor-pointer disabled:opacity-60"
+              >
+                取消
+              </button>
+              <button
+                onClick={async () => {
+                  const text = diagText.trim();
+                  if (text.length < DIAGNOSIS_MIN) return;
+                  setDiagOpen(false);
+                  await onAdoptApprove(text);
+                }}
+                disabled={busy || diagText.trim().length < DIAGNOSIS_MIN}
+                className="bg-ink text-background px-4 py-2 text-sm font-semibold hover:bg-vermilion transition-colors cursor-pointer disabled:opacity-40"
+              >
+                {busy ? "处理中…" : "确认诊断并采纳"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {mergePrompt && (
         <div
@@ -2380,7 +2597,14 @@ function DraftPage() {
                     {speciesExistingLabel(item, draft?.title)}
                     {speciesExistingCountSuffix(item)}
                     <span className="block text-[11px] font-normal opacity-70">
-                      {inline ? "点击就在本页展开，不会跳走" : "点击跳转到该页"}
+                      {/* 这个弹窗只推**一份**现成的（目的就是止住那一枚银叶），所以有好几份时
+                          得把话说明白 —— 否则标题写着「共 2 份」、点了只到一份，又是对不上。
+                          要逐份挑，关掉弹窗后在下方常驻那一栏点开列表。 */}
+                      {item.count > 1
+                        ? "先带你看最新的一份 · 其余在下方那一栏点开"
+                        : inline
+                          ? "点击就在本页展开，不会跳走"
+                          : "点击跳转到该页"}
                     </span>
                   </button>
                 );

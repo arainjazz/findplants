@@ -2,11 +2,13 @@ import { useEffect, useRef, useState } from "react";
 import { Link } from "@tanstack/react-router";
 import { useQuery } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
+import { SafeImg } from "@/components/safe-img";
 import { enhanceDraftHtmlForViewing } from "@/lib/draft-enhance";
 import { fetchDraftById } from "@/lib/drafts";
 import {
   lookupSpeciesExisting,
   type SpeciesExisting,
+  type SpeciesExistingEntry,
   type SpeciesExistingItem,
   type SpeciesExistingKind,
 } from "@/lib/species-existing.functions";
@@ -26,6 +28,11 @@ import {
 //
 // 点击行为：**未收录的银叶草稿**就地展开、不跳页（这条是用户 2026-07-30 定的，理由是跳过去
 // 会让人以为换了一份草稿）；已收录成条目的一律跳详页——那是它的正式家，有评论和修改记录。
+//
+// 一类有好几份时（2026-08-09）：按钮不再直接把人带去其中某一份，而是**展开成一行一份的列表**。
+// 从前每类只给 `entries[0]` 一个入口、后缀却写着「共 2 份」（拂子茅 4 份内容只点得到 2 份），
+// 数字与入口对不上。每行带缩略图 + 已收录/草稿 + 作者 + 日期 + 拍摄地点 —— 同物种的几份多半
+// 是不同人在不同地点拍的，光有标题分辨不出谁是谁。
 
 /**
  * 未收录的银叶科普草稿的**就地展开**视图。
@@ -180,6 +187,93 @@ function isInlineItem(item: SpeciesExistingItem) {
   return item.kind === "silver" && !!item.draftId;
 }
 
+/** 列表里的一行，是不是那种「点了就地展开、不跳页」的银叶草稿。 */
+function isInlineEntry(kind: SpeciesExistingKind, entry: SpeciesExistingEntry) {
+  return kind === "silver" && !!entry.draftId;
+}
+
+/** 只显示到「日」—— 同物种的几份差着好几天，时分秒是噪音。 */
+function formatDay(iso: string | null) {
+  if (!iso) return null;
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return null;
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+/**
+ * 「共 N 份」展开后的一行。
+ *
+ * 四样区分信息（用户 2026-08-09 选的）：缩略图、已收录/未收录草稿、作者+日期、拍摄地点。
+ * 缩略图走 SafeImg —— 草稿照片被清理掉的情况真发生过（2026-07-13 那次），不能让列表里
+ * 裂出一排碎图标。
+ */
+function SpeciesExistingEntryRow({
+  kind,
+  entry,
+  fallbackTitle,
+  inlineOpen,
+  onInline,
+}: {
+  kind: SpeciesExistingKind;
+  entry: SpeciesExistingEntry;
+  fallbackTitle?: string | null;
+  /** 这一行就是当前就地展开着的那份银叶草稿。 */
+  inlineOpen: boolean;
+  onInline: (draftId: string) => void;
+}) {
+  const s = SPECIES_EXISTING_STYLE[kind];
+  const meta = [
+    entry.published ? "已收录" : "未收录草稿",
+    entry.author,
+    formatDay(entry.createdAt),
+    entry.place,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+
+  const base = `text-[12px] border px-2.5 py-2 rounded-sm transition-colors flex items-center gap-2.5 w-full text-left ${s.cls}`;
+  const body = (
+    <>
+      <SafeImg
+        src={entry.thumb}
+        className="w-9 h-9 object-cover rounded-sm shrink-0"
+        loading="lazy"
+        fallback={<span className="w-9 h-9 rounded-sm bg-paper-deep/60 shrink-0" />}
+      />
+      <span className="min-w-0 flex-1">
+        <span className="block truncate font-medium">
+          {entry.title || fallbackTitle || "同物种内容"}
+        </span>
+        <span className="block truncate text-[11px] opacity-70">{meta}</span>
+      </span>
+      {isInlineEntry(kind, entry) && <span aria-hidden>{inlineOpen ? "▲" : "▼"}</span>}
+    </>
+  );
+
+  if (isInlineEntry(kind, entry)) {
+    return (
+      <button
+        type="button"
+        onClick={() => onInline(entry.draftId!)}
+        aria-expanded={inlineOpen}
+        className={`${base} cursor-pointer`}
+      >
+        {body}
+      </button>
+    );
+  }
+  return entry.draftId ? (
+    <Link to="/drafts/$id" params={{ id: entry.draftId }} className={base}>
+      {body}
+    </Link>
+  ) : (
+    <Link to="/plants/$slug" params={{ slug: entry.slug! }} className={base}>
+      {body}
+    </Link>
+  );
+}
+
 /**
  * 那一块。`existing` 由调用方查好传进来 —— 草稿页本来就在查它（还要给关分享卡时那个
  * 面板用），条目页则自己查一次（见下面的 `useSpeciesExistingForPlant`）。
@@ -218,8 +312,24 @@ export function SpeciesExistingLinks({
   const inlineOpen = open ?? selfOpen;
   const setInlineOpen = (v: boolean) => (onOpenChange ? onOpenChange(v) : setSelfOpen(v));
   const items = existing?.items ?? [];
-  const inlineDraftId = items.find(isInlineItem)?.draftId;
+  // 哪一类的「共 N 份」列表正展开着（一次只开一个，几个列表同时铺开会把正文挤没）。
+  const [expandedKind, setExpandedKind] = useState<SpeciesExistingKind | null>(null);
+  // 列表里另点了某一份银叶草稿 → 就地展开的换成它；没点过就还是代表那份。
+  const [pickedDraftId, setPickedDraftId] = useState<string | null>(null);
+  const headInlineDraftId = items.find(isInlineItem)?.draftId ?? null;
+  const inlineDraftId = pickedDraftId ?? headInlineDraftId;
+  const expandedItem = items.find((it) => it.kind === expandedKind) ?? null;
   if (!items.length) return null;
+
+  /** 列表里点某一份银叶草稿：再点同一份就收起，点另一份就换过去。 */
+  const onPickInline = (draftId: string) => {
+    if (inlineOpen && inlineDraftId === draftId) {
+      setInlineOpen(false);
+      return;
+    }
+    setPickedDraftId(draftId);
+    setInlineOpen(true);
+  };
 
   const base =
     "text-[12px] border px-3 py-1.5 rounded-sm transition-colors inline-flex items-center gap-1.5";
@@ -232,12 +342,29 @@ export function SpeciesExistingLinks({
           {items.map((item) => {
             const s = SPECIES_EXISTING_STYLE[item.kind];
             const suffix = speciesExistingCountSuffix(item);
+            const listOpen = expandedKind === item.kind;
             const body = (
               <>
                 <span>{speciesExistingLabel(item, fallbackTitle)}</span>
                 {suffix && <span className="opacity-70">{suffix}</span>}
               </>
             );
+            // 好几份时按钮**不再替人选一份**，而是把这一类整组摊开让人自己挑。
+            // 直接带去 entries[0] 正是「写着共 2 份、只点得到 1 份」的由来。
+            if (item.count > 1) {
+              return (
+                <button
+                  key={item.kind}
+                  type="button"
+                  onClick={() => setExpandedKind(listOpen ? null : item.kind)}
+                  aria-expanded={listOpen}
+                  className={`${base} ${s.cls} cursor-pointer`}
+                >
+                  {body}
+                  <span aria-hidden>{listOpen ? "▲" : "▼"}</span>
+                </button>
+              );
+            }
             if (isInlineItem(item)) {
               return (
                 <button
@@ -273,6 +400,20 @@ export function SpeciesExistingLinks({
             );
           })}
         </div>
+        {expandedItem && (
+          <div className="mt-2 flex flex-col gap-1.5">
+            {expandedItem.entries.map((entry, i) => (
+              <SpeciesExistingEntryRow
+                key={entry.draftId ?? entry.slug ?? i}
+                kind={expandedItem.kind}
+                entry={entry}
+                fallbackTitle={fallbackTitle}
+                inlineOpen={inlineOpen && inlineDraftId === entry.draftId}
+                onInline={onPickInline}
+              />
+            ))}
+          </div>
+        )}
       </div>
       {inlineOpen && inlineDraftId && (
         <InlineEnrichedDraft draftId={inlineDraftId} onClose={() => setInlineOpen(false)} />

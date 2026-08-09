@@ -2,7 +2,7 @@ import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { compressImage, extForMime } from "@/lib/image-compress";
 import { useServerFn } from "@tanstack/react-start";
 import { extractPlantMetaFn, savePlantFn, uploadAssetFn } from "@/lib/identify-plant.functions";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { FolderOpen, Link2, Image as ImageIcon, Globe, Trash2, UploadCloud } from "lucide-react";
@@ -21,6 +21,46 @@ import { fetchAllTags, type TagWithCount } from "@/lib/tags";
 export const Route = createFileRoute("/_authenticated/admin/batch-new")({
   component: BatchNewPage,
 });
+
+const relOf = (f: File): string =>
+  ((f as File & { webkitRelativePath?: string }).webkitRelativePath || "").replace(/\\/g, "/");
+
+/** 文件所在目录（不含文件名）。顶层散文件返回 ""。 */
+const dirOf = (rel: string): string => {
+  const i = rel.lastIndexOf("/");
+  return i < 0 ? "" : rel.slice(0, i);
+};
+
+/**
+ * 把一批文件切成若干「物种包」。
+ *
+ * 🔴 判据是**「装着那份 HTML 的那个目录」**，不是 webkitRelativePath 的顶层目录。
+ * 这个区别是致命的：选中父目录 `1batchspeciespackages` 时，所有 4184 个文件的顶层
+ * **都是那一个父目录名**，按顶层分组只会得到 1 组 —— 勾选框不会弹、236 个物种
+ * 730MB 全量直传，而且配图索引也退化成全局的、又开始串图
+ * （2026-08-08 拿真实目录跑 gate_test 当场照出来，写完没测的话就是线上事故）。
+ *
+ * 一个包 = 一份 HTML 及其所在目录下的一切（含 images/ 之类子目录）。
+ * 同一目录下有多份 HTML 时算同一个包。
+ */
+function groupIntoPackages(files: File[]): { name: string; dir: string; files: File[] }[] {
+  const htmls = files.filter((f) => /\.html?$/i.test(f.name) || f.type === "text/html");
+  if (!htmls.length) return [];
+  const dirs = [...new Set(htmls.map((f) => dirOf(relOf(f))))];
+  // 深的目录先匹配：`A/sub` 里的图不能被 `A` 抢走。
+  const ordered = [...dirs].sort((a, b) => b.length - a.length);
+  const byDir = new Map<string, File[]>(dirs.map((d) => [d, []]));
+  for (const f of files) {
+    const rel = relOf(f) || f.name;
+    const owner = ordered.find((d) => (d === "" ? true : rel === d || rel.startsWith(d + "/")));
+    if (owner != null) byDir.get(owner)!.push(f);
+  }
+  return dirs.map((d) => ({
+    name: d ? d.split("/").pop()! : "（根目录散文件）",
+    dir: d,
+    files: byDir.get(d) ?? [],
+  }));
+}
 
 type Item = {
   key: string;
@@ -77,6 +117,12 @@ function BatchNewPage() {
   const [fullscreen, setFullscreen] = useState(false);
   const [savingAll, setSavingAll] = useState(false);
   const [creatingAll, setCreatingAll] = useState(false);
+  /** 选中父文件夹后的「挑物种」勾选框。见 gateFolders。 */
+  const [folderPick, setFolderPick] = useState<{
+    rows: { name: string; files: File[]; html: number; images: number }[];
+    loose: File[];
+    selected: Set<string>;
+  } | null>(null);
   const editorRefs = useRef<Map<string, HtmlDocEditorHandle | null>>(new Map());
 
   // Build a normalized lookup of image files by name + relative path suffixes.
@@ -280,33 +326,28 @@ function BatchNewPage() {
         toast.error("请选择 .html 文件，或拖入包含 HTML 与图片的文件夹");
         return;
       }
-      // 🔴 **按物种文件夹分组解析，不能只建一个全局索引。**
-      // 一次 ⌘ 多选 5 个物种文件夹时，每个文件夹里往往都有 `images/cover.jpg`、`1.jpg`
-      // 这种同名图 —— 全局索引是按文件名建键的，后写的会覆盖先写的，于是 A 物种的正文
-      // 匹配到 B 物种的照片，而且**不报错**（refs 都「找到」了），发布出去才发现配图串了。
-      // 现在：先按 webkitRelativePath 的顶层目录分组，各自建索引各自解析；
-      // 只有本组里确实找不到时，才退回全局池（HTML 与图片被分散选中的情况）。
-      const topDir = (f: File) => {
-        const rel = ((f as File & { webkitRelativePath?: string }).webkitRelativePath || "").replace(/\\/g, "/");
-        return rel.includes("/") ? rel.split("/")[0] : "";
-      };
+      // 🔴 **按物种包分组解析，不能只建一个全局索引。**
+      // 一次录入 5 个物种时，每个包里往往都有 `images/cover.jpg`、`1.jpg` 这种同名图 ——
+      // 全局索引按文件名建键，后写的覆盖先写的，于是 A 物种的正文匹配到 B 物种的照片，
+      // 而且**不报错**（refs 都「找到」了），发布出去才发现配图串了。
+      //
+      // 分组判据用 `groupIntoPackages`（= 装着那份 HTML 的目录），**不是顶层目录**：
+      // 选中父目录时所有文件的顶层都一样，按顶层分只会得到一组、串图照旧。
+      // 本包里确实找不到时才退回全局池（HTML 与图片被分散选中的情况）。
       const globalIdx = indexImageFiles(imageFiles);
-      const idxByDir = new Map<string, Map<string, File>>();
-      for (const f of imageFiles) {
-        const d = topDir(f);
-        const list = idxByDir.get(d);
-        if (list) continue; // 建过了
-        idxByDir.set(d, indexImageFiles(imageFiles.filter((g) => topDir(g) === d)));
-      }
-      const folderCount = new Set(files.map(topDir).filter(Boolean)).size;
-      // Pre-parse every HTML to resolve refs against its OWN folder first.
+      const pkgs = groupIntoPackages(files);
+      const idxByDir = new Map<string, Map<string, File>>(
+        pkgs.map((p) => [p.dir, indexImageFiles(p.files.filter((f) => isImageFile(f)))]),
+      );
+      const folderCount = pkgs.filter((p) => p.dir).length;
+      // Pre-parse every HTML to resolve refs against its OWN package first.
       const parsed: { file: File; text: string; matched: Map<string, File>; missing: string[] }[] = [];
       for (const f of htmlFiles) {
         const text = await f.text();
         const refs = findLocalAssetRefs(text);
-        const own = idxByDir.get(topDir(f));
+        const own = idxByDir.get(dirOf(relOf(f)));
         const first = own ? resolveRefs(refs, own) : { matched: new Map<string, File>(), missing: refs };
-        // 本组没命中的，再去全局池碰一次运气。
+        // 本包没命中的，再去全局池碰一次运气。
         const fallback = first.missing.length ? resolveRefs(first.missing, globalIdx) : { matched: new Map<string, File>(), missing: [] as string[] };
         const matched = new Map([...first.matched, ...fallback.matched]);
         parsed.push({ file: f, text, matched, missing: fallback.missing });
@@ -339,10 +380,43 @@ function BatchNewPage() {
     }
   };
 
+  /**
+   * 选中的一批文件里，若含**多个**顶层文件夹，先弹勾选框让人挑。
+   *
+   * 🔴 这是「一次录入多个物种」唯一真正走得通的路。`<input webkitdirectory>` 调起的是
+   * **操作系统的目录选择面板**，浏览器把它配成单选、`multiple` 对它直接被忽略
+   * （Chrome / Safari / Firefox 一致，站点 JS 改不了）——所以「按 ⌘ 多选文件夹」
+   * 这件事在任何网站上都不存在，别再往那个方向试了（2026-08-07 我误判过一次）。
+   * 但选**父文件夹**时它会递归给出所有子文件，每个都带 webkitRelativePath；
+   * 按顶层目录一分组，就等价于「一次挑好几个物种」。
+   *
+   * 父目录可能很大（用户的 1batchspeciespackages = 236 个物种 / 4184 文件 / 730MB），
+   * 所以绝不能选完就全传：超过 10 个文件夹时**默认一个都不勾**，宁可多点一下。
+   */
+  const gateFolders = async (files: File[]) => {
+    if (!files.length) return;
+    const pkgs = groupIntoPackages(files);
+    // 只有一个包（= 只选了一个物种文件夹 / 只挑了几份散 HTML）：照旧直传，不打扰。
+    if (pkgs.length <= 1) return processPickedFiles(files);
+    const rows = pkgs
+      .map((p) => ({
+        name: p.name,
+        files: p.files,
+        html: p.files.filter((f) => /\.html?$/i.test(f.name) || f.type === "text/html").length,
+        images: p.files.filter((f) => isImageFile(f)).length,
+      }))
+      .sort((a, b) => a.name.localeCompare(b.name, "zh"));
+    setFolderPick({
+      rows,
+      loose: [],
+      selected: new Set(rows.length <= 10 ? rows.map((r) => r.name) : []),
+    });
+  };
+
   const onPickFiles = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files ?? []);
     e.target.value = "";
-    await processPickedFiles(files);
+    await gateFolders(files);
   };
 
   const scanFiles = async (dataTransfer: DataTransfer): Promise<File[]> => {
@@ -403,7 +477,7 @@ function BatchNewPage() {
     if (e.dataTransfer.items) {
       try {
         const files = await scanFiles(e.dataTransfer);
-        await processPickedFiles(files);
+        await gateFolders(files);
       } catch (err) {
         toast.error((err as Error).message);
       }
@@ -665,7 +739,7 @@ function BatchNewPage() {
               disabled={uploading}
               className="border border-ink px-4 py-2 hover:bg-ink hover:text-background transition-colors disabled:opacity-60 text-sm bg-transparent text-ink"
             >
-              {uploading ? "上传中…" : "+ 选择文件夹（可重复点，累加）"}
+              {uploading ? "上传中…" : "+ 选择文件夹（可选父目录批量挑）"}
             </button>
             <input
               ref={fileRef}
@@ -711,12 +785,15 @@ function BatchNewPage() {
               <p className="text-sm max-w-xl mx-auto leading-relaxed px-4 text-ink-faint">
                 当你的页面有本地配图时，请拖入文件夹；或通过下方按钮点击选择上传。
                 <br />
-                <b className="text-ink-soft">一次录入多个物种</b>：浏览器的文件夹对话框
-                <b className="text-ink-soft">只能选一个文件夹</b>（目录选择器会忽略 ⌘/Shift 多选，
-                这是浏览器行为，不是本站的限制）。两条可行的路：
-                ① <b className="text-ink-soft">把多个物种文件夹一起拖进这个框</b>——这条支持多选；
-                ② 重复点「选择文件夹」逐个添加，条目会<b className="text-ink-soft">累加</b>，不会互相覆盖。
-                无论哪条，每个文件夹的配图都只在<b className="text-ink-soft">它自己</b>的正文里匹配，
+                <b className="text-ink-soft">一次录入多个物种</b>：直接
+                <b className="text-ink-soft">选中装着这些物种的「父文件夹」</b>，
+                然后在弹出的清单里勾选要哪几个（带搜索，几百个也好挑）。
+                <br />
+                ⌘/Shift 在文件夹对话框里
+                <b className="text-ink-soft">是无效的</b>——目录选择器只能选一个，
+                这是浏览器的限制、任何网站都一样，所以才用「选父目录 + 勾选」这条路。
+                把多个文件夹一起<b className="text-ink-soft">拖</b>进这个框同样可以。
+                每个文件夹的配图只在<b className="text-ink-soft">它自己</b>的正文里匹配，
                 不会串到别的物种上。
               </p>
               <div className="flex flex-wrap justify-center gap-3 mt-3">
@@ -734,7 +811,7 @@ function BatchNewPage() {
                   disabled={uploading}
                   className="border border-ink px-5 py-2 hover:bg-ink hover:text-background transition-colors text-sm font-medium bg-background text-ink"
                 >
-                  + 选择文件夹（可重复点，累加）
+                  + 选择文件夹（可选父目录批量挑）
                 </button>
               </div>
             </div>
@@ -825,6 +902,31 @@ function BatchNewPage() {
           </>
         )}
       </main>
+      {folderPick && (
+        <FolderPickDialog
+          rows={folderPick.rows}
+          selected={folderPick.selected}
+          onToggle={(name) =>
+            setFolderPick((p) => {
+              if (!p) return p;
+              const next = new Set(p.selected);
+              if (next.has(name)) next.delete(name);
+              else next.add(name);
+              return { ...p, selected: next };
+            })
+          }
+          onSetAll={(names) => setFolderPick((p) => (p ? { ...p, selected: new Set(names) } : p))}
+          onCancel={() => setFolderPick(null)}
+          onConfirm={() => {
+            const picked = folderPick.rows.filter((r) => folderPick.selected.has(r.name));
+            // 散落在父目录根下的文件（没有子文件夹的那些）一并带上 —— 用户可能就是把
+            // 几份 HTML 直接扔在父目录里的。
+            const files = [...picked.flatMap((r) => r.files), ...folderPick.loose];
+            setFolderPick(null);
+            void processPickedFiles(files);
+          }}
+        />
+      )}
       <SiteFooter />
     </div>
   );
@@ -860,6 +962,103 @@ function BulkButtons({
         {creatingAll ? "创建中…" : "全部创建条目"}
       </button>
     </>
+  );
+}
+
+/**
+ * 「挑物种」勾选框 —— 选了父文件夹之后出现。
+ *
+ * 存在的理由见 gateFolders 顶部：浏览器的目录选择面板永远只能选一个文件夹，
+ * 所以「一次录入多个物种」只能靠「选父目录 → 在这里挑」。236 个包也要好挑，
+ * 因此带搜索框、全选/全不选、以及顶部实时的已选计数。
+ */
+function FolderPickDialog({
+  rows,
+  selected,
+  onToggle,
+  onSetAll,
+  onCancel,
+  onConfirm,
+}: {
+  rows: { name: string; html: number; images: number }[];
+  selected: Set<string>;
+  onToggle: (name: string) => void;
+  onSetAll: (names: string[]) => void;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  const [q, setQ] = useState("");
+  const shown = useMemo(() => {
+    const k = q.trim().toLowerCase();
+    return k ? rows.filter((r) => r.name.toLowerCase().includes(k)) : rows;
+  }, [rows, q]);
+  return (
+    <div className="fixed inset-0 z-[70] bg-black/60 flex items-center justify-center p-4" onClick={onCancel}>
+      <div
+        className="bg-background border border-ink shadow-xl w-full max-w-2xl max-h-[85vh] flex flex-col"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="border-b border-rule px-4 py-3">
+          <div className="flex items-center justify-between">
+            <h3 className="label text-vermilion">
+              发现 {rows.length} 个物种文件夹 —— 勾选要录入的
+            </h3>
+            <button type="button" onClick={onCancel} className="text-xl leading-none text-ink-faint hover:text-ink" aria-label="关闭">
+              ×
+            </button>
+          </div>
+          <p className="mt-1 text-[11px] text-ink-faint">
+            浏览器的文件夹选择框只能选一个（⌘ 多选对它无效，这是浏览器的限制）。
+            选中父文件夹后在这里挑，等同于一次选好几个。
+          </p>
+          <div className="mt-2 flex items-center gap-2">
+            <input
+              value={q}
+              onChange={(e) => setQ(e.target.value)}
+              placeholder="搜索文件夹名（中文名 / 学名都行）"
+              className="flex-1 border border-ink bg-transparent px-2 py-1 text-xs focus:border-vermilion focus:outline-none"
+            />
+            <button type="button" onClick={() => onSetAll(shown.map((r) => r.name))} className="border border-rule px-2 py-1 text-xs hover:border-ink">
+              {q.trim() ? "全选搜索结果" : "全选"}
+            </button>
+            <button type="button" onClick={() => onSetAll([])} className="border border-rule px-2 py-1 text-xs hover:border-ink">
+              全不选
+            </button>
+          </div>
+        </div>
+        <div className="flex-1 overflow-auto p-2">
+          {shown.length === 0 ? (
+            <p className="p-4 text-sm text-ink-faint">没有匹配的文件夹。</p>
+          ) : (
+            shown.map((r) => (
+              <label key={r.name} className="flex cursor-pointer items-center gap-2 px-2 py-1.5 text-sm hover:bg-paper-deep">
+                <input type="checkbox" checked={selected.has(r.name)} onChange={() => onToggle(r.name)} />
+                <span className="flex-1 truncate" title={r.name}>{r.name}</span>
+                <span className="shrink-0 text-[11px] text-ink-faint">
+                  {r.html} 份 HTML · {r.images} 张图
+                </span>
+              </label>
+            ))
+          )}
+        </div>
+        <div className="flex items-center justify-between border-t border-rule px-4 py-2">
+          <span className="text-xs text-ink-faint">已选 {selected.size} / {rows.length}</span>
+          <div className="flex gap-2">
+            <button type="button" onClick={onCancel} className="border border-rule px-3 py-1 text-sm hover:border-ink">
+              取消
+            </button>
+            <button
+              type="button"
+              onClick={onConfirm}
+              disabled={selected.size === 0}
+              className="border border-ink bg-ink px-3 py-1 text-sm text-background hover:opacity-90 disabled:opacity-50"
+            >
+              上传选中的 {selected.size} 个
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
   );
 }
 

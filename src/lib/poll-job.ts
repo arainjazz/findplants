@@ -10,11 +10,33 @@ import { pollJobFn } from "./identify-plant.functions";
 
 /** 轮询间隔。3 秒足够跟手，又不会把 site_config 打爆。 */
 const POLL_INTERVAL_MS = 3000;
+/**
+ * **收尾阶段**的轮询间隔。
+ *
+ * 3 秒是给「模型正在想、还有好几分钟」那一段用的；一旦服务端报到 80%（识别链路的
+ * 「正在写入云端…」是 90），剩下的活是几百毫秒的写库，此时还按 3 秒问一次，等于把
+ * 「其实已经好了」硬压在完成界面上最多再多 3 秒 —— 用户 2026-08-06 报的
+ * 「深度分析完成后很久才出分享卡」，这是排在最前面的一段。
+ *
+ * 只在最后这一小段提速，所以对 site_config 的写读压力几乎没有变化（多的是几次读）。
+ */
+const POLL_FINAL_INTERVAL_MS = 800;
+/** 进度到这个百分比之后改用上面的快节奏。 */
+const POLL_FINAL_FROM_PCT = 80;
 /** 兜底上限：任务再慢也不该超过这个时长，超了就当它挂了，免得无限转圈。 */
 const POLL_TIMEOUT_MS = 20 * 60 * 1000;
 
 export type JobOutcome<T> =
-  | { ok: true; result: T }
+  | {
+      ok: true;
+      result: T;
+      /**
+       * 识别任务完成时，服务端顺手带回的那份草稿行（见 pollJobFn 里的说明）。
+       * 调用方用它把 react-query 缓存喂上，草稿页就不必再往返一趟才画得出分享卡。
+       * 其它任务类型 / 读取失败时为 null —— 调用方照常自己去查即可。
+       */
+      draft: unknown;
+    }
   | {
       ok: false;
       error: string;
@@ -62,6 +84,8 @@ export async function awaitJob<T>(
   let lastPhase = "";
   // 连续读不到任务行时的容错：偶发网络抖动不该直接判死，连着几次才算数。
   let missStreak = 0;
+  /** 服务端最近报的进度 —— 决定下一觉睡多久（见 POLL_FINAL_INTERVAL_MS）。 */
+  let lastProgress = 0;
 
   for (;;) {
     if (opts?.signal?.aborted) {
@@ -86,11 +110,17 @@ export async function awaitJob<T>(
 
     if (snap && snap.found) {
       missStreak = 0;
+      lastProgress = snap.progress ?? lastProgress;
       if (snap.phase && snap.phase !== lastPhase) {
         lastPhase = snap.phase;
         onPhase?.(snap.phase, snap.progress);
       }
-      if (snap.status === "done") return { ok: true, result: snap.result as T };
+      if (snap.status === "done")
+        return {
+          ok: true,
+          result: snap.result as T,
+          draft: (snap as { draft?: unknown }).draft ?? null,
+        };
       if (snap.status === "error") {
         return {
           ok: false,
@@ -128,7 +158,10 @@ export async function awaitJob<T>(
       }
     }
 
-    await sleepOrAbort(POLL_INTERVAL_MS, opts?.signal);
+    await sleepOrAbort(
+      lastProgress >= POLL_FINAL_FROM_PCT ? POLL_FINAL_INTERVAL_MS : POLL_INTERVAL_MS,
+      opts?.signal,
+    );
   }
 }
 
