@@ -12,7 +12,12 @@ approved 却查不到条目的历史脏数据两边都不算。`tags.$slug.tsx` 
 同一规矩（`.neq(status,approved).is(published_plant_id,null)`）。修完实测：
 #阳台杂草「已收录 7 · 待审 1（马唐）」、/plants 标签栏同步、特征词 #路边杂草 4 条待审
 与库里 4 条 pending 逐条对上、地图主题下拉仍是「阳台杂草·10 / 圣水草原的植被·10」（未清零，
-说明 `inTheme` 的 published_plant_id 那一支正常接住）。tsc=0。**⚠️ 未部署、未提交。**）_
+说明 `inTheme` 的 published_plant_id 那一支正常接住）。tsc=0。
+**✅ 已提交 `15a52d9`（连同续三那轮小P蛙定名复核一起）、build 过；
+🚧 部署卡住 —— `wrangler deploy` 连续 2 次 `fetch failed`（undici `SocketError: other side closed`
+/ `write EPIPE`），而同一时刻 `curl api.cloudflare.com` 0.77 秒返回 403，说明网络通、
+是本地代理/TUN 掐上传。按止损原则停手，未上线。代理关掉后重跑
+`npm run build && ./node_modules/.bin/wrangler deploy` 即可，代码无需再动。**）_
 _上一轮：2026-08-09（续三）— by Claude（**小P蛙复核过定名的疑似草稿：采纳免填诊断意见 +
 可信度 +20**。用户实测：已用小P蛙把「疑似长毛棘豆」改定为名录正名「绵毛棘豆」，页面上疑似
 两个字早已不见，点「采纳识别」仍被拦「这份草稿的 AI 结论是疑似：请先填写诊断意见」。
@@ -8148,3 +8153,16 @@ approved 但查不到条目 → 两边都不算（历史脏数据，它已经不
   `explore.tsx` 的 `inTheme` 本来就有 `published_plant_id → plants 集合`那一支，
   草稿 id 换成条目 id 之后正好被它接住。
 - `tsc` = 0；控制台无报错。**⚠️ 未部署、未提交。**
+
+### 🚧 BLOCKER（2026-08-09 06:47）部署未完成 —— `wrangler deploy` 两次 `fetch failed`
+- 代码**已提交** `15a52d9`，`npm run build` 通过（dist/ 是最新的）。**线上仍是旧版
+  `80a4e260`**，本轮两组修复都还没生效。
+- 两次都停在同一处，日志里的真实原因是 undici 的
+  `SocketError: other side closed` + `write EPIPE` —— **上传 bundle 的过程中socket 被掐**。
+- 已排除「网络断了/CF 挂了」：同一时刻 `curl -o /dev/null https://api.cloudflare.com/client/v4/user`
+  **0.77 秒返回 403**（403 = 没带鉴权，正是预期）。清掉 `HTTP_PROXY/HTTPS_PROXY/ALL_PROXY`
+  也不管用 —— 环境变量里本来就没有代理，说明是 **TUN / 全局路由那一层**在掐，
+  不是进程环境变量能绕开的（与 memory 里那条 ECONNRESET 根因同源）。
+- **下次怎么做**：把本地代理 / TUN 关掉（或按 07-21 的先例过一阵子再试，那次是自行恢复的），
+  然后 `npm run build && ./node_modules/.bin/wrangler deploy`。**代码一个字都不用改。**
+  按 CLAUDE.md 的止损原则，本轮不再重试第三次。
