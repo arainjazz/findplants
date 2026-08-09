@@ -1,6 +1,16 @@
 # Plantspedia — Working State  (single source of truth)
 
-_Last updated: 2026-08-09（续四）— by Claude（**修：已收录的条目仍被算成「待审草稿」**。
+_Last updated: 2026-08-09（续五）— by Claude（**修：「← 返回 #标签 名单」显示的是 slug 乱码**。
+用户报「← 返回 #59-3-6-0-4-88-89-58-9-79-84-6-48-8-2 名单」。根因：`slugifyTag` 对中文名是
+**先 encodeURIComponent、再把 `%` 全删掉**，这个变换**不可逆**，而两处退路都只有一条
+`decodeURIComponent(slug)` 兜底 —— 它连 `%` 都找不到，原样吐回那串数字。
+（那条 decode 兜底本身要留着：**特征词**那条路的「slug」就是标签名 URL-encode 出来的。）
+新增共用组件 `components/back-to-tag.tsx`：查库拿真名（`fetchTagBySlug`，单行查询、
+react-query 缓存 10 分钟）→ 查不到再 decode；名字没回来之前**不显示 `#`+slug**
+（那一瞬间就是同样的乱码），先写「← 返回标签名单」。条目页仍优先用卡签里那一枚真名、零查询。
+草稿页那一处从前连卡签兜底都没有，是彻底坏的。三条路已实测：条目页+真标签、草稿页+真标签
+都出「#阳台杂草」，条目页+特征词出「#路边杂草」。tsc=0。）_
+_上一轮：2026-08-09（续四）— by Claude（**修：已收录的条目仍被算成「待审草稿」**。
 用户报 #阳台杂草「已收录 4 个物种 · 另有 8 条待审草稿」，而那 8 条里 4 条就是上面刚列过的
 同一批条目。根因在 `lib/tags.ts` 的 `fetchTagMembership`：草稿只滤了 `rejected`，
 **采纳后草稿行仍在库里**（`status='approved'` + `published_plant_id`），标签还挂在它身上，
@@ -8166,3 +8176,40 @@ approved 但查不到条目 → 两边都不算（历史脏数据，它已经不
 - **下次怎么做**：把本地代理 / TUN 关掉（或按 07-21 的先例过一阵子再试，那次是自行恢复的），
   然后 `npm run build && ./node_modules/.bin/wrangler deploy`。**代码一个字都不用改。**
   按 CLAUDE.md 的止损原则，本轮不再重试第三次。
+
+---
+
+## 2026-08-09（续五）— 修：「← 返回 #标签 名单」显示成一串 slug 乱码
+
+### 现象
+从标签名单点进条目/草稿后，页头那条退路写着
+「← 返回 **#59-3-6-0-4-88-89-58-9-79-84-6-48-8-2** 名单」。
+
+### 根因
+`lib/tags.ts` 的 `slugifyTag` 处理中文名的方式是 **先 `encodeURIComponent`、再把 `%` 全删掉**：
+
+```
+阳台杂草 → %E9%98%B3%E5%8F%B0... → E998B3E58FB0...（数字与横杠）
+```
+
+**这个变换不可逆**。而 `plants.$slug.tsx` / `drafts.$id.tsx` 两处退路都只有一条
+`decodeURIComponent(from)` 兜底 —— 它连一个 `%` 都找不到，于是原样把那串数字吐回屏幕。
+条目页还有一层「卡签里找同 slug 的那一枚」优先，但卡签只有条目**自己**挂的标签；
+经「并入已有条目」进名单的那些（见续四）条目上根本没有这枚卡签，照样掉进 decode 兜底。
+草稿页则**连那层兜底都没有**，是彻底坏的。
+
+### 修法
+新增 `components/back-to-tag.tsx`，两处共用：
+1. `knownLabel`（卡签里的真名）给了就直接用 —— 零查询，保留条目页原有的快路径；
+2. 否则 `fetchTagBySlug(slug)` 回库拿真名（单行查询，react-query 缓存 10 分钟）；
+3. 都没有再 `decodeURIComponent` —— **这条兜底必须留着**：AI 特征词那条路
+   （tags 表里没有行）的「slug」就是标签名本身 URL-encode 出来的，decode 回来正是它的名字；
+4. 名字还在路上时**不渲染 `#`+slug**（那一瞬间读者看到的就是同一种乱码），
+   先给一句「← 返回标签名单」，查到了再换成真名。
+
+### 验证（dev 5223，连真库）
+- 条目页 + 真标签 `/plants/solanum-nigrum?from=998-3-58-0-69-82-88-89` → 「← 返回 #阳台杂草 名单」
+- 草稿页 + 真标签 `/drafts/af8c62a6…?from=998-3-58-0-69-82-88-89` → 「← 返回 #阳台杂草 名单」
+- 条目页 + 特征词 `/plants/phyllanthus-tenellus-roxb?from=%E8%B7%AF%E8%BE%B9%E6%9D%82%E8%8D%89`
+  → 「← 返回 #路边杂草 名单」（decode 兜底没被改坏）
+- `tsc` = 0；控制台只剩两条既有噪音（sandbox iframe 的 srcdoc 脚本拦截）。

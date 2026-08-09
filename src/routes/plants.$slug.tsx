@@ -36,6 +36,7 @@ import { ShareButton } from "@/components/share-button";
 import { ShareCardButton } from "@/components/share-card-button";
 import { AdminExportButton } from "@/components/admin-export-button";
 import { RegistryChips } from "@/components/registry-chips";
+import { BackToTagLink } from "@/components/back-to-tag";
 import { NameAuthorityNote, readNameStamp } from "@/components/name-authority-badge";
 import { useRegistryChips } from "@/lib/use-registry-chips";
 import { supabase } from "@/integrations/supabase/client";
@@ -651,26 +652,15 @@ function PlantDetail() {
 
   /**
    * 「← 返回 #标签 名单」—— 只有从标签名单点进来（`?from=<tagSlug>`）时才出现。
-   * 标签名优先取卡签里那一枚（库里的真名），取不到再把 slug 解码回来兜底。
+   * 标签名优先取卡签里那一枚（库里的真名，零查询），取不到就回库里查 ——
+   * **不能拿 slug 硬凑**，中文名的 slug 是不可逆的（见 components/back-to-tag.tsx）。
    */
   const fromTag = (Route.useSearch() as { from?: string }).from || null;
   const backToTagNode = fromTag ? (
-    <Link
-      to="/tags/$slug"
-      params={{ slug: fromTag }}
-      className="label text-emerald-700 hover:text-vermilion whitespace-nowrap"
-    >
-      ← 返回 #
-      {registryChipList.find((c) => c.slug === fromTag)?.label ??
-        (() => {
-          try {
-            return decodeURIComponent(fromTag);
-          } catch {
-            return fromTag;
-          }
-        })()}{" "}
-      名单
-    </Link>
+    <BackToTagLink
+      from={fromTag}
+      knownLabel={registryChipList.find((c) => c.slug === fromTag)?.label}
+    />
   ) : null;
 
   const fmtDate = (ts: string) => {

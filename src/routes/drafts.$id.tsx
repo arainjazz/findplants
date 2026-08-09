@@ -79,6 +79,7 @@ import { computeIdentifyConfidence, traceSteps, type IdentifyTrace } from "@/lib
 import { JobProgressPanel } from "@/components/job-progress";
 import { ConfidenceStars } from "@/components/confidence-stars";
 import { RegistryChips } from "@/components/registry-chips";
+import { BackToTagLink } from "@/components/back-to-tag";
 import { useRegistryChips } from "@/lib/use-registry-chips";
 import { toast } from "sonner";
 
@@ -1378,21 +1379,7 @@ function DraftPage() {
               <div className="flex flex-wrap items-center gap-3 text-sm w-full">
                 {/* 从标签名单点进来的，先给一条回名单的路（读者多半要接着看下一条）。 */}
                 {fromTag && (
-                  <Link
-                    to="/tags/$slug"
-                    params={{ slug: fromTag }}
-                    className="label text-emerald-700 hover:text-vermilion"
-                  >
-                    ← 返回 #
-                    {(() => {
-                      try {
-                        return decodeURIComponent(fromTag);
-                      } catch {
-                        return fromTag;
-                      }
-                    })()}{" "}
-                    名单
-                  </Link>
+                  <BackToTagLink from={fromTag} className="label text-emerald-700 hover:text-vermilion" />
                 )}
                 <Link to="/identify" className="label hover:text-vermilion">
                   ← 返回 AI 识别
