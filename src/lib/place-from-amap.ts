@@ -44,18 +44,16 @@ const POI_MAX_M = 150;
  * 判据用高德自己的类型编码体系（POI 与 AOI 共用）：
  *   `12` = 商务住宅大类；其中 `1203` = 住宅区（小区/别墅/宿舍），`1202` = 产业园区。
  * 所以规则是「商务住宅大类一律不用，**产业园区除外**」。
- */
-/**
- * 能当「地点」用的大类 —— 白名单而不是黑名单。
  *
- * 只按住宅过滤是不够的：过滤完之后兜底 POI 挑中的是**离得最近的那个商户**，
+ * ## 为什么最后是白名单，不是黑名单
+ * 只按住宅过滤跑一遍真数据就知道不够：兜底 POI 挑的是**离得最近的那个商户**，
  * 于是出现「…青春山街道·隆升源美味牛肉拉面(珠江店)」「…·海川口腔」
  * 「…·中共鄂托克旗委巡察工作领导小组办公室」。植物不长在拉面馆里 ——
- * 这些只是碰巧 100 米内有个店，写进标本记录既误导又难看，而且店会关门、改名。
+ * 那只是碰巧 100 米内有个店，写进标本记录既误导又难看，而且店会关门、改名。
  *
- * 留下的是**地物**：景区、公园、湿地、园区、高速服务区、校园、村庄名、道路名。
- * 这类名字指的是一片地方，不是一门生意，几年后依然成立。
- * 匹配不上就退回街道级 —— 退回去永远是安全的。
+ * 所以反过来列**能当地点用**的大类：景区、公园、湿地、园区、高速服务区、校园、
+ * 村庄名、道路名 —— 指的是一片地方而不是一门生意，几年后依然成立。
+ * 匹配不上就退回街道级；退回去永远是安全的。
  */
 const PLACE_LIKE_TOP = [
   "风景名胜", // 景区、公园、广场、纪念地
@@ -78,6 +76,7 @@ function isPublishable(typeStr: string): boolean {
     // 「通行设施;临街院门」—— 大门不是地点，用它会把「圣水草原」和
     // 「圣水草原(入口)」拆成两种写法，同一个地方看着像两处
     if (top.includes("通行设施")) return false;
+    if (mid.includes("培训机构")) return false; // 「厚德教育」这类是生意，不是校园
     return PLACE_LIKE_TOP.some((x) => top.includes(x));
   }
 
@@ -136,12 +135,17 @@ export function placeFromAmapRegeo(regeocode: AmapRegeocode | null | undefined):
   }
   const leaksHome = (name: string) => blocked.some((b) => name.includes(b));
 
+  // 机构不是地点。类型体系拦不住这些 —— 「龙岗区龙城工业园安全文明小区办公室」
+  // 归在「地名地址信息」里，类型上完全合规，可它是个**办公室**，还捎带一个「小区」
+  // 字样，挂在假蒿底下像笑话。名字层面单独判一道。
+  const isOrgNotPlace = (name: string) => /办公室|管委会|委员会|居委会|党支部|服务站$/.test(name);
+
   // AOI = 面状地物（公园、景区、园区、校园），点落在里面，比 POI 可靠，优先。
   // **不能直接取 aois[0]** —— 一个点常同时落在好几个 AOI 里（悦和城/公租房/万和城
   // 三个住宅 AOI 叠在一起），第一个恰好是住宅就把整条路堵死了。要挑第一个能公开的。
   for (const a of aois) {
     const name = amapStr(a.name);
-    if (name && isPublishable(amapStr(a.type)) && !leaksHome(name)) {
+    if (name && isPublishable(amapStr(a.type)) && !leaksHome(name) && !isOrgNotPlace(name)) {
       return admin ? `${admin}·${name}` : name;
     }
   }
@@ -157,7 +161,7 @@ export function placeFromAmapRegeo(regeocode: AmapRegeocode | null | undefined):
     if (!isPublishable(amapStr(p.type))) continue; // 住宅/楼栋/院门都不作数
     const d = Number(dRaw);
     const n = amapStr(p.name);
-    if (n && leaksHome(n)) continue; // 类型清白但名字带小区的，同样不用
+    if (n && (leaksHome(n) || isOrgNotPlace(n))) continue; // 类型清白但名字带小区的，同样不用
     if (n && Number.isFinite(d) && d < bestD) {
       best = n;
       bestD = d;

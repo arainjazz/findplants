@@ -141,6 +141,35 @@ const cases = [
     },
     "广东省深圳市南山区沙河街道·广东深圳华侨城国家湿地公园",
   ],
+  [
+    "机构不是地点：办公室退回街道级（真·漏网的那份假蒿）",
+    {
+      addressComponent: { province: "广东省", city: "深圳市", district: "龙岗区", township: "龙城街道" },
+      aois: [],
+      pois: [
+        { name: "龙岗区龙城工业园安全文明小区办公室", type: "地名地址信息;普通地名;普通地名", distance: "40" },
+      ],
+    },
+    "广东省深圳市龙岗区龙城街道",
+  ],
+  [
+    "培训机构是生意，不算校园",
+    {
+      addressComponent: { province: "广东省", city: "东莞市", district: [], township: "凤岗镇" },
+      aois: [],
+      pois: [{ name: "厚德教育", type: "科教文化服务;培训机构;培训机构", distance: "35" }],
+    },
+    "广东省东莞市凤岗镇",
+  ],
+  [
+    "真学校照常保留",
+    {
+      addressComponent: { ...KBS, township: "青春山街道" },
+      aois: [],
+      pois: [{ name: "康巴什第二中学", type: "科教文化服务;学校;中学", distance: "60" }],
+    },
+    "内蒙古自治区鄂尔多斯市康巴什区青春山街道·康巴什第二中学",
+  ],
   ["空对象", {}, ""],
   ["null", null, ""],
 ];
