@@ -8679,7 +8679,14 @@ AOI「和悦云锦」。**靠地名区分这 5 份是做不到的**，不是接�
   （07-18 90% / 07-17 45%×3）。地名分不开这件事已成定局。
 - console 只有既有的 sandboxed srcdoc 报错，与本次无关。
 
+### 已上线（08-12）
+`wrangler secret put AMAP_KEY` 已传（`secret list` 复核：AMAP_KEY / GEMINI_API_KEY /
+SUPABASE_SERVICE_ROLE_KEY 三把都在 —— deploy 不会冲掉 secret）。
+`wrangler deploy` 成功，Version `b1fd495f-eabc-4558-9e89-b1b7f92d2a80`，
+plantspedia.club / www 双域名已切。**浏览器实看线上**猪毛蒿页：
+「…伊金霍洛镇·成吉思汗陵旅游区」「…·圣水草原」✅（curl 抓不到，这页是客户端取数的）。
+
 ### 下一步（等定）
-1. **线上还没生效**：`wrangler secret put AMAP_KEY` + 部署（累计 6 个 commit 未上线）。
-   不配 secret 的话，线上新识别仍走 Nominatim。
-2. 那几份同址观测要不要「相对方位+距离」区分 —— 未做。
+同一处的多份观测要不要用「相对方位+距离」区分（如『圣水草原东北约 300 m』，
+用坐标算但不显示坐标）—— **未做**。这是目前唯一还能把它们分开的办法：
+高德实测证明地名这条路到头了。
