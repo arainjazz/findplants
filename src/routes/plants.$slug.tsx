@@ -6,17 +6,24 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 import { SiteHeader, SiteFooter } from "@/components/site-header";
 import { XiaoPAgentPanel } from "@/components/draft-agent-panel";
-import { askPlantAgentFn, applyPlantAgentEditFn } from "@/lib/identify-plant.functions";
+import {
+  askPlantAgentFn,
+  applyPlantAgentEditFn,
+  savePlantHtmlFn,
+  startEnrichDraftFn,
+} from "@/lib/identify-plant.functions";
 import { userModelArg } from "@/lib/xiaop-user-model";
 import {
   applyImagePlan,
+  firstImageUrlIn,
   listSectionSlots,
   summarizeChanges,
   type ImagePlanItem,
   type PlanPhoto,
 } from "@/lib/xiaop-image-plan";
 import { fetchPlantBySlug, fetchAuthor, plantEntryKind } from "@/lib/plants";
-import { fetchPlantSourceKinds } from "@/lib/drafts";
+import { fetchPlantSourceKinds, fetchQuickSourceDraftId } from "@/lib/drafts";
+import { rememberJob } from "@/lib/poll-job";
 import { PlantKindBadge } from "@/components/plant-kind-badge";
 import { useAuth } from "@/hooks/use-auth";
 import { fetchEditById, isCurrentUserAdmin, revertEdit, fetchEditsForPlant, fetchOriginProvenance, fetchPlantProvenance, type PlantEdit } from "@/lib/edits";
@@ -148,6 +155,17 @@ function PlantDetail() {
     queryFn: () => isCurrentUserAdmin(user?.id),
     enabled: !!user,
   });
+  // 「编辑」角色 —— 与草稿页同一条判据。条目页从前只认 作者/管理员/共同作者，
+  // 于是小P蛙这只审稿助手在**已发布条目**上对编辑完全不出现（详见 canCurate）。
+  const { data: isEditorRole = false } = useQuery({
+    queryKey: ["is-editor", user?.id],
+    enabled: !!user,
+    queryFn: async () => {
+      if (!user) return false;
+      const { data } = await supabase.from("user_roles").select("role").eq("user_id", user.id);
+      return !!data?.some((r) => r.role === "editor" || r.role === "admin");
+    },
+  });
   const [editMenu, setEditMenu] = useState<{ x: number; y: number; editId: string } | null>(null);
   const [coverMenu, setCoverMenu] = useState<{ x: number; y: number } | null>(null);
   const [coverSearch, setCoverSearch] = useState(false);
@@ -170,6 +188,7 @@ function PlantDetail() {
   const lastSizedRef = useRef(0);
   const askPlantAgent = useServerFn(askPlantAgentFn);
   const applyPlantAgent = useServerFn(applyPlantAgentEditFn);
+  const savePlantHtml = useServerFn(savePlantHtmlFn);
 
   const { data: author } = useQuery({
     queryKey: ["author", plant?.author_id],
@@ -206,6 +225,39 @@ function PlantDetail() {
     plant?.scientific_name,
     plant?.slug ?? "",
   );
+
+  // ── 🟢快速识别条目 → 补上「生成银叶完整科普」这条断掉的路 ───────────────────
+  // 这一类条目的正文就只有那张简介卡，读者读完就没了下文；而生成按钮长在草稿页上，
+  // 对已收录的草稿从前必报 DRAFT_ALREADY_APPROVED（2026-08-10 用户反馈）。服务端现在
+  // 改为**派生一份新的待审草稿**去写正文，本页一个字都不动，所以这里也能安全地发起。
+  // 同物种已经有银叶科普时不出现：那条路没断，上面那栏已经指过去了。
+  const alreadyHasSilver = (speciesExisting?.items ?? []).some((i) => i.kind === "silver");
+  const { data: quickSourceDraftId } = useQuery({
+    queryKey: ["plant-quick-source-draft", plant?.id],
+    queryFn: () => fetchQuickSourceDraftId(plant!.id),
+    enabled: !!plant?.id && entryKind === "quick" && !alreadyHasSilver,
+  });
+  const startEnrich = useServerFn(startEnrichDraftFn);
+  const [enrichBusy, setEnrichBusy] = useState(false);
+  const onEnrichFromEntry = async () => {
+    if (enrichBusy || !quickSourceDraftId) return;
+    setEnrichBusy(true);
+    try {
+      const res = (await startEnrich({ data: { draft_id: quickSourceDraftId } })) as {
+        jobId: string | null;
+        draftId: string;
+      };
+      // 任务挂在**新草稿**名下，把 jobId 记进它的作用域再跳过去 —— 那一页挂载时的
+      // 「断线续跑」会把轮询接回来，进度条、失败原因都在那边显示。
+      if (res.jobId) rememberJob(`enrich:${res.draftId}`, res.jobId);
+      toast.success("已新建一份待审草稿，正在生成完整科普（本条目不受影响）");
+      await navigate({ to: "/drafts/$id", params: { id: res.draftId } });
+    } catch (e) {
+      toast.error(e instanceof Error && e.message ? e.message : "生成失败，请重试");
+    } finally {
+      setEnrichBusy(false);
+    }
+  };
 
   // 溯源表头：「AI 识别条目」显示「最早识别人/地点/时间」，从最早那条来源草稿回溯。
   // 注意：采纳流程当前不写 source（留 null）、content_type 为 html，故无法靠字段区分
@@ -488,6 +540,7 @@ function PlantDetail() {
         html,
         before,
         `小P蛙按方案换图（${changes.length} 处）：${summarizeChanges(changes)}`,
+        "image",
       );
     } catch (e) {
       // 落库失败就把画面退回去，别让人以为已经保存了。
@@ -499,41 +552,22 @@ function PlantDetail() {
 
   // Persist a new page HTML: upload to the plant-html bucket, repoint the plant,
   // and write a DETAILED plant_edits record so the change is auditable/revertible.
-  const persistPlantHtml = async (html: string, oldHtml: string, summary: string) => {
+  //
+  // ⚠️ 这一步**必须**走服务端函数。浏览器直写时 `plants` 的 UPDATE 策略只放行
+  // 作者本人与管理员，「编辑」角色一律被 RLS 挡下 —— 小P蛙在条目页对编辑等于形同虚设
+  // （2026-08-10 用户反馈）。服务端那边按 编辑/管理员/作者 判权，并顺带把从前被
+  // CHECK 静默拒收的 `ai_page_edit` 流水改成库里认的 kind，改动这才真的进得了修改记录。
+  const persistPlantHtml = async (
+    html: string,
+    oldHtml: string,
+    summary: string,
+    kind: "html_save" | "image" = "html_save",
+  ) => {
     if (!plant || !user) throw new Error("请先登录");
-    const bucket = "plant-html";
-    const path = `${user.id}/xiaop-${Date.now()}.html`;
-    const blob = new Blob([html], { type: "text/html" });
-    const { error: upErr } = await supabase.storage
-      .from(bucket)
-      .upload(path, blob, { cacheControl: "3600", upsert: false, contentType: "text/html" });
-    if (upErr) throw upErr;
-    const newUrl = supabase.storage.from(bucket).getPublicUrl(path).data.publicUrl;
-
-    const { error: updErr } = await supabase.from("plants").update({ html_url: newUrl }).eq("id", plant.id);
-    if (updErr) throw updErr;
-
-    let editorName = "编辑";
-    try {
-      const { data: prof } = await supabase
-        .from("profiles")
-        .select("display_name")
-        .eq("id", user.id)
-        .maybeSingle();
-      if (prof?.display_name) editorName = prof.display_name;
-    } catch { /* fall back to 编辑 */ }
-
-    await supabase.from("plant_edits").insert({
-      plant_id: plant.id,
-      editor_id: user.id,
-      editor_name: editorName,
-      kind: "ai_page_edit",
-      marker_n: 0,
-      source: "xiaop_agent",
-      summary: summary.slice(0, 500),
-      before_html: oldHtml,
-      after_html: html,
-    });
+    const res = (await savePlantHtml({
+      data: { plantId: plant.id, html, beforeHtml: oldHtml || undefined, summary, kind },
+    })) as { url: string; logged: boolean };
+    if (!res.logged) toast.warning("改动已保存，但这一笔没能记进「修改记录」");
 
     qc.invalidateQueries({ queryKey: ["plant", slug] });
     qc.invalidateQueries({ queryKey: ["plant-edits"] });
@@ -550,29 +584,25 @@ function PlantDetail() {
     await persistPlantHtml(html, oldHtml, `小P蛙改写${scope ? `（${scope}）` : "（整页）"}：${instruction}`);
   };
 
-  // Revert one change from the bottom log. 小P蛙 full-page rewrites (ai_page_edit)
-  // store a full before_html snapshot → restore it as a new file + repoint. Other
-  // (block-marker) edits go through the existing revertEdit machinery.
+  // Revert one change from the bottom log. 小P蛙 的整页改写存的是**整份 HTML** 快照 →
+  // 原样传回服务端重新落一份、把 html_url 指回去。其余（块标记）修改照旧走 revertEdit。
+  //
+  // 判据用「快照是不是一整份文档」而不是 kind：从前只认 `ai_page_edit`，而那个 kind 被
+  // plant_edits 的 CHECK 拒收、库里一条都没有，这条分支等于从来没跑过。
   const onRevertPlantEdit = async (edit: PlantEdit) => {
     if (!plant || !user) return;
     if (!confirm("确定撤销这条修改吗？")) return;
     setRevertingId(edit.id);
     try {
-      if (edit.kind === "ai_page_edit" && edit.before_html) {
-        const bucket = "plant-html";
-        const path = `${user.id}/revert-${Date.now()}.html`;
-        const blob = new Blob([edit.before_html], { type: "text/html" });
-        const { error: upErr } = await supabase.storage
-          .from(bucket)
-          .upload(path, blob, { cacheControl: "3600", upsert: false, contentType: "text/html" });
-        if (upErr) throw upErr;
-        const newUrl = supabase.storage.from(bucket).getPublicUrl(path).data.publicUrl;
-        const { error: updErr } = await supabase.from("plants").update({ html_url: newUrl }).eq("id", plant.id);
-        if (updErr) throw updErr;
-        await supabase
-          .from("plant_edits")
-          .update({ reverted: true, reverted_by: user.id, reverted_at: new Date().toISOString() })
-          .eq("id", edit.id);
+      if (edit.before_html && /<\/html>/i.test(edit.before_html)) {
+        await savePlantHtml({
+          data: {
+            plantId: plant.id,
+            html: edit.before_html,
+            summary: `撤销：${edit.summary ?? ""}`.slice(0, 500),
+            revertOfEditId: edit.id,
+          },
+        });
       } else {
         await revertEdit(edit, user.id);
       }
@@ -622,6 +652,15 @@ function PlantDetail() {
     isAdmin ||
     (plant.co_author_ids ?? []).includes(user.id)
   );
+  /**
+   * 谁能用小P蛙改这一页：作者 / 管理员 / 共同作者 **加上「编辑」角色**。
+   *
+   * 为什么不直接把 `canEdit` 放宽：这一页上挂在 canEdit 后面的还有换封面、
+   * 「编辑此条」、撤销等一批**浏览器直写**的操作，而 `plants` 的 UPDATE 策略是
+   * 「作者本人 + 已批准编辑 或 管理员」—— 给纯编辑放出那些按钮只会点一个错一个。
+   * 小P蛙这条路已经改走服务端函数（persistPlantHtml），所以单独开一道门。
+   */
+  const canCurate = canEdit || (!!user && isEditorRole);
 
   // Share-card content for the published entry. leafEarned is intentionally omitted
   // (no identify-round context here → the card skips the「本轮铜叶」line). Rendered
@@ -915,6 +954,47 @@ function PlantDetail() {
           // 🟢 快速识别条目：正文只有一张摘要卡，同物种若已有银叶科普就**默认展开在下面**。
           defaultOpen={entryKind === "quick"}
         />
+        {/* 站内**还没有**银叶科普时，上面那栏指不出任何去路 —— 这里就是那条去路。
+            生成落到一份新的待审草稿上，本页不动（见 onEnrichFromEntry 上方注释）。 */}
+        {quickSourceDraftId && (
+          <div className="mx-auto max-w-3xl px-6 w-full mt-4">
+            <div className="border border-leaf/40 bg-leaf/5 rounded-xl p-5 text-center">
+              <p className="text-sm text-ink-soft leading-relaxed">
+                本条目的正文只有一张<strong>快速识别简介卡</strong>。可以让 AI
+                基于同一张照片撰写含形态特征、生境分布、植物人文、养护建议等分区的
+                <strong>完整科普</strong>。
+              </p>
+              {user ? (
+                <button
+                  onClick={onEnrichFromEntry}
+                  disabled={enrichBusy}
+                  className="mt-4 inline-flex items-center gap-2 bg-leaf-deep text-background px-6 py-2.5 text-sm font-semibold rounded-full hover:bg-leaf transition-colors disabled:opacity-60 cursor-pointer"
+                >
+                  {enrichBusy ? (
+                    <>
+                      <span className="w-4 h-4 rounded-full border-2 border-background/30 border-t-background animate-spin" />
+                      正在新建草稿…
+                    </>
+                  ) : (
+                    "另建草稿，生成完整科普"
+                  )}
+                </button>
+              ) : (
+                <Link
+                  to="/login"
+                  className="mt-4 inline-flex items-center gap-2 border border-leaf-deep text-leaf-deep px-6 py-2.5 text-sm font-semibold rounded-full hover:bg-leaf-deep hover:text-background transition-colors"
+                >
+                  登录后可生成（需 1 枚银叶）
+                </Link>
+              )}
+              <p className="mt-2 text-[11px] text-ink-faint leading-relaxed">
+                生成的是一份<strong>新的待审草稿</strong>（约 1–3 分钟，在服务器后台跑），
+                <strong>本页不会被改动</strong>；写好后由编辑决定单独收录，还是并入本条目。
+                消耗 1 枚银叶，编辑免。
+              </p>
+            </div>
+          </div>
+        )}
         <div className="mx-auto max-w-3xl px-6 w-full">
           {/* 封面图不在此重复展示——编辑封面请用条目右上角「编辑 →」。 */}
           {attributionFooter}
@@ -927,8 +1007,10 @@ function PlantDetail() {
           />
           <PlantComments plantId={plant.id} />
         </div>
-        {/* 小P蛙 — 编辑登录后可对该已发布页提问并改写（标注范围或整页），保存上线并记入修改记录 */}
-        {canEdit && (
+        {/* 小P蛙 — 编辑登录后可对该已发布页提问并改写（标注范围或整页），保存上线并记入修改记录。
+            门槛是 canCurate 而不是 canEdit：这句注释从最早就写着「编辑登录后」，可 canEdit
+            里根本没有「编辑」角色，纯编辑连面板都看不到（2026-08-10 修）。 */}
+        {canCurate && (
           <XiaoPAgentPanel
             storageKey={`plant:${plant.id}`}
             greetingTitle={plant.title}
@@ -948,6 +1030,7 @@ function PlantDetail() {
           <ReplaceImageFlow
             html={rawHtml}
             initialQuery={xiaopImg.query}
+            initialUrl={firstImageUrlIn(xiaopImg.instruction)}
             uploadPathPrefix={`plants/xiaop/${plant.id}`}
             onClose={() => setXiaopImg(null)}
             onDone={async (newHtml, oldUrl, newUrl) => {
@@ -962,6 +1045,7 @@ function PlantDetail() {
                   newHtml,
                   prevHtml,
                   `小P蛙换图（${ctx?.instruction || "手动"}）：${oldUrl} → ${newUrl}`,
+                  "image",
                 );
                 toast.success("配图已替换并保存");
               } catch (e) {

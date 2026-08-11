@@ -1335,12 +1335,16 @@ export async function searchPlantImages(term: string, limit = 3): Promise<PlantI
 
 export function ImageSearchDialog({
   initialQuery,
+  initialUrl,
   onClose,
   onPick,
   nameChips,
   onUploadFile,
 }: {
   initialQuery: string;
+  /** 预填在「或粘贴图片地址」里的 URL —— 编辑在对话里已经给出地址时（小P蛙那条路）
+   *  就不该让他再复制粘贴一次。 */
+  initialUrl?: string;
   onClose: () => void;
   onPick: (url: string, title: string, source: ImgSource) => void;
   /** Optional one-tap quick-fill chips (e.g. Latin / English / Chinese names). */
@@ -1355,8 +1359,27 @@ export function ImageSearchDialog({
   const [loading, setLoading] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const [urlInput, setUrlInput] = useState(initialUrl ?? "");
+  const [urlErr, setUrlErr] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+
+  /** 「使用此地址」：只挡明显不是 http(s) 的输入，不去猜后缀 —— iNaturalist / 维基的
+   *  很多图片地址并不以 .jpg 结尾，按后缀拦会把正经图挡在外面。 */
+  const applyPastedUrl = () => {
+    const u = urlInput.trim();
+    if (!u) return setUrlErr("请先粘贴图片地址");
+    let parsed: URL;
+    try {
+      parsed = new URL(u);
+    } catch {
+      return setUrlErr("这不是一个有效的网址，请粘贴以 http:// 或 https:// 开头的图片地址");
+    }
+    if (!/^https?:$/.test(parsed.protocol))
+      return setUrlErr("只支持 http:// 或 https:// 开头的图片地址");
+    setUrlErr(null);
+    onPick(u, "粘贴的图片地址", source);
+  };
 
   const handleFile = async (f: File | undefined | null) => {
     if (!f || !onUploadFile) return;
@@ -1506,6 +1529,34 @@ export function ImageSearchDialog({
               ))}
             </div>
           )}
+          {/* 直接粘一个图片地址。搜图搜不到、或已经在别处挑好了图（小P蛙给的、
+              iNaturalist 页面上复制的）时，这是唯一一条不用先上传就能用的路 ——
+              从前只有「搜」和「传」两种，手里攥着 URL 的人无处可去。 */}
+          <div className="flex gap-2">
+            <input
+              value={urlInput}
+              onChange={(e) => {
+                setUrlInput(e.target.value);
+                setUrlErr(null);
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  applyPastedUrl();
+                }
+              }}
+              placeholder="或粘贴图片地址：https://…jpg / .png / .webp"
+              className="flex-1 border border-rule px-3 py-2 text-sm bg-background"
+            />
+            <button
+              type="button"
+              onClick={applyPastedUrl}
+              className="border border-leaf text-leaf-deep px-4 py-2 text-sm hover:bg-leaf hover:text-background transition-colors"
+            >
+              使用此地址
+            </button>
+          </div>
+          {urlErr && <p className="text-[11px] text-destructive">{urlErr}</p>}
           <p className="text-[11px] text-ink-faint">
             提示：建议一次只用<strong className="text-ink-soft">一类</strong>关键词（拉丁学名 /
             英文俗名 / 中文常用名）命中率更高。iNaturalist 适合物种照片（自动按学名匹配

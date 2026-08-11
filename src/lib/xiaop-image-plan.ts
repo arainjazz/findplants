@@ -586,3 +586,19 @@ export function summarizeChanges(changes: PlanChange[]): string {
     )
     .join("；");
 }
+
+/**
+ * 从一句话里摘出第一个图片地址。
+ *
+ * 编辑常常直接把地址丢给小P蛙（「把最后一张换成 https://…jpg」），模型照实把它写进
+ * `editInstruction`，而换图弹窗从前只会「搜」和「传」—— 那个地址就此掉在地上，编辑得
+ * 自己再复制一遍。摘出来预填进「或粘贴图片地址」，这条路才是通的。
+ *
+ * 只认 http(s)，并把中文标点/引号/句末括号这些常见的尾巴削掉。
+ */
+export function firstImageUrlIn(text: string | undefined | null): string | undefined {
+  if (!text) return undefined;
+  const m = text.match(/https?:\/\/[^\s"'<>）】」，。；]+/);
+  if (!m) return undefined;
+  return m[0].replace(/[.,;:!?、。，；)\]}】）]+$/, "") || undefined;
+}

@@ -130,6 +130,7 @@ export function XiaoPAgentPanel({
   imageSlots,
   storageKey,
   isRegistered = true,
+  applyBlockedHint,
   registerAsPageAgent = true,
 }: {
   greetingTitle?: string | null;
@@ -169,6 +170,15 @@ export function XiaoPAgentPanel({
   storageKey?: string;
   /** Logged-in? Guests can open the panel but every send returns GUEST_NOTICE. */
   isRegistered?: boolean;
+  /**
+   * `canApply` 为 false 时，按钮位置上摆的那句话。
+   *
+   * 默认是「登录为编辑后可一键应用」—— 而这句话只有在**真的没登录**时才成立。
+   * 已收录的草稿上 `canApply` 同样是 false（内容已经冻结，改它读者也看不到），
+   * 于是编辑本人明明登录着，却被告知去登录（2026-08-10 用户反馈）。宿主知道真实
+   * 原因是什么，就由宿主把话说清楚。
+   */
+  applyBlockedHint?: React.ReactNode;
   /**
    * 要不要向登记处声明「这一页自带小P蛙」。页面自带的那两只（草稿页 / 条目页）用默认的
    * true；**全站那只（TaskFeedLauncher）必须传 false** —— 它自己就是据此让位的那个，
@@ -781,7 +791,10 @@ export function XiaoPAgentPanel({
                         会让人在改不了的页面上白等一场，所以两种页面分开说。 */}
                     {canApply
                       ? "如果你发现内容什么问题我可以帮你调查，帮你修改（修改前会让你点「采纳并保存」）。"
-                      : "这一页上我能陪你读、帮你查、回答关于本页内容的问题。想让我动手改内容，请到植物条目页或草稿页找我。"}
+                      : // 宿主给了具体理由就照它说 —— 已收录的草稿页上，那句「请到草稿页找我」
+                        // 是对着正站在草稿页上的人说的，纯属废话。
+                        (applyBlockedHint ??
+                          "这一页上我能陪你读、帮你查、回答关于本页内容的问题。想让我动手改内容，请到植物条目页或草稿页找我。")}
                     如果你想使用你自己的智能模型，可以点击右下方的齿轮图标进行配置。
                     {canApply && "准确的换图操作请在输入框的下方进行。"}
                   </div>
@@ -891,7 +904,7 @@ export function XiaoPAgentPanel({
                             )
                           ) : (
                             <span className="text-[11px] text-ink-faint">
-                              登录为编辑后可一键执行
+                              {applyBlockedHint ?? "登录为编辑后可一键执行"}
                             </span>
                           )}
                         </div>
@@ -936,7 +949,7 @@ export function XiaoPAgentPanel({
                             )
                           ) : (
                             <span className="text-[11px] text-ink-faint">
-                              登录为编辑后可一键应用
+                              {applyBlockedHint ?? "登录为编辑后可一键应用"}
                             </span>
                           )}
                         </div>

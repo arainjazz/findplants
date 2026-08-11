@@ -31,8 +31,10 @@ import {
 //
 // 一类有好几份时（2026-08-09）：按钮不再直接把人带去其中某一份，而是**展开成一行一份的列表**。
 // 从前每类只给 `entries[0]` 一个入口、后缀却写着「共 2 份」（拂子茅 4 份内容只点得到 2 份），
-// 数字与入口对不上。每行带缩略图 + 已收录/草稿 + 作者 + 日期 + 拍摄地点 —— 同物种的几份多半
-// 是不同人在不同地点拍的，光有标题分辨不出谁是谁。
+// 数字与入口对不上。每行带缩略图 + 已收录/草稿 + 作者 + 时间 + 综合可信度 + 拍摄地点与坐标
+// —— 同物种的几份多半是不同人在不同地点拍的，光有标题分辨不出谁是谁；而地名的粒度全看
+// 识别当时反地理编码给到哪一级（从「陕西省榆林市定边县」到整条街的门牌都有），同一个区里的
+// 两株只有坐标分得开（用户 2026-08-11）。
 
 /**
  * 未收录的银叶科普草稿的**就地展开**视图。
@@ -192,19 +194,34 @@ function isInlineEntry(kind: SpeciesExistingKind, entry: SpeciesExistingEntry) {
   return kind === "silver" && !!entry.draftId;
 }
 
-/** 只显示到「日」—— 同物种的几份差着好几天，时分秒是噪音。 */
-function formatDay(iso: string | null) {
+/**
+ * 显示到「分」（用户 2026-08-11）。同一天同一个人连拍好几份是常事（一次外出、
+ * 一株植物补拍两三轮），只写到「日」时那几行连时间都一模一样，分不出先后。
+ */
+function formatWhen(iso: string | null) {
   if (!iso) return null;
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return null;
   const p = (n: number) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+/**
+ * 坐标。小数点后 4 位 ≈ 11 米，足够把同一片草地上的两株分开，再多就是噪音。
+ * 经纬缺一个就不显示 —— 服务端已经成对取过一次，这里是最后一道。
+ */
+function formatCoords(lat: number | null, lng: number | null) {
+  if (lat == null || lng == null) return null;
+  return `${lat.toFixed(4)}, ${lng.toFixed(4)}`;
 }
 
 /**
  * 「共 N 份」展开后的一行。
  *
- * 四样区分信息（用户 2026-08-09 选的）：缩略图、已收录/未收录草稿、作者+日期、拍摄地点。
+ * 区分信息：缩略图、已收录/未收录草稿、作者+时间、综合可信度（2026-08-09 选的四样，
+ * 时间那项 08-11 精确到「分」）＋ 拍摄地点、坐标（用户 2026-08-11 加的）。
+ * **分两行摆**：第一行是短的（状态·作者·时间·可信度），第二行让给会很长的地点 ——
+ * 挤成一行时地名一长，可信度就被 `truncate` 吃掉了，而那正是用来挑哪一份的关键数字。
  * 缩略图走 SafeImg —— 草稿照片被清理掉的情况真发生过（2026-07-13 那次），不能让列表里
  * 裂出一排碎图标。
  */
@@ -226,11 +243,13 @@ function SpeciesExistingEntryRow({
   const meta = [
     entry.published ? "已收录" : "未收录草稿",
     entry.author,
-    formatDay(entry.createdAt),
-    entry.place,
+    formatWhen(entry.createdAt),
+    // 借不到来源草稿的条目就是 null —— 不显示，绝不编一个数出来。
+    entry.confidencePct != null ? `可信度 ${entry.confidencePct}%` : null,
   ]
     .filter(Boolean)
     .join(" · ");
+  const where = [entry.place, formatCoords(entry.lat, entry.lng)].filter(Boolean).join(" · ");
 
   const base = `text-[12px] border px-2.5 py-2 rounded-sm transition-colors flex items-center gap-2.5 w-full text-left ${s.cls}`;
   const body = (
@@ -246,6 +265,7 @@ function SpeciesExistingEntryRow({
           {entry.title || fallbackTitle || "同物种内容"}
         </span>
         <span className="block truncate text-[11px] opacity-70">{meta}</span>
+        {where && <span className="block truncate text-[11px] opacity-60">{where}</span>}
       </span>
       {isInlineEntry(kind, entry) && <span aria-hidden>{inlineOpen ? "▲" : "▼"}</span>}
     </>

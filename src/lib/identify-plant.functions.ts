@@ -93,6 +93,7 @@ import {
   splitKeyPool,
   postOpenAICompat,
   postOpenAICompatStream,
+  offendingParams,
   THINKING_OFF,
   THINKING_ON,
   geminiThinkingConfig,
@@ -5343,6 +5344,36 @@ export type EnrichResult = {
 };
 
 /**
+ * 「进一步生成草稿」的银叶闸门：余额够不够、要不要收。
+ *
+ * 进一步草稿消耗 1 枚银叶（owner 无限）。这里**只校验**，真正扣叶在生成成功之后
+ * （runEnrichCore 末尾）—— 生成失败不该扣钱。银叶来自贡献积分，因此该步骤要求登录。
+ * 已通过申请的编辑（editor/admin 角色）免银叶：他们是审稿人，生成属工作职责。
+ *
+ * 单独抽出来是因为**已收录条目那条路要在派生新草稿之前先问一次**（见
+ * resolveEnrichTarget）—— 先派生再发现叶子不够，库里就白白多出一行没人要的空草稿。
+ */
+async function enrichSilverGate(userId: string, email: string | null) {
+  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+  const leaves = await serverLeafBalance(userId, email);
+  const { data: roleRows } = await supabaseAdmin
+    .from("user_roles")
+    .select("role")
+    .eq("user_id", userId);
+  const isEditorUser = (roleRows ?? []).some(
+    (r: { role: string }) => r.role === "editor" || r.role === "admin",
+  );
+  const silverExempt = leaves.isOwner || isEditorUser;
+  if (!silverExempt && leaves.silverAvailable < 1) {
+    throw new AiError(
+      "SILVER_INSUFFICIENT",
+      `生成失败（SILVER_INSUFFICIENT）：生成进一步草稿需消耗 1 枚银叶，你当前可用银叶为 0（已获得 ${leaves.silver} 枚，已用 ${leaves.silverUsed} 枚）。每 10 枚铜叶兑 1 枚银叶——多识别、多修文换图即可累积。（通过申请成为编辑后，此操作免银叶。）`,
+    );
+  }
+  return { leaves, silverExempt };
+}
+
+/**
  * 「进一步生成草稿」的**快速前置校验**：草稿在不在、是否已收录、有没有原图、银叶够不够。
  * 全是几十毫秒的库查询，所以放在前台请求里同步做 —— 用户点下去立刻知道能不能干，
  * 而不是等一个后台任务两秒后失败。真正的重活在 runEnrichCore 里。
@@ -5371,24 +5402,7 @@ async function enrichPreflight(draftId: string, userId: string, email: string | 
   if (draft.ai_payload?._enriched)
     return { alreadyEnriched: true as const, draft, leaves: null, silverExempt: false };
 
-  // 进一步草稿消耗 1 枚银叶（owner 无限）。先校验余额；真正扣叶放在生成成功之后，
-  // 避免生成失败仍扣叶。银叶来自贡献积分，因此该步骤要求登录。
-  // 已通过申请的编辑（editor/admin 角色）免银叶——他们是审稿人，生成属工作职责。
-  const leaves = await serverLeafBalance(userId, email);
-  const { data: roleRows } = await supabaseAdmin
-    .from("user_roles")
-    .select("role")
-    .eq("user_id", userId);
-  const isEditorUser = (roleRows ?? []).some(
-    (r: { role: string }) => r.role === "editor" || r.role === "admin",
-  );
-  const silverExempt = leaves.isOwner || isEditorUser;
-  if (!silverExempt && leaves.silverAvailable < 1) {
-    throw new AiError(
-      "SILVER_INSUFFICIENT",
-      `生成失败（SILVER_INSUFFICIENT）：生成进一步草稿需消耗 1 枚银叶，你当前可用银叶为 0（已获得 ${leaves.silver} 枚，已用 ${leaves.silverUsed} 枚）。每 10 枚铜叶兑 1 枚银叶——多识别、多修文换图即可累积。（通过申请成为编辑后，此操作免银叶。）`,
-    );
-  }
+  const { leaves, silverExempt } = await enrichSilverGate(userId, email);
 
   if (!draft.photo_url)
     throw new AiError(
@@ -5400,6 +5414,139 @@ async function enrichPreflight(draftId: string, userId: string, email: string | 
 }
 
 type EnrichPreflight = Awaited<ReturnType<typeof enrichPreflight>>;
+
+/** 派生副本在 ai_payload 里留的记号：来源草稿 / 那份草稿收录成的条目。 */
+const ENRICH_FORK_SOURCE = "_enrich_source_draft_id";
+const ENRICH_FORK_PLANT = "_enrich_source_plant_id";
+
+/**
+ * 决定这次「进一步生成」写到哪一份草稿上。
+ *
+ * 未收录的草稿：就地写回，与从前完全一样，返回的还是它自己。
+ *
+ * **已收录的快速简介卡**：不能就地重写 —— 它的内容已经定稿成了线上条目（草稿页的小P蛙
+ * 也是这么拦的），所以从前这里直接抛 DRAFT_ALREADY_APPROVED。代价是「采纳快速卡」之后
+ * 这个物种就再没有生成银叶科普的入口，连带金叶详页（要求 `_enriched`）一起断掉
+ * （2026-08-10 用户反馈）。现在改为**派生一份新的待审草稿**：照片、地点、定名、定名
+ * 复核痕迹全部继承，status 回到 pending，与线上那一页零接触。生成完它就是一份普通银叶
+ * 草稿，编辑照旧「采纳收录」或「并入已有条目」。
+ *
+ * 连点两次不会长出两份：上一次派生的副本只要还没生成正文，就直接复用。
+ */
+async function resolveEnrichTarget(
+  sourceDraftId: string,
+  userId: string,
+  email: string | null,
+): Promise<{ draftId: string; forkedFrom: string | null }> {
+  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+
+  const { data: srcRow } = await supabaseAdmin
+    .from("plant_drafts")
+    .select("*")
+    .eq("id", sourceDraftId)
+    .maybeSingle();
+  const src = srcRow as any;
+  if (!src)
+    throw new AiError(
+      "DRAFT_NOT_FOUND",
+      "生成失败（DRAFT_NOT_FOUND）：找不到这份草稿，可能已被删除。",
+    );
+  // 没收录的一律走老路（含被驳回的：那条路从前就通，不在这次改动范围内）。
+  if (src.status !== "approved") return { draftId: sourceDraftId, forkedFrom: null };
+
+  const payload = (src.ai_payload ?? {}) as Record<string, unknown>;
+  // 已收录的**银叶草稿**不派生：它已经有成篇正文，再生成一份只是拿银叶换重复内容。
+  // 要改那一份的内容，去条目页找小P蛙（草稿页的 applyBlockedHint 就是这么指路的）。
+  if (payload._enriched !== false)
+    throw new AiError(
+      "DRAFT_ALREADY_APPROVED",
+      "生成失败（DRAFT_ALREADY_APPROVED）：这份草稿已通过审核并收录，内容就此定稿。要改动请到它的条目页找小P蛙。",
+    );
+  if (!src.photo_url)
+    throw new AiError(
+      "DRAFT_NO_PHOTO",
+      "生成失败（DRAFT_NO_PHOTO）：这份草稿没有原图，无法重新送 AI 生成。请重新拍照识别。",
+    );
+
+  // 上一次派生留下的、还没生成正文的副本 → 复用（防连点、防库里堆空草稿）。
+  // JSON 列筛选在个别 PostgREST 版本上会报错，查不动就当作没有、往下新建一份。
+  try {
+    const { data: reusable } = await (supabaseAdmin as any)
+      .from("plant_drafts")
+      .select("id")
+      .eq(`ai_payload->>${ENRICH_FORK_SOURCE}`, sourceDraftId)
+      .eq("ai_payload->>_enriched", "false")
+      .eq("status", "pending")
+      .order("created_at", { ascending: false })
+      .limit(1);
+    if (reusable?.length) {
+      console.log(`[EnrichFork] reusing pending fork ${reusable[0].id} of ${sourceDraftId}`);
+      return { draftId: reusable[0].id as string, forkedFrom: sourceDraftId };
+    }
+  } catch (e) {
+    console.warn("[EnrichFork] reuse lookup failed (json filter unsupported?):", e);
+  }
+
+  // 叶子在**建行之前**问 —— 顺序颠倒就会给余额不足的用户白留一行空草稿。
+  await enrichSilverGate(userId, email);
+
+  const forkPayload = JSON.parse(
+    JSON.stringify({
+      ...payload,
+      _enriched: false,
+      [ENRICH_FORK_SOURCE]: sourceDraftId,
+      [ENRICH_FORK_PLANT]: src.published_plant_id ?? null,
+      _enrich_forked_at: new Date().toISOString(),
+      _enrich_forked_by: userId,
+    }),
+  );
+
+  const { data: forked, error: forkErr } = await (supabaseAdmin as any)
+    .from("plant_drafts")
+    .insert({
+      // 观测本身没变，全部继承：照片、地点、定名，以及采纳时写下的诊断意见 /
+      // 小P蛙定名复核痕迹（都在 ai_payload 里）—— 新草稿因此不会又变回「疑似」。
+      photo_url: src.photo_url,
+      user_photos: src.user_photos ?? [src.photo_url],
+      capture_lat: src.capture_lat ?? null,
+      capture_lng: src.capture_lng ?? null,
+      capture_place: src.capture_place ?? "",
+      ai_model: src.ai_model ?? null,
+      ai_payload: forkPayload,
+      title: src.title,
+      scientific_name: src.scientific_name ?? null,
+      common_name_en: src.common_name_en ?? null,
+      common_names_zh: src.common_names_zh ?? null,
+      family: src.family ?? null,
+      genus: src.genus ?? null,
+      summary: src.summary ?? null,
+      tags: src.tags ?? [],
+      iucn_status: src.iucn_status ?? null,
+      is_invasive: src.is_invasive ?? false,
+      gbif_taxon_key: src.gbif_taxon_key ?? null,
+      html_content: src.html_content ?? "",
+      // 发现者仍是当初拍照的人（铜叶归属、贡献表都按它算）；花掉这枚银叶的人由
+      // runEnrichCore 记进 `_enriched_by`，两者本来就分开列。
+      created_by: src.created_by ?? null,
+      creator_label: src.creator_label,
+      // 补拍次数不继承：新草稿有它自己的 3 次纠错机会。
+      retake_count: 0,
+      status: "pending",
+      // 生成成功那一刻才进待审队列（runEnrichCore 置 true）。中途失败只留下一份
+      // 没提交的私有草稿，不会污染审核列表。
+      submitted_for_review: false,
+    })
+    .select("id")
+    .single();
+  if (forkErr || !forked)
+    throw new AiError(
+      "DRAFT_FORK_FAILED",
+      `生成失败（DRAFT_FORK_FAILED）：无法为已收录的简介卡新建草稿。原因：${forkErr?.message ?? "未知"}。`,
+    );
+
+  console.log(`[EnrichFork] ${sourceDraftId}（已收录）→ 新草稿 ${forked.id}`);
+  return { draftId: forked.id as string, forkedFrom: sourceDraftId };
+}
 
 /**
  * 「进一步生成草稿」的重活：取原图 → 联网调研 → 长文生成 → 写回 → 记账 → 扣叶。
@@ -5700,18 +5847,27 @@ export const startEnrichDraftFn = createServerFn({ method: "POST" })
     const { keepAlive } = await import("./worker-ctx");
     const { enqueueJob } = await import("./job-queue");
 
+    // 已收录的快速简介卡不能就地重写，先派生一份新的待审草稿；其余情况原样返回自己。
+    // **必须在建任务之前**：任务行、动态流、前端轮询作用域都得认准最终那一份草稿，
+    // 而消费者侧重跑 preflight 时看到的也是它（pending，于是不会再派生一次）。
+    const { draftId: targetId, forkedFrom } = await resolveEnrichTarget(
+      data.draft_id,
+      userId,
+      email,
+    );
+
     // 这里先跑一次前置校验，是为了让「叶子不够」「已经生成过」这类问题**当场**报给用户，
     // 而不是排进队列、三十秒后才在轮询里冒出来。消费者会再跑一次（见 runQueuedJob）。
-    const pre = await enrichPreflight(data.draft_id, userId, email);
+    const pre = await enrichPreflight(targetId, userId, email);
     if (pre.alreadyEnriched) {
-      return { alreadyEnriched: true as const, jobId: null, draftId: data.draft_id };
+      return { alreadyEnriched: true as const, jobId: null, draftId: targetId, forkedFrom };
     }
 
     void pruneExpiredJobs();
     const job = await createJob({
       kind: "enrich_draft",
       userId,
-      draftId: data.draft_id,
+      draftId: targetId,
       phase: "已排队，正在启动…",
       // 队列消息里只放 jobId，真实入参存这儿（见 job-queue.ts 的说明）。
       payload: { email },
@@ -5719,13 +5875,13 @@ export const startEnrichDraftFn = createServerFn({ method: "POST" })
 
     // 一入队就进动态流 —— 用户点完就可以切走，小P蛙上立刻能看到这条在跑。
     // 等第一个 onPhase 才落地会留一段「点了没反应」的空窗（冷启动可达几十秒）。
-    await feedStart(userId, "enrich_draft", data.draft_id, job.id);
+    await feedStart(userId, "enrich_draft", targetId, job.id);
 
     // 正路：交给 Queues（消费者有 15 分钟）。绑定不可用时（本地 dev / 队列没建）
     // 才退回 waitUntil —— 那条路只有约 26 秒，冷启动多半跑不完，但总比什么都不做强。
     if (!(await enqueueJob(job.id))) keepAlive(runQueuedJob(job.id));
 
-    return { alreadyEnriched: false as const, jobId: job.id, draftId: data.draft_id };
+    return { alreadyEnriched: false as const, jobId: job.id, draftId: targetId, forkedFrom };
   });
 
 /**
@@ -7829,17 +7985,27 @@ async function openaiCompatChat(
   // NOTE: deliberately DO NOT send response_format:json_object — some relays /
   // reasoning models return an EMPTY reply when it's set. We instruct JSON in the
   // system prompt + cleanJson() instead.
-  const buildBody = (useImages: boolean): Record<string, unknown> => ({
-    model,
-    messages: buildMessages(useImages),
-    max_tokens: 16000,
-    // 小P蛙默认关思考：它要么在跟用户对话（要跟手），要么在做配图器官打标签
-    // （机械活）。两种都不吃思维链，却都会被它拖到 2 分钟超时那条分支上。
-    ...thinkingParams({ thinking }),
-  });
+  // `dropParams` = 上游已经明确 400 拒收过的可调参数，这一发要把它们摘掉（见下面
+  // 「拒收参数」那段的背景）。默认空数组 = 照常全发。
+  const buildBody = (useImages: boolean, dropParams: readonly string[] = []): Record<string, unknown> => {
+    const body: Record<string, unknown> = {
+      model,
+      messages: buildMessages(useImages),
+      max_tokens: 16000,
+      // 小P蛙默认关思考：它要么在跟用户对话（要跟手），要么在做配图器官打标签
+      // （机械活）。两种都不吃思维链，却都会被它拖到 2 分钟超时那条分支上。
+      ...thinkingParams({ thinking }),
+    };
+    for (const p of dropParams) delete body[p];
+    return body;
+  };
 
-  const send = async (useImages: boolean, key: string): Promise<Response> => {
-    const body = buildBody(useImages);
+  const send = async (
+    useImages: boolean,
+    key: string,
+    dropParams: readonly string[] = [],
+  ): Promise<Response> => {
+    const body = buildBody(useImages, dropParams);
     let lastErr: unknown = null;
     for (let attempt = 0; attempt < 2; attempt++) {
       const controller = new AbortController();
@@ -7881,6 +8047,8 @@ async function openaiCompatChat(
   let usedKey = keyPool[0];
   /** 最后一次实际发出去时带没带图 —— 下面的流式重发要照着同一份 body 重来。 */
   let sentImages = !!images?.length;
+  /** 已被上游 400 拒收、后续每一发都要继续摘掉的可调参数 —— 同样要带进流式重发。 */
+  let droppedParams: string[] = [];
   let resp = await send(sentImages, usedKey);
   for (let i = 1; i < keyPool.length && !resp.ok && keyRejected(resp.status); i++) {
     usedKey = keyPool[i];
@@ -7906,7 +8074,35 @@ async function openaiCompatChat(
         `[openaiCompatChat] ${model} 拒收图片，已**去掉图**重发一次 —— 本次回答没有看到任何图片。`,
       );
       sentImages = false;
-      resp = await send(false, usedKey);
+      resp = await send(false, usedKey, droppedParams);
+    }
+  }
+
+  // ── 400 + 点名了我们发出去的某个可调参数 → 摘掉它重发一次 ────────────────────
+  //
+  // 线上实例（2026-08-10，小P蛙序列 2 配 `z-ai/glm-5.2`）：
+  //   `Validation: Unsupported parameter(s): \`enable_thinking\``
+  // 根因是 buildBody 无条件展开 thinkingParams()，把「关思考」三件套一起发出去
+  // （enable_thinking / reasoning_effort / thinking），而这家只认后两个。
+  //
+  // ai-key-pool.ts 里本来就有这套自愈 —— offendingParams 从 400 文本里认出是我们发的
+  // 哪个可调参数惹的祸、摘掉重试一次，TUNABLE_PARAMS 也早就收录了 enable_thinking。
+  // 只是**这条链路走的是裸 fetch，从没接上它**（postOpenAICompat 那条路才有）。
+  //
+  // 不接的代价远不止「这一项失败」：参数类 400 既不属于 SLOT_SPECIFIC_400 也不属于
+  // CAPABILITY_400，于是 shouldFailOver 判它「不可降级」→ 整个序列**提前停在这一项**，
+  // 后面的备胎一个都轮不上。用户看到的正是「已依次尝试 2 / 3 个序列（已停止顺位）」。
+  //
+  // 放在图片重试**之后**：两者的匹配面互不重叠（图片那条认 image_url/vision 等字样，
+  // 这条只认 TUNABLE_PARAMS 里的参数名），谁先谁后都不会互相吃掉，但图片问题更常见，
+  // 让它先走可以少构造一次 body。
+  if (resp.status === 400) {
+    const t = await resp.clone().text();
+    const drop = offendingParams(t, buildBody(sentImages, droppedParams));
+    if (drop.length) {
+      console.warn(`[openaiCompatChat] ${model} 拒收参数 ${drop.join("、")}，已摘掉重发`);
+      droppedParams = drop;
+      resp = await send(sentImages, usedKey, droppedParams);
     }
   }
 
@@ -7938,9 +8134,10 @@ async function openaiCompatChat(
     const timer = setTimeout(() => ctrl.abort(), timeoutMs);
     try {
       const streamed = await postOpenAICompatStream(
+        // 带上 droppedParams：上游已经 400 拒过的参数，流式这一发再塞回去照样会被拒。
         `${apiBase}/chat/completions`,
         usedKey,
-        buildBody(sentImages),
+        buildBody(sentImages, droppedParams),
         { signal: ctrl.signal },
       );
       if (streamed.ok) resp = streamed;
@@ -8972,6 +9169,19 @@ const AskPageAgentInput = z.object({
     .array(z.object({ role: z.enum(["user", "assistant"]), text: z.string() }))
     .max(24)
     .optional(),
+  /**
+   * 页面上**看得见的照片**。这条通道从前根本不存在 —— 全站那只小P蛙只收到一段
+   * DOM 文本，于是在识别页上被问「这三张图是什么」时只能老实说「我看不到您上传的
+   * 照片」（2026-08-10 用户反馈）。分两路是因为来源不同：
+   *   · `imageUrls`   —— 页面上 http(s) 的图，服务端自己去抓（不受浏览器 CORS 限制）；
+   *   · `inlineImages`—— `blob:` / `data:` 的图（识别页刚拍/刚选的原图就是 blob:），
+   *      服务端拿到那个 URL 也取不到东西，只能由客户端压完转 base64 送上来。
+   */
+  imageUrls: z.array(z.string().url()).max(4).optional(),
+  inlineImages: z
+    .array(z.object({ mimeType: z.string().max(60), base64: z.string().max(4_000_000) }))
+    .max(4)
+    .optional(),
   userModel: UserModelInput,
 });
 
@@ -8985,9 +9195,20 @@ export const askPageAgentFn = createServerFn({ method: "POST" })
   .inputValidator((input) => AskPageAgentInput.parse(input))
   .handler(async ({ data }) => {
     const where = data.pageTitle ? `${data.pageTitle}（${data.path}）` : data.path;
+    // 页面上的图：http(s) 的由服务端抓，blob:/data: 的由客户端压好送来。按「先页面顺序、
+    // 后客户端内联」拼，再统一截到 4 张 —— 每一张都要进 prompt，多了纯烧钱。
+    const pagePhotos = [
+      ...(await fetchInlineImages(data.imageUrls ?? [])),
+      ...(data.inlineImages ?? []),
+    ].slice(0, 4);
     const system = `你是「小P蛙」，Plantspedia（鄂尔多斯植物百科）的双语助手，正在陪用户看站内的一个页面：${where}。
 职责：
 - 用【中文】回答用户关于**这一页内容**的问题；页面文本没写到的，可以用植物学常识补充，但要说清哪些是页面上的、哪些是你的补充；不确定就如实说，不要编造。
+- ${
+      pagePhotos.length
+        ? `本条消息附带了这一页上**用户看得见的照片**，共 ${pagePhotos.length} 张（按页面里出现的先后顺序）。用户问「这（几）张图是什么 / 帮我看看这张 / 比对一下」时，**就是在说这些照片**：请逐张按叶形叶序、茎、花序花色、果实、生境等可见特征描述与判断，不要再说"我看不到你上传的照片、请你展示给我"。看不清或特征不足以定种时，说清缺哪一类特写（如叶背、花的正面、果实）。`
+        : "（这一页没有可读取的照片，若用户在问某张图，请说明你这一轮没有拿到图，请他把图所在的页面滚动到可见处再问一次）"
+    }
 - 用户问的若是「这个网站怎么用 / 这一页是干什么的」，就依据页面文本解释；站内有一页专门讲这些，可以请他看导航栏的「关于 about」。
 ${NO_MODEL_DISCLOSURE.trimEnd()}
 - 如果用户想**修改内容**：站内可直接改的只有两种页面 —— 植物条目详情页（/plants/…）和草稿页（/drafts/…）。请告诉他去那一页找小P蛙，那里的我能改写并保存。其余页面（识别页、名录、探索页等）属于站点功能界面，我改不了，别答应做不到的事。
@@ -9043,6 +9264,7 @@ ${NO_MODEL_DISCLOSURE.trimEnd()}
       contents,
       system,
       schema,
+      images: pagePhotos.length ? pagePhotos : undefined,
       overrideSequence: toOverrideSlots(data.userModel),
     });
     await logChatUsage(ans, { draftTitle: data.pageTitle ?? data.path, label: "小P对话（页面）" });
@@ -9231,6 +9453,99 @@ ${htmlShapeRule(fullDoc)}
       overrideSequence: toOverrideSlots(data.userModel),
     });
     return { html: normalizeRewrittenHtml(txt, fullDoc), oldHtml: original };
+  });
+
+// ─── 已发布条目：写回整页 HTML（编辑权限在服务端判定） ────────────────────────
+//
+// 为什么非要一个服务端函数不可：条目页从前是**浏览器直写**（storage 上传 →
+// `plants.update({html_url})` → `plant_edits.insert`），而 `plants` 的 UPDATE 策略是
+//   (auth.uid() = author_id AND is_approved_editor) OR has_role(admin)
+// —— 「编辑」这个角色本身根本不在里面。于是站里除站长/作者以外的编辑，小P蛙
+// 在已发布条目上**永远保存失败**（2026-08-10 用户报的「以编辑身份登录还是受限」）。
+// 顺带修掉一个静默故障：旧代码写的 `kind: "ai_page_edit"` 不在 plant_edits.kind 的
+// CHECK 白名单里，那条 insert 一直被库拒收且返回值没人看 —— 小P蛙在条目页改过的每
+// 一笔都没进「修改记录」，也就无从撤销。这里改用库里确实存在的 html_save / image。
+const SavePlantHtmlInput = z.object({
+  plantId: z.string().uuid(),
+  html: z.string().min(50).max(2_000_000),
+  summary: z.string().max(500),
+  /** 改动前的整页 HTML —— 「修改记录」里那条「撤销」全靠它。 */
+  beforeHtml: z.string().max(2_000_000).optional(),
+  /** 只收 plant_edits.kind 白名单里确实存在的值（见上）。 */
+  kind: z.enum(["html_save", "image"]).optional(),
+  /** 撤销时置 true：不再新记一条流水，只把被撤的那条标记成已撤销。 */
+  revertOfEditId: z.string().uuid().optional(),
+});
+
+export const savePlantHtmlFn = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input) => SavePlantHtmlInput.parse(input))
+  .handler(async ({ data, context }) => {
+    const { supabase, userId } = context;
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+
+    const { data: roles } = await supabase.from("user_roles").select("role").eq("user_id", userId);
+    const isEditor = roles?.some((r) => r.role === "editor" || r.role === "admin") ?? false;
+    const { data: plant } = await supabaseAdmin
+      .from("plants")
+      .select("id,author_id,co_author_ids")
+      .eq("id", data.plantId)
+      .maybeSingle();
+    if (!plant) throw new Error("条目不存在");
+    const isOwner =
+      plant.author_id === userId ||
+      (((plant as { co_author_ids?: string[] | null }).co_author_ids ?? []) as string[]).includes(
+        userId,
+      );
+    if (!isEditor && !isOwner) throw new Error("只有编辑或本条目的作者可以修改这一页");
+
+    const path = `${userId}/xiaop-${Date.now()}.html`;
+    const { error: upErr } = await supabaseAdmin.storage
+      .from("plant-html")
+      .upload(path, Buffer.from(data.html, "utf8"), {
+        cacheControl: "3600",
+        upsert: false,
+        contentType: "text/html",
+      });
+    if (upErr) throw new Error(`保存失败：${upErr.message}`);
+    const url = supabaseAdmin.storage.from("plant-html").getPublicUrl(path).data.publicUrl;
+
+    const { error: updErr } = await supabaseAdmin
+      .from("plants")
+      .update({ html_url: url })
+      .eq("id", data.plantId);
+    if (updErr) throw new Error(`保存失败：${updErr.message}`);
+
+    // 撤销：不新记流水，只把原来那条翻成 reverted。
+    if (data.revertOfEditId) {
+      await supabaseAdmin
+        .from("plant_edits")
+        .update({ reverted: true, reverted_by: userId, reverted_at: new Date().toISOString() })
+        .eq("id", data.revertOfEditId);
+      return { url, logged: true };
+    }
+
+    let editorName = "编辑";
+    const { data: prof } = await supabaseAdmin
+      .from("profiles")
+      .select("display_name")
+      .eq("id", userId)
+      .maybeSingle();
+    if (prof?.display_name) editorName = prof.display_name;
+
+    // 记不上流水不该把已经保存成功的改动判成失败 —— 照实回报 logged。
+    const { error: logErr } = await supabaseAdmin.from("plant_edits").insert({
+      plant_id: data.plantId,
+      editor_id: userId,
+      editor_name: editorName,
+      kind: data.kind ?? "html_save",
+      marker_n: 0,
+      source: "xiaop_agent",
+      summary: data.summary.slice(0, 500),
+      before_html: data.beforeHtml ?? null,
+      after_html: data.html,
+    });
+    return { url, logged: !logErr };
   });
 
 // ─── Admin: 小P model config CRUD (key `xiaop_model_config`) ─────────────────

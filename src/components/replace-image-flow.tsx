@@ -14,6 +14,7 @@ import { compressImage, extForMime } from "@/lib/image-compress";
 export function ReplaceImageFlow({
   html,
   initialQuery,
+  initialUrl,
   uploadPathPrefix,
   onDone,
   onClose,
@@ -22,6 +23,8 @@ export function ReplaceImageFlow({
   html: string;
   /** 搜图框预填词（一般为拉丁学名）。 */
   initialQuery: string;
+  /** 「或粘贴图片地址」预填 —— 编辑在对话里已经把地址给小P蛙了（宿主从指令里摘出来）。 */
+  initialUrl?: string;
   /** 本地上传落库路径前缀，如 `drafts/xiaop/<id>`；存 plant-images 桶。 */
   uploadPathPrefix: string;
   /** 替换完成：newHtml 为替换后的整页 HTML；old/new 供记日志。 */
@@ -87,6 +90,7 @@ export function ReplaceImageFlow({
     return (
       <ImageSearchDialog
         initialQuery={initialQuery}
+        initialUrl={initialUrl}
         onClose={onClose}
         onUploadFile={uploadFile}
         onPick={(url) => {

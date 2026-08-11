@@ -1,6 +1,80 @@
 # Plantspedia — Working State  (single source of truth)
 
-_Last updated: 2026-08-09（续五）— by Claude（**修：「← 返回 #标签 名单」显示的是 slug 乱码**。
+_Last updated: 2026-08-11（续二）— by Claude（**接上被打断的活：同物种「共 N 份」列表每行
+补上拍摄坐标与综合可信度，时间精确到「分」**。工作树里躺着半截 —— 上一段（并入判据）把
+`SpeciesExistingEntry` 的 `lat/lng/confidencePct` 和查询字段都加好了，`Raw`/`entries` 两处没跟上，
+**`tsc` 是红的**；本轮补完并接上前端。为什么要：`capture_place` 的粒度全看识别当时反地理编码
+给到哪一级，猪毛蒿那 4 行地点**一模一样**（都是「内蒙古自治区康巴什区」）、作者也都是吉木，
+根本挑不出该点哪一份。服务端新增 `confidenceOf()`，**与草稿页逐参数同源**（老草稿最小痕迹兜底
++ 传整份 meta + `tentativeResolution`），条目行只向**真来源草稿**借地点/坐标/可信度，经纬成对认；
+前端 `formatWhen`（到分）+ `formatCoords`（4 位小数 ≈ 11m），行**分两行**摆 —— 挤一行时地名一长，
+`truncate` 先吃掉的正是可信度。已验：那 4 行靠 39.6441/39.6445/39.6448 与 90%/45% 才分得开、
+三份 07-17 的时间从「同一天」变成 09:39/09:40/09:43；**可信度与草稿页逐份对上**（90%/45%）；
+拂子茅「已收录」那行成功借到 84% 与坐标；猪毛蒿橙框「skill 科普详页」入口已回来。
+tsc=0、build 过、两个改动文件 ESLint 与基线逐条一致。⚠️ 排版是用 `getBoundingClientRect`
+量的（行高 76px、950px 零截断、按 375px 折算两行 224/195px < 277px 可用宽），**没拿到视觉截图**
+—— Browser pane 中途被收走（滚动锁死、`computer` 超时）。
+✅ **本轮连同积压的 08-10 fork、08-11 参数自愈、并入判据一起提交**；⚠️ **未部署**，
+线上仍是 `81a71e8f`（不含本轮与并入判据两节）。详见文末本轮小节。）_
+_上一轮：2026-08-11 — by Claude（**✅ 部署终于成功：线上 `80a4e260` → `81a71e8f`**。
+连续卡了 3 次的 `wrangler deploy` 用记忆里那招一条命令过了：
+`env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy ./node_modules/.bin/wrangler deploy`
+（中途 asset upload 自动重试了 1 次，总耗时约 4 分钟）。**08-09 那四组 + 08-10 的 fork 派生
+新草稿，全部随本次一并上线** —— build 打包整个工作树，那些改动至今仍未 commit。
+已验线上：`/` 与 `www` 均 200、`/identify` 200、`/plants` 307（自带带参重定向）。
+**⚠️ 仍未提交**：10 个已改文件 + 未跟踪的 `mcp/`，线上跑的是未入库的代码，建议尽快 commit。
+
+**本轮主修：小P蛙「模型都不正常」—— 参数类 400 会打死整个优先调用序列**。
+用户报错：序列 1 `custom qwen3.7-max` 回 `Unexpected item type`，序列 2 `z-ai/glm-5.2` 回
+`Validation: Unsupported parameter(s): ` + "`enable_thinking`" + ``，然后「已停止顺位」，序列 3 一次没试。
+两条其实是两个独立问题，**只有序列 2 是 bug**：qwen3.7-max 是纯文本模型、收到图必拒，
+`CAPABILITY_400` 早已正确让它顺位（代码注释里记着 2026-07-26 同一案例）；真正的缺陷是
+`openaiCompatChat`（identify-plant.functions.ts）**走裸 `fetch()`，从没接上 ai-key-pool.ts 里
+那套参数自愈**（`offendingParams` + `postOpenAICompat`：从 400 文本认出是我们发的哪个可调
+参数惹的祸、摘掉重试一次，`TUNABLE_PARAMS` 早就收录了 `enable_thinking`）。而 `buildBody`
+无条件展开 `thinkingParams()` 把「关思考」三件套一起发出去，glm 只认后两个 → 400。
+代价不止这一项失败：参数类 400 既不属 `SLOT_SPECIFIC_400` 也不属 `CAPABILITY_400`，
+`shouldFailOver` 判「不可降级」→ **整条序列提前停死**，备胎全轮不上。
+改法（4 处）：import `offendingParams`；`buildBody(useImages, dropParams)` 支持摘参数；
+`send(useImages, key, dropParams)` 透传；图片重试之后新增自愈分支，用 `droppedParams`
+记住并带进 524 流式重发（否则塞回去照样被拒）。
+已验：tsc=0、build 过、**用用户实报的两段错误原文直接调源码 `offendingParams`**——
+glm 那条正确摘出 `enable_thinking`（连带子串 `thinking`）保留 `reasoning_effort`，
+qwen 那条与坏图片场景均不误判、仍走各自顺位分支。
+**⚠️ 未做端到端**（要真烧一次模型调用）。**配置侧建议**：序列 1 的 qwen3.7-max 配在需要
+看图的链路里没有意义，应在控制台换成视觉模型或后排。
+
+**顺带（本机环境，非项目代码）**：plantspedia 全链路改走国内直连。`~/.zshrc` 的 `NO_PROXY`
+扩到 29 条并拆成四组，`_proxy_apply()` 补 `git http.noProxy` + `npm noproxy`（这两者不读
+环境变量），`proxystatus` 加了一行实测出口 IP。梯子是**西游云**（mihomo 内核、系统代理 7888），
+GUI 那层要在 App 内 Dashboard → System Proxy → Bypass Domain 加 13 条（用户自行操作）。
+⚠️ 绝不能把整个 `googleapis.com` 打成直连 —— 会连带废掉本地 dev 的 Gemini。
+详见记忆 `xiyou-proxy-architecture` / `plantspedia-direct-connect-bypass`。）_
+_上一轮：2026-08-10 — by Claude（**修：快速简介卡被采纳收录后，银叶科普这条路是断的**。
+用户报碱毛茛：已收录的简介卡页上照旧摆着「让 AI 生成进一步介绍草稿」，点下去必报
+`DRAFT_ALREADY_APPROVED`。根因是两处判据各说各话 —— 前端 `notEnriched`（drafts.$id.tsx）
+**只看 `ai_payload._enriched`、从不看 status**，服务端 `enrichPreflight` 第一条却是
+`status==='approved'` 直接拒。更要紧的是背后的能力缺口：采纳快速卡之后这个物种再没有生成
+银叶科普的入口，连带金叶详页（要求 `_enriched`）一起断掉。
+**用户 2026-08-10 选定的方案：派生新草稿，不碰线上条目。** 服务端新增
+`resolveEnrichTarget`（identify-plant.functions.ts）：已收录的 lite 卡不再抛错，而是复制一份
+新草稿（照片/地点/定名/`_editor_diagnosis` 等复核痕迹全继承，status=pending、
+`published_plant_id=null`、`submitted_for_review=false`、retake 归零），enrich 写到它头上；
+`startEnrichDraftFn` 在**建任务之前**解析目标，于是任务行/动态流/前端轮询作用域认的都是新
+草稿，消费者侧重跑 preflight 时它已是 pending、不会再派生第二份。连点两次复用上一份没写完的
+副本（JSON 列过滤 `ai_payload->>_enrich_source_draft_id`，查不动就退化成新建）。银叶闸门抽成
+`enrichSilverGate` 并**前移到建行之前** —— 否则余额不足的用户会白留一行空草稿。
+前端：草稿页已收录时撤掉「保存为待审批草稿」，生成按钮改文案（「另建草稿，生成完整科普」+
+说清不动线上条目），拿到新 id 后 `rememberJob` 到新作用域再跳过去（DraftPageRoute 按 id 打了
+key，必重新挂载 → 断线续跑把轮询接回）；条目页新增同一个入口（`fetchQuickSourceDraftId`，
+仅 🟢quick 且同物种尚无银叶时出现）。
+tsc=0、改动文件 ESLint 可修复数前后一致（新增 3 个 `as any`，与该文件既有写法同款）。
+**已验（未登录 DOM 实测）**：碱毛茛条目页新区块 720px 正常渲染、草稿页「保存为待审批草稿」
+已消失、新文案与跳转提示都在；`fetchQuickSourceDraftId` 返回真值也顺带证明了 JSON 列过滤在
+本库可用（fork 的复用查询同款写法）。
+**⚠️ 未验的一段：fork 的服务端端到端**（要编辑账号登录 + 真烧一次银叶生成）。
+**⚠️ 未提交、未部署**；线上仍是 `80a4e260`，08-09 那四组修复也还压着。）_
+_上一轮：2026-08-09（续五）— by Claude（**修：「← 返回 #标签 名单」显示的是 slug 乱码**。
 用户报「← 返回 #59-3-6-0-4-88-89-58-9-79-84-6-48-8-2 名单」。根因：`slugifyTag` 对中文名是
 **先 encodeURIComponent、再把 `%` 全删掉**，这个变换**不可逆**，而两处退路都只有一条
 `decodeURIComponent(slug)` 兜底 —— 它连 `%` 都找不到，原样吐回那串数字。
@@ -8218,3 +8292,208 @@ approved 但查不到条目 → 两边都不算（历史脏数据，它已经不
 - 条目页 + 特征词 `/plants/phyllanthus-tenellus-roxb?from=%E8%B7%AF%E8%BE%B9%E6%9D%82%E8%8D%89`
   → 「← 返回 #路边杂草 名单」（decode 兜底没被改坏）
 - `tsc` = 0；控制台只剩两条既有噪音（sandbox iframe 的 srcdoc 脚本拦截）。
+
+---
+
+## 2026-08-10 — 小P蛙「以编辑身份登录仍然改不了 / 看不到图」：四处修复 + 绵毛棘豆换图
+
+### 用户报的三件事
+1. 以**编辑**身份登录，小P蛙的编辑能力仍然受限（对话里只给出「建议换图：…」，按钮位置写着
+   「登录为编辑后可一键应用」）；
+2. 银叶草稿的换图流程要能**粘贴 URL 替换**；
+3. 把「绵毛棘豆」文末（最后一张）配图换成
+   `https://inaturalist-open-data.s3.amazonaws.com/photos/166216681/large.jpg`；
+4. （追加）小P蛙说「我目前无法直接看到您上传的照片，请您让我展示这三张图片」。
+
+### 根因（两条独立的，都不是「权限没配好」）
+**① 条目页压根不认「编辑」这个角色。** `plants.$slug.tsx` 的
+`canEdit = 作者 ‖ 管理员 ‖ 共同作者` —— 而那一行上面的注释从最早就写着「小P蛙 —— 编辑
+登录后可对该已发布页提问并改写」。于是纯编辑账号在**已发布条目**上连面板都看不到，
+右下角那只是全站版（`askPageAgentFn` 里 `canEdit` 恒 false，只会聊）。
+就算把门放开也没用：`plants` 的 UPDATE 策略是
+`(auth.uid()=author_id AND is_approved_editor) OR has_role(admin)`，浏览器直写必被 RLS 挡。
+
+**② 那句提示在撒谎。** 用户当时在 `/drafts/28c5e133…`（绵毛棘豆，**status=approved**），
+`canApply = isEditor && status !== "approved"` → false。已收录草稿内容冻结是对的
+（`saveDraftHtmlContentFn` 服务端同样拒收），但面板照着默认文案说「登录为编辑后可一键应用」
+—— 编辑本人登录着，却被叫去登录。
+
+**③ 全站那只小P蛙没有图像通道。** `askPageAgentFn` 只收 `pageText`（DOM innerText），
+一张图都不送。识别页上用户刚拍的三张图是 `URL.createObjectURL` 出来的 **blob:** 地址，
+服务端拿到也取不到 —— 所以它只能老实说「我看不到您上传的照片」。
+（草稿页那只**是**送图的：实测 `疑似泽芹` 三张原图 200/image/jpeg，全部可用。）
+
+### 改动
+1. **新 `savePlantHtmlFn`**（`identify-plant.functions.ts`）：服务端按 编辑/管理员/作者 判权 →
+   service role 上传 HTML → 改 `plants.html_url` → 记 `plant_edits`。`plants.$slug.tsx` 的
+   `persistPlantHtml` 改走它（小P蛙改写 / 按方案换图 / 换图弹窗三条路共用）。
+   顺带修掉一个**静默故障**：旧代码写 `kind:"ai_page_edit"`，那个值不在 `plant_edits.kind`
+   的 CHECK 白名单里、insert 一直被拒且返回值没人看 —— 小P蛙在条目页改过的每一笔都没进
+   修改记录。现在写库里认的 `html_save` / `image`，并把 `logged` 照实回报给前端。
+2. **`canCurate = canEdit ‖ 编辑角色`**：只用来开小P蛙面板。**没有**放宽 canEdit ——
+   换封面、「编辑此条」、块标记撤销都还是浏览器直写，给纯编辑放出来只会点一个错一个。
+3. **撤销判据换成「快照是不是整份文档」**（原来只认 `ai_page_edit`，而那种行库里一条都没有，
+   等于这条分支从没跑过），整页撤销也走服务端函数，编辑因此能撤自己的改动。
+4. **`XiaoPAgentPanel` 新增 `applyBlockedHint`**：宿主知道真实原因就由宿主说。草稿页在
+   「已收录 + 是编辑」时给「这份草稿已收录为条目…要改动请到**条目页**找我」并直接给链接。
+   开场白里那句「想改请到草稿页找我」同样按它替换（对着站在草稿页上的人说这句话没意义）。
+5. **`entrySlug`**：`approvedSlug` 只在「本次会话刚采纳完」那一刻有值 —— 历史已收录草稿上
+   三处「查看条目 →」从来不显示。按 `published_plant_id` 回查一次补上。
+6. **`ImageSearchDialog` 加「或粘贴图片地址」**（一处改动惠及所有入口：小P蛙搜图换图、
+   `ReplaceImageFlow`、`ReplacePhotoDialog`）。`ReplaceImageFlow` 新增 `initialUrl`，
+   两个宿主用新的 `firstImageUrlIn(instruction)` 从小P蛙的指令里摘出地址**预填**进去 ——
+   用户把 URL 给了小P蛙，就不该再让他复制一遍。
+   ⚠️ `rich-editor.tsx` 里另有一个**同名的本地** ImageSearchDialog（博客/项目用），没动。
+7. **全站小P蛙能看图了**：`readPageImages()` 收集 `main` 里看得见的照片 ——
+   http(s) 的送 URL（服务端抓，不吃 CORS）、blob:/data: 的走 canvas 压到 1024px 转 base64
+   （跨域图在 canvas 上会污染画布，客户端这条路走不通，所以必须分两路）。每轮最多 4 张。
+   `askPageAgentFn` 收下并传给模型，system 里明说「用户问『这几张图』就是在说这些」。
+   **筛选阈值有讲究**：识别页缩略图条是 `w-14 h-14`=56px，阈值定 96 会把要看的图全挡掉；
+   所以渲染尺寸只用 48px 滤图标（站内 logo 40px），真正区分照片靠原始尺寸 ≥256。
+
+### 绵毛棘豆换图（已落库）
+- 条目 `oxytropis-lanata-pall-dc` 与草稿 `28c5e133…` **同步**改：文末 `生长条件` 那张
+  `section-…-4-cbxaj3.webp` → 那条 iNaturalist 地址。两份原来一模一样，只改一边会分叉。
+- 旧 HTML 备份在 scratchpad（`oxy-entry-before.html` / `oxy-draft-before.html`）；
+  `plant_edits` 记了一条 `html_save/xiaop_agent`，快照是整份文档 —— 按新判据可一键撤销。
+- 实测：条目页 iframe 里最后一张 `src` 已是新地址、`naturalWidth=1024` 加载成功。
+
+### 验证
+- `tsc --noEmit` = 0；`npm run build` 通过；改动的 6 个文件 ESLint 零新增
+  （prettier 已滤；`plants.$slug.tsx` 那条 `Route.useSearch` 条件调用是既有的，HEAD 里就有）。
+- 浏览器（dev 5203，连真库，**未登录**）：条目页 / 两份草稿页均无新增报错（只剩既有的
+  srcdoc sandbox 噪音）；在识别页用脚本塞进一张 1200×900 的图，`readPageImages` 的判据
+  实跑通过 → 1 张 blob: 转出 1024×768 的 base64。
+- **没验到**（都需要编辑账号登录 + 真烧模型调用）：条目页面板对纯编辑真的出现并保存成功、
+  草稿页那句新提示的实际渲染、「或粘贴图片地址」的弹窗外观、全站小P蛙带图问答的真实回答。
+- **⚠️ 未部署、未提交。**
+
+### 已知缺口（有意留下）
+- 纯编辑在条目页仍**看不到「撤销」**：`EditLogSection isEditor={canEdit}` 没放宽 ——
+  块标记那条撤销路径还是浏览器直写，放开会给出一批点了就报错的按钮。要一并解决得把
+  `revertEdit` 也搬去服务端。
+- 「每个页面只能进行 2 次对话」这条**在代码里查无实据**：面板不限轮数（只截最近 24 条历史），
+  服务端也没有轮数闸门。待用户复现时补充是哪一页、什么表现。
+
+---
+
+## 2026-08-11 — 修：并入的观测把一份 skill 详页降级成绿框「快速简介卡」
+
+### 用户报的
+猪毛蒿「有详页但是不显示」——站内明明有 `/plants/artemisia-scoparia-waldst-kit-1802`
+（2026-07-13 导入的 skill 科普详页），但草稿页那栏「站内已有该物种的内容」里只有
+
+```
+🟢 吉木识别的快速简介卡：猪毛蒿（共 5 份）
+🔵 吉木创建的银叶科普：猪毛蒿
+```
+
+——没有任何一个写着「详页」的入口。那份详页被折进了绿框的「共 5 份」里，标签写着
+「快速简介卡」。
+
+### 根因
+`plant_drafts.published_plant_id` 有**两条**写入路径，字段写得一模一样：
+
+| 路径 | 时序 | 语义 |
+|------|------|------|
+| 采纳收录 | 先有草稿 → 才落成条目 | 条目**就是**这份草稿 |
+| 并入已有条目（`mergeTargetId` 分支） | 条目早就在 → 草稿追加成一张「补充观测」卡片 | 条目**不是**这份草稿 |
+
+而两处「条目类别跟着来源草稿走」的算法只看这一列，于是**后来并进去的快速卡把一份正经
+详页降级成了 quick**：
+- `lib/species-existing.functions.ts` 的 `sourceEnriched` → 那一栏的绿/蓝/橙分类
+- `lib/drafts.ts` 的 `fetchPlantSourceKinds` → 档案列表 / 条目页顶部的三色标
+
+猪毛蒿：详页建于 07-13，两份并入的快速卡是 07-25 与 08-11。
+
+### 修法
+两处共用同一把闸门 —— **时间序**：采纳必然「草稿在前、条目在后」，并入必然反过来。
+只有 `draft.created_at <= plant.created_at` 的草稿才算「来源草稿」；时间缺一头就退回旧行为。
+`fetchPlantSourceKinds` 为此多查一次 `plants(id, created_at)`（283 行的小索引，与草稿查询并发）。
+拍摄地点（`fromSourceDraft.place`）也一并只认真来源 —— 把一次补充观测的地点挂到百科详页上，
+读者会当成这一页是在那儿拍的；缩略图仍照借（纯视觉兜底，不会被误读）。
+
+### 影响面（真库实测，scratch/_merge_kind_impact.mjs）
+283 个条目里 **6 个**类别改判，全部是 07-13 导入的详页，全部有 `plant_edits.kind='merge'` 佐证：
+
+```
+silver→skill 绶草 / 黑沙蒿      quick→skill 酢浆草 / 狗尾草 / 水麦冬 / 猪毛蒿
+```
+
+判出的 10 份「晚于条目」的关联 100% 对得上 merge 记录，**零误判**。
+
+### 已知缺口（有意留下）
+反向漏网 4 例：并入的草稿恰好**建于条目之前**（用户先拍照、很久以后才合并）时时间序认不出来，
+如蕨麻（08-09 把一份 07-24 的银叶草稿并进 07-30 的条目 → 仍显示 silver，实际应是 quick）。
+维持现状，不是新错。要根治得在合并时给草稿打标记（如 `ai_payload._merged_into`）并回填存量
+——存量可从条目 HTML 里的 `data-draft-id` 精确还原。
+
+### 验证
+- `tsc --noEmit` = 0。
+- dev 5203（连真库，未登录）：
+  - 草稿 `2ba53ab7`（今天那份猪毛蒿）那一栏现在是三个入口，第三个
+    「吉木创建的skill 科普详页：猪毛蒿」→ `/plants/artemisia-scoparia-waldst-kit-1802` ✅
+  - 「共 4 份」点开正常列出 4 行（缩略图 + 未收录草稿 + 吉木 + 日期 + 康巴什区）✅
+  - 详页 `/plants/artemisia-scoparia-waldst-kit-1802` 顶部三色标：AI 快速识别 → **skill 创建详页** ✅
+    并且「让 AI 生成进一步介绍」按钮不再出现在这份详页上（它的门是 `entryKind==="quick"`）✅
+- **⚠️ 未部署、未提交。** 线上仍是 80a4e260，此前四组修复也还在等上线。
+
+---
+
+## 2026-08-11（续）— 「共 N 份」每行补上坐标与综合可信度；时间精确到分
+
+### 起点：工作树里有半截活
+上一段（并入判据那节）写完服务端一半就断了 —— `SpeciesExistingEntry` 已经加上
+`lat/lng/confidencePct`、查询也已经把 `capture_lat/lng`、`summary`、`ai_model`、
+`retake_count` 和四个 `ai_payload` 子字段取回来了，但 `Raw` 与 `entries` 两处没跟上，
+**`tsc` 是红的**（species-existing.functions.ts:350）。本轮把它补完，并接上前端。
+
+### 为什么要这两样（用户 2026-08-11）
+`capture_place` 的粒度全看识别当时反地理编码给到哪一级 —— 从「陕西省榆林市定边县」到
+「内蒙古自治区康巴什区青春山街道呼和塔拉路辅路」都有。猪毛蒿那 4 行的地点**一模一样**
+（都是「内蒙古自治区康巴什区」），作者也都是吉木，光靠这几样根本挑不出该点哪一份。
+坐标才是那一份真正「在哪」，可信度才是「哪一份更靠得住」。
+
+### 服务端（`lib/species-existing.functions.ts`）
+- 新增 `confidenceOf(d)`：**与草稿页（drafts.$id.tsx）逐参数同源** —— 老草稿那份
+  「只含置信档的最小痕迹」兜底、传**整份 meta**（「疑似」可能只写在摘要或标题里）、
+  外加 `tentativeResolution({_editor_diagnosis, _xiaop_id_fix})`。三样缺一，同一份草稿
+  就会在两处显示两个数字。摘要按「列优先」取即可：建卡时 `summary` 列就是从 `summary_zh`
+  写下来的（identify-plant.functions.ts 各处 `summary:` 落库），列空则 payload 里也是空的。
+- `Raw` 与 `entries` 补 `lat/lng/confidencePct`；草稿行取自己的，条目行**只向真来源草稿借**
+  （`isSourceDraft`，并入型借不到 —— 这三样都是「那一次观测的事实」）。
+- 经纬**成对**认：一条来自 A、一条来自 B 会拼出一个谁都没去过的地方；缺一个就当没有。
+
+### 前端（`components/species-existing-links.tsx`）
+- `formatDay` → `formatWhen`，到「分」。同一天同一个人连拍好几份是常事，只写到「日」时
+  那几行连时间都一样（猪毛蒿三份 07-17 的原来全写「2026-07-17」）。
+- `formatCoords`：4 位小数 ≈ 11 米，够把同一片草地上的两株分开。
+- 行**分两行**摆：短的一行放「状态 · 作者 · 时间 · 可信度」，会很长的地点+坐标另起一行。
+  挤成一行时地名一长，`truncate` 先吃掉的正是可信度 —— 那是用来挑哪一份的关键数字。
+
+### 验证（dev 5203 连真库、未登录）
+- 猪毛蒿 `/plants/artemisia-scoparia-waldst-kit-1802` 展开「共 4 份」：
+  ```
+  未收录草稿 · 吉木 · 2026-07-18 23:42 · 可信度 90%   内蒙古自治区康巴什区 · 39.6441, 109.8102
+  未收录草稿 · 吉木 · 2026-07-17 09:43 · 可信度 45%   内蒙古自治区康巴什区 · 39.6441, 109.8103
+  未收录草稿 · 吉木 · 2026-07-17 09:40 · 可信度 45%   内蒙古自治区康巴什区 · 39.6445, 109.8105
+  未收录草稿 · 吉木 · 2026-07-17 09:39 · 可信度 45%   内蒙古自治区康巴什区 · 39.6448, 109.8106
+  ```
+  ——地名四行全同，靠坐标与可信度才分得开，正是用户要的。
+- **可信度与草稿页逐份对上**：`f20ad9d7` 那行 90%，草稿页写「综合可信度 90%（模型自评确诊档=90）」；
+  `d6de4468` 那行 45%，草稿页写「45%（模型自评疑似档=45）」。
+- 条目行借得到：拂子茅那栏「已收录 · 吉木 · 2026-07-30 15:15 · 可信度 84%／内蒙古自治区康巴什区
+  鄂尔多斯市高新技术产业园区 · 39.6663, 109.8402」（全部来自它的真来源草稿）。
+- 并入判据同时复验：猪毛蒿草稿页上橙框「吉木创建的skill 科普详页」已回来。
+- 排版用 DOM 量的：行高 76px、三行分别 20/19/19px、950px 宽零截断、缩略图 900×1200 正常加载；
+  按手机 375px 折算可用宽 277px，两行文字自然宽 224px / 195px，**可信度不会被切掉**。
+- `tsc --noEmit` = 0；`npm run build` 通过；两个改动文件 ESLint 非 prettier 问题与 HEAD 基线
+  逐条一致（links 4/4、functions 6/6，全是既有的 `any` 与 react-refresh）。
+- ⚠️ **视觉截图没拿到**：Browser pane 中途被收走（滚动锁死、`computer` 超时），排版结论来自
+  `getBoundingClientRect` / `scrollWidth` 实测，不是眼睛看的。
+
+### 留下的两点（都不是新错）
+- 条目行的**时间**仍是条目自己的 `created_at`，而同一行的地点/坐标/可信度来自来源草稿 ——
+  语义混着，读者可能把「2026-07-30 15:15」当成拍摄时间。要改的话把条目行的时间也换成
+  来源草稿的拍摄时间；本轮没动（那会改掉 08-09 定下的「条目当代表」口径）。
+- 地名很长时（街道级）坐标会被 truncate 吃掉。有意如此：地名已经到街道，坐标的边际价值最低。

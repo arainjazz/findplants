@@ -1,6 +1,8 @@
 import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 import { speciesKey } from "./plants";
+import { computeIdentifyConfidence, type IdentifyTrace } from "./identify-trace";
+import { tentativeResolution } from "./tentative";
 
 // ─── 「这个物种已经有人做过了」查询 ──────────────────────────────────────────
 // 识别出**非疑似**结果后，草稿页在关掉分享卡时用它决定要不要拦一下：库里已经有同物种的
@@ -42,10 +44,23 @@ export type SpeciesExistingEntry = {
   draftId?: string;
   /** 已收录条目去向（跳详页）。与 `draftId` 二选一。 */
   slug?: string;
-  /** ISO 时间串；列表里只显示到「日」。 */
+  /** ISO 时间串；列表里显示到「分」。 */
   createdAt: string | null;
   /** 拍摄地点。`plants` 没有这一列 —— 采纳来的条目借它来源草稿的 `capture_place`。 */
   place: string | null;
+  /**
+   * 拍摄坐标。`capture_place` 的粒度**全靠识别当时的反地理编码**，从「陕西省榆林市定边县」
+   * 到「内蒙古自治区康巴什区青春山街道呼和塔拉路辅路」都有（全库 251 份里 44 份只到区）。
+   * 只给地名分辨不出同一个区里的两株，坐标才是那一份真正「在哪」（用户 2026-08-11 要求）。
+   */
+  lat: number | null;
+  lng: number | null;
+  /**
+   * 综合可信度%。**与草稿页同一套算法**（`computeIdentifyConfidence`）—— 同一份草稿在
+   * 两处显示两个数字是最糟的结果，所以判据字段一个都不省，包括那个 219 字的 summary。
+   * 条目行借它**真来源草稿**的；借不到就是 null（不显示，不编一个数出来）。
+   */
+  confidencePct: number | null;
   /** 缩略图。条目取 `cover_url`，为空时退到来源草稿的 `photo_url`。 */
   thumb: string | null;
   /** true = 已收录条目（跳详页），false = 未收录草稿。 */
@@ -134,12 +149,20 @@ export const lookupSpeciesExisting = createServerFn({ method: "POST" })
         // 快速卡也要查（`_enriched=false`）—— 常驻那一栏要把它绿框列出来。以前这里写死
         // `.eq(_enriched,"true")`，快速卡根本查不到。**弹窗的门槛没跟着放宽**：每次识别都会
         // 落一条快速卡，拿它弹推荐面板会变成天天打扰，见 drafts.$id 的 offerExistingWork。
-        // `enriched:ai_payload->>_enriched` 是 PostgREST 的 JSON 取值别名，返回字符串 "true"/"false"，
-        // 这样不必把整个 ai_payload（很大）拉回来 300 份。
+        //
+        // `x:ai_payload->>k` / `x:ai_payload->k` 是 PostgREST 的 JSON 取值别名（`->>` 出文本、
+        // `->` 出对象），这样不必把整个 ai_payload（很大）拉回来 300 份。取这几个子字段是为了
+        // 让每一行都能算出**与草稿页同一个**综合可信度%：算法要痕迹 + 置信档 + 「疑似」判据 +
+        // 人工解除留痕（见 identify-trace.ts / tentative.ts）。
+        //
+        // `summary` 是唯一一个非取不可的大字段（全库 251 份平均 219 字 ≈ 64KB）：模型经常
+        // 不设 `identification_confidence=low`，而是把「疑似」写在摘要开头 —— 实测有 3 份
+        // 草稿**只有这一个信号**。省掉它，那几份在这里会算出 70%、在草稿页上却是 45%，
+        // 同一份草稿两个数字。宁可多传 64KB（服务端内部查询，还有 5 分钟前端缓存）。
         (supabaseAdmin as any)
           .from("plant_drafts")
           .select(
-            "id, title, created_by, creator_label, scientific_name, created_at, capture_place, photo_url, published_plant_id, enriched:ai_payload->>_enriched",
+            "id, title, created_by, creator_label, scientific_name, created_at, capture_place, capture_lat, capture_lng, photo_url, published_plant_id, summary, ai_model, retake_count, enriched:ai_payload->>_enriched, trace:ai_payload->_identify_trace, conf:ai_payload->>identification_confidence, diag:ai_payload->_editor_diagnosis, xfix:ai_payload->_xiaop_id_fix",
           )
           .ilike("scientific_name", `${genus}%`)
           .order("created_at", { ascending: false })
@@ -162,9 +185,18 @@ export const lookupSpeciesExisting = createServerFn({ method: "POST" })
         scientific_name: string | null;
         created_at: string | null;
         capture_place: string | null;
+        capture_lat: number | null;
+        capture_lng: number | null;
         photo_url: string | null;
         published_plant_id: string | null;
+        summary: string | null;
+        ai_model: string | null;
+        retake_count: number | null;
         enriched: string | null;
+        trace: IdentifyTrace | null;
+        conf: string | null;
+        diag: unknown;
+        xfix: unknown;
       };
       type PlantRow = {
         id: string;
@@ -202,24 +234,93 @@ export const lookupSpeciesExisting = createServerFn({ method: "POST" })
 
       // 条目的类别跟着**来源草稿**走：银叶草稿采纳来的仍是银叶科普，快速卡采纳来的仍是快速卡。
       // 一株植物可能有好几份草稿指向同一条目，只要其中一份是银叶，这一页就算银叶科普。
+      //
+      // ⚠️ 但「来源」必须是**真来源**。`published_plant_id` 有两条写入路径（都在
+      // identify-plant.functions.ts）：**采纳收录**——先有草稿，才落成条目；**并入已有条目**
+      // ——条目早就在了，只是把这次观测当一张「补充观测」卡片追加到页尾。两者写的字段
+      // 一模一样，光看这一列分不出来，于是后来并进去的快速卡会把一份正经详页**降级**成
+      // 绿框「快速简介卡」。猪毛蒿就是这么丢掉入口的（用户 2026-08-11 报「有详页但是不
+      // 显示」）：2026-07-13 导入的 skill 详页，被 07-25 / 08-11 两份并入的快速卡判成
+      // quick，那一栏里再没有任何一个写着「详页」的按钮。
+      //
+      // 判据用时间序：采纳必然「草稿在前、条目在后」（条目就是那一刻建的），并入必然反过来。
+      // 实测全库 283 个条目判出 10 份「晚于条目」的关联，每一份都对得上 plant_edits 里的
+      // merge 记录 —— 零误判。反向漏网仍有（并入的草稿恰好建于条目之前时认不出来，全库 4 例），
+      // 那是维持现状，不是新错。
+      const plantCreatedAt = new Map(plants.map((p) => [p.id, p.created_at]));
+      const isSourceDraft = (d: DraftRow) => {
+        if (!d.published_plant_id) return false;
+        const plantAt = plantCreatedAt.get(d.published_plant_id);
+        // 时间缺一头就无从判断 —— 退回旧行为（算作来源），宁可少改也不错改。
+        if (!plantAt || !d.created_at) return true;
+        return Date.parse(d.created_at) <= Date.parse(plantAt);
+      };
+
       const sourceEnriched = new Map<string, boolean>();
       for (const d of drafts) {
-        if (!d.published_plant_id) continue;
+        if (!isSourceDraft(d)) continue;
         sourceEnriched.set(
-          d.published_plant_id,
-          (sourceEnriched.get(d.published_plant_id) ?? false) || d.enriched === "true",
+          d.published_plant_id!,
+          (sourceEnriched.get(d.published_plant_id!) ?? false) || d.enriched === "true",
         );
       }
 
-      // plants 没有 capture_place，封面也可能是空的 —— 采纳来的条目就借它**来源草稿**的
-      // 拍摄地点与照片。列表里要靠这两样把同物种的几份区分开（多半是不同地点拍的）。
-      const fromSourceDraft = new Map<string, { place: string | null; thumb: string | null }>();
+      /**
+       * 一份草稿的综合可信度%。**与草稿页（drafts.$id.tsx）逐参数同源** —— 同一份草稿在
+       * 两处显示两个数字是最糟的结果，所以那三样都不能省：老草稿的「只含置信档的最小痕迹」
+       * 兜底、整份 meta（「疑似」可能只写在摘要或标题里）、人工解除留痕。
+       * 摘要按「列优先」取即可：建卡时 `summary` 列就是从 `summary_zh` 写下来的
+       * （identify-plant.functions.ts 各处 `summary:` 落库），列空则 payload 里也是空的。
+       */
+      const confidenceOf = (d: DraftRow): number => {
+        const conf = (d.conf ?? "").toString();
+        const trace: IdentifyTrace = d.trace ?? {
+          primaryEngine: "none",
+          primaryLabel: "",
+          primaryPct: null,
+          phase1Model: (d.ai_model ?? "").toString(),
+          phase1Confidence: conf,
+          review: { ran: false, reason: "本次识别早于该功能上线，没有留下过程记录" },
+          retakeCount: Number(d.retake_count ?? 0),
+        };
+        return computeIdentifyConfidence(
+          trace,
+          (d.scientific_name ?? "").toString(),
+          { identification_confidence: conf, summary_zh: d.summary, title: d.title },
+          tentativeResolution({ _editor_diagnosis: d.diag, _xiaop_id_fix: d.xfix }),
+        ).pct;
+      };
+
+      // plants 没有 capture_place / 坐标 / 可信度，封面也可能是空的 —— 采纳来的条目就借它
+      // **来源草稿**的。列表里要靠这几样把同物种的几份区分开（多半是不同人在不同地点拍的）。
+      //
+      // 地点、坐标、可信度都只认真来源（并入型条目借不到）：这三样都是**那一次观测的事实**，
+      // 把一次补充观测的地点或可信度挂到一份百科详页上，读者会当成这一页就是那么来的。
+      // 缩略图则**照借不误** —— 那只是视觉辅助，同物种的照片当封面兜底不会让人误读，
+      // 而空缩略图会让一行塌成灰块。
+      const fromSourceDraft = new Map<
+        string,
+        {
+          place: string | null;
+          thumb: string | null;
+          lat: number | null;
+          lng: number | null;
+          confidencePct: number | null;
+        }
+      >();
       for (const d of drafts) {
         if (!d.published_plant_id) continue;
         const cur = fromSourceDraft.get(d.published_plant_id);
+        const src = isSourceDraft(d);
+        // 经纬**成对**认：一条来自 A、一条来自 B 会拼出一个谁都没去过的地方。
+        const kept = cur?.lat != null && cur?.lng != null;
+        const own = src && d.capture_lat != null && d.capture_lng != null;
         fromSourceDraft.set(d.published_plant_id, {
-          place: cur?.place || d.capture_place || null,
+          place: cur?.place || (src ? d.capture_place || null : null),
           thumb: cur?.thumb || d.photo_url || null,
+          lat: kept ? cur!.lat : own ? d.capture_lat : null,
+          lng: kept ? cur!.lng : own ? d.capture_lng : null,
+          confidencePct: cur?.confidencePct ?? (src ? confidenceOf(d) : null),
         });
       }
 
@@ -232,6 +333,9 @@ export const lookupSpeciesExisting = createServerFn({ method: "POST" })
         label: string | null;
         createdAt: string | null;
         place: string | null;
+        lat: number | null;
+        lng: number | null;
+        confidencePct: number | null;
         thumb: string | null;
         published: boolean;
       };
@@ -256,6 +360,9 @@ export const lookupSpeciesExisting = createServerFn({ method: "POST" })
           label: null,
           createdAt: p.created_at ?? null,
           place: src?.place ?? null,
+          lat: src?.lat ?? null,
+          lng: src?.lng ?? null,
+          confidencePct: src?.confidencePct ?? null,
           thumb: p.cover_url || src?.thumb || null,
           published: true,
         });
@@ -269,6 +376,10 @@ export const lookupSpeciesExisting = createServerFn({ method: "POST" })
           label: d.creator_label,
           createdAt: d.created_at ?? null,
           place: d.capture_place ?? null,
+          // 同上：缺一头的坐标指不到任何地方，一律当没有。
+          lat: d.capture_lat != null && d.capture_lng != null ? d.capture_lat : null,
+          lng: d.capture_lat != null && d.capture_lng != null ? d.capture_lng : null,
+          confidencePct: confidenceOf(d),
           thumb: d.photo_url ?? null,
           published: false,
         });
@@ -296,6 +407,9 @@ export const lookupSpeciesExisting = createServerFn({ method: "POST" })
             slug: g.slug,
             createdAt: g.createdAt,
             place: g.place,
+            lat: g.lat,
+            lng: g.lng,
+            confidencePct: g.confidencePct,
             thumb: g.thumb,
             published: g.published,
           })),

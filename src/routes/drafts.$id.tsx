@@ -10,6 +10,7 @@ import { XiaoPAgentPanel } from "@/components/draft-agent-panel";
 import { userModelArg } from "@/lib/xiaop-user-model";
 import {
   applyImagePlan,
+  firstImageUrlIn,
   listSectionSlots,
   summarizeChanges,
   type ImagePlanItem,
@@ -396,6 +397,16 @@ function DraftPage() {
     (draft?.ai_payload as { _enriched?: boolean } | undefined)?._enriched === false;
 
   /**
+   * 已采纳收录成条目 —— 这一份的内容就此定稿（小P蛙那侧同样以它为准）。
+   *
+   * `notEnriched` 只认 `_enriched`，从来不看 status，于是已收录的简介卡页面上照旧摆着
+   * 「保存为待审批草稿」和「让 AI 生成进一步介绍草稿」两个按钮，点下去必撞服务端闸门
+   * （DRAFT_ALREADY_APPROVED）——2026-08-10 用户报的就是这个。提审那个按钮直接撤掉；
+   * 生成那个留着，但走的是「派生一份新草稿」而不是就地重写，文案也换成说清这件事。
+   */
+  const isApproved = draft?.status === "approved";
+
+  /**
    * 编辑采纳这条疑似识别时写下的诊断意见（服务端 approvePlantDraft 写进 ai_payload）。
    * 有它 = 已经有人签字定种了，全站从此不再按「疑似」渲染这份草稿。
    */
@@ -598,10 +609,22 @@ function DraftPage() {
       const res = (await startEnrich({ data: { draft_id: id } })) as {
         alreadyEnriched: boolean;
         jobId: string | null;
+        draftId: string;
+        forkedFrom: string | null;
       };
       if (res.alreadyEnriched || !res.jobId) {
         await qc.invalidateQueries({ queryKey: ["draft", id] });
         setEnrichDone("这份草稿已经生成过完整内容了");
+        return;
+      }
+      // 已收录的简介卡不能就地重写，服务端改为派生一份新的待审草稿（见
+      // resolveEnrichTarget）。任务是挂在**新草稿**名下的，所以把 jobId 记进它的
+      // 作用域再跳过去 —— 那一页挂载时的「断线续跑」会把轮询接回来（DraftPageRoute
+      // 按 id 打了 key，换 id 必定重新挂载，续跑那段因此一定会重跑）。
+      if (res.draftId !== id) {
+        rememberJob(`enrich:${res.draftId}`, res.jobId);
+        toast.success("已为你新建一份待审草稿，正在生成完整科普（已收录的条目不受影响）");
+        await navigate({ to: "/drafts/$id", params: { id: res.draftId } });
         return;
       }
       await followEnrichJob(res.jobId);
@@ -746,6 +769,26 @@ function DraftPage() {
       return !!data?.some((r) => r.role === "editor" || r.role === "admin");
     },
   });
+
+  // `approvedSlug` 只在**本次会话里刚采纳完**那一刻才有值，刷新就没了 —— 于是页面上
+  // 那几条「查看条目 →」在所有历史已收录草稿上从来不出现。按 published_plant_id 回查一次补上。
+  const publishedPlantId = (draft as { published_plant_id?: string | null } | undefined)
+    ?.published_plant_id;
+  const { data: publishedSlug = null } = useQuery({
+    queryKey: ["draft-published-slug", publishedPlantId],
+    enabled: !!publishedPlantId,
+    staleTime: 10 * 60 * 1000,
+    queryFn: async () => {
+      const { data } = await supabase
+        .from("plants")
+        .select("slug")
+        .eq("id", publishedPlantId!)
+        .maybeSingle();
+      return data?.slug ?? null;
+    },
+  });
+  /** 这份草稿对应的已收录条目 slug（刚采纳的 或 早就采纳过的）。 */
+  const entrySlug = approvedSlug ?? publishedSlug;
 
   /** 正名核对留痕。核对是服务端在内容生成那一刻做完的，这里只读不算。 */
   const nameStamp = useMemo(
@@ -1459,12 +1502,12 @@ function DraftPage() {
                   )}
                   {/* 采纳/合并成功后的去向。以前这里是「直接 navigate 走人」，编辑因此以为
                       简介卡、可信度、金叶按钮全丢了 —— 现在留在原地，去哪儿由他自己点。 */}
-                  {approvedSlug && (
+                  {entrySlug && (
                     <span className="inline-flex items-center gap-2 text-[11px] text-leaf-deep w-full sm:w-auto">
                       ✅ 已收录到本站。
                       <Link
                         to="/plants/$slug"
-                        params={{ slug: approvedSlug }}
+                        params={{ slug: entrySlug }}
                         className="underline underline-offset-2 hover:text-vermilion font-semibold"
                       >
                         查看已收录条目 →
@@ -1891,8 +1934,9 @@ function DraftPage() {
                 把它正式送进审核流程。
                 注意「草稿内容和我的观察不符」**不在这里** —— 快速简介卡只有寥寥几行，用户根本
                 无从判断「符不符」；要等他点了「让 AI 生成进一步介绍草稿」、看到成篇的内容之后，
-                这个判断才有依据。那个按钮因此挪到了下面的 !notEnriched 分支。 */}
-            {notEnriched && !isEditing && (
+                这个判断才有依据。那个按钮因此挪到了下面的 !notEnriched 分支。
+                已收录的不出现：那一份早就过了审，再「提交待审批」既没意义，服务端也不认。 */}
+            {notEnriched && !isEditing && !isApproved && (
               <section className="mx-auto max-w-5xl px-6 mt-4">
                 <div className="flex flex-wrap justify-center gap-3">
                   <button
@@ -1925,6 +1969,16 @@ function DraftPage() {
                     生境分布、植物人文、养护建议等分区，并自动配上多张物种图片的
                     <strong>完整科普草稿</strong>。
                   </p>
+                  {/* 已收录那一份的内容已经定稿成线上条目，只能另起一份来写（服务端
+                      resolveEnrichTarget 负责派生）。这里把去向说在前面，免得用户以为
+                      点下去会改动已经上线的条目。 */}
+                  {isApproved && (
+                    <p className="mt-2 text-xs text-leaf-deep leading-relaxed">
+                      这份简介卡<strong>已收录为条目</strong>，内容就此定稿。生成会用同一张照片、
+                      同一个定名<strong>另建一份待审草稿</strong>，
+                      <strong>不改动已上线的条目</strong>；写好后由编辑决定单独收录，还是并入该条目。
+                    </p>
+                  )}
                   {user ? (
                     <button
                       onClick={onEnrich}
@@ -1934,11 +1988,12 @@ function DraftPage() {
                       {enriching ? (
                         <>
                           <span className="w-4 h-4 rounded-full border-2 border-background/30 border-t-background animate-spin" />
-                          正在生成完整草稿…
+                          {isApproved ? "正在新建草稿…" : "正在生成完整草稿…"}
                         </>
                       ) : (
                         <>
-                          <SparkleIcon className="w-4 h-4" />让 AI 生成进一步介绍草稿
+                          <SparkleIcon className="w-4 h-4" />
+                          {isApproved ? "另建草稿，生成完整科普" : "让 AI 生成进一步介绍草稿"}
                         </>
                       )}
                     </button>
@@ -1954,6 +2009,7 @@ function DraftPage() {
                   <p className="mt-2 text-[11px] text-ink-faint">
                     生成在服务器后台进行（约 1–3 分钟，可关闭或刷新本页）。
                     <strong>完成后自动进入待审批草稿库。</strong>
+                    {isApproved && <>点击后会先跳到<strong>那份新草稿</strong>，进度在那边看。</>}
                   </p>
                   <div className="mt-2 inline-flex items-center gap-1.5 text-[11px] text-ink-soft bg-paper-deep/50 border border-rule/40 rounded-full px-3 py-1">
                     <LeafIcon tier="silver" />
@@ -2123,10 +2179,10 @@ function DraftPage() {
                       {draft.status === "approved" ? (
                         <>
                           这份草稿已进入已收录条目。
-                          {approvedSlug && (
+                          {entrySlug && (
                             <Link
                               to="/plants/$slug"
-                              params={{ slug: approvedSlug }}
+                              params={{ slug: entrySlug }}
                               className="ml-1 underline underline-offset-2 hover:text-vermilion font-semibold text-leaf-deep"
                             >
                               查看条目 →
@@ -2192,6 +2248,29 @@ function DraftPage() {
                 greetingTitle={draft.title}
                 canApply={isEditor && draft.status !== "approved"}
                 isRegistered={!!user}
+                /* 改不了的两种原因得分开说。已收录的草稿是**内容冻结**（读者看的是条目页
+                   那一份，改草稿等于改了个没人看的副本，服务端 saveDraftHtmlContentFn
+                   也照样会拒），跟「你没登录」毫无关系 —— 而编辑看到的偏偏是后面那句
+                   （2026-08-10 用户反馈）。这里把实情连同去路一起给出。 */
+                applyBlockedHint={
+                  isEditor && draft.status === "approved" ? (
+                    <>
+                      这份草稿已收录为条目，内容就此定稿；要改动请到
+                      {entrySlug ? (
+                        <Link
+                          to="/plants/$slug"
+                          params={{ slug: entrySlug }}
+                          className="mx-1 underline underline-offset-2 font-semibold text-leaf-deep hover:text-vermilion"
+                        >
+                          条目页
+                        </Link>
+                      ) : (
+                        "条目页"
+                      )}
+                      找我，那边改完直接上线。
+                    </>
+                  ) : undefined
+                }
                 scopes={pageSections}
                 // 只有简介卡的草稿：默认就选中那张卡，并且**不给**「整页 · 全文」这一项 ——
                 // 这一档没有正文，选「整页」既指不到东西，又让服务端只能替编辑猜意图。
@@ -2301,6 +2380,7 @@ function DraftPage() {
               <ReplaceImageFlow
                 html={draft.html_content}
                 initialQuery={xiaopImg.query}
+                initialUrl={firstImageUrlIn(xiaopImg.instruction)}
                 uploadPathPrefix={`drafts/xiaop/${id}`}
                 onClose={() => setXiaopImg(null)}
                 onDone={async (newHtml, oldUrl, newUrl) => {
