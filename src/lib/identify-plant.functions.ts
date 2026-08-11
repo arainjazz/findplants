@@ -52,6 +52,8 @@ import {
 } from "./photo-slots";
 import { FUZZ_SUFFIX, coarsenPlace, fuzzCoord } from "./protected-coords";
 import { placeFromNominatimAddress } from "./place-from-address";
+import { placeFromAmapRegeo } from "./place-from-amap";
+import { wgs84ToGcj02 } from "./gcj02";
 import { checkDraftQuality, checkGoldQuality, describeIssues } from "./quality-gate";
 import { lookupChinaInvasive } from "./china-invasive-list";
 import { keepVisualAdvice, DEFAULT_VISUAL_ADVICE } from "./retake-advice";
@@ -2559,6 +2561,38 @@ async function callAiIdentifyWithConfig(
 }
 
 async function reverseGeocode(lat: number, lng: number): Promise<string> {
+  // 0) 有高德 key 就先走高德。OSM 在鄂尔多斯**只到街道**，同一个街道里相距几十米的
+  // 观测拿到的是一模一样的地名（实测猪毛蒿 5 份全是「哈巴格希街道」）；高德有 AOI/POI，
+  // 能给到「XX公园 / XX小区」这一级，这是换它的**唯一**理由 —— 所以 `extensions=all` 不能省。
+  const amapKey = (process.env.AMAP_KEY ?? "").trim();
+  if (amapKey) {
+    try {
+      // ⚠️ 库里/EXIF 是 WGS-84，高德收 GCJ-02。此地偏移约 500 m，而我们要分辨的点
+      // 相距才 80 m —— 漏了这一步不会报错，只会稳定地报出半公里外那个地方的名字。
+      const g = wgs84ToGcj02(lat, lng);
+      const url =
+        `https://restapi.amap.com/v3/geocode/regeo?key=${encodeURIComponent(amapKey)}` +
+        `&location=${g.lng.toFixed(6)},${g.lat.toFixed(6)}&extensions=all&radius=200`;
+      const resp = await fetch(url);
+      if (resp.ok) {
+        const data = (await resp.json()) as { status?: string; info?: string; regeocode?: unknown };
+        // 高德的失败是 HTTP 200 + status:"0"（额度用尽、key 无效都长这样），
+        // 只看 resp.ok 会把错误当成功、拿到空地名。
+        if (data.status === "1") {
+          const placeName = placeFromAmapRegeo(data.regeocode as Record<string, unknown>);
+          if (placeName) {
+            console.log(`[ReverseGeocode] Resolved via Amap: ${placeName}`);
+            return placeName;
+          }
+        } else {
+          console.warn(`[ReverseGeocode] Amap returned status=${data.status} info=${data.info}`);
+        }
+      }
+    } catch (err) {
+      console.warn("[ReverseGeocode] Amap failed, falling back to Nominatim:", err);
+    }
+  }
+
   // 1) Try OpenStreetMap Nominatim free public geocoding API first to avoid consuming Gemini rate limits
   try {
     const url = `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lng}&format=json&accept-language=zh-CN`;

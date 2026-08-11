@@ -22,14 +22,20 @@
  *               `backfill_capture_place.snapshot-<时间>.json`（这一列没有版本历史）。
  *   --restore <快照文件>   把 --apply 写下的地名原样倒回去，不打网。
  *
+ * `.env` 里配了 `AMAP_KEY` 就**优先走高德**（OSM 在鄂尔多斯只到街道，同街道内的几份
+ * 地名一模一样；高德有 AOI/POI 才分得开）。没配则行为与之前完全一致，走 Nominatim。
+ *
  * ⚠️ Nominatim 是**免费公共服务**，用量政策要求最多 1 次/秒且带真实 User-Agent。
  * 这里固定 1.2 秒一发、串行跑；250 份约 5 分钟。别为了快改小它 —— 被封的是全站识别。
+ * 走高德时改成 400ms（个人 key 3 QPS）。
  *
  * ⚠️ 只动 `capture_place` 一列。坐标、照片、正文一个字不碰。
  */
 import { readFileSync, writeFileSync } from "node:fs";
 import { createClient } from "@supabase/supabase-js";
 import { placeFromNominatimAddress } from "../src/lib/place-from-address.ts";
+import { placeFromAmapRegeo } from "../src/lib/place-from-amap.ts";
+import { wgs84ToGcj02 } from "../src/lib/gcj02.ts";
 
 const APPLY = process.argv.includes("--apply");
 const LIMIT = process.argv.includes("--limit")
@@ -72,8 +78,40 @@ if (!process.env.NODE_USE_ENV_PROXY && (process.env.HTTPS_PROXY || process.env.h
   process.exit(1);
 }
 
+// `.env` 里配了 AMAP_KEY 就走高德 —— OSM 在鄂尔多斯只到街道，同街道内的几份地名
+// 一模一样；高德有 AOI/POI 才分得开。没配就还是 Nominatim，行为与之前一致。
+const AMAP_KEY = (env.AMAP_KEY || "").trim();
+
+/** 高德一次反查。返回 null 表示这次没成，交给调用方决定是否退到 Nominatim。 */
+async function reverseAmap(lat, lng) {
+  // ⚠️ 库里是 WGS-84，高德收 GCJ-02，此地偏移约 500 m —— 而我们要分辨的点相距才 80 m。
+  const g = wgs84ToGcj02(lat, lng);
+  const url =
+    `https://restapi.amap.com/v3/geocode/regeo?key=${encodeURIComponent(AMAP_KEY)}` +
+    `&location=${g.lng.toFixed(6)},${g.lat.toFixed(6)}&extensions=all&radius=200`;
+  try {
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
+    // 高德报错是 200 + status:"0"（额度用尽、key 无效都这样），只看 resp.ok 会把错误当成功。
+    if (data.status !== "1") {
+      console.warn(`  ⚠️ 高德 status=${data.status} info=${data.info}`);
+      return null;
+    }
+    return placeFromAmapRegeo(data.regeocode);
+  } catch (e) {
+    console.warn(`  ⚠️ 高德反查失败 ${lat},${lng}：${e.message}`);
+    return null;
+  }
+}
+
 /** 一次反查。失败返回 null（这一份跳过，绝不写空地名覆盖已有的）。 */
 async function reverse(lat, lng) {
+  if (AMAP_KEY) {
+    const viaAmap = await reverseAmap(lat, lng);
+    if (viaAmap) return viaAmap;
+    // 高德没成就退到 Nominatim，别让一次抖动把这一份写成空。
+  }
   const url = `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lng}&format=json&accept-language=zh-CN`;
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
@@ -136,7 +174,8 @@ const failed = [];
 for (let i = 0; i < rows.length; i++) {
   const d = rows[i];
   const next = await reverse(d.capture_lat, d.capture_lng);
-  if (i < rows.length - 1) await sleep(1200);
+  // Nominatim 硬性 1 次/秒；高德个人 key 是 3 QPS，400ms 稳稳在线内。
+  if (i < rows.length - 1) await sleep(AMAP_KEY ? 400 : 1200);
   if (next === null) {
     failed.push(d);
     continue;
