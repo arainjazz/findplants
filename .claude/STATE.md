@@ -41,11 +41,23 @@ tsc=0、build 过、`place-from-address.ts` ESLint 非 prettier 项 0、`identif
 已从快照按 `wrote` 补写完成 → **213/213**。写库循环也补了重试（否则补 3 份要把 240 多次反查整个重来）。
 库里复核：243 份有坐标，**空地名 0 · 「镇在旗前」倒序 0 · 内蒙缺地级市 0**（这三样改前都是成片的）。
 ⚠️ 代码已提交但**未部署**；线上识别仍写旧格式地名，下次部署才跟上。
-👉 **下一步已定**：用户选了**换国内地理编码（高德/腾讯）**来解决同街道分不开的问题。
-**卡在 key 上 —— 需要用户自己去 lbs.amap.com 申请 Web 服务 API key**（注册账号这类事我不做），
-拿到后放 `.env`。⚠️ **实现时最大的坑：高德用 GCJ-02，我们库里的 EXIF 坐标是 WGS-84**，
-直接塞进 regeo 会偏 50–500 m —— 而我们要分辨的点本身才相距 80 m，不转换等于白换。
-详见文末本轮小节。）_
+✅ **高德那条路已写完并提交（`bc7c266`），只差一把 key**。用户选了换国内地理编码，
+不依赖 key 的部分全部做完：`src/lib/gcj02.ts`（WGS-84 ↔ GCJ-02）、
+`src/lib/place-from-amap.ts`（regeo 解析，AOI 优先、无 AOI 才退到 150 m 内最近 POI —— 远处
+POI 写进地名是撒谎）、`reverseGeocode()` 有 key 走高德失败退回 Nominatim、回填脚本同样支持
+（节流按高德个人 key 3 QPS 放宽到 400ms）。
+⚠️ **最大的坑已经填了：高德收 GCJ-02，我们库里/EXIF 是 WGS-84**，实测此地偏移 **497 m**，
+而要分辨的点相距才 **80 m** —— 漏这一步**不报错**，只会稳定地报出半公里外那个地方的名字，
+比现在只到街道更糟。另：**高德报错是 HTTP 200 + `status:"0"`**（额度用尽/key 无效都这样），
+只看 `resp.ok` 会把错误当成功、写下空地名。
+断言三套全离线、不需要 key：`check_place_from_address`(13) / `check_gcj02` / `check_place_from_amap`(9)，
+全绿；tsc=0、build 过、三个 lib 文件 ESLint 非 prettier 项 0。
+写 amap 断言时当场逮到一个真 bug：`Number("")` 是 0，`distance` 缺失的 POI 会被当成「就在脚下」。
+🔑 **唯一待办：去 lbs.amap.com 申请「Web 服务」API key**（注册账号这类事不代办），
+写进 `.env` 的 `AMAP_KEY=`，然后重跑回填即可把存量换成 POI 级地名：
+`NODE_USE_ENV_PROXY=1 node --experimental-strip-types scratch/backfill_capture_place.mjs`
+（先 dry-run 看效果，再 `--apply`；旧值照样会存快照）。
+⚠️ 代码全部**未部署**，线上识别仍写旧格式地名。详见文末本轮小节。）_
 _上一轮：2026-08-11（续三）— by Claude（**那一栏不再摆经纬度，改显示「坐标反查出来的
 地名」；保护名单里的物种粗化到区/县/旗**。用户：「我要你展示的不是坐标，而是坐标背后代表的
 地点（保护名单里的物种除外）」。除了前端不再显示数字，**服务端连坐标都不再回传** —— 对保护
