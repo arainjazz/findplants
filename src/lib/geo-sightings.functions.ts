@@ -38,6 +38,28 @@ const BASE =
 type Row = Record<string, unknown>;
 
 /**
+ * 进程内缓存。名录是人工维护的静态数据（改动以天计），而判「这个物种是不是重点保护」
+ * 现在**每次打开条目页/草稿页**都要来一趟（见 species-existing.functions.ts），
+ * 每趟三四个查询、两千多行 —— 同一个 worker 实例里 10 分钟复用同一份。
+ * 失败的那次不留（`catch` 里清掉），否则一次网络抖动会被缓存十分钟。
+ */
+let matcherCache: { at: number; value: Promise<Awaited<ReturnType<typeof loadMatcher>>> } | null =
+  null;
+const MATCHER_TTL_MS = 10 * 60_000;
+
+/** 带缓存的 {@link loadMatcher}。给「一次只判一个物种」的调用方用。 */
+export async function loadConservationMatcherCached() {
+  const now = Date.now();
+  if (matcherCache && now - matcherCache.at < MATCHER_TTL_MS) return matcherCache.value;
+  const value = loadMatcher();
+  matcherCache = { at: now, value };
+  value.catch(() => {
+    if (matcherCache?.value === value) matcherCache = null;
+  });
+  return value;
+}
+
+/**
  * 名录匹配器。与识别流程（identify-plant.functions.ts）同一套：分页拉全 `conservation_taxa`
  * —— 这张表两千多行，PostgREST 默认 1000 行封顶，不分页会让后播种的名录整段匹配不上。
  */

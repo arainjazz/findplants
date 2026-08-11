@@ -3,6 +3,7 @@ import { z } from "zod";
 import { speciesKey } from "./plants";
 import { computeIdentifyConfidence, type IdentifyTrace } from "./identify-trace";
 import { tentativeResolution } from "./tentative";
+import { coarsenPlace } from "./protected-coords";
 
 // ─── 「这个物种已经有人做过了」查询 ──────────────────────────────────────────
 // 识别出**非疑似**结果后，草稿页在关掉分享卡时用它决定要不要拦一下：库里已经有同物种的
@@ -46,15 +47,21 @@ export type SpeciesExistingEntry = {
   slug?: string;
   /** ISO 时间串；列表里显示到「分」。 */
   createdAt: string | null;
-  /** 拍摄地点。`plants` 没有这一列 —— 采纳来的条目借它来源草稿的 `capture_place`。 */
-  place: string | null;
   /**
-   * 拍摄坐标。`capture_place` 的粒度**全靠识别当时的反地理编码**，从「陕西省榆林市定边县」
-   * 到「内蒙古自治区康巴什区青春山街道呼和塔拉路辅路」都有（全库 251 份里 44 份只到区）。
-   * 只给地名分辨不出同一个区里的两株，坐标才是那一份真正「在哪」（用户 2026-08-11 要求）。
+   * 拍摄地点 —— 也就是**坐标反查出来的那个地名**（识别时由 `reverseGeocode` 写进
+   * `capture_place`）。`plants` 没有这一列，采纳来的条目借它来源草稿的。
+   *
+   * 🔒 这里给出的已经是**对外可见**的值：命中重点保护名录的物种，服务端在这一步就已经
+   * 粗化到区/县/旗（`coarsenPlace`），粗化不出来就写「地点已隐去」。
+   *
+   * ⚠️ **不要在这个接口里回传经纬度。** 用户 2026-08-11 的要求是「展示坐标背后代表的
+   * 地点，保护名单里的物种除外」—— 而对保护物种来说，把精确坐标塞进 JSON 再在前端
+   * 决定不画出来，等于照样公开（页面源码里就能读到）。判据与脱敏都必须留在服务端，
+   * 与地图那条路（geo-sightings.functions.ts）同一个规矩。
    */
-  lat: number | null;
-  lng: number | null;
+  place: string | null;
+  /** true = 上面那个地点是保护物种粗化过的（行上给一句解释）。 */
+  placeCoarsened: boolean;
   /**
    * 综合可信度%。**与草稿页同一套算法**（`computeIdentifyConfidence`）—— 同一份草稿在
    * 两处显示两个数字是最糟的结果，所以判据字段一个都不省，包括那个 219 字的 summary。
@@ -162,7 +169,7 @@ export const lookupSpeciesExisting = createServerFn({ method: "POST" })
         (supabaseAdmin as any)
           .from("plant_drafts")
           .select(
-            "id, title, created_by, creator_label, scientific_name, created_at, capture_place, capture_lat, capture_lng, photo_url, published_plant_id, summary, ai_model, retake_count, enriched:ai_payload->>_enriched, trace:ai_payload->_identify_trace, conf:ai_payload->>identification_confidence, diag:ai_payload->_editor_diagnosis, xfix:ai_payload->_xiaop_id_fix",
+            "id, title, created_by, creator_label, scientific_name, family, created_at, capture_place, photo_url, published_plant_id, summary, ai_model, retake_count, enriched:ai_payload->>_enriched, trace:ai_payload->_identify_trace, conf:ai_payload->>identification_confidence, diag:ai_payload->_editor_diagnosis, xfix:ai_payload->_xiaop_id_fix",
           )
           .ilike("scientific_name", `${genus}%`)
           .order("created_at", { ascending: false })
@@ -171,7 +178,7 @@ export const lookupSpeciesExisting = createServerFn({ method: "POST" })
           // id 用来和草稿的 published_plant_id 对上（判断这一行是不是采纳来的）；
           // author_id 用来写「谁创建的」；created_at 决定同类里挑哪一份当代表。
           .from("plants")
-          .select("id, slug, title, scientific_name, source, created_at, author_id, cover_url")
+          .select("id, slug, title, scientific_name, family, source, created_at, author_id, cover_url")
           .ilike("scientific_name", `${genus}%`)
           .order("created_at", { ascending: false })
           .limit(300),
@@ -183,10 +190,10 @@ export const lookupSpeciesExisting = createServerFn({ method: "POST" })
         created_by: string | null;
         creator_label: string | null;
         scientific_name: string | null;
+        /** 名录匹配要用（科级条目：整个科都受保护的情形）。 */
+        family: string | null;
         created_at: string | null;
         capture_place: string | null;
-        capture_lat: number | null;
-        capture_lng: number | null;
         photo_url: string | null;
         published_plant_id: string | null;
         summary: string | null;
@@ -203,6 +210,7 @@ export const lookupSpeciesExisting = createServerFn({ method: "POST" })
         slug: string;
         title: string;
         scientific_name: string | null;
+        family: string | null;
         source: string | null;
         created_at: string | null;
         author_id: string | null;
@@ -291,38 +299,53 @@ export const lookupSpeciesExisting = createServerFn({ method: "POST" })
         ).pct;
       };
 
-      // plants 没有 capture_place / 坐标 / 可信度，封面也可能是空的 —— 采纳来的条目就借它
+      // plants 没有 capture_place / 可信度，封面也可能是空的 —— 采纳来的条目就借它
       // **来源草稿**的。列表里要靠这几样把同物种的几份区分开（多半是不同人在不同地点拍的）。
       //
-      // 地点、坐标、可信度都只认真来源（并入型条目借不到）：这三样都是**那一次观测的事实**，
+      // 地点与可信度都只认真来源（并入型条目借不到）：这两样都是**那一次观测的事实**，
       // 把一次补充观测的地点或可信度挂到一份百科详页上，读者会当成这一页就是那么来的。
       // 缩略图则**照借不误** —— 那只是视觉辅助，同物种的照片当封面兜底不会让人误读，
       // 而空缩略图会让一行塌成灰块。
       const fromSourceDraft = new Map<
         string,
-        {
-          place: string | null;
-          thumb: string | null;
-          lat: number | null;
-          lng: number | null;
-          confidencePct: number | null;
-        }
+        { place: string | null; thumb: string | null; confidencePct: number | null }
       >();
       for (const d of drafts) {
         if (!d.published_plant_id) continue;
         const cur = fromSourceDraft.get(d.published_plant_id);
         const src = isSourceDraft(d);
-        // 经纬**成对**认：一条来自 A、一条来自 B 会拼出一个谁都没去过的地方。
-        const kept = cur?.lat != null && cur?.lng != null;
-        const own = src && d.capture_lat != null && d.capture_lng != null;
         fromSourceDraft.set(d.published_plant_id, {
           place: cur?.place || (src ? d.capture_place || null : null),
           thumb: cur?.thumb || d.photo_url || null,
-          lat: kept ? cur!.lat : own ? d.capture_lat : null,
-          lng: kept ? cur!.lng : own ? d.capture_lng : null,
           confidencePct: cur?.confidencePct ?? (src ? confidenceOf(d) : null),
         });
       }
+
+      // 🔒 重点保护物种的地点粗化。这一栏里的每一行都是**同一个物种**，所以只判一次。
+      //
+      // 判据必须留在服务端：前端拿到什么就等于公开了什么（页面源码里读得到），而这一栏
+      // 列的是**别人**的观测点 —— 与地图那条路（geo-sightings.functions.ts）同一个处境，
+      // 那里也是服务端脱敏。身份一律不看（不像草稿页会给站长/资深编辑/本人放行）：
+      // 一份紧凑的清单没必要为此多跑一趟鉴权，分享卡那条路同样是「命中名录就一律模糊」。
+      let protectedSpecies = false;
+      try {
+        const { loadConservationMatcherCached } = await import("./geo-sightings.functions");
+        const { match } = await loadConservationMatcherCached();
+        // 科名一定要给：**兰科全科**是国家二级，绶草这类只在科一级命中（`match` 的
+        // family 分支）。草稿没有就退到条目那一行，两边都空才作罢。
+        const hit = match(
+          drafts[0]?.scientific_name ?? plants[0]?.scientific_name ?? null,
+          drafts[0]?.family ?? plants[0]?.family ?? null,
+        );
+        protectedSpecies = hit.protectedLists.size > 0;
+      } catch (e) {
+        // 名录查不动时**按保护处理**（宁可少给信息，也不能把一株四合木的位置漏出去）。
+        console.warn("[SpeciesExisting] conservation matcher failed, coarsening places:", e);
+        protectedSpecies = true;
+      }
+      /** 对外可见的地点文字。保护物种砍到区/县/旗，砍不出来就整个隐去。 */
+      const shownPlace = (place: string | null) =>
+        protectedSpecies ? coarsenPlace(place) || "地点已隐去" : place;
 
       type Raw = {
         kind: SpeciesExistingKind;
@@ -333,8 +356,6 @@ export const lookupSpeciesExisting = createServerFn({ method: "POST" })
         label: string | null;
         createdAt: string | null;
         place: string | null;
-        lat: number | null;
-        lng: number | null;
         confidencePct: number | null;
         thumb: string | null;
         published: boolean;
@@ -359,9 +380,7 @@ export const lookupSpeciesExisting = createServerFn({ method: "POST" })
           userId: p.author_id,
           label: null,
           createdAt: p.created_at ?? null,
-          place: src?.place ?? null,
-          lat: src?.lat ?? null,
-          lng: src?.lng ?? null,
+          place: shownPlace(src?.place ?? null),
           confidencePct: src?.confidencePct ?? null,
           thumb: p.cover_url || src?.thumb || null,
           published: true,
@@ -375,10 +394,7 @@ export const lookupSpeciesExisting = createServerFn({ method: "POST" })
           userId: d.created_by,
           label: d.creator_label,
           createdAt: d.created_at ?? null,
-          place: d.capture_place ?? null,
-          // 同上：缺一头的坐标指不到任何地方，一律当没有。
-          lat: d.capture_lat != null && d.capture_lng != null ? d.capture_lat : null,
-          lng: d.capture_lat != null && d.capture_lng != null ? d.capture_lng : null,
+          place: shownPlace(d.capture_place ?? null),
           confidencePct: confidenceOf(d),
           thumb: d.photo_url ?? null,
           published: false,
@@ -407,8 +423,7 @@ export const lookupSpeciesExisting = createServerFn({ method: "POST" })
             slug: g.slug,
             createdAt: g.createdAt,
             place: g.place,
-            lat: g.lat,
-            lng: g.lng,
+            placeCoarsened: protectedSpecies && !!g.place,
             confidencePct: g.confidencePct,
             thumb: g.thumb,
             published: g.published,

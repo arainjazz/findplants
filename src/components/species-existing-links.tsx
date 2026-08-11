@@ -3,6 +3,7 @@ import { Link } from "@tanstack/react-router";
 import { useQuery } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
 import { SafeImg } from "@/components/safe-img";
+import { PLACE_COARSENED_EXPLAIN } from "@/lib/protected-coords";
 import { enhanceDraftHtmlForViewing } from "@/lib/draft-enhance";
 import { fetchDraftById } from "@/lib/drafts";
 import {
@@ -31,10 +32,10 @@ import {
 //
 // 一类有好几份时（2026-08-09）：按钮不再直接把人带去其中某一份，而是**展开成一行一份的列表**。
 // 从前每类只给 `entries[0]` 一个入口、后缀却写着「共 2 份」（拂子茅 4 份内容只点得到 2 份），
-// 数字与入口对不上。每行带缩略图 + 已收录/草稿 + 作者 + 时间 + 综合可信度 + 拍摄地点与坐标
-// —— 同物种的几份多半是不同人在不同地点拍的，光有标题分辨不出谁是谁；而地名的粒度全看
-// 识别当时反地理编码给到哪一级（从「陕西省榆林市定边县」到整条街的门牌都有），同一个区里的
-// 两株只有坐标分得开（用户 2026-08-11）。
+// 数字与入口对不上。每行带缩略图 + 已收录/草稿 + 作者 + 时间 + 综合可信度 + 拍摄地点
+// —— 同物种的几份多半是不同人在不同地点拍的，光有标题分辨不出谁是谁。
+// 地点写的是**坐标反查出来的地名**，不摆经纬度数字（用户 2026-08-11）；重点保护名录里的
+// 物种例外 —— 那一栏由服务端粗化到区/县/旗，防盗挖，见 lib/protected-coords.ts。
 
 /**
  * 未收录的银叶科普草稿的**就地展开**视图。
@@ -207,21 +208,21 @@ function formatWhen(iso: string | null) {
 }
 
 /**
- * 坐标。小数点后 4 位 ≈ 11 米，足够把同一片草地上的两株分开，再多就是噪音。
- * 经纬缺一个就不显示 —— 服务端已经成对取过一次，这里是最后一道。
+ * 地点那一行的解释（保护物种才有）。行上只挂一把锁、不写整句话 —— 一行清单塞不下，
+ * 而且那句话对读者的用处远不如地名本身；hover / 读屏能拿到完整说明。
  */
-function formatCoords(lat: number | null, lng: number | null) {
-  if (lat == null || lng == null) return null;
-  return `${lat.toFixed(4)}, ${lng.toFixed(4)}`;
-}
+const COARSENED_HINT = PLACE_COARSENED_EXPLAIN;
 
 /**
  * 「共 N 份」展开后的一行。
  *
  * 区分信息：缩略图、已收录/未收录草稿、作者+时间、综合可信度（2026-08-09 选的四样，
- * 时间那项 08-11 精确到「分」）＋ 拍摄地点、坐标（用户 2026-08-11 加的）。
+ * 时间那项 08-11 精确到「分」）＋ 拍摄地点。
  * **分两行摆**：第一行是短的（状态·作者·时间·可信度），第二行让给会很长的地点 ——
  * 挤成一行时地名一长，可信度就被 `truncate` 吃掉了，而那正是用来挑哪一份的关键数字。
+ *
+ * 🔒 地点是**服务端**给的对外值：保护物种到这里已经粗化过（`placeCoarsened`），
+ * 行上挂一把锁 + hover 解释。经纬度这一层压根拿不到，也不该拿到（见 SpeciesExistingEntry）。
  * 缩略图走 SafeImg —— 草稿照片被清理掉的情况真发生过（2026-07-13 那次），不能让列表里
  * 裂出一排碎图标。
  */
@@ -249,7 +250,6 @@ function SpeciesExistingEntryRow({
   ]
     .filter(Boolean)
     .join(" · ");
-  const where = [entry.place, formatCoords(entry.lat, entry.lng)].filter(Boolean).join(" · ");
 
   const base = `text-[12px] border px-2.5 py-2 rounded-sm transition-colors flex items-center gap-2.5 w-full text-left ${s.cls}`;
   const body = (
@@ -265,7 +265,15 @@ function SpeciesExistingEntryRow({
           {entry.title || fallbackTitle || "同物种内容"}
         </span>
         <span className="block truncate text-[11px] opacity-70">{meta}</span>
-        {where && <span className="block truncate text-[11px] opacity-60">{where}</span>}
+        {entry.place && (
+          <span
+            className="block truncate text-[11px] opacity-60"
+            title={entry.placeCoarsened ? COARSENED_HINT : undefined}
+          >
+            {entry.place}
+            {entry.placeCoarsened && <span aria-hidden> 🔒</span>}
+          </span>
+        )}
       </span>
       {isInlineEntry(kind, entry) && <span aria-hidden>{inlineOpen ? "▲" : "▼"}</span>}
     </>
