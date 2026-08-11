@@ -51,6 +51,7 @@ import {
   GOLD_SLOTS,
 } from "./photo-slots";
 import { FUZZ_SUFFIX, coarsenPlace, fuzzCoord } from "./protected-coords";
+import { placeFromNominatimAddress } from "./place-from-address";
 import { checkDraftQuality, checkGoldQuality, describeIssues } from "./quality-gate";
 import { lookupChinaInvasive } from "./china-invasive-list";
 import { keepVisualAdvice, DEFAULT_VISUAL_ADVICE } from "./retake-advice";
@@ -2568,18 +2569,12 @@ async function reverseGeocode(lat: number, lng: number): Promise<string> {
     });
     if (resp.ok) {
       const data = await resp.json();
-      const addr = data.address;
-      if (addr) {
-        const province = addr.province || addr.state || "";
-        const city = addr.city || addr.town || addr.city_district || "";
-        const county = addr.county || addr.district || addr.suburb || "";
-        const road = addr.road || "";
-        const parts = [province, city, county, road].filter(Boolean);
-        if (parts.length > 0) {
-          const placeName = parts.join("");
-          console.log(`[ReverseGeocode] Resolved via Nominatim: ${placeName}`);
-          return placeName;
-        }
+      // 拼装规则在 place-from-address.ts —— 与存量回填脚本共用同一份，
+      // 否则新草稿和老草稿的地名会长成两个样子（旧规则丢地级市、还把镇拼到旗前面）。
+      const placeName = placeFromNominatimAddress(data.address);
+      if (placeName) {
+        console.log(`[ReverseGeocode] Resolved via Nominatim: ${placeName}`);
+        return placeName;
       }
     }
   } catch (err) {
