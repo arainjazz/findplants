@@ -18,14 +18,16 @@
  *   NODE_USE_ENV_PROXY=1 node --experimental-strip-types scratch/backfill_capture_place.mjs --apply
  *
  *   --limit N   只处理最近的 N 份（先拿一小撮看看效果，别一上来就打 250 次外部接口）
- *   --apply     真正写库。不带就只打印对照表。
+ *   --apply     真正写库。不带就只打印对照表。写库前会把旧值存成
+ *               `backfill_capture_place.snapshot-<时间>.json`（这一列没有版本历史）。
+ *   --restore <快照文件>   把 --apply 写下的地名原样倒回去，不打网。
  *
  * ⚠️ Nominatim 是**免费公共服务**，用量政策要求最多 1 次/秒且带真实 User-Agent。
  * 这里固定 1.2 秒一发、串行跑；250 份约 5 分钟。别为了快改小它 —— 被封的是全站识别。
  *
  * ⚠️ 只动 `capture_place` 一列。坐标、照片、正文一个字不碰。
  */
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { createClient } from "@supabase/supabase-js";
 import { placeFromNominatimAddress } from "../src/lib/place-from-address.ts";
 
@@ -33,6 +35,9 @@ const APPLY = process.argv.includes("--apply");
 const LIMIT = process.argv.includes("--limit")
   ? Number(process.argv[process.argv.indexOf("--limit") + 1])
   : 0;
+const RESTORE = process.argv.includes("--restore")
+  ? process.argv[process.argv.indexOf("--restore") + 1]
+  : "";
 
 // .env 只读不打印（项目铁规矩：service-role key 不许出现在任何输出里）。
 const env = Object.fromEntries(
@@ -86,16 +91,40 @@ async function reverse(lat, lng) {
   return null;
 }
 
-const { data, error } = await db
-  .from("plant_drafts")
-  .select("id, title, capture_lat, capture_lng, capture_place")
-  .not("capture_lat", "is", null)
-  .not("capture_lng", "is", null)
-  .order("created_at", { ascending: false });
-if (error) {
-  console.error("查库失败：", error.message);
-  process.exit(1);
+// `--restore <快照文件>`：把 --apply 写下的地名原样倒回去。不打网，只读快照里的旧值。
+if (RESTORE) {
+  const snap = JSON.parse(readFileSync(RESTORE, "utf8"));
+  console.log(`从快照回滚 ${snap.length} 份：${RESTORE}\n`);
+  let back = 0;
+  for (const s of snap) {
+    const { error: e } = await db
+      .from("plant_drafts")
+      .update({ capture_place: s.old })
+      .eq("id", s.id);
+    if (e) console.warn(`  ⚠️ 回滚失败 ${s.id}：${e.message}`);
+    else back++;
+  }
+  console.log(`\n✅ 已回滚 ${back}/${snap.length} 份。`);
+  process.exit(back === snap.length ? 0 : 1);
 }
+
+// 本机代理有约一成的握手会抖（记忆里那条 ECONNRESET 老毛病），这步裸跑过一次就吃了
+// 一个 `fetch failed` 直接退出。反查那边早有重试，唯独这里没有 —— 补上。
+async function selectDrafts() {
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const { data, error } = await db
+      .from("plant_drafts")
+      .select("id, title, capture_lat, capture_lng, capture_place")
+      .not("capture_lat", "is", null)
+      .not("capture_lng", "is", null)
+      .order("created_at", { ascending: false });
+    if (!error) return data;
+    console.warn(`  ⚠️ 查库第 ${attempt} 次失败：${error.message}`);
+    if (attempt === 3) process.exit(1);
+    await sleep(3000);
+  }
+}
+const data = await selectDrafts();
 
 const rows = LIMIT > 0 ? data.slice(0, LIMIT) : data;
 console.log(`有坐标的草稿 ${data.length} 份，本次处理 ${rows.length} 份${APPLY ? "（--apply 会写库）" : "（dry-run，只看不改）"}\n`);
@@ -157,13 +186,34 @@ if (!APPLY) {
   process.exit(0);
 }
 
+// 写库前先把**旧值**落盘。这一列没有版本历史，覆盖掉就找不回来了；
+// 快照里存的是 id → 旧地名，`--restore <文件>` 可以原样倒回去。
+const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+const snapPath = new URL(`./backfill_capture_place.snapshot-${stamp}.json`, import.meta.url);
+writeFileSync(
+  snapPath,
+  JSON.stringify(
+    changes.map((c) => ({ id: c.id, title: c.title, old: c.old, wrote: c.next })),
+    null,
+    2,
+  ),
+);
+console.log(`\n🗂  旧值快照已存：${snapPath.pathname.split("/").pop()}（${changes.length} 份）`);
+
 let ok = 0;
 for (const c of changes) {
-  const { error: upErr } = await db
-    .from("plant_drafts")
-    .update({ capture_place: c.next })
-    .eq("id", c.id);
-  if (upErr) console.warn(`  ⚠️ 写失败 ${c.id}：${upErr.message}`);
-  else ok++;
+  // 同样要重试：第一次真跑就有 3 份栽在握手抖动上（210/213），
+  // 而这一步没重试就意味着**得把 240 多次反查整个重来**才能补上那几份。
+  let done = false;
+  for (let attempt = 1; attempt <= 3 && !done; attempt++) {
+    const { error: upErr } = await db
+      .from("plant_drafts")
+      .update({ capture_place: c.next })
+      .eq("id", c.id);
+    if (!upErr) done = true;
+    else if (attempt === 3) console.warn(`  ⚠️ 写失败 ${c.id}：${upErr.message}`);
+    else await sleep(2000);
+  }
+  if (done) ok++;
 }
 console.log(`\n✅ 已写库 ${ok}/${changes.length} 份。`);
