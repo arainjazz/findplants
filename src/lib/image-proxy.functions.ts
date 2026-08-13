@@ -1,5 +1,6 @@
 import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
+import { isAllowedImageHost, hostOf } from "@/lib/image-host-allowlist";
 
 const ProxyImageInput = z.object({ url: z.string().url().max(2000) });
 
@@ -16,6 +17,11 @@ export const proxyImageDataUrlFn = createServerFn({ method: "POST" })
     try {
       const u = new URL(data.url);
       if (u.protocol !== "https:" && u.protocol !== "http:") return { dataUrl: null };
+      // 白名单之外一律不抓（判定与断言都在 image-host-allowlist.ts）。和其它失败一样
+      // 静默回 null —— 调用方（share-card）本来就会退到占位图，这里抛错只会把「一张卡
+      // 画不出来」升级成「整个分享流程报错」。
+      const ownHost = hostOf(process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL);
+      if (!isAllowedImageHost(u.hostname, ownHost)) return { dataUrl: null };
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 12_000);
       let r: Response;
