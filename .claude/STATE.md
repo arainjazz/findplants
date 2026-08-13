@@ -407,7 +407,18 @@ _Read this FIRST and update it LAST, every session._
 
 ## 🚨 部署真相（以 Cloudflare 为准，不以本文件的小节标签为准）
 
-**⬆️ 最新：线上版本 = `a48f622c-d06a-43ac-8ef6-3ab2b675b6a2`，2026-08-13 部署**
+**⬆️ 最新：线上版本 = `855aad89-3ce8-4f3f-82ab-40fe2f930b19`，2026-08-13 部署（当天第二次）**
+（只带一条：`ebe18e8` 匿名识别日限改为可在后台热改。用户追问「共用网络撞上 60 怎么办」
+之后补的 —— 从此调这个数**不用再部署**，往 `site_config` 写一行
+`anon_identify_daily_limit` 即可，写 `0` 是急停开关。`env -u HTTP_PROXY …` 一次过，56 秒。）
+**上线核验（已做）**：`/` `/identify` `/explore` `/about` `/blog` `/plants/plantago-major`
+全 200；三条坏 slug 仍是 **404**；`/default-og-image.jpg` 200；www 首页 200。
+`/identify` 截图渲染正常、**线上控制台零报错**。
+⚠️ 计数与热改本身仍**没有在线上验过**（同上一条：要验就得真发一次识别）。
+
+---
+
+**上一次：线上版本 = `a48f622c-d06a-43ac-8ef6-3ab2b675b6a2`，2026-08-13 部署**
 （本轮 8 条 bug 修复，**已全部提交**：`30de22a` / `e3b4f9b` / `ec98e89` / `e06fb63` / `d8ac011`。
 `env -u HTTP_PROXY …` 那招**一次过**，27 秒，无重试。）
 **上线核验（已做，这次是用眼睛看的）**：
