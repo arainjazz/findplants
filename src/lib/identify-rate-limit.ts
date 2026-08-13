@@ -10,19 +10,58 @@
 // 这里补的是一道**前端伪造不了**的闸：Cloudflare 在边缘写入 `CF-Connecting-IP`，
 // 请求里自带的同名头会被它覆盖掉，所以这个值可信。
 //
+// 🔧 **上限可以在后台改，不用重新部署**：往 `site_config` 写一行
+// `anon_identify_daily_limit`（值直接写数字即可），下一次请求就生效；删掉这行就回到
+// 代码里的默认值。同 `ai_model_config` 的路子。写 `0` = 彻底关掉匿名识别（急停开关）。
+//
 // ⚠️ 已知取舍，别当 bug 修：
-// · **共用出口 IP 会互相挤占**（学校、公司、运营商 CGNAT）。所以上限定得比"够用"宽得多，
-//   宁可放过一些刷子，也不能让一个班的学生互相顶掉。登录用户完全不受这条限制。
+// · **共用出口 IP 会互相挤占**（学校、公司、运营商 CGNAT）。一个班的人是**一起分**这个
+//   额度的，所以上限定得比"够用"宽得多：宁可放过一些刷子，也不能让他们互相顶掉。
+//   被挡下的人**登录即可继续**，登录用户完全不走这条路。
 // · **读-改-写不是原子的**：同一 IP 并发打进来可能都读到同一个计数，实际放行会略多于
 //   上限。对限流来说无所谓 —— 它要挡的是「一天几千次」，不是「精确到第 60 次」。
 //   为此上了原子的 RPC 反而要写迁移（托管 Supabase，得用户手工去控制台跑）。
 // · 拿不到 IP（本地 dev、非 Cloudflare 环境）时**放行**。宁可不限，也不能让本地开发和
 //   任何非预期部署环境下的识别整个瘫掉。
 
-/** 匿名访客每个 IP 每天最多起多少次识别。放宽是刻意的 —— 见文件头的取舍说明。 */
+/**
+ * 匿名访客每个 IP 每天最多起多少次识别 —— **默认值**，真正生效的值优先读库
+ * （`site_config.anon_identify_daily_limit`，见 `readLimit`）。
+ *
+ * 放宽到 60 是刻意的：共用出口 IP 的用户是**一起分**这个额度的，一个班同时用就撞上了。
+ * 纯按成本算 10 次都够，但宁可放过一些刷子，也不能让一个机房的人互相顶掉。
+ */
 export const ANON_IDENTIFY_DAILY_LIMIT = 60;
 
 export const KEY_PREFIX = "rl:identify:";
+
+/**
+ * 上限的库内覆盖键。放在 `site_config` 里是为了**改完立刻生效、不用重新部署** ——
+ * 同 `ai_model_config` 的路子。真撞上共用网络的投诉时，改代码 + build + deploy 要几分钟，
+ * 而这里在后台改一个数就行。
+ */
+export const LIMIT_KEY = "anon_identify_daily_limit";
+
+/**
+ * 解析库里那个覆盖值。看不懂就回 null（调用方用代码里的默认值）。
+ *
+ * 容忍几种写法，因为这一列是 jsonb、而人是手工在控制台填的：
+ * 直接写数字 `150`、写成字符串 `"150"`、或包一层 `{"limit":150}` / `{"value":150}`。
+ *
+ * ⚠️ **`0` 是有效值，含义是「彻底关掉匿名识别」** —— 这是被刷爆时的急停开关，
+ * 不用等一次部署。正因为它有效，才要把「负数 / 小数 / 非数字」明确挡掉回 null：
+ * 手滑写个 `-1` 或 `abc` 应该退回默认值，而不是把游客识别整个关死。
+ */
+export function parseLimitOverride(raw: unknown): number | null {
+  let v: unknown = raw;
+  if (v && typeof v === "object") {
+    const o = v as Record<string, unknown>;
+    v = o.limit ?? o.value;
+  }
+  if (typeof v === "string") v = v.trim() === "" ? NaN : Number(v);
+  if (typeof v !== "number" || !Number.isInteger(v) || v < 0) return null;
+  return v;
+}
 
 /** UTC 日期，形如 `2026-08-13`。用 UTC 是为了让 Worker 在哪个地区跑都切在同一刻。 */
 function today(): string {
@@ -89,7 +128,7 @@ export async function bumpAnonIdentify(): Promise<{
   used: number;
   limit: number;
 }> {
-  const limit = ANON_IDENTIFY_DAILY_LIMIT;
+  let limit = ANON_IDENTIFY_DAILY_LIMIT;
   try {
     const ip = await clientIp();
     // 本地 dev / 非 Cloudflare 环境：没有这个头，不限。
@@ -101,9 +140,27 @@ export async function bumpAnonIdentify(): Promise<{
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const db = supabaseAdmin as any;
 
-    const { data } = await db.from("site_config").select("value").eq("key", key).maybeSingle();
-    const raw = (data as { value?: unknown } | null)?.value;
-    const rec = (typeof raw === "string" ? JSON.parse(raw) : raw) as Counter | null;
+    // 计数行和上限覆盖值**一次查回来**。分两次查会给每一次匿名识别多加一个往返，
+    // 而这两行都在同一张表里，用 `.in()` 取回再分拣即可。
+    const { data } = await db.from("site_config").select("key,value").in("key", [key, LIMIT_KEY]);
+    const rows = (data ?? []) as { key?: unknown; value?: unknown }[];
+    const valueOf = (k: string): unknown => {
+      const row = rows.find((r) => r.key === k);
+      const raw = row?.value;
+      // 这一列是 jsonb，但历史上也有存成字符串的，两种都接住。
+      if (typeof raw !== "string") return raw;
+      try {
+        return JSON.parse(raw);
+      } catch {
+        return raw;
+      }
+    };
+
+    // 库里配了就用库里的，改完立刻生效、不用重新部署；没配 / 配得看不懂就用代码默认值。
+    const override = parseLimitOverride(valueOf(LIMIT_KEY));
+    if (override !== null) limit = override;
+
+    const rec = valueOf(key) as Counter | null;
     const used = rec && rec.day === day && typeof rec.count === "number" ? rec.count : 0;
 
     if (used >= limit) return { allowed: false, used, limit };
