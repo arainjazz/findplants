@@ -1,6 +1,57 @@
 # Plantspedia — Working State  (single source of truth)
 
-_Last updated: 2026-08-12（续四）— by Claude（**把「坐标反查出来的地名」真正做细：新写
+_Last updated: 2026-08-13 — by Claude（**全站找 bug 并按用户逐条选定的方案修了 8 条**，
+**已提交并部署上线**。先是 6 条，用户看完后要求「接着处理」剩下两条，遂补上
+⑦ **匿名识别按 IP 加每日上限**（新 `src/lib/identify-rate-limit.ts` + 16 条离线断言）与
+⑧ **「关于本站」章节编辑补本地暂存**。
+⚠️ 两处**修正了我上一轮的说法**：匿名识别**不是**完全没限制（`ANON_MAX_ACTIVE_JOBS=2` 的
+并发上限一直在），但它认前端传的 `anon_id`、换一个就绕过 —— `anon-id.ts` 的注释自己写着
+「只是防手滑连点，不是防刷的安全边界」；`rich-editor` **本身不需要**自动保存（它是受控
+组件，内容在父组件手里），真正的缺口只有 `about.tsx`。
+🔴 ⑦ 里最该记住的一条：清理往日计数行**刻意不写成 `.delete().like().not()`** ——
+要删的是 `site_config`，那张表同时躺着 AI key / 模型配置 / Pl@ntNet 配额 / 全部后台任务行，
+条件删只要有一个筛子没生效就能把整张表清空**且不报错**（2026-07-13 的孤儿清理事故就是同类）。
+改成「先查 → 代码里逐条核对前缀 → 按精确 key 列表删」，并把选择逻辑抽成纯函数钉死。
+以下是原 6 条：
+用户要求「检查网站还有哪些可能出现的 bug，用选择题问我怎么修」。先起了 6 路并行审查，
+**6/6 全挂在 `Connection closed mid-response`**（就是本文件记了多次的老毛病），按项目规则
+不重试第二轮、改为自己逐块查。查出并当场核实 6 条，全部经用户选择后落地：
+① **图片代理是开放的** —— `proxyImageDataUrlFn` 无鉴权、无域名白名单、任意 URL 服务端代抓
+（server fn 在 `/_serverFn/<id>` 公开可 POST，id 就写在客户端 bundle 里）。判定逻辑抽成
+`src/lib/image-host-allowlist.ts`（自家 Supabase 桶 + iNat/GBIF/Wikimedia，后缀匹配要求前面
+是 `.`，否则 `evil-inaturalist.org` 会蒙混过关），配 `scratch/check_image_host_allowlist.mjs`
+**20 条离线断言全绿**。⚠️ 抽成独立模块是因为**手打那个 RPC 端点验不动**（payload 编码是
+内部约定，两次都回 `Seroval Error (step: 3)`），别再去试第三次。
+② **`fillChineseNames` 无鉴权可白嫖 AI 额度**（单次 500 个学名、直接烧 `LOVABLE_API_KEY`；
+全仓 grep 不到任何限流）。⚠️ **改的时候发现原推荐前提是错的**：它不是管理员专用，
+`plants.index:937` / `catalog-row:80` 的「补充图鉴条目」入口门槛是 `user &&`，收紧到管理员会让
+普通编辑者的中文名补全**静默失效**（调用处是 `catch {}` 吞掉的）。经用户改选，门槛定在
+**登录**。已核实 `attachSupabaseAuth` 是 `start.ts` 里的全局 client 中间件，登录用户每次
+server fn 调用都自动带 token，所以只挡匿名。
+③ **soft-404**：不存在的 slug 一律回 **HTTP 200** —— `notFound()` 写在**组件渲染期**，那时候
+SSR 响应头早发出去了。改到 loader 里（plants.$slug / blog.$slug / projects.$id）；projects
+原本连 loader 都没有，顺带卡了道 uuid 形状（塞 `abc` 进 uuid 列是 22P02 → **500** 而不是 404）。
+④ **分享卡碎图**：`og:image` 兜底指向 `/default-og-image.jpg`，**这文件从来不存在**（线上 404），
+且是相对路径（抓取器多半当无效值丢掉）。生成了 1200×630 的默认图进 `public/`，
+新增 `src/lib/site-url.ts` 统一拼绝对地址。
+⑤ **编辑器写一半会丢**：blog-editor / project-editor 既无本地暂存也无离开拦截。抽了
+`src/hooks/use-editor-draft.ts` 两处共用。⚠️ 有个**非显然的坑**：`BlockEditor` 只在自己挂载
+那一刻读一次 `initialHTML`，光 `setHtml` 正文不会回来 —— 必须同时翻 `key` 逼它重挂，
+否则标题副标题都恢复了唯独正文空着。
+⑥ plants.$slug 的 postMessage 监听不校验 `e.source`（另外两处都校验），补齐。
+**验证**：tsc=0、build 过、改动文件 ESLint 非 prettier 项只剩 1 条**在 HEAD 就存在**的
+`rules-of-hooks`（plants.$slug 的 `Route.useSearch` 在早退之后，与本轮无关）；
+本地实测 `/plants/不存在`、`/blog/不存在`、`/projects/not-a-uuid` **全部 404**，
+`/default-og-image.jpg` 200 且已进 `dist/client`；有封面的页 og:image 原样透传 Supabase 绝对
+地址，无封面的页回落 `https://plantspedia.club/default-og-image.jpg`（植物 + 博客各实测一份）。
+⚠️ **⑤ 的自动保存没有端到端实测** —— 编辑器在 `_authenticated` 下要真人登录；且浏览器面板
+在本机取 dev 模块普遍失败（`/about` 这条**没碰过**的路由报一模一样的水合+动态导入错误，
+是环境不是回归）。⚠️ **⑦ 的计数也没有端到端实测** —— 本地没有 `CF-Connecting-IP`，
+这条路按设计直接放行（拿不到 IP 一律不限）；且本地 dev 连的是**生产 Supabase**，真跑一次
+识别会写真数据、烧真额度。逻辑靠 16 条离线断言，接线靠 tsc/build + `/identify` 200 且
+服务端无报错（这一条专门验 STATE 里记过的「dev 500 而 build 照过」陷阱，没踩上）。
+详见文件最下方本轮小节。）_
+_上一轮：2026-08-12（续四）— by Claude（**把「坐标反查出来的地名」真正做细：新写
 `src/lib/place-from-address.ts`，识别路径与回填脚本共用同一份拼装规则**。上一轮把粒度问题
 摆到明面之后，本轮只做「地名怎么拼」这一件事。旧 `reverseGeocode()` 的四行取值
 （`province+city+county+road`，每格 `a||b||c`）有三处硬伤：**`region` 从没被读过**（地级市
@@ -8690,3 +8741,152 @@ plantspedia.club / www 双域名已切。**浏览器实看线上**猪毛蒿页�
 同一处的多份观测要不要用「相对方位+距离」区分（如『圣水草原东北约 300 m』，
 用坐标算但不显示坐标）—— **未做**。这是目前唯一还能把它们分开的办法：
 高德实测证明地名这条路到头了。
+
+---
+
+## 🆕 2026-08-13 — 全站找 bug + 用户逐条选定的 6 项修复（tsc=0 / build 过；⚠️ **未提交、未部署**）
+
+用户原话：「检查网站还有哪些可能会出现的bug，通过给出选择题的方式向我询问如何修复」。
+
+### 0. 审查过程本身踩的坑（记下来免得下次重来）
+起了 6 路并行审查（服务端鉴权 / 坐标隐私 / AI 与队列 / 上传图片 / 草稿流转 / 前端渲染），
+**6 个全部死在 `API Error: Connection closed mid-response`**，`journal.jsonl` 里连一条
+result 都没有 —— 每个 agent 都只输出了一句「I'll start by reading…」就断。
+这就是本文件多次记过的本机代理老毛病（见 memory `session-econnreset-root-cause`）。
+**按 CLAUDE.md 的「Cap retries」规则没有重试第二轮**，改为自己逐块 grep + Read。
+结论：这个环境下**不要指望长跑的并行 subagent**，要么自己查，要么把任务切到很小。
+
+### 1. 图片代理是开放的（无鉴权 + 无白名单）→ 已收口
+`proxyImageDataUrlFn`（`src/lib/image-proxy.functions.ts`）不带鉴权（游客也要能生成分享卡），
+接受任意 `http(s)` URL 服务端抓取后回 base64。而 server fn 在 `/_serverFn/<id>` 上**公开可
+POST，id 就写在客户端 bundle 里**（dev 下 `curl http://localhost:PORT/src/lib/image-proxy.functions.ts`
+就能看到那串 base64 id）。等于一个开放图片代理：拿我们的出口 IP 刷别人的站、把带宽当 CDN、
+探内网/云元数据地址。
+**改法**（用户选「加域名白名单，保持匿名可用」）：判定逻辑抽成独立模块
+`src/lib/image-host-allowlist.ts` —— 自家 Supabase 桶（从 `SUPABASE_URL` 现取，换项目不用改
+名单）+ iNaturalist / GBIF / Wikimedia / Wikipedia。
+🔧 **最容易写错的一处**：后缀匹配必须要求前面是 `.`。只写 `endsWith("inaturalist.org")` 的话
+`evil-inaturalist.org` 直接蒙混过关，白名单等于白设。断言里专门钉了这条。
+🔴 **为什么抽成独立模块**：想直接打那个 RPC 端点做端到端验证，**两次都回
+`{"t":25,...,"Seroval Error (step: 3)"}`**（payload 编码是 TanStack 内部约定，`{"data":{...}}`
+和裸 `{...}` 都不对）。按项目规则第 2 次就停了，改走仓库既有的「纯函数 + 离线断言」路子。
+**别再去试第三次手打 RPC** —— 要端到端只能从 share-card 那条真实调用链走。
+断言：`scratch/check_image_host_allowlist.mjs`，**20 条全绿**，不打网、不需要环境变量：
+`node --experimental-strip-types scratch/check_image_host_allowlist.mjs`
+
+### 2. `fillChineseNames` 无鉴权，AI 额度敞着 → 改成「要求登录」
+`src/lib/catalog-ai.functions.ts`：单次最多 500 个学名，直接拿 `LOVABLE_API_KEY` 打大模型，
+**没有任何鉴权**；且全仓 grep 不到限流（`rate.?limit|throttle|每日上限` 只命中 key 体检里读
+响应头的那几处）。
+⚠️ **本轮最值得记的一条**：我最初推荐「加管理员鉴权」，**前提是错的**。它真正的调用方是
+`src/routes/plants.index.tsx:937` 和 `src/components/catalog-row.tsx:80` 的「补充图鉴条目」，
+入口门槛是 `user &&`（plants.index.tsx:1020），也就是**任何登录用户**；catalog-row 还同时挂在
+`/admin` 和 `/profile`。收紧到管理员会让普通编辑者的中文名补全**静默失效** —— 调用处是
+`catch {}` 吞掉的，用户只会看到中文名莫名空着、连报错都没有。已就地向用户说明并改选。
+**最终门槛 = 登录**（`.middleware([requireSupabaseAuth])`）。
+已核实这不会伤到已登录用户：`attachSupabaseAuth` 是 `src/start.ts` 里注册的**全局**
+`functionMiddleware`，浏览器每次 server fn RPC 都会自动带上 bearer token。
+
+### 3. soft-404：不存在的 slug 一律回 HTTP 200 → 改到 loader 里抛
+`notFound()` 原本写在**组件渲染期**（plants.$slug:648 / blog.$slug:42 / projects.$id:28），
+那时候 SSR 的响应头早就发出去了。线上实测 `/plants/does-not-exist-xyz` → **200**，
+标题还回落成站点默认「Plantspedia · 全民植物志」。后果：搜索引擎把大批不存在的地址当正常页
+收录、外链检查器看不出死链、分享出去全是同一句默认文案。
+**改法**：三条路由的 loader 里查空即 `throw notFound()`；组件里那句照旧留着（客户端 query
+在页面打开后重新取到 null，比如条目刚被删，还要靠它）。
+🔧 `projects.$id` **原本连 loader 都没有**（纯客户端 query），顺带补了一道 uuid 形状校验：
+`id` 在库里是 uuid 列，塞个 `abc` 进去是 Postgres 22P02，`fetchProjectById` 把它 throw 出来
+就成了 **500**，而这本来只是「地址不存在」。只挡形状、不吞真错误（DB 真故障仍原样抛）。
+本地实测：`/plants/不存在` → 404、`/blog/不存在` → 404、`/projects/not-a-uuid` → 404，
+404 页（「未收录此条目」）正常渲染。
+
+### 4. 分享卡兜底图根本不存在 → 补图 + 全改绝对 URL
+三处 `og:image` 的兜底都写 `/default-og-image.jpg`，而**这个文件从来没有过**（线上 404、
+`public/` 里也没有）。而且是相对路径 —— 微信 / Twitter 这些抓取器多半直接当无效值丢掉。
+**改法**：`public/default-og-image.jpg`（1200×630，配色取 styles.css 的 paper/ink/vermilion +
+theme-color 绿，生成脚本在 scratchpad，一次性产物已落盘）；新增 `src/lib/site-url.ts`
+统一拼绝对地址（`SITE_ORIGIN` / `DEFAULT_OG_IMAGE` / `absoluteUrl`）。
+`absoluteUrl` 对已经是绝对地址的原样返回 —— 封面绝大多数是 Supabase 公开链接，**不能再加前缀**。
+域名写死 `plantspedia.club`（不带 www）：抓取器缓存的是 URL，同一张图在两个域名下会被当成两份。
+实测：有封面 → 原样透传 Supabase 绝对地址；无封面（`allium-bidentatum-fisch-ex-prokh` 与一篇
+无封面博文）→ `https://plantspedia.club/default-og-image.jpg`；该图已进 `dist/client`。
+
+### 5. 编辑器写一半会丢 → blog / project 补自动保存
+`plant-editor` 和 `html-doc-editor` 早有本地暂存，**blog-editor / project-editor / rich-editor
+一个都没有**，全仓也搜不到 `beforeunload` / `useBlocker`。误刷新、误返回、手机切后台被回收，
+内容直接没了 —— 一篇调研成果可能是坐着写了一小时的东西。
+**改法**（用户选「抄 plant-editor 的 localStorage 自动保存」）：抽 `src/hooks/use-editor-draft.ts`
+两处共用。三条约定写在文件头注释里，改的时候别破坏：恢复必须在 effect 里做（这些编辑器
+照样走 SSR，渲染期读 localStorage 会 hydration mismatch）；只在快照比库里的 `updated_at` 新时
+才恢复（否则旧残留会盖掉别处已保存的内容）；保存成功后必须 `clear()`。
+🔧 **非显然的坑**：`BlockEditor` 只在**自己挂载那一刻**读一次 `initialHTML`
+（block-editor.tsx 里的 `loaded.current` 闸门），光 `setHtml` 正文根本不会回来。所以恢复时
+必须同时把正文喂给 `initialHTML` **并翻 `key` 逼编辑器重挂** —— 不然标题副标题都恢复了、
+唯独正文空着，比不恢复更让人懵。
+⚠️ **这条没有端到端实测**：编辑器在 `_authenticated` 下要真人登录（我不能代登）。
+
+### 6. postMessage 少一道来源校验 → 补齐
+`plants.$slug.tsx` 的 `lov-edit-mark-ctx` 监听只看 `d.type` 和 `d.editId` 的类型，
+**不校验 `e.source`**，而另外两处（drafts.$id / species-existing-links）本来就校验。
+外站把本页嵌进 iframe 就能伪造一条消息，把「撤销这处修改」的菜单钉在管理员眼皮底下、
+editId 由攻击者指定（菜单动作本身还有 isAdmin + RLS 兜底，所以是低危、不是直接可利用）。
+
+### 验证与状态
+- `tsc --noEmit` = **0**；`npm run build` **过**；`scratch/check_image_host_allowlist.mjs` **20/20**。
+- 改动文件 ESLint 非 prettier 项只剩 **1 条，且在 HEAD 就存在**：plants.$slug 的
+  `Route.useSearch` 在 `throw notFound()` 早退之后（`react-hooks/rules-of-hooks`）。
+  与本轮无关；顺带一提，loader 里先抛之后组件那条早退更难被走到了。
+- ⚠️ 浏览器面板在本机取 dev 模块**普遍失败**（水合失败 + `Failed to fetch dynamically
+  imported module`）。**不是回归** —— `/about` 这条本轮没碰过的路由报一模一样的错。
+  状态码与 meta 全部改用 curl 对拍验证。
+- ⚠️ **未提交、未部署**（用户选的就是「改代码 + tsc + 本地预览，先不提交」）。
+
+### 本轮改动的文件
+新增：`src/lib/site-url.ts`、`src/lib/image-host-allowlist.ts`、`src/lib/identify-rate-limit.ts`、
+`src/hooks/use-editor-draft.ts`、`public/default-og-image.jpg`、
+`scratch/check_image_host_allowlist.mjs`、`scratch/check_identify_rate_limit.mjs`
+改动：`src/lib/image-proxy.functions.ts`、`src/lib/catalog-ai.functions.ts`、
+`src/lib/identify-plant.functions.ts`、`src/routes/plants.$slug.tsx`、`src/routes/blog.$slug.tsx`、
+`src/routes/projects.$id.tsx`、`src/routes/drafts.$id.tsx`、`src/routes/about.tsx`、
+`src/components/blog-editor.tsx`、`src/components/project-editor.tsx`
+
+### 7. 匿名识别的成本敞口 → 按 IP 加每日上限
+⚠️ **先修正上一段的说法**：匿名识别**不是**完全没限制。`ANON_MAX_ACTIVE_JOBS = 2`
+（background-jobs.ts:136）一直在挡并发。但它认的是**前端传上来的** `anon_id`，而
+`lib/anon-id.ts` 的注释自己就写着「清掉浏览器存储就换一个新的……本来就只是防手滑连点，
+**不是防刷的安全边界**」。换个 id 成本为零 → 全站最贵的一次操作（Pl@ntNet + 一线视觉模型 +
+疑似复核 + 出卡 + 两次存储写入）可以被无限循环调用。
+**改法**（用户选「按 IP 加每日上限」）：新 `src/lib/identify-rate-limit.ts`，读 Cloudflare 边缘
+写入的 `CF-Connecting-IP`（**前端伪造不了** —— 自带的同名头会被 CF 覆盖；`X-Forwarded-For`
+则是客户端能自己塞的，认它等于没限）。计数存 `site_config`，零迁移，同 background-jobs 的路子。
+闸卡在**传图之前**，与既有并发上限同一处。默认 `ANON_IDENTIFY_DAILY_LIMIT = 60`。
+🔒 **IP 不落库**：存的是「当日日期 + IP」一起 SHA-256 后的短摘要。日期拌进去是因为 IPv4
+空间小、光哈希一个 IP 能穷举反推；每天换盐至少让隔天记录无法互相关联。
+🔴 **最该记住的一条**：清理往日计数行**刻意不写成一条 `.delete().like().not()`**。要删的是
+`site_config` —— 那张表同时躺着 AI key、模型配置、Pl@ntNet 配额状态和**全部后台任务行**，
+条件删只要有一个筛子没生效（列名写错 / PostgREST 语法变动 / `.not` 被忽略），一条语句就能
+把整张表清空，**而且不会报错**。本仓库 2026-07-13 已栽过同类事故（孤儿清理误删封面/头像，
+不可恢复）。现在是「先查出来 → 在代码里逐条核对前缀 → 按**精确 key 列表** `.in()` 删」，
+选择逻辑抽成纯函数 `selectStaleCounterKeys` 单独钉死。
+⚠️ **三处已知取舍，别当 bug 修**：共用出口 IP（学校/公司/CGNAT）会互相挤占，所以上限
+定得比"够用"宽得多；读-改-写不原子，并发下实际放行会略多于上限（要原子就得写迁移，
+托管 Supabase 得用户手工去控制台跑）；**拿不到 IP 一律放行**（本地 dev、非 Cloudflare 环境）。
+断言：`scratch/check_identify_rate_limit.mjs`，**16 条全绿**，不打网、不碰库。
+
+### 8. 「关于本站」章节编辑没有暂存 → 接上同一个 hook
+⚠️ **也修正一下上一段**：`rich-editor` **本身不需要**自动保存 —— 它是受控组件
+（`{ value, onChange }`），内容在父组件手里；三个使用方里 plant-editor 和 html-doc-editor
+都已有持久化。真正的缺口只有 `about.tsx` 的 `SectionEditor`（站长专用，正文动辄几百行 HTML，
+误刷新 / 误点「取消」之前一点不剩）。
+**改法**：接上第 5 条那个 `useEditorDraft`。这一节没有 `updated_at` 可比（整页作为一个 JSON
+存在 site_config 里，单个章节没有自己的时间戳），所以给 hook 加了个**可选的 `baseline`**：
+把「开始改时库里长什么样」连同草稿一起存，恢复时必须仍然相等才认。比时间戳更准 —— 比的是
+内容本身；别处保存过、或整页被「退回初稿」重置过，底本对不上，草稿自动作废，不会把旧文倒灌回去。
+顺带把 `persist` 改成回报 `boolean`：**存成功才清草稿**，存失败时草稿是唯一还留着那段内容的地方。
+
+### 下一步（等定）
+- 8 条已全部上线。回归观察点：匿名识别在真实 Cloudflare 环境下的计数（本地验不了），
+  以及有没有共用网络的用户撞上 60 次/天这个数字（要调就改
+  `ANON_IDENTIFY_DAILY_LIMIT`，改完需重新部署）。
+- 仍未处理：`plants.$slug` 那条 **HEAD 就存在**的 `rules-of-hooks`
+  （`Route.useSearch` 在早退之后）—— 本轮没动它。
