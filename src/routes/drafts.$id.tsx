@@ -31,6 +31,7 @@ import {
   type DraftCardFields,
 } from "@/lib/draft-card-fields";
 import { stripTentativeMarks, isDraftTentative, tentativeResolution } from "@/lib/tentative";
+import { absoluteUrl } from "@/lib/site-url";
 import { fetchDraftById } from "@/lib/drafts";
 import { fetchEditsForDraft } from "@/lib/edits";
 import { EditLogSection } from "@/components/edit-log-section";
@@ -115,7 +116,8 @@ export const Route = createFileRoute("/drafts/$id")({
     const name = loaderData?.title || "";
     const shareTitle = name ? `Plantspedia草木志·${name}` : "Plantspedia · 全民植物志";
     const desc = (loaderData?.summary || "AI 识别生成的植物草稿，等待编辑审核收录。").slice(0, 180);
-    const img = loaderData?.photo_url || "/default-og-image.jpg";
+    // 绝对 URL + 空图兜底到站点默认分享图（详见 site-url.ts）。
+    const img = absoluteUrl(loaderData?.photo_url);
     return {
       meta: [
         { title: shareTitle },

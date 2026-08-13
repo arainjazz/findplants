@@ -22,6 +22,7 @@ import {
   type PlanPhoto,
 } from "@/lib/xiaop-image-plan";
 import { fetchPlantBySlug, fetchAuthor, plantEntryKind } from "@/lib/plants";
+import { absoluteUrl } from "@/lib/site-url";
 import { fetchPlantSourceKinds, fetchQuickSourceDraftId } from "@/lib/drafts";
 import { rememberJob } from "@/lib/poll-job";
 import { PlantKindBadge } from "@/components/plant-kind-badge";
@@ -61,8 +62,19 @@ export const Route = createFileRoute("/plants/$slug")({
   validateSearch: (search: Record<string, unknown>): { from?: string } => ({
     from: typeof search.from === "string" ? search.from.slice(0, 120) : undefined,
   }),
+  /**
+   * 查不到就在**这里**抛 notFound —— 不能只留给组件里那句兜底。
+   *
+   * 组件是在渲染期抛的，那时候 SSR 的响应头早就发出去了：`/plants/随便什么`
+   * 一律回 **HTTP 200**，标题还会回落成站点默认的「Plantspedia · 全民植物志」。
+   * 后果是搜索引擎把大批不存在的地址当正常页收录、外链检查器看不出这是死链、
+   * 分享出去也是一模一样的默认文案。改在 loader 里抛，SSR 阶段就能定下 404 状态码。
+   * 组件里那句照旧留着：客户端 query 在页面打开后重新取到 null（条目刚被删）时还要靠它。
+   */
   loader: async ({ params }) => {
-    return fetchPlantBySlug(params.slug);
+    const plant = await fetchPlantBySlug(params.slug);
+    if (!plant) throw notFound();
+    return plant;
   },
   head: ({ loaderData }) => {
     // 分享卡：标题「Plantspedia草木志·中文名」、简介用该植物的 summary、缩略图用它的封面照片。
@@ -73,7 +85,9 @@ export const Route = createFileRoute("/plants/$slug")({
     const name = loaderData?.title || "";
     const shareTitle = name ? `Plantspedia草木志·${name}` : "Plantspedia · 全民植物志";
     const desc = (loaderData?.summary || "查看该植物的详细特征、分布与科普信息。").slice(0, 180);
-    const img = loaderData?.cover_url || "/default-og-image.jpg";
+    // 必须是**绝对** URL：抓取器多半会把相对路径当无效值丢掉（详见 site-url.ts）。
+    // `absoluteUrl` 顺带兜住封面为空的情况 → 站点默认分享图。
+    const img = absoluteUrl(loaderData?.cover_url);
     return {
       meta: [
         { title: shareTitle },
@@ -386,14 +400,21 @@ function PlantDetail() {
   // Listen for postMessage from the iframe when an edit marker is right-clicked.
   useEffect(() => {
     const onMsg = (e: MessageEvent) => {
-      const d = e.data;
-      if (!d || d.type !== "lov-edit-mark-ctx" || typeof d.editId !== "string") return;
       // Iframe sits below page chrome (~120px header bar); offset to parent coords.
       const iframe = document.querySelector("iframe[title]") as HTMLIFrameElement | null;
-      const rect = iframe?.getBoundingClientRect();
+      // ⚠️ 只认**自家这个 iframe** 发来的消息。`window` 上的 message 事件是全局的：
+      // 任何把本页嵌进去的外站、或另一个开着的窗口，都能 postMessage 一条伪造的
+      // `lov-edit-mark-ctx` 带上它挑的 editId，把「撤销这处修改」的菜单钉在管理员
+      // 眼皮底下的任意位置。菜单里的动作虽然还有 isAdmin + RLS 兜底，但被诱导点下去的
+      // 就是攻击者指定的那条记录。另外两处 postMessage 监听
+      //（drafts.$id.tsx / species-existing-links.tsx）本来就是这么校验的，这里补齐。
+      if (!iframe || e.source !== iframe.contentWindow) return;
+      const d = e.data;
+      if (!d || d.type !== "lov-edit-mark-ctx" || typeof d.editId !== "string") return;
+      const rect = iframe.getBoundingClientRect();
       setEditMenu({
-        x: (rect?.left ?? 0) + (typeof d.x === "number" ? d.x : 0),
-        y: (rect?.top ?? 0) + (typeof d.y === "number" ? d.y : 0),
+        x: rect.left + (typeof d.x === "number" ? d.x : 0),
+        y: rect.top + (typeof d.y === "number" ? d.y : 0),
         editId: d.editId,
       });
     };

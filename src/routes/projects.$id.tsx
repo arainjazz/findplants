@@ -5,16 +5,36 @@ import { fetchProjectById } from "@/lib/projects";
 import { ShareButton } from "@/components/share-button";
 import { useAuth } from "@/hooks/use-auth";
 
+/** `projects.id` 是 uuid 列。形状不对就别送进 DB —— 见 loader 里的说明。 */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 export const Route = createFileRoute("/projects/$id")({
+  /**
+   * 这一页原本**没有 loader**，全靠组件里的 query —— 于是 `/projects/任意字符串`
+   * 一律 SSR 出一个 HTTP 200 的空壳（理由同 plants.$slug）。补上 loader 在服务端就定 404。
+   *
+   * 另外先卡一道 uuid 形状：`id` 在库里是 uuid 列，塞个 `abc` 进去 Postgres 会直接
+   * 报 22P02（invalid input syntax for type uuid），`fetchProjectById` 把它 throw 出来
+   * 就成了 **500**。而这本来只是「这个地址不存在」而已。只挡形状、不吞真错误：
+   * 数据库真出故障时仍旧原样抛出去，不会被伪装成 404。
+   */
+  loader: async ({ params }) => {
+    if (!UUID_RE.test(params.id)) throw notFound();
+    const project = await fetchProjectById(params.id);
+    if (!project) throw notFound();
+    return project;
+  },
   component: ProjectDetail,
 });
 
 function ProjectDetail() {
   const { id } = Route.useParams();
   const { user } = useAuth();
+  const loaderData = Route.useLoaderData();
   const { data: project, isLoading } = useQuery({
     queryKey: ["project", id],
     queryFn: () => fetchProjectById(id),
+    initialData: loaderData,
   });
 
   if (isLoading)

@@ -2,19 +2,24 @@ import { createFileRoute, Link, notFound } from "@tanstack/react-router";
 import { useQuery } from "@tanstack/react-query";
 import { SiteHeader, SiteFooter } from "@/components/site-header";
 import { fetchPostBySlug, blogCoverUrl } from "@/lib/blog";
+import { absoluteUrl } from "@/lib/site-url";
 import { ShareButton } from "@/components/share-button";
 import { BlogComments } from "@/components/blog-comments";
 import { useAuth } from "@/hooks/use-auth";
 
 export const Route = createFileRoute("/blog/$slug")({
+  /** 查不到就在 loader 里抛，SSR 阶段定下 404 状态码（理由同 plants.$slug）。 */
   loader: async ({ params }) => {
-    return fetchPostBySlug(params.slug);
+    const post = await fetchPostBySlug(params.slug);
+    if (!post) throw notFound();
+    return post;
   },
   head: ({ loaderData }) => ({
     meta: [
       { title: loaderData ? `${loaderData.title} · Plantspedia` : "Plantspedia · 全民植物志" },
       { name: "description", content: loaderData?.subtitle || "阅读植物科普文章、社区动态与科学探索。" },
-      { property: "og:image", content: loaderData?.cover_url || "/default-og-image.jpg" },
+      // 绝对 URL + 空封面兜底到站点默认分享图（详见 site-url.ts）。
+      { property: "og:image", content: absoluteUrl(loaderData?.cover_url) },
       { property: "og:type", content: "article" },
     ],
   }),
