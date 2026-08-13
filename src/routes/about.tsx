@@ -8,6 +8,7 @@ import { RichEditor } from "@/components/rich-editor";
 import { compressImage, extForMime } from "@/lib/image-compress";
 import { supabase } from "@/integrations/supabase/client";
 import { useAuth } from "@/hooks/use-auth";
+import { useEditorDraft } from "@/hooks/use-editor-draft";
 import { isOwnerEmail } from "@/lib/leaves";
 import { getAboutFn, saveAboutFn, resetAboutFn } from "@/lib/about.functions";
 import {
@@ -275,12 +276,31 @@ function SectionEditor({
   saving,
 }: {
   section: AboutSection;
-  onSave: (html: string) => void;
+  /** 回 true 表示真的存进去了；只有那时才清本地草稿。 */
+  onSave: (html: string) => Promise<boolean>;
   onCancel: () => void;
   saving: boolean;
 }) {
   const { user } = useAuth();
   const [html, setHtml] = useState(section.html);
+
+  /**
+   * 未保存内容的本地暂存。这一页的正文改起来动辄几百行 HTML，误刷新 / 误点「取消」
+   * 之前是**一点不剩**的。
+   *
+   * 用 `baseline` 而不是 `dbUpdatedAt` 判过时：整页作为一个 JSON 存在 site_config 里，
+   * 单个章节没有自己的时间戳；拿「开始改时库里长什么样」直接比内容更准 —— 别处保存过、
+   * 或整页被「退回初稿」重置过，底本就对不上，草稿自动作废，不会把旧文倒灌回去。
+   */
+  const { clear: clearDraft } = useEditorDraft({
+    key: `about-section-draft:${section.id}`,
+    baseline: section.html,
+    snapshot: { html },
+    onRestore: (d) => {
+      setHtml(d.html ?? "");
+      toast.message("已恢复上次未保存的编辑草稿");
+    },
+  });
   // prose 也默认 true —— 见上面的说明。
   const [rawMode, setRawMode] = useState(true);
   const [uploading, setUploading] = useState(false);
@@ -410,7 +430,10 @@ function SectionEditor({
 
       <div className="flex items-center gap-2 mt-3">
         <button
-          onClick={() => onSave(html)}
+          onClick={async () => {
+            // 存成功才清草稿；存失败时草稿是唯一还留着这段内容的地方。
+            if (await onSave(html)) clearDraft();
+          }}
           disabled={saving}
           className="rounded border border-ink px-3 py-1 text-[12.5px] hover:bg-ink hover:text-background transition-colors disabled:opacity-50 cursor-pointer"
         >
@@ -495,15 +518,18 @@ function AboutPage() {
     return () => clearTimeout(t);
   }, [sections, jump]);
 
-  const persist = async (next: AboutSection[]) => {
+  /** 回报成功与否 —— 章节编辑器要据此决定清不清本地草稿（存失败绝不能清）。 */
+  const persist = async (next: AboutSection[]): Promise<boolean> => {
     setSaving(true);
     try {
       await saveAbout({ data: { sections: next } });
       await qc.invalidateQueries({ queryKey: ["about-doc"] });
       setEditingId(null);
       toast.success("已保存，立即生效");
+      return true;
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "保存失败");
+      return false;
     } finally {
       setSaving(false);
     }

@@ -8,6 +8,7 @@ import { compressImage, extForMime } from "@/lib/image-compress";
 import { BlockEditor, type BlockEditorHandle } from "@/components/block-editor";
 import { docToImages, isConvertibleDoc } from "@/lib/doc-to-images";
 import { createProject, updateProject, type Project } from "@/lib/projects";
+import { useEditorDraft } from "@/hooks/use-editor-draft";
 
 /** Create / edit a 项目驱动调研成果 entry. 时间/地点/主题/发起人 are required — they
  *  power the filters on the public /projects page. */
@@ -29,6 +30,26 @@ export function ProjectEditor({ initial }: { initial?: Project }) {
   const [busy, setBusy] = useState(false);
   const [docBusy, setDocBusy] = useState(false);
   const [docProgress, setDocProgress] = useState("");
+  /** 从本地草稿恢复出来的正文；用途与理由同 blog-editor（BlockEditor 只在挂载时读一次）。 */
+  const [restoredHtml, setRestoredHtml] = useState<string | null>(null);
+
+  const { clear: clearDraft } = useEditorDraft({
+    key: `project-editor-draft:${initial?.id ?? "new"}`,
+    dbUpdatedAt: initial?.updated_at,
+    snapshot: { title, projectDate, location, theme, initiator, summary, coverUrl, html },
+    onRestore: (d) => {
+      setTitle(d.title ?? "");
+      setProjectDate(d.projectDate ?? "");
+      setLocation(d.location ?? "");
+      setTheme(d.theme ?? "");
+      setInitiator(d.initiator ?? "");
+      setSummary(d.summary ?? "");
+      setCoverUrl(d.coverUrl ?? "");
+      setHtml(d.html ?? "");
+      setRestoredHtml(d.html ?? "");
+      toast.message("已恢复上次未保存的编辑草稿");
+    },
+  });
 
   // ── PDF → 图片 ────────────────────────────────────────────────────────────
   // 源文件**一次都不上传**：转换在浏览器里做完，只有渲染出的图片进 storage。
@@ -147,10 +168,13 @@ export function ProjectEditor({ initial }: { initial?: Project }) {
       };
       if (initial) {
         await updateProject(initial.id, { ...fields, published: publish || initial.published });
+        // 已经落库了，本地快照必须扔掉 —— 留着下次进来会「恢复」出同样的内容。
+        clearDraft();
         toast.success(publish ? "已发布" : "已保存");
         if (publish) navigate({ to: "/projects/$id", params: { id: initial.id } });
       } else {
         const created = await createProject({ ...fields, publish, authorId: user.id, authorName });
+        clearDraft();
         toast.success(publish ? "已发布" : "草稿已保存");
         if (publish) navigate({ to: "/projects/$id", params: { id: created.id } });
         else navigate({ to: "/admin/projects/edit/$id", params: { id: created.id } });
@@ -248,7 +272,9 @@ export function ProjectEditor({ initial }: { initial?: Project }) {
 
       <BlockEditor
         ref={editorRef}
-        initialHTML={initial?.content_html ?? ""}
+        // key 一翻就重挂，重挂才会重新读 initialHTML（编辑器只在挂载时读一次）。
+        key={restoredHtml === null ? "initial" : "restored"}
+        initialHTML={restoredHtml ?? initial?.content_html ?? ""}
         onChange={setHtml}
         uploadFile={handleEditorUpload}
         placeholder="输入 / 唤出命令菜单，像 Notion 一样撰写调研成果…"

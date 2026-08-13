@@ -9,6 +9,7 @@ import { supabase } from "@/integrations/supabase/client";
 import { BlockEditor, type BlockEditorHandle } from "@/components/block-editor";
 import { docToImages, isConvertibleDoc } from "@/lib/doc-to-images";
 import { createPost, updatePost, firstImageSrc, type BlogPost } from "@/lib/blog";
+import { useEditorDraft } from "@/hooks/use-editor-draft";
 
 export function BlogEditor({ initial }: { initial?: BlogPost }) {
   const { user } = useAuth();
@@ -24,6 +25,28 @@ export function BlogEditor({ initial }: { initial?: BlogPost }) {
   const [busy, setBusy] = useState(false);
   const [docBusy, setDocBusy] = useState(false);
   const [docProgress, setDocProgress] = useState("");
+  /**
+   * 从本地草稿恢复出来的正文。为什么要单开一个 state 而不是只 setHtml：
+   * `BlockEditor` 只在**自己挂载的那一刻**读一次 `initialHTML`（见 block-editor.tsx 里的
+   * `loaded.current` 闸门），事后改 html 状态它不会跟着变。所以恢复时把正文同时喂给
+   * `initialHTML`，并用它翻 `key` 逼编辑器重挂一次 —— 不这么做的话，标题副标题都回来了，
+   * 唯独正文还是空的，那比不恢复更让人懵。
+   */
+  const [restoredHtml, setRestoredHtml] = useState<string | null>(null);
+
+  const { clear: clearDraft } = useEditorDraft({
+    key: `blog-editor-draft:${initial?.id ?? "new"}`,
+    dbUpdatedAt: initial?.updated_at,
+    snapshot: { title, subtitle, coverUrl, html },
+    onRestore: (d) => {
+      setTitle(d.title ?? "");
+      setSubtitle(d.subtitle ?? "");
+      setCoverUrl(d.coverUrl ?? "");
+      setHtml(d.html ?? "");
+      setRestoredHtml(d.html ?? "");
+      toast.message("已恢复上次未保存的编辑草稿");
+    },
+  });
 
   // Auto-resize title textarea
   const titleRef = useRef<HTMLTextAreaElement>(null);
@@ -188,6 +211,8 @@ export function BlogEditor({ initial }: { initial?: BlogPost }) {
           content_html: html,
           published: publish || initial.published,
         });
+        // 已经落库了，本地那份快照必须扔掉 —— 留着下次进来会「恢复」出同样的内容。
+        clearDraft();
         toast.success(publish ? "已发布" : "已保存");
         if (publish && !initial.published) await logBlogPublish(next.id, next.title);
         else if (changed) await logBlogEdit(next.id, next.title, initial.content_html ?? "", html);
@@ -202,6 +227,7 @@ export function BlogEditor({ initial }: { initial?: BlogPost }) {
           authorId: user.id,
           authorName,
         });
+        clearDraft();
         toast.success(publish ? "已发布" : "草稿已保存");
         if (publish) await logBlogPublish(post.id, post.title);
         if (publish) navigate({ to: "/blog/$slug", params: { slug: post.slug } });
@@ -310,7 +336,9 @@ export function BlogEditor({ initial }: { initial?: BlogPost }) {
 
       <BlockEditor
         ref={editorRef}
-        initialHTML={initial?.content_html ?? ""}
+        // key 一翻就重挂，重挂才会重新读 initialHTML（编辑器只在挂载时读一次）。
+        key={restoredHtml === null ? "initial" : "restored"}
+        initialHTML={restoredHtml ?? initial?.content_html ?? ""}
         onChange={setHtml}
         uploadFile={handleEditorUpload}
         placeholder="输入 / 唤出命令菜单，像 Notion 一样写作…"
