@@ -4496,6 +4496,20 @@ export const startQuickIdentifyFn = createServerFn({ method: "POST" })
           `未登录状态下最多同时排 ${ANON_MAX_ACTIVE_JOBS} 条识别任务（当前已有 ${active} 条在跑）。` +
             `请等前面的出结果，或登录后再试 —— 登录用户不受这条限制，还能在小P蛙的通知里跨设备接回任务。`,
         );
+
+      // 上面那道闸认的是**前端传的** anon_id，清一下浏览器存储就换一个，只防手滑连点
+      // （anon-id.ts 的注释自己就这么写的）。这道按 IP 的日限才是前端伪造不了的那一层：
+      // 识别是全站最贵的一次操作，不设顶等于把 AI 额度敞开给任何人循环调用。
+      // 登录用户完全不走这里。取舍与已知代价见 identify-rate-limit.ts 的文件头。
+      const { bumpAnonIdentify } = await import("./identify-rate-limit");
+      const quota = await bumpAnonIdentify();
+      if (!quota.allowed)
+        throw new AiError(
+          "ANON_DAILY_LIMIT",
+          `未登录识别今天已达上限（每个网络每天 ${quota.limit} 次）。` +
+            `登录后不受这条限制 —— 识别每次都要调用多个付费模型，这道上限是为了不让少数人把额度用光。` +
+            `如果你和很多人共用同一个网络（学校 / 公司 / 校园网），换成登录使用即可。`,
+        );
     }
 
     const extOf = (mime: string) =>
