@@ -1,7 +1,10 @@
 # Plantspedia — Working State  (single source of truth)
 
 _Last updated: 2026-08-15（续二）— by Claude（**「点博物趣闻摘要卡出现乱码」查清并修好，
-tsc=0 / build 过 / 本地 desktop+mobile 双实测；⚠️ 未提交、未部署**。用户报「进大籽蒿的
+已提交 `8e54262`、**已部署上线** `Version ID 6b6c87b8-c6a2-4d9f-9460-8f089663a78d`，
+线上逐条核验过（见文末「线上核验」）。tsc=0 / build 过 / 本地 desktop+mobile 双实测。
+⚠️ 部署走的是 `env -u HTTP_PROXY -u HTTPS_PROXY …/wrangler deploy`（老规矩，见 memory）。
+用户报「进大籽蒿的
 skill 创建详页后，点跳转博物趣闻的摘要卡出现乱码，估计还有不少 skill 详页有这个问题」。
 **先把「是不是内容坏了」排掉**：全量拉了 287 张详页 HTML 逐份对锚点与目标 id ——
 242 张有摘要卡，**href 一律是 `#section-vi`、目标 id 一律在，0 张坏**（相对/怪异 href 也是 0）；
@@ -42,7 +45,31 @@ Supabase 公共桶把 HTML 一律按 `content-type: text/plain` + `x-content-typ
 模拟断网 → 出错误卡 + 0 个 iframe，点「重试」→ 正文回来。
 lint 改动文件非 prettier 项只剩 1 条**HEAD 就有**的 `rules-of-hooks`（与本轮无关）。
 ⚠️ **没能复现用户那一次点击的精确时序** —— Chrome desktop/mobile 上父窗口拦截本来就生效；
-上面两条是「无论哪种浏览器都不可能再出乱码」的结构性修法，不是照着复现步骤打的补丁。）_
+上面两条是「无论哪种浏览器都不可能再出乱码」的结构性修法，不是照着复现步骤打的补丁。
+
+**线上核验（部署后，plantspedia.club 实测）**：
+· SSR：`/plants/tetraena-mongolica` 与 `/plants/artemisia-…` **iframe 数 = 0**、
+  有「正在载入正文…」占位、**没有任何 `<iframe src=…plant-html…>`**；
+· 四合木 desktop(1280×900)：卡片无 href、页内 `a[href^="#"]` 剩 0 个、点击 defaultPrevented=true、
+  滚到 9677（offBy=1），落点元素正文是「VI 博物趣闻博客」，iframe 仍在 about:srcdoc；
+· 大籽蒿 mobile(390×844)：同上，滚到 18071（**offBy=0**）；
+· 草稿页（牻牛儿苗）未受牵连：srcdoc 32295 字、量高 9301px、viewer 样式/脚本/换图提示都在。
+
+🔴 **同一轮查清、但用户只批了部署、没批改配置的一件事（下次接着办）**：
+小P蛙「看不见照片」**不是模型能力问题，是序列 2 接了单**。
+`ai_usage_logs` 2026-08-15T07:58:57 那条 `custom / z-ai/glm-5.2`（疑似窄叶黄菀）就是它。
+用后台视觉自检那套判据 + **两张颜色顺序不同的探针图**逐项实测 `xiaop_model_config`：
+① `qwen3.8-max` 4/4 & 4/4、token 增量 +15 → **看得见**；
+② `z-ai/glm-5.2` 2/4 & **1/4**、增量 +24 → **看不见**；
+③ `minimaxai/minimax-m3` 4/4 & 4/4、增量 +83 → 看得见。
+草稿那 3 个照片 URL 全部 200 / image/jpeg / 483KB+256KB，远低于 6MB 上限，**图没问题**。
+⚠️ 关键细节：glm-5.2 **返回 HTTP 200 并照收 `image_url`，只是把像素扔了** ——
+所以 openaiCompatChat 里那条「拒收图片就去掉图重发」的降级**根本没触发**（它只认 400），
+线上无错、日志干净。建议把序列 ②③ 对调或删掉 glm-5.2（后台热改，不用部署）。
+⚠️ 另一个坑：`qwen3.8-max` 点「视觉自检」会被**误判成 blind** ——
+阿里云百炼 compatible-mode **不把图片计入 `prompt_tokens`**（增量 15 < `MIN_IMAGE_TOKEN_DELTA`=30），
+而 `judgeVisionProbe` 在「答对了但 token 说没读图」时保守判 blind。别照那个结论换模型。
+另：`probeSlotVisionFn` 的结论**既不落库也不参与运行时选路**，纯粹是控制台里看一眼。）_
 _上一轮：2026-08-15 — by Claude（**先诊断、后按用户「a b c d 全做」四条全修，tsc=0 /
 build 过 / 本地实测；⚠️ 未提交、未部署**。用户报「小P蛙任务动态在电脑上点了很顺，
 在手机上很慢、有时干脆不跳」。线上取证定位到三条叠加原因：
