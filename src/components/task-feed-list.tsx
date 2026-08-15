@@ -8,7 +8,8 @@
 // 由 drafts.$id 挂载时自己去标（见 task-feed.functions 的 markDraftReadFn）。
 // 这样从草稿列表、从分享链接进去也一样算数。
 
-import { Link } from "@tanstack/react-router";
+import { useEffect, useState } from "react";
+import { Link, useRouterState } from "@tanstack/react-router";
 import { TASK_KIND_META, type TaskFeedRow } from "@/lib/task-feed";
 
 /** 相对时间，够用即可（不为这一处引第三方库）。 */
@@ -22,7 +23,7 @@ export function ago(iso: string): string {
   return `${Math.floor(s / 86400)} 天前`;
 }
 
-function CardBody({ row }: { row: TaskFeedRow }) {
+function CardBody({ row, opening }: { row: TaskFeedRow; opening?: boolean }) {
   const meta = TASK_KIND_META[row.kind];
   const unread = row.status === "done" && !row.readAt;
   return (
@@ -43,7 +44,10 @@ function CardBody({ row }: { row: TaskFeedRow }) {
           {unread && (
             <span className={`w-1.5 h-1.5 rounded-full ${meta.ring}`} aria-label="未查看" />
           )}
-          <span className="text-[10px] text-ink-faint ml-auto shrink-0">{ago(row.updatedAt)}</span>
+          {/* 点开那一下的回执：手机上网络慢，这张卡是用户唯一看得见的「我收到了」。 */}
+          <span className="text-[10px] text-ink-faint ml-auto shrink-0">
+            {opening ? <span className="text-leaf-deep font-semibold">正在打开…</span> : ago(row.updatedAt)}
+          </span>
         </div>
         <p className="text-xs font-semibold text-ink truncate">{row.title || "（未命名）"}</p>
         {row.status === "running" ? (
@@ -67,6 +71,32 @@ function CardBody({ row }: { row: TaskFeedRow }) {
 }
 
 export function TaskFeedList({ rows, onGo }: { rows: TaskFeedRow[]; onGo?: () => void }) {
+  // 正在打开的那一份（draftId）。
+  const [opening, setOpening] = useState<string | null>(null);
+  // ⚠️ 判据**不能只看 pathname 变了没有**：实测 URL 会在页面渲染之前就切过去
+  // （loader 挂死那次，985ms 时 URL 已是 /drafts/…，8 秒后屏幕还停在原页面）。
+  // 取「status 回到 idle 那一刻的 pathname」才是真落地。
+  const settled = useRouterState({
+    select: (s) => (s.status === "idle" ? s.location.pathname : null),
+  });
+
+  // 🔑 抽屉**等路由落地才收**（原来是 onClick 里立刻收）。手机上先收抽屉、页面又还没换，
+  // 用户看到的就是「浮层没了、页面没动」—— 跟没跳一模一样，连重试的入口都一起没了。
+  useEffect(() => {
+    if (!opening) return;
+    if (settled === `/drafts/${opening}`) {
+      setOpening(null);
+      onGo?.();
+    }
+  }, [settled, opening, onGo]);
+
+  // 兜底：万一那一跳彻底没落地（chunk 取不到 / 请求卡死），卡片不能一直挂着「正在打开…」。
+  useEffect(() => {
+    if (!opening) return;
+    const t = setTimeout(() => setOpening(null), 10_000);
+    return () => clearTimeout(t);
+  }, [opening]);
+
   if (!rows.length) {
     return (
       <div className="px-4 py-8 text-center text-[11px] text-ink-faint leading-relaxed">
@@ -85,10 +115,12 @@ export function TaskFeedList({ rows, onGo }: { rows: TaskFeedRow[]; onGo?: () =>
             key={row.id}
             to="/drafts/$id"
             params={{ id: row.draftId }}
-            onClick={onGo}
-            className="flex gap-2.5 px-3 py-2.5 border-b border-rule/40 hover:bg-leaf/5 transition-colors"
+            onClick={() => setOpening(row.draftId)}
+            className={`flex gap-2.5 px-3 py-2.5 border-b border-rule/40 transition-colors ${
+              opening === row.draftId ? "bg-leaf/10" : "hover:bg-leaf/5"
+            }`}
           >
-            <CardBody row={row} />
+            <CardBody row={row} opening={opening === row.draftId} />
           </Link>
         ) : (
           <div key={row.id} className="flex gap-2.5 px-3 py-2.5 border-b border-rule/40">

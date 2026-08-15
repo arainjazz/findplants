@@ -101,11 +101,37 @@ export const Route = createFileRoute("/drafts/$id")({
   // 报的「深度分析完成后很久才出分享卡」，这是其中一段串行等待。
   // 缓存里那份可能不是最新的（比如几分钟前看过这份草稿），但下面的 useQuery 配了
   // `refetchOnMount:"always"`，挂载后必回查一次真库，所以它只影响首帧和 <head>。
+  //
+  // 🔴 **客户端跳转一律不等这次网络**（2026-08-15，用户报「手机上点小P蛙任务动态很慢、
+  // 有时干脆不跳」）。线上取证：把这条 `plant_drafts` 查询挂起后，URL 985ms 就切到
+  // `/drafts/…`，可 **8 秒内 DOM 变化 0 次** —— TanStack Router 在 loader 落地前会一直
+  // 渲染**旧页面**，而全站又没有 pendingComponent（现已补，见 router.tsx），于是弱网下
+  // 表现成「点了完全没反应」。而这次往返在客户端**本来就是白跑的**：下面的 useQuery 配了
+  // `refetchOnMount:"always"`，同一行每次跳转都查两遍（实测两条一模一样的请求，371+406ms）。
+  // 所以浏览器里只**预热**、不 await：react-query 会把随后挂载时的那次查询与这次在途请求
+  // 合并（同 key 去重），页面立刻渲染成自己的「载入中…」，数据到了再填。
+  // 代价：客户端跳转时 <head> 只有默认 og:*/标题 —— 标题由组件里的 effect 补回（分享面板
+  // 读的是 document.title）；og:* 只有抓取器在乎，而它们走的是 SSR 那条路，不受影响。
   loader: async ({ params, context }) => {
-    const cached = (
-      context as { queryClient?: { getQueryData: (k: unknown[]) => unknown } }
-    ).queryClient?.getQueryData?.(["draft", params.id]);
+    const qc = (
+      context as {
+        queryClient?: {
+          getQueryData: (k: unknown[]) => unknown;
+          prefetchQuery: (o: unknown) => Promise<unknown>;
+        };
+      }
+    ).queryClient;
+    const cached = qc?.getQueryData?.(["draft", params.id]);
     if (cached) return cached as Awaited<ReturnType<typeof fetchDraftById>>;
+    if (typeof window !== "undefined") {
+      void qc
+        ?.prefetchQuery?.({
+          queryKey: ["draft", params.id],
+          queryFn: () => fetchDraftById(params.id),
+        })
+        .catch(() => {});
+      return null;
+    }
     try {
       return await fetchDraftById(params.id);
     } catch {
@@ -361,6 +387,14 @@ function DraftPage() {
     // 这一页，是这条链路上很常见的用法。
     refetchOnWindowFocus: true,
   });
+
+  // 客户端跳转时 loader 不再取数（见 Route 上的长注释），`head` 于是只算得出站点默认标题。
+  // 数据到手后把标题补回来 —— 手机浏览器的「分享」面板和收藏夹用的都是 document.title。
+  // og:* 不用补：读它们的只有抓取器，而抓取器走的是 SSR 那条路，那边 loader 照常 await。
+  useEffect(() => {
+    if (!draft?.title) return;
+    document.title = `Plantspedia草木志·${draft.title}`;
+  }, [draft?.title]);
 
   // Query the draft creator's profile to get their avatar
   const { data: creatorProfile } = useQuery({

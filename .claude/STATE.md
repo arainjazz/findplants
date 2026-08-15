@@ -1,6 +1,25 @@
 # Plantspedia — Working State  (single source of truth)
 
-_Last updated: 2026-08-13 — by Claude（**全站找 bug 并按用户逐条选定的方案修了 8 条**，
+_Last updated: 2026-08-15 — by Claude（**先诊断、后按用户「a b c d 全做」四条全修，tsc=0 /
+build 过 / 本地实测；⚠️ 未提交、未部署**。用户报「小P蛙任务动态在电脑上点了很顺，
+在手机上很慢、有时干脆不跳」。线上取证定位到三条叠加原因：
+① `/drafts/$id` 的 **loader 是挡渲染的**，而全站**没有任何 `pendingComponent`** ——
+把那条 `plant_drafts` 查询挂起后实测：URL 已切到 `/drafts/…`，**8 秒内 DOM 变化 0 次**、
+屏幕还停在原页面；② 该 loader 的那次网络往返在客户端跳转里**是白跑的** ——
+页面 `useQuery` 配了 `refetchOnMount:"always"`，同一行**每次跳转都查两遍**
+（实测两条一模一样的 `plant_drafts?select=*&id=eq.…`，371ms + 406ms）；
+③ `defaultPreload` 没配，15 个路由 chunk 全是点下去那一刻才开始取。
+再叠上 `TaskFeedList` 的 `onGo` 会**先把抽屉收起来**，手机上的观感就是「浮层没了、页面没动」。
+桌面快只是因为网快：本机实测点击→新页可见 1.1–1.4s，其中 Supabase 单次往返 371–564ms。
+**四条修法全部落地**：A `drafts.$id` 的 loader 在浏览器里只预热不 await（SSR 那半原样保留，
+og:* 与 `<title>` 实测与线上逐字一致）；B `router.tsx` 补 `defaultPendingComponent`
+（新 `components/route-pending.tsx`，250ms 才亮、亮了留 400ms）；C 开 `defaultPreload:"intent"`
+并把 `defaultPreloadStaleTime` 从 **0 改成 10s**（0 等于预取白做，点下去还要整个重跑）；
+D `TaskFeedList` 点了先显示「正在打开…」，**路由真落地才收抽屉**。
+复验：同一条「查询永不返回」的挂起实验，改前 8 秒 DOM 变化 0 次，改后 **402ms 就渲染出草稿页
+自己的「载入中…」**；同一行的重复查询从 2 条降到 1 条；touchstart 在点击前 534ms 就把数据取了。
+⚠️ **D 只做了类型与逻辑复核，没有端到端实测**（动态流要真人登录才有卡片）。详见文末本轮小节。）_
+_上一轮：2026-08-13 — by Claude（**全站找 bug 并按用户逐条选定的方案修了 8 条**，
 **已提交并部署上线**。先是 6 条，用户看完后要求「接着处理」剩下两条，遂补上
 ⑦ **匿名识别按 IP 加每日上限**（新 `src/lib/identify-rate-limit.ts` + 16 条离线断言）与
 ⑧ **「关于本站」章节编辑补本地暂存**。
@@ -8925,3 +8944,95 @@ editId 由攻击者指定（菜单动作本身还有 isAdmin + RLS 兜底，所�
   `ANON_IDENTIFY_DAILY_LIMIT`，改完需重新部署）。
 - 仍未处理：`plants.$slug` 那条 **HEAD 就存在**的 `rules-of-hooks`
   （`Route.useSearch` 在早退之后）—— 本轮没动它。
+
+---
+
+## 🔎 2026-08-15 — 诊断：手机上点「任务动态」跳转很慢 / 有时不跳（**未改代码**）
+
+用户报：电脑浏览器点小P蛙的任务动态卡片跳转很顺，手机浏览器上有时很慢才跳、有时完全不跳。
+
+**链路**：`task-feed-list.tsx:84` 的 `<Link to="/drafts/$id" onClick={onGo}>`
+（`onGo` = `draft-agent-panel.tsx:752` 的 `setOpen(false)`）→ TanStack Router 客户端跳转
+→ 取 `/drafts/$id` 路由 chunk → 跑 `drafts.$id.tsx` 的 `loader` → 渲染。
+
+**线上取证（mobile 视口，plantspedia.club，用 `/editors/<uuid>` 上同款 `<Link>` 复现，
+因为动态流要登录态）**：
+
+1. 🔴 **loader 挡渲染 + 全站没有任何 pendingComponent**（`grep pendingComponent|defaultPending` = 0 处）。
+   把 `plant_drafts` 那条请求 patch 成永不 resolve 之后实测：**URL 985ms 就切到 `/drafts/…`，
+   但 8 秒内 `MutationObserver` 记到的 DOM 变化是 0 次**，屏幕原封不动停在上一页。
+   即：请求一卡住，跳转就**永久悬停且零反馈**（不是「慢」，是彻底不动）。这就是「有时直接无跳转」。
+2. 🟠 **loader 那次往返在客户端跳转里是白跑的**。它存在的理由只是 SSR 时把 og:* 写进 `<head>`
+   （给抓取器看）；而页面自己的 `useQuery(["draft", id])` 配了 `staleTime:0` +
+   `refetchOnMount:"always"`，挂载必再查一次。实测一次跳转打出**两条一模一样**的
+   `plant_drafts?select=*&id=eq.…`（371ms 与 406ms）。行本身不大（实测 6–7KB），
+   贵的是**往返**：本机到 Supabase 单次 371–564ms，手机蜂窝上还要叠射频唤醒。
+3. 🟡 **`defaultPreload` 没配**（`router.tsx:17`），所以点下去那一刻才开始取 15 个路由 chunk。
+   `@tanstack/react-router` 的 `preload:"intent"` 在移动端是**认 `touchstart`** 的
+   （`link.js:339 handleTouchStart`），现在这条完全没用上。
+4. ⚪️ 观感放大器：`onGo` 在导航还没落地时**先把抽屉收掉**，用户看到的就是「浮层收起、页面没变」。
+
+**基线数字（本机固网、桌面 CPU）**：点击 → 新页可见 **1.1s**；另一次量到 URL 切换 1.4s，
+其间 longtask 只有 99ms —— **瓶颈是网络往返，不是 CPU**。手机端把这几百毫秒乘以蜂窝 RTT
+和射频唤醒，就是「有时很慢」；命中卡死的请求就是「有时不跳」。
+
+**未验证**：手指在滚动列表里轻微移动/惯性滚动时浏览器会吞掉 tap，这是移动端浏览器的固有行为，
+本轮没有证据，只能算次要嫌疑。
+
+### 可选修法（等用户定，本轮一个字没改）
+- **A（治本，最小）**：`drafts.$id` 的 loader 在**客户端跳转时直接跳过**（只在 SSR 跑），
+  或给它加超时兜底 —— 反正落地后 `useQuery` 必查一次。跳转从此不等网络。
+- **B（治标，通用）**：`router.tsx` 加 `defaultPendingComponent` + `defaultPendingMs`，
+  让任何路由等 loader 时都有骨架/进度，杜绝「点了没反应」。
+- **C（提速）**：`createRouter` 加 `defaultPreload: "intent"`（移动端走 touchstart 预取）。
+- **D（观感）**：`onGo` 改成导航开始后再收抽屉，或收起前先给一条 loading。
+
+### 2026-08-15（续）— 四条修法落地（a b c d 全做；tsc=0 / build 过；⚠️ 未提交未部署）
+
+用户看完诊断后：「a b c d 全做」。
+
+**A · `drafts.$id` 的 loader 不再挡客户端跳转**（[drafts.$id.tsx](../src/routes/drafts.$id.tsx)）
+浏览器里改成**只预热、不 await**：`queryClient.prefetchQuery(["draft", id])` 之后立刻 `return null`，
+页面秒开自己的「载入中…」骨架，数据到了再填。SSR 那一支**一个字没动**（`typeof window === "undefined"`
+时照常 await），因为 og:* 只有抓取器在乎，而抓取器走的就是 SSR。
+🔑 react-query 会把随后挂载时那次 `refetchOnMount:"always"` 与在途的预热请求**合并**（同 key 去重）
+—— 实测跳转一次只剩 **1 条** `plant_drafts?select=*`（改前是两条，371+406ms）。
+代价：客户端跳转时 `<head>` 只算得出默认标题 → 组件里加了个 effect 把 `document.title` 补回来
+（手机「分享」面板读的就是它），实测跳转后标题是「Plantspedia草木志·疑似龙蒿」。
+
+**B · 全站补 pendingComponent**（新 [route-pending.tsx](../src/components/route-pending.tsx) + [router.tsx](../src/router.tsx)）
+`defaultPendingMs: 250`（快跳转根本轮不到它，不会闪）、`defaultPendingMinMs: 400`（亮了别一闪而过）。
+组件刻意做得很轻 —— 它跟着 router 进主包，且要在最慢的那一刻顶用，所以只有一段内联 SVG。
+
+**C · 开预取**（[router.tsx](../src/router.tsx)）
+`defaultPreload: "intent"` + `defaultPreloadDelay: 60`（只管 hover；`link.js` 的 `handleTouchStart`
+是**立即**预取、不吃这个延迟，所以移动端手指一按下就开始取）。
+🔴 连带必须改的一行：`defaultPreloadStaleTime` 原本是 **0**，那等于**预取白做** ——
+数据一落地就算过期，点下去仍要把 loader 整个重跑（每次点击两趟网络）。改成 10s：
+只服务「马上就要点的这一下」。常规跳转的新鲜度归 `defaultStaleTime` 管，仍是 0，没被动。
+
+**D · 抽屉等路由落地才收**（[task-feed-list.tsx](../src/components/task-feed-list.tsx)）
+原来 `onClick={onGo}` 立刻 `setOpen(false)`：手机上先收浮层、页面又还没换，看起来跟没跳一模一样，
+连重试的入口都一起没了。现在点了先把该行标成「正在打开…」，等路由真落地才调 `onGo`。
+⚠️ 判据**不能只看 pathname 变了没有** —— 实测 URL 会在渲染之前就切过去（挂起实验里 985ms
+URL 已是 `/drafts/…`、8 秒后屏幕还停在原页面），所以取的是
+`useRouterState(s => s.status === "idle" ? s.location.pathname : null)`。
+另加 10s 兜底，免得那一跳彻底没落地时卡片一直挂着「正在打开…」。
+
+### 验证（本地 dev :5203 + 线上对照）
+- 🔴 **决定性复验**：同一条「让 `plant_drafts` 查询永不返回」的挂起实验 ——
+  **改前**：URL 985ms 切走，8 秒内 DOM 变化 **0** 次，屏幕停在上一页；
+  **改后**：**402ms** 就渲染出草稿页自己的骨架（「AI识别 … 载入中… … 小P蛙」），URL 同步。
+- B：把 `plants.$slug` 的 loader 挂起 → 叶子 + 「载入中…」如期出现（**已截图**）；
+  而正常的草稿页跳转**全程没出现过** pending（`[role=status]` 一次都没抓到）→ 不闪。
+- C：先只派 `touchstart`、400ms 后才点击 → 数据请求在 **t=3ms** 就发出，**比点击早 534ms**。
+- A：`document.title` 跳转后正确；**SSR 未受影响** —— dev SSR 的 `<title>`/og:title/og:image
+  与线上生产逐字一致（用 Python 读 HTML 比对，`grep` 在那种单行长文件上不可靠）。
+- tsc=0；`npm run build` 过；四个文件 ESLint 非 prettier 项 **3 条，全部在 HEAD 就存在**
+  （`ago()` 的 only-export-components、`draftTags` 的两条 exhaustive-deps，都不在本轮改动处）。
+- ⚠️ **D 没有端到端实测**：动态流要真人登录才有卡片（`useTaskFeed` 的 query 是 `enabled: !!user?.id`），
+  匿名开面板连「任务动态」这个标签都不出现。逻辑与类型复核过，真机上手一点即知。
+
+### 下一步
+- 未提交、未部署。要上线：`npm run build && env -u HTTP_PROXY -u HTTPS_PROXY … wrangler deploy`。
+- 上线后请用户在手机上点一次任务动态确认 D 的观感（「正在打开…」→ 抽屉收起 → 草稿页）。
