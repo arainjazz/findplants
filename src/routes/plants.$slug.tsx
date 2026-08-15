@@ -34,6 +34,7 @@ import { EditLogSection } from "@/components/edit-log-section";
 import { PlantComments } from "@/components/plant-comments";
 import { embedVideosInHtml } from "@/lib/embed";
 import { rewriteDraftOnlyHints, stripStaleMissingNotes } from "@/lib/draft-enhance";
+import { IN_PAGE_ANCHOR_CSS, inPageJumpTarget, neutralizeInPageAnchors } from "@/lib/in-page-anchors";
 import {
   SpeciesExistingLinks,
   useSpeciesExistingForPlant,
@@ -131,6 +132,8 @@ function buildViewerDoc(text: string): string {
     // 保留 .broken 占位框的固定尺寸（否则空图会塌成一条线）。
     `.img-slot:not(.broken),.img-slot.habitat-photo:not(.broken){aspect-ratio:auto!important;height:auto!important;overflow:visible!important;}` +
     `.img-slot:not(.broken) img{position:static!important;width:100%!important;height:auto!important;max-height:80vh!important;object-fit:contain!important;}` +
+    // 页内锚点被拆成 data-jump 之后没了 href，手型光标要补回来（见 in-page-anchors.ts）。
+    IN_PAGE_ANCHOR_CSS +
     `</style>`;
   // Forward right-click on edit markers to the parent page.
   const script = `<script>document.addEventListener('contextmenu',function(e){var t=e.target;var m=t&&t.closest&&t.closest('.lov-edit-mark');if(!m)return;e.preventDefault();var id=m.getAttribute('data-edit-id');if(!id)return;var r=m.getBoundingClientRect();parent.postMessage({type:'lov-edit-mark-ctx',editId:id,x:r.left+r.width,y:r.top+r.height},'*');});</script>`;
@@ -139,9 +142,15 @@ function buildViewerDoc(text: string): string {
   // （按钮长在草稿页）。发布路径已经改写掉，这里再改一次是为了存量条目 ——
   // 2026-07-31 线上 12 个 ai_identify 条目里有 3 个带着它，不必为此跑迁移。
   // 真正的去路由下面那块「站内已有该物种的内容」提供。
-  let processed = rewriteDraftOnlyHints(text);
+  // 🔴 **在送进 srcDoc 之前**就把页内锚点的 href 拆掉。留着 href 的话，只要父窗口那道
+  // capture 拦截有一次没装上（WebView 读不到 contentDocument、load 时序错开…），
+  // 点一下摘要卡 iframe 就被导航成 `about:srcdoc#section-vi`，屏幕上是一屏源码乱码。
+  // 详见 in-page-anchors.ts。
+  let processed = neutralizeInPageAnchors(rewriteDraftOnlyHints(text));
   try {
-    const parsed = new DOMParser().parseFromString(text, "text/html");
+    // ⚠️ 解析的是 `processed` 而不是原始 `text`：早先这里从 `text` 重新序列化，于是
+    // **带编辑评论的条目**会把上面两步改写（草稿提示语、页内锚点）整个丢掉。
+    const parsed = new DOMParser().parseFromString(processed, "text/html");
     const ec = parsed.body?.querySelector("section.editor-comments [data-comments-body]");
     if (ec) {
       ec.innerHTML = embedVideosInHtml(ec.innerHTML);
@@ -300,6 +309,10 @@ function PlantDetail() {
   const [htmlDoc, setHtmlDoc] = useState<string | null>(null);
   // Collect images + section headings from the HTML page (cover picker + 小P蛙标注范围).
   const [rawHtml, setRawHtml] = useState<string | null>(null);
+  // 正文取不回来（离线 / 存储抽风）。**必须与「还在取」分开**：这两种状态从前共用
+  // 「htmlDoc 为空」一个条件，于是都退回到那个直连存储地址的 iframe —— 见下方渲染处。
+  const [htmlFailed, setHtmlFailed] = useState(false);
+  const [htmlReloadTick, setHtmlReloadTick] = useState(0);
 
   /**
    * 把一份正文 HTML 装进页面：iframe 的 srcDoc、换图流程用的原始 HTML、封面选择器的
@@ -344,8 +357,12 @@ function PlantDetail() {
     }
     let cancelled = false;
     const url = plant.html_url;
+    setHtmlFailed(false);
     fetch(url)
-      .then((r) => r.text())
+      .then((r) => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.text();
+      })
       .then((text) => {
         if (cancelled) return;
         applyPageHtml(text, url);
@@ -355,9 +372,10 @@ function PlantDetail() {
         setHtmlDoc(null);
         setPageImages([]);
         setPageSections([]);
+        setHtmlFailed(true);
       });
     return () => { cancelled = true; };
-  }, [plant?.html_url, plant?.content_type, applyPageHtml]);
+  }, [plant?.html_url, plant?.content_type, applyPageHtml, htmlReloadTick]);
 
   useEffect(() => {
     if (!coverMenu) return;
@@ -458,6 +476,42 @@ function PlantDetail() {
     }
   };
 
+  /**
+   * 把父窗口滚到 iframe 内某个元素处。
+   *
+   * 🔴 **不能用 `behavior:"smooth"`**（2026-08-15 实测）：站点 CSS 给 html 挂了
+   * `scroll-behavior:smooth`，而 iframe 的高度在图片/字体陆续加载时被 sizeIframe
+   * 一路改写（大籽蒿页最终 25229px），每次改写都触发布局与滚动锚定，把还在跑的平滑
+   * 滚动动画掐掉 —— 手机上实测点完摘要卡 scrollY 一动不动（4.5 → 4.5），看着就是
+   * 「这张卡是死的」。改成立即跳，再在随后的几帧里按新高度**校正一次位置**：
+   * 目标元素会因为上方图片撑开而下移，只跳一次会停在半路。
+   * 用户自己一动（滚轮 / 触摸 / 方向键），校正立刻停手，绝不跟人抢滚动条。
+   */
+  const scrollParentTo = (iframe: HTMLIFrameElement, el: Element) => {
+    let cancelled = false;
+    const stop = () => { cancelled = true; };
+    const opts = { passive: true, once: true } as const;
+    window.addEventListener("wheel", stop, opts);
+    window.addEventListener("touchstart", stop, opts);
+    window.addEventListener("keydown", stop, opts);
+    const go = () => {
+      const top = iframe.getBoundingClientRect().top + window.scrollY + el.getBoundingClientRect().top;
+      window.scrollTo({ top: Math.max(0, top - 90), behavior: "auto" });
+    };
+    go();
+    [80, 260, 600].forEach((t) =>
+      setTimeout(() => {
+        if (cancelled) return;
+        go();
+      }, t),
+    );
+    setTimeout(() => {
+      window.removeEventListener("wheel", stop);
+      window.removeEventListener("touchstart", stop);
+      window.removeEventListener("keydown", stop);
+    }, 700);
+  };
+
   // 「注 N」= 正文里的 .lov-edit-mark 上标。iframe 出于安全无 allow-scripts（中和上传 HTML 里的脚本），
   // 但 srcDoc + allow-same-origin 是同源，父页面可直接给 iframe 文档挂点击监听 → 定位到页尾「修改记录」，
   // 并接管页内锚点跳转（沙箱里点 #hash 会把 iframe 导航到 about:srcdoc 显示源码乱码）。
@@ -500,19 +554,18 @@ function PlantDetail() {
         requestAnimationFrame(() => setFocusedNoteId(id));
         return;
       }
-      // 页内锚点（如「博物趣闻」摘要卡 href="#section-vi"）：手动滚动父窗口到目标，
-      // 避免沙箱 srcdoc 的 #hash 导航把 iframe 变成一屏源码乱码。
-      const anchor = (target?.closest?.('a[href^="#"]') as HTMLAnchorElement | null) ?? null;
-      if (anchor) {
-        const rawId = (anchor.getAttribute("href") || "").slice(1);
-        if (!rawId) return;
-        let el: Element | null = null;
-        try { el = doc.getElementById(decodeURIComponent(rawId)) || doc.getElementById(rawId); } catch { el = doc.getElementById(rawId); }
-        if (!el) return;
-        ev.preventDefault();
-        const top = iframe.getBoundingClientRect().top + window.scrollY + el.getBoundingClientRect().top;
-        window.scrollTo({ top: Math.max(0, top - 90), behavior: "smooth" });
-      }
+      // 页内锚点（如「博物趣闻」摘要卡）：手动滚动父窗口到目标。href 在 buildViewerDoc
+      // 里已经被拆成 data-jump，这里两种都认 —— 存量缓存里可能还有带 href 的那份。
+      const rawId = inPageJumpTarget(target);
+      if (rawId == null) return;
+      // ⚠️ **先 preventDefault，再去找目标**。找不到就默默不动即可；早先是找不到就
+      // `return`，于是那一次点击走了浏览器默认行为 —— 正是「点一下变成一屏源码乱码」。
+      ev.preventDefault();
+      if (!rawId) return;
+      let el: Element | null = null;
+      try { el = doc.getElementById(decodeURIComponent(rawId)) || doc.getElementById(rawId); } catch { el = doc.getElementById(rawId); }
+      if (!el) return;
+      scrollParentTo(iframe, el);
     }, true);
   };
 
@@ -951,13 +1004,33 @@ function PlantDetail() {
               style={{ minHeight: "60vh" }}
             />
           ) : plant.html_url ? (
-            <iframe
-              title={plant.title}
-              src={plant.html_url}
-              sandbox="allow-same-origin allow-popups"
-              className="w-full"
-              style={{ height: "calc(100vh - 120px)" }}
-            />
+            /* 🔴 这里**绝不能**再放一个 `src={plant.html_url}` 的 iframe。
+               Supabase 公共存储桶把 HTML 一律按 `content-type: text/plain` + `nosniff`
+               吐出来（我们上传时写的 `text/html` 会被它改掉，这是它防 XSS 的既定行为），
+               于是那个 iframe 只可能画出**一屏带乱码的源代码**——`<!DOCTYPE html>`、
+               `å¤§ç±½è’¿`……而它偏偏被服务端渲染进了每一张详页的首屏，正文取回来之前人人都能
+               看见；取不回来时更是一直停在那儿（2026-08-15 实测 + 截图）。
+               改成：还在取 → 骨架；取失败 → 说人话 + 重试。 */
+            htmlFailed ? (
+              <div className="mx-auto max-w-2xl px-6 py-16 text-center">
+                <p className="text-ink-soft">这一页的正文暂时没取回来。</p>
+                <p className="mt-1 text-[13px] text-ink-faint">多半是网络断了一下，重试通常就好。</p>
+                <button
+                  type="button"
+                  onClick={() => setHtmlReloadTick((n) => n + 1)}
+                  className="mt-4 border border-ink px-4 py-1.5 text-sm hover:bg-ink hover:text-background transition-colors cursor-pointer"
+                >
+                  重试
+                </button>
+              </div>
+            ) : (
+              <div
+                className="mx-auto max-w-2xl px-6 py-20 text-center text-ink-faint text-sm"
+                style={{ minHeight: "60vh" }}
+              >
+                正在载入正文…
+              </div>
+            )
           ) : (
             <p className="p-10 text-center text-ink-faint">未提供 HTML 文件。</p>
           )}

@@ -13,6 +13,8 @@
 // The iframe must be sandboxed with `allow-scripts` for the injected script to
 // run. The replaceable set and ordering here MUST match replaceImageInDraftHtml.
 
+import { IN_PAGE_ANCHOR_CSS, neutralizeInPageAnchors } from "./in-page-anchors";
+
 const REPLACEABLE_SELECTOR = "img.sec-img";
 
 const VIEWER_STYLE = `<style id="pp-viewer-style">
@@ -56,6 +58,7 @@ img,video,iframe,table,pre{max-width:100%!important;height:auto;}
 .pp-replaceable img{cursor:pointer;}
 .pp-replaceable.pp-default img{outline:2px dashed #c0392b;outline-offset:-3px;}
 .pp-replaceable.pp-default:hover img{outline-color:#e05540;}
+${IN_PAGE_ANCHOR_CSS}
 .pp-hint{position:absolute;top:8px;left:50%;transform:translateX(-50%);max-width:92%;background:rgba(192,57,43,.92);color:#fff;font-size:11px;font-weight:600;padding:4px 10px;border-radius:3px;pointer-events:none;font-family:'Noto Serif SC',system-ui,sans-serif;white-space:nowrap;box-shadow:0 2px 6px rgba(0,0,0,.22);}
 </style>`;
 
@@ -284,6 +287,11 @@ export function enhanceDraftHtmlForViewing(html: string): string {
   // 先清掉「有图却仍写着暂无照片」的旧草稿（库里已经存成这样的那些）——视图层兜底，
   // 保证用户现在就看不到这条自相矛盾的说明，不必等编辑再保存一次。
   let out = stripStaleMissingNotes(html);
+  // 页内锚点（`<a href="#…">`）在这里比条目页更危险：草稿预览的 iframe 是
+  // `sandbox="allow-scripts allow-popups"`，**没有 allow-same-origin**，父窗口根本读不到
+  // contentDocument，也就无从拦截点击。一旦草稿正文里带上锚点（金叶正文并进来就会），
+  // 点一下 iframe 就被导航成 about:srcdoc#… 的一屏源码乱码。拆掉 href 让它彻底不导航。
+  out = neutralizeInPageAnchors(out);
   out = out.includes("</head>")
     ? out.replace("</head>", () => VIEWER_STYLE + "</head>")
     : VIEWER_STYLE + out;

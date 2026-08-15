@@ -1,6 +1,49 @@
 # Plantspedia — Working State  (single source of truth)
 
-_Last updated: 2026-08-15 — by Claude（**先诊断、后按用户「a b c d 全做」四条全修，tsc=0 /
+_Last updated: 2026-08-15（续二）— by Claude（**「点博物趣闻摘要卡出现乱码」查清并修好，
+tsc=0 / build 过 / 本地 desktop+mobile 双实测；⚠️ 未提交、未部署**。用户报「进大籽蒿的
+skill 创建详页后，点跳转博物趣闻的摘要卡出现乱码，估计还有不少 skill 详页有这个问题」。
+**先把「是不是内容坏了」排掉**：全量拉了 287 张详页 HTML 逐份对锚点与目标 id ——
+242 张有摘要卡，**href 一律是 `#section-vi`、目标 id 一律在，0 张坏**（相对/怪异 href 也是 0）；
+`plant_drafts` 280 份里带页内锚点的是 **0**。所以不是数据问题，是**看的那一层**的问题，
+于是「有这个问题的详页」= 全部 242 张。查出两条，都已修：
+
+🔴 **① 乱码的真身：`plants.$slug` 那个直连存储地址的兜底 iframe。**
+Supabase 公共桶把 HTML 一律按 `content-type: text/plain` + `x-content-type-options: nosniff`
+吐出来（我们上传时写的是 `text/html`，**被它改掉**，这是它防 XSS 的既定行为，不是配置错）。
+所以 `<iframe src={plant.html_url}>` 只可能画出**一屏带乱码的源码**（已截图：`<!DOCTYPE html>`、
+`å¤§ç±½è’¿`…）。而 `htmlDoc` 初值是 null → **服务端渲染就把这个 iframe 写进了每一张详页首屏**
+（curl 线上逐字确认），正文取回来之前人人都看得见；**取不回来时永远停在那儿**。
+改法：兜底不再是 iframe —— 还在取给「正在载入正文…」，取失败给一句人话 + 「重试」按钮
+（新 `htmlFailed` / `htmlReloadTick` 两个 state，`!r.ok` 也算失败）。
+
+🔴 **② 点了会导航的 href 本身。** 正文是 `srcDoc` + sandbox 的 iframe，文档地址是
+`about:srcdoc`；`#section-vi` 一旦走默认行为就把 iframe 导航成 `about:srcdoc#…` ——
+同样是一屏源码乱码。父窗口那道 capture 拦截**只在读得到 `contentDocument` 时才装得上**
+（WebView/微信内置浏览器、或 load 时序错开就没有），而 href 一直在。
+改法：新 `src/lib/in-page-anchors.ts`，**在送进 srcDoc 之前**把 `<a href="#x">` 改写成
+`<a data-jump="x">` —— 没有 href 就没有导航，与浏览器无关。父窗口的点击监听改认
+`[data-jump]`（也仍认 `a[href^="#"]` 兜存量），并且**先 preventDefault 再找目标**
+（旧写法是「找不到目标就 return」，那一次点击正好走了默认行为 = 乱码）。
+`draft-enhance.ts` 的草稿预览同样接上：它的 iframe 是 `allow-scripts` **无 allow-same-origin**，
+父窗口根本无从拦截，金叶正文并进草稿就会中招。
+配 `scratch/check_in_page_anchors.mjs`，**17 条离线断言全绿**（外链/mailto/`<abbr>`/正文里的
+字面 `href="#…"` 都不许误伤）。
+
+🔴 **③ 顺带修掉的两个**：(a) 摘要卡**点了不跳** —— `window.scrollTo({behavior:"smooth"})`
+被 sizeIframe 持续改写 iframe 高度触发的布局/滚动锚定掐掉，手机上实测 scrollY 一动不动
+（4.5 → 4.5）。改成立即跳 + 随后 80/260/600ms 按新高度校正（图片撑开会让目标下移），
+用户一动滚轮/触摸/方向键就立刻停手。(b) `buildViewerDoc` 里那段 DOMParser 从**原始 `text`**
+重新序列化，于是**带编辑评论的条目**会把前面所有改写（草稿提示语、锚点）整个丢掉 ——
+改成解析 `processed`。
+**实测**：本地 dev，desktop(1280) 与 mobile(390×844) 各一次，点摘要卡后 `offBy = 0`
+（Section VI 正好停在视口下 90px）、iframe 仍在 `about:srcdoc`、卡片 `href` 已不存在、
+`cursor` 仍是 pointer；SSR 输出里 **iframe 数 = 0**、只剩「正在载入正文…」；
+模拟断网 → 出错误卡 + 0 个 iframe，点「重试」→ 正文回来。
+lint 改动文件非 prettier 项只剩 1 条**HEAD 就有**的 `rules-of-hooks`（与本轮无关）。
+⚠️ **没能复现用户那一次点击的精确时序** —— Chrome desktop/mobile 上父窗口拦截本来就生效；
+上面两条是「无论哪种浏览器都不可能再出乱码」的结构性修法，不是照着复现步骤打的补丁。）_
+_上一轮：2026-08-15 — by Claude（**先诊断、后按用户「a b c d 全做」四条全修，tsc=0 /
 build 过 / 本地实测；⚠️ 未提交、未部署**。用户报「小P蛙任务动态在电脑上点了很顺，
 在手机上很慢、有时干脆不跳」。线上取证定位到三条叠加原因：
 ① `/drafts/$id` 的 **loader 是挡渲染的**，而全站**没有任何 `pendingComponent`** ——
