@@ -1,3 +1,4 @@
+import { sizedImageUrl } from "@/lib/img-url";
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useMemo, useState, useEffect } from "react";
@@ -737,9 +738,10 @@ function PlantRow({ plant, kind }: { plant: Plant; kind: PlantEntryKind }) {
         <div className="w-16 h-16 flex-shrink-0 border border-rule bg-paper-deep overflow-hidden">
           {plant.cover_url ? (
             <img
-              src={plant.cover_url}
+              src={sizedImageUrl(plant.cover_url, 64)}
               alt={plant.title}
               loading="lazy"
+              decoding="async"
               className="w-full h-full object-cover"
             />
           ) : (

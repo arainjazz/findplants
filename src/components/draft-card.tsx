@@ -3,6 +3,7 @@ import type { PlantDraft } from "@/lib/drafts";
 import { displayPlace } from "@/lib/editor-stats";
 import { SafeImg } from "@/components/safe-img";
 import { isDraftTentative } from "@/lib/tentative";
+import { sizedImageUrl } from "@/lib/img-url";
 
 /**
  * 这条在待审名单里是不是还挂着「疑似」。
@@ -83,7 +84,7 @@ export function DraftCard({
       >
         <div className="w-24 h-24 sm:w-28 sm:h-28 flex-shrink-0 overflow-hidden bg-paper-deep">
           <SafeImg
-            src={d.photo_url}
+            src={sizedImageUrl(d.photo_url, 112)}
             alt={d.title}
             className="w-full h-full object-cover group-hover:scale-[1.04] transition-transform duration-500"
             fallback={

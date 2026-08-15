@@ -11,6 +11,7 @@
 import { useEffect, useState } from "react";
 import { Link, useRouterState } from "@tanstack/react-router";
 import { TASK_KIND_META, type TaskFeedRow } from "@/lib/task-feed";
+import { sizedImageUrl } from "@/lib/img-url";
 
 /** 相对时间，够用即可（不为这一处引第三方库）。 */
 export function ago(iso: string): string {
@@ -30,9 +31,11 @@ function CardBody({ row, opening }: { row: TaskFeedRow; opening?: boolean }) {
     <>
       {row.thumbUrl ? (
         <img
-          src={row.thumbUrl}
+          // 48px 的方图不该下 400KB 的原图（见 lib/img-url.ts）
+          src={sizedImageUrl(row.thumbUrl, 48)}
           alt=""
           loading="lazy"
+          decoding="async"
           className="w-12 h-12 rounded-lg object-cover border border-rule/50 shrink-0"
         />
       ) : (

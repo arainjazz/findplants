@@ -1,3 +1,4 @@
+import { sizedImageUrl } from "@/lib/img-url";
 import { useEffect, useRef, useState } from "react";
 import { Link } from "@tanstack/react-router";
 import { useQuery } from "@tanstack/react-query";
@@ -255,7 +256,7 @@ function SpeciesExistingEntryRow({
   const body = (
     <>
       <SafeImg
-        src={entry.thumb}
+        src={sizedImageUrl(entry.thumb, 36)}
         className="w-9 h-9 object-cover rounded-sm shrink-0"
         loading="lazy"
         fallback={<span className="w-9 h-9 rounded-sm bg-paper-deep/60 shrink-0" />}

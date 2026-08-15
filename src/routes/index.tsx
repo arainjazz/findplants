@@ -15,6 +15,7 @@ import { fetchPublishedPosts, blogCoverUrl, type BlogPost } from "@/lib/blog";
 import { type EditorColumnEntry } from "@/lib/editor-stats";
 import { fetchEditorColumnFn } from "@/lib/identify-plant.functions";
 import { SafeImg } from "@/components/safe-img";
+import { sizedImageUrl } from "@/lib/img-url";
 
 export const Route = createFileRoute("/")({
   head: () => ({
@@ -163,7 +164,7 @@ function HomePage() {
                 <div className="grid md:grid-cols-5 gap-8 items-start">
                   <div className="md:col-span-3 overflow-hidden border border-rule bg-paper-deep">
                     <SafeImg
-                      src={hero.cover_url}
+                      src={sizedImageUrl(hero.cover_url, 400)}
                       alt={hero.title}
                       className="w-full h-auto block group-hover:scale-[1.02] transition-transform duration-700"
                       fallback={<div className="aspect-[4/3]"><PlantPattern /></div>}
@@ -222,7 +223,7 @@ function HomePage() {
                     <Link key={p.id} to="/plants/$slug" params={{ slug: p.slug }} className="group block">
                       <div className="overflow-hidden border border-rule bg-paper-deep mb-2 aspect-square">
                         <SafeImg
-                          src={p.cover_url}
+                          src={sizedImageUrl(p.cover_url, 220)}
                           alt={p.title}
                           loading="lazy"
                           className="w-full h-full object-cover group-hover:scale-[1.04] transition-transform duration-500"
@@ -308,7 +309,7 @@ function EditorsBlogStrip({ posts }: { posts: BlogPost[] }) {
           <Link key={p.id} to="/blog/$slug" params={{ slug: p.slug }} className="group block">
             <div className="overflow-hidden border border-rule bg-paper-deep mb-3 aspect-[16/10]">
               <SafeImg
-                src={blogCoverUrl(p)}
+                src={sizedImageUrl(blogCoverUrl(p), 330)}
                 alt={p.title}
                 className="w-full h-full object-cover group-hover:scale-[1.03] transition-transform duration-500"
                 fallback={<PlantPattern />}

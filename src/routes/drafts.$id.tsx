@@ -1,3 +1,4 @@
+import { sizedImageUrl } from "@/lib/img-url";
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
@@ -1846,7 +1847,8 @@ function DraftPage() {
                       return (
                         <div className="md:w-60 lg:w-72 shrink-0">
                           <SafeImg
-                            src={cover}
+                            // 主图在手机上占满一栏(≈375px)、桌面 240–288px；按 375 取档就够
+                            src={sizedImageUrl(cover, 375)}
                             alt={draft.title}
                             className="w-full aspect-square object-cover border border-rule rounded-md"
                             fallback={
@@ -1861,7 +1863,7 @@ function DraftPage() {
                                 {rest.map((u, i) => (
                                   <SafeImg
                                     key={`${u}-${i}`}
-                                    src={u}
+                                    src={sizedImageUrl(u, 96)}
                                     alt={`${draft.title} 补拍 ${i + 1}`}
                                     className="w-full aspect-square object-cover border border-rule rounded"
                                     fallback={
