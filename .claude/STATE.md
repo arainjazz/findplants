@@ -426,7 +426,27 @@ _Read this FIRST and update it LAST, every session._
 
 ## 🚨 部署真相（以 Cloudflare 为准，不以本文件的小节标签为准）
 
-**⬆️ 最新：线上版本 = `e1ee5176-8210-4370-bef5-99fd8f4bde8f`，2026-08-15 部署**
+**⬆️ 最新：线上版本 = `94789e51-656a-44f6-ba89-8687461010c7`，2026-08-15 部署（当天第二次）**
+（提交 `2761bd2` + `be8c757`：图片提速两条。用户「跳转顺了，只是图片出来得慢」之后做的。
+① 两张**每页必下**的 logo 缩到实际尺寸：xiaop-logo 1920×1502/186KB → 320×250/33KB、
+ai-identify-logo 1140×1250/114KB → 127×140/13KB（每页省 255KB，纯白下的）；
+preconnect 补上 Supabase 图片主机并排在 Google Fonts 之前。
+② 缩略图不再下原图：新 `lib/img-url.ts` 的 `sizedImageUrl()` 把自家 Storage 地址改写成
+`/render/image/public/?width=&resize=contain&quality=`，宽度归档。实测同一张
+**395KB → 128 档 7.9KB（-98%）/ 256 档 25.7KB / 800 档 123KB（-69%）**，且直接回 WebP。
+**上线核验**：`/` `/identify` `/explore` `/blog` 200（`/plants` 是 307→补默认查询串→200，既有行为）；
+线上页面上 15 张缩略图**全部**是 `/render/image/` 地址；抓线上正在用的那条地址实测
+**8086B、128×171**（原图 900×1200，比例保持）；两张 logo 线上体积与构建产物一致。
+⚠️ 图片变换是 Supabase 的**计费项**（按每月被变换的原图张数），用户已知情并选择「全部部署」；
+站上约 500 张图（287 条目 + 250 草稿），配额与单价请在 Supabase 控制台用量页盯一下。
+🔴 **踩过一个差点上线的坑**：只传 `width=128` 时 Supabase 默认 `cover` 且缺省 height 取原图高，
+拿回的是 **128×1200 的竖条**（29KB）而不是缩略图；`resize=contain` 才是等比（128×171、7.9KB，
+反而更小）。是靠**下载变换后的图去量真实像素**发现的 —— 只看「HTTP 200 + 体积变小」会漏掉。
+27 条离线断言已把这条钉死（`scratch/check_img_url.mjs`，scratch 不入库）。
+⚠️ **本机浏览器面板取不到 Supabase 图片**（连 197 秒 0 张，shell 里 curl 1.5 秒就回）——
+图片的视觉验证只能靠 curl 量像素，不是站点问题。）_
+
+_上一次：`e1ee5176-8210-4370-bef5-99fd8f4bde8f`，2026-08-15 部署（当天第一次）_
 （提交 `5d4275f`：手机上点小P蛙任务动态「很慢 / 不跳」的四条修法 a+b+c+d，详见文末本轮小节。
 `env -u HTTP_PROXY …` 一次过，上传 85s、Worker 上传 285s。）
 **上线核验（已做）**：`/` `/identify` `/explore` `/blog` `/plants/plantago-major` `/drafts/<id>`
