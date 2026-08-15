@@ -14,6 +14,11 @@ import { AuthProvider } from "@/hooks/use-auth";
 import { OfflineStatus } from "@/components/offline-status";
 import appCss from "../styles.css?url";
 
+/** 图片主机 = Supabase 项目域名。构建时注入，取不到就退回线上那个（wrangler.jsonc 同值）。 */
+const SUPABASE_ORIGIN =
+  (import.meta.env?.VITE_SUPABASE_URL as string | undefined) ??
+  "https://ianlasfsfuaibqldkfyb.supabase.co";
+
 function NotFoundComponent() {
   return (
     <div className="flex min-h-screen items-center justify-center bg-background px-4">
@@ -100,6 +105,11 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
     links: [
       { rel: "manifest", href: "/manifest.json" },
       { rel: "stylesheet", href: appCss },
+      // 站上**每一张照片**都在这个域名下（Supabase Storage）。原来只预连了 Google Fonts，
+      // 于是第一张图还要现做 DNS + TLS —— 手机上就是首图迟迟不出来的那几百毫秒。
+      // 放在字体前面：连接槽有限，先给真正必用的那个。
+      { rel: "preconnect", href: SUPABASE_ORIGIN, crossOrigin: "" },
+      { rel: "dns-prefetch", href: SUPABASE_ORIGIN },
       { rel: "preconnect", href: "https://fonts.googleapis.com" },
       { rel: "preconnect", href: "https://fonts.gstatic.com", crossOrigin: "" },
       {
