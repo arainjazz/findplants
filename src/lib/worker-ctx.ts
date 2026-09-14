@@ -19,6 +19,8 @@ type ExecutionCtxLike = { waitUntil?: (p: Promise<unknown>) => void };
  */
 export type WorkerEnvLike = {
   PLANT_JOBS?: { send: (body: unknown) => Promise<void> };
+  /** 长任务车道（银叶/金叶）。识别不走这条 —— 见 job-queue.ts 的 JobLane。 */
+  PLANT_JOBS_LONG?: { send: (body: unknown) => Promise<void> };
   [k: string]: unknown;
 };
 

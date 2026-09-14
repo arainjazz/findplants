@@ -45,11 +45,19 @@
   //
   // ⚠️ 首次部署前必须先建队列，否则 deploy 会因绑定不存在而失败：
   //     npx wrangler queues create plant-jobs
+  //     npx wrangler queues create plant-jobs-long
   //     npx wrangler queues create plant-jobs-dlq
+  //
+  // 🛣️ **两条车道**（2026-09-08）：识别 20–40 秒、金叶 3–10 分钟，差两个数量级。
+  // 挤在一条队列上时没法限流 —— 见下面 max_concurrency 的注释。
   "queues": {
-    "producers": [{ "queue": "plant-jobs", "binding": "PLANT_JOBS" }],
+    "producers": [
+      { "queue": "plant-jobs", "binding": "PLANT_JOBS" },
+      { "queue": "plant-jobs-long", "binding": "PLANT_JOBS_LONG" }
+    ],
     "consumers": [
       {
+        // 快车道：**只跑识别**（quick_identify）。用户正盯着转圈等。
         "queue": "plant-jobs",
         // 一次只取一条：每个任务本身就要跑好几分钟，攒批毫无意义，
         // 反而会让先到的任务干等后面的凑批。
@@ -58,6 +66,28 @@
         // 生成失败已经写进任务行、也已经烧过 token 了，重投只会再烧一遍。
         // 留 1 次是为了覆盖「消费者启动阶段就崩」这种没真正跑过的情况。
         "max_retries": 1,
+        // 🔴 **并发上限。不设的话 Cloudflare 会自动扩到最多 250 个并发调用** ——
+        // 队列解决了边缘 100 秒超时，却**没有做任何平滑**：一个人连拍 8 张，
+        // 就是 8 个消费者同时打同一把 key。2026-09-06 线上实测的后果是
+        // Gemini 连挂 3 次、minimax 也抖，两次掉到 Pl@ntNet 兜底出空卡。
+        //
+        // 取 2 的依据（别随手调大）：一次识别对出卡模型只发 1 次请求、耗时 20–40 秒，
+        // 并发 2 ≈ 3–6 RPM，稳在 Gemini 免费层 10 RPM 之下；而智谱免费模型的
+        // 并发上限本身就是 2/key。要往上调，先确认序列里每一家的 RPM 都撑得住。
+        // ⚠️ Cloudflare 是从 1 逐步往上加的，爆发的头几秒可能只跑 1 个，属正常。
+        "max_concurrency": 2,
+        "dead_letter_queue": "plant-jobs-dlq"
+      },
+      {
+        // 慢车道：银叶草稿 / 金叶详页。没人盯着，慢一点无所谓，
+        // 但**绝不能占用识别的位置** —— 这正是拆车道的全部理由。
+        "queue": "plant-jobs-long",
+        "max_batch_size": 1,
+        "max_batch_timeout": 0,
+        "max_retries": 1,
+        // 串行。这类任务单次就要烧掉大量 token（金叶四轮长文 + 十几张配图转存），
+        // 并行跑只会同时撞上同一个模型的限流，还让每一个都更慢。
+        "max_concurrency": 1,
         "dead_letter_queue": "plant-jobs-dlq"
       },
       // 🪦 **死信队列也要有消费者。**

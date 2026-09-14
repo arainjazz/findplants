@@ -22,23 +22,50 @@ export type JobMessage = { jobId: string };
 
 /** 绑定名，与 wrangler.jsonc 里的 `queues.producers[].binding` 必须一致。 */
 const BINDING = "PLANT_JOBS";
+/** 长任务车道的绑定名。见下面 `lane` 的注释。 */
+const BINDING_LONG = "PLANT_JOBS_LONG";
+
+/**
+ * 走哪条车道。
+ *
+ * **为什么要分**（2026-09-08）：识别和「银叶草稿 / 金叶详页」原本挤在同一条队列上，
+ * 而两者的时长差两个数量级 —— 识别 20–40 秒，金叶 3–10 分钟。
+ * 给消费者设并发上限（把爆发削成排队、别一口气打爆免费模型的额度）时，这就要命了：
+ * 上限压到 2，两个金叶任务就能把识别堵在后面十分钟，用户拍完照只能干等。
+ *
+ * 拆开之后两条车道各自限流：
+ *  · `fast`（`plant-jobs`）—— 只跑识别，并发 2，用户在等，必须一直有位置；
+ *  · `long`（`plant-jobs-long`）—— 银叶/金叶，并发 1，慢就慢，反正是后台任务。
+ */
+export type JobLane = "fast" | "long";
 
 /**
  * 把任务推进队列。**返回 false 表示没推成**（本地 vite dev 没有 workerd，
  * 或队列尚未创建/绑定），调用方必须据此退回 waitUntil，绝不能假定它一定成功 ——
  * 否则功能上线那一刻，任何绑定问题都会变成「点了按钮什么也没发生」。
+ *
+ * `lane` 选不到绑定时**自动退回主队列**再退回 waitUntil。这一层降级是刻意的：
+ * 代码可能先于 `plant-jobs-long` 队列上线（或者队列被误删），那时长任务照样得能跑，
+ * 只是暂时和识别挤在一起 —— 比直接掉进 26 秒的 waitUntil 强得多。
  */
-export async function enqueueJob(jobId: string): Promise<boolean> {
+export async function enqueueJob(jobId: string, lane: JobLane = "fast"): Promise<boolean> {
   try {
     const env = currentEnv();
-    const q = env?.[BINDING] as { send?: (b: unknown) => Promise<void> } | undefined;
+    const wanted = lane === "long" ? BINDING_LONG : BINDING;
+    let name = wanted;
+    let q = env?.[name] as { send?: (b: unknown) => Promise<void> } | undefined;
+    if (!q?.send && lane === "long") {
+      console.warn(`[job-queue] 没有 ${BINDING_LONG} 绑定，长任务暂时退回 ${BINDING}`);
+      name = BINDING;
+      q = env?.[name] as { send?: (b: unknown) => Promise<void> } | undefined;
+    }
     if (!q?.send) {
-      console.warn(`[job-queue] 没有 ${BINDING} 绑定，退回 waitUntil（仅约 26 秒）`);
+      console.warn(`[job-queue] 没有 ${name} 绑定，退回 waitUntil（仅约 26 秒）`);
       return false;
     }
     const msg: JobMessage = { jobId };
     await q.send(msg);
-    console.log(`[job-queue] 已入队 job ${jobId}`);
+    console.log(`[job-queue] 已入队 job ${jobId}（车道 ${lane} → ${name}）`);
     return true;
   } catch (e) {
     console.warn("[job-queue] 入队失败，退回 waitUntil：", e instanceof Error ? e.message : e);

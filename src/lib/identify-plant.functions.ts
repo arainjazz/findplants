@@ -5986,7 +5986,8 @@ export const startEnrichDraftFn = createServerFn({ method: "POST" })
 
     // 正路：交给 Queues（消费者有 15 分钟）。绑定不可用时（本地 dev / 队列没建）
     // 才退回 waitUntil —— 那条路只有约 26 秒，冷启动多半跑不完，但总比什么都不做强。
-    if (!(await enqueueJob(job.id))) keepAlive(runQueuedJob(job.id));
+    // 走 long 车道：这活儿要 3–10 分钟，不能占着识别那条「用户在等」的队列（见 JobLane）。
+    if (!(await enqueueJob(job.id, "long"))) keepAlive(runQueuedJob(job.id));
 
     return { alreadyEnriched: false as const, jobId: job.id, draftId: targetId, forkedFrom };
   });
@@ -7167,7 +7168,8 @@ export const startGoldDetailPageFn = createServerFn({ method: "POST" })
     // 同 enrich：一入队就进动态流，用户点完立刻能切走。
     await feedStart(userId, "gold_page", data.draft_id, job.id);
 
-    if (!(await enqueueJob(job.id))) keepAlive(runQueuedJob(job.id));
+    // 金叶是全站最长的任务（转存十几张图 + 四轮长文），必须走 long 车道。
+    if (!(await enqueueJob(job.id, "long"))) keepAlive(runQueuedJob(job.id));
 
     return { jobId: job.id };
   });
