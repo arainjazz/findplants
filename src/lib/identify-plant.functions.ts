@@ -1011,6 +1011,9 @@ function httpStatusOf(e: unknown): number {
  * 全挂时抛出的错误里带**每一项各自的失败原因**（key 打码）—— 不然管理员只会看到
  * 最后一项的报错，根本不知道前面几项为什么没顶上。
  */
+/** 429 原地重试等多久。识别是用户在等的实时链路 —— 这个数字直接加在他等待的时间上，别调大。 */
+const RETRY_429_MS = 3_000;
+
 async function runModelQueue<T>(
   sequence: ModelSlot[],
   callSlot: (slot: ModelSlot, index: number) => Promise<T>,
@@ -1023,7 +1026,7 @@ async function runModelQueue<T>(
    * 只跳过**明确测出 blind** 的项；没测过的照跑不误 —— 否则本功能上线当天就会把所有
    * 未检测的序列清空，比事故本身更糟。
    */
-  opts?: { requireVision?: boolean },
+  opts?: { requireVision?: boolean; retry429?: boolean },
 ): Promise<T> {
   if (!sequence.length) throw new Error(`${label} 暂不可用：优先调用序列为空，请在控制台配置。`);
 
@@ -1045,25 +1048,56 @@ async function runModelQueue<T>(
   }
   const failures: string[] = [];
   for (const [i, slot] of sequence.entries()) {
-    try {
-      return await callSlot(slot, i);
-    } catch (e) {
-      const status = httpStatusOf(e);
-      const msg = e instanceof Error ? e.message : String(e);
-      failures.push(`${slotLabel(slot, i)}（${maskKey(slot.apiKey)}）：${msg.slice(0, 160)}`);
-      if (!shouldFailOver(status, msg) || i === sequence.length - 1) {
-        if (sequence.length === 1) throw e;
-        // 报「试了几个」而不是「一共几个」—— 遇到不可降级的错误（400）会提前停，
-        // 说成「N 个都没出结果」会让人以为后面的替补试过了、白白去查没问题的配置。
-        const tried = failures.length;
-        const stoppedEarly = tried < sequence.length;
-        throw new Error(
-          `${label} 失败：已依次尝试 ${tried} / ${sequence.length} 个序列` +
-            (stoppedEarly ? "（末项的错误无法靠换模型解决，已停止顺位）" : "") +
-            `：\n${failures.join("\n")}`,
+    let retried429 = false;
+    // 单项内可能跑两次（429 短重试），所以这里再套一层循环。
+    for (;;) {
+      try {
+        return await callSlot(slot, i);
+      } catch (e) {
+        const status = httpStatusOf(e);
+        const msg = e instanceof Error ? e.message : String(e);
+
+        // ── 429：先原地等一下再重试**同一项**，等不来才顺位 ───────────────────
+        //
+        // 为什么要有这一步（2026-09-07，配智谱免费模型时实测逼出来的）：
+        // 免费视觉模型的 429 有两种，性质完全相反：
+        //  · **共享容量满**（智谱 `code 1305 该模型当前访问量过大`）—— 几秒后就好了，
+        //    这时立刻换家是最亏的：白烧掉后面每一项的额度，最后可能全军覆没，
+        //    而原本只要等 3 秒。09-06 那次「两档全挂 → 掉到 Pl@ntNet 兜底」就是这么来的。
+        //  · **自己的额度用尽**（Gemini 每日配额）—— 等多久都没用，必须立刻换家。
+        //
+        // 所以只对**非 Gemini**的项做这一次重试：Gemini 的 429 由
+        // callGeminiWithRotation 自己按 Google 的 RetryInfo 处理（它分得清每分钟/每日），
+        // 在这里再等一轮只会重复它已经做过的事。
+        // 重试**至多一次**、固定 3 秒 —— 识别是用户在等的实时链路，代价必须封顶。
+        if (opts?.retry429 && status === 429 && !retried429 && slot.provider !== "gemini") {
+          retried429 = true;
+          console.warn(
+            `[${label}] 序列 ${i + 1}（${slot.model}）被限流（429），` +
+              `等 ${RETRY_429_MS / 1000} 秒原地重试一次再决定是否顺位`,
+          );
+          await new Promise((r) => setTimeout(r, RETRY_429_MS));
+          continue;
+        }
+
+        failures.push(
+          `${slotLabel(slot, i)}（${maskKey(slot.apiKey)}）：${retried429 ? "限流，等 3 秒重试后仍失败 —— " : ""}${msg.slice(0, 160)}`,
         );
+        if (!shouldFailOver(status, msg) || i === sequence.length - 1) {
+          if (sequence.length === 1) throw e;
+          // 报「试了几个」而不是「一共几个」—— 遇到不可降级的错误（400）会提前停，
+          // 说成「N 个都没出结果」会让人以为后面的替补试过了、白白去查没问题的配置。
+          const tried = failures.length;
+          const stoppedEarly = tried < sequence.length;
+          throw new Error(
+            `${label} 失败：已依次尝试 ${tried} / ${sequence.length} 个序列` +
+              (stoppedEarly ? "（末项的错误无法靠换模型解决，已停止顺位）" : "") +
+              `：\n${failures.join("\n")}`,
+          );
+        }
+        // 可降级 → 跳出单项循环，继续下一项。
+        break;
       }
-      // 可降级 → 继续下一项。
     }
   }
   throw new Error(`${label} 暂不可用：优先调用序列为空。`);
@@ -1381,6 +1415,30 @@ async function loadSecondOpinionConfig(): Promise<SecondOpinionConfig | null> {
  * 序列为空时退回 loadSecondOpinionConfig()（它自带 .env 兜底）。
  */
 /**
+ * 一轮复核的全部可变状态。
+ *
+ * 🔴 **必须是每次调用一份，不能是模块级变量**（2026-09-07 修）。
+ * 在此之前 `secondOpinionDeadline` / `secondOpinionFailures` 是模块级的 `let`。
+ * 单线程跑一次识别时看不出问题，但识别是 Queues 消费者跑的，**同一个 isolate 里
+ * 可以并发跑多个任务**（消费者未设 max_concurrency 时 Cloudflare 会自动扩到上百个）：
+ * 后进来的那次识别一进 `withSecondOpinionSlots` 就把前一次的 deadline 覆盖成
+ * 「此刻 +45 秒」、把 failures 清空。于是 A 的复核可能继承 B 已经用掉大半的预算，
+ * 提前判「预算已用完」，或者把 B 的失败原因当成自己的报给用户。
+ * 多人同时识别、或一个人连拍时，这是实打实的串味。
+ */
+type ReviewRun = {
+  /** 本轮复核的截止时刻（epoch ms）。 */
+  deadline: number;
+  /** 本轮各序列项的真实失败原因（见下面 noteFailure 的注释）。 */
+  failures: string[];
+};
+
+/** 开一轮复核。`sink` 传进来时失败原因直接写进调用方的数组，省掉一次「取走」。 */
+function newReviewRun(sink?: string[]): ReviewRun {
+  return { deadline: Date.now() + SECOND_OPINION_TOTAL_BUDGET_MS, failures: sink ?? [] };
+}
+
+/**
  * 复核失败的**真实原因**。
  *
  * 为什么要有这个：原先复核一失败就统一报「模型限流、超时或未配置」—— 那是一句**猜测**，
@@ -1388,15 +1446,8 @@ async function loadSecondOpinionConfig(): Promise<SecondOpinionConfig | null> {
  * 看到「连通体检 ✅ 视觉自检 ✅」，前台却说「未配置」，只能一脸问号。
  * 现在把每个序列项的实际失败写进来，原样呈给用户。
  */
-let secondOpinionFailures: string[] = [];
-function noteFailure(msg: string) {
-  if (secondOpinionFailures.length < 4) secondOpinionFailures.push(msg);
-}
-/** 取出并清空本次识别累积的复核失败原因。 */
-function takeSecondOpinionFailures(): string {
-  const s = secondOpinionFailures.join("；");
-  secondOpinionFailures = [];
-  return s;
+function noteFailure(run: ReviewRun, msg: string) {
+  if (run.failures.length < 4) run.failures.push(msg);
 }
 
 /**
@@ -1417,21 +1468,18 @@ const SECOND_OPINION_SLOT_CAP_MS = 28_000;
 /** 起一项新调用至少要剩这么多时间，否则起了也只是白等一次超时。 */
 const SECOND_OPINION_MIN_SLOT_MS = 8_000;
 
-/** 本轮复核的截止时刻（epoch ms）。withSecondOpinionSlots 进入时设定。 */
-let secondOpinionDeadline = 0;
-
 /** 当前这一项能用的超时（毫秒）；已无预算返回 0。 */
-function secondOpinionSlotTimeout(): number {
-  const left = secondOpinionDeadline - Date.now();
+function secondOpinionSlotTimeout(run: ReviewRun): number {
+  const left = run.deadline - Date.now();
   if (left < SECOND_OPINION_MIN_SLOT_MS) return 0;
   return Math.min(left, SECOND_OPINION_SLOT_CAP_MS);
 }
 
 async function withSecondOpinionSlots<T>(
-  fn: (cfg: SecondOpinionConfig) => Promise<T | null>,
+  fn: (cfg: SecondOpinionConfig, run: ReviewRun) => Promise<T | null>,
+  opts?: { failures?: string[] },
 ): Promise<T | null> {
-  secondOpinionFailures = [];
-  secondOpinionDeadline = Date.now() + SECOND_OPINION_TOTAL_BUDGET_MS;
+  const run = newReviewRun(opts?.failures);
   const { sequence } = await loadSecondOpinionQueue();
   // 复核链路**必须**能看照片（它的全部工作就是重看一遍图）。已测出 blind 的项直接剔除 ——
   // 留着它只会得到一个凭空编造的"复核结论"，而且因为它 HTTP 200，顺位机制永远不会救场。
@@ -1456,6 +1504,7 @@ async function withSecondOpinionSlots<T>(
       : await loadSecondOpinionConfig().then((c) => (c ? [c] : []));
   if (!slots.length) {
     noteFailure(
+      run,
       sequence.length
         ? `「二次复核」控制台的 ${sequence.length} 个序列项**全部被测出不读图**` +
             `（${sequence.map((s) => s.model).join("、")}），已跳过 —— ` +
@@ -1465,8 +1514,9 @@ async function withSecondOpinionSlots<T>(
   }
   for (const [i, cfg] of slots.entries()) {
     // 预算见底就停 —— 起一项注定超时的调用，只会把 phase-1 整体推向边缘 100 秒上限。
-    if (secondOpinionSlotTimeout() === 0) {
+    if (secondOpinionSlotTimeout(run) === 0) {
       noteFailure(
+        run,
         `复核总预算 ${Math.round(SECOND_OPINION_TOTAL_BUDGET_MS / 1000)} 秒已用完，` +
           `剩余 ${slots.length - i} 个序列项（${slots
             .slice(i)
@@ -1475,7 +1525,7 @@ async function withSecondOpinionSlots<T>(
       );
       break;
     }
-    const r = await fn(cfg);
+    const r = await fn(cfg, run);
     if (r) return r;
     if (i < slots.length - 1)
       console.warn(`[二次复核] 序列 ${i + 1}（${cfg.model}）没出结果，顺位下一个`);
@@ -1490,9 +1540,14 @@ async function secondOpinionIdentify(
   photoDataUrl: string,
   priorPhotos: InlineImage[],
   hintPlace: string,
-  ctx: { candidate?: string | null; plantNetHint?: string | null },
+  ctx: {
+    candidate?: string | null;
+    plantNetHint?: string | null;
+    /** 失败原因写进调用方的数组 —— 出卡那头要把它原样报给用户。 */
+    failures?: string[];
+  },
 ): Promise<{ meta: AiMeta; model: string; usage: AiTokenUsage } | null> {
-  return withSecondOpinionSlots(async (cfg) => {
+  return withSecondOpinionSlots(async (cfg, run) => {
     // 补拍照片从 4 张收到 2 张：图片是这次请求里**最重的输入**，每多一张都同时推高
     // 上传耗时与首字延迟，而复核要的只是「再看一眼、给个物种」——第 3、4 张补拍照
     // 对结论的边际贡献远不抵它们对超时风险的贡献。最新那张永远单独发（下面 photoDataUrl）。
@@ -1527,7 +1582,7 @@ async function secondOpinionIdentify(
       })),
     ];
 
-    const budgetMs = secondOpinionSlotTimeout();
+    const budgetMs = secondOpinionSlotTimeout(run);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), budgetMs);
     const startedAt = Date.now();
@@ -1590,6 +1645,7 @@ async function secondOpinionIdentify(
         const body = (await resp.text().catch(() => "")).slice(0, 300);
         console.warn("[SecondOpinion] HTTP", resp.status, body);
         noteFailure(
+          run,
           `${cfg.model} 返回 HTTP ${resp.status}${body ? "：" + body.slice(0, 120) : ""}`,
         );
         return null;
@@ -1598,7 +1654,7 @@ async function secondOpinionIdentify(
       const text = data.choices?.[0]?.message?.content;
       if (!text) {
         console.warn("[SecondOpinion] 空响应", cfg.model, JSON.stringify(data).slice(0, 200));
-        noteFailure(`${cfg.model} 返回了空内容（HTTP 200 但 choices[0].message.content 为空）`);
+        noteFailure(run, `${cfg.model} 返回了空内容（HTTP 200 但 choices[0].message.content 为空）`);
         return null;
       }
       const meta = JSON.parse(cleanJson(text)) as AiMeta;
@@ -1619,6 +1675,7 @@ async function secondOpinionIdentify(
       const spent = Math.round((Date.now() - startedAt) / 1000);
       console.warn(`[SecondOpinion] second opinion failed after ${spent}s:`, msg);
       noteFailure(
+        run,
         controller.signal.aborted
           ? // ⚠️ 这句话必须点破「自检全绿 ≠ 真复核能跑完」。用户实测里最费解的一点就是：
             // 后台三条自检全过，前台却说复核没运行。原因是自检发的是一张 846 字节的
@@ -1637,7 +1694,7 @@ async function secondOpinionIdentify(
     } finally {
       clearTimeout(timer);
     }
-  });
+  }, { failures: ctx.failures });
 }
 
 /** 二次复核模型顶替 Pl@ntNet 做「一线专业定种」——只在 Pl@ntNet 不可用（每日 500 次免费额度用尽 /
@@ -1647,7 +1704,9 @@ async function secondOpinionPrimaryVerdict(
   photoDataUrl: string,
   priorPhotos: InlineImage[],
 ): Promise<{ hint: string; label: string; usage: AiTokenUsage; model: string } | null> {
-  return withSecondOpinionSlots(async (cfg) => {
+  // 刻意**不**共享出卡那头的 failures 数组：这条路是「Pl@ntNet 挂了顶一线」，
+  // 它的失败原因不该被当成「二次复核为什么没跑」报给用户（改成 per-call 之前就是这样串的）。
+  return withSecondOpinionSlots(async (cfg, run) => {
     const prior = priorPhotos.slice(0, 4);
     const system = `你是专业植物分类引擎。识别照片里的植物，只返回一个 JSON 对象（不要 markdown、不要多余文字）：
 {"scientific_name":"最可能物种的拉丁学名（尽量到种）","family":"科（拉丁）","genus":"属（拉丁）","confidence":0到100的整数,"candidates":["候选学名（xx%）","…最多 4 个，按可能性降序"]}
@@ -1673,7 +1732,7 @@ async function secondOpinionPrimaryVerdict(
     // 不写导语，本来就快得多，所以给 20 秒封顶就够。
     const timer = setTimeout(
       () => controller.abort(),
-      Math.min(secondOpinionSlotTimeout() || 1, 20_000),
+      Math.min(secondOpinionSlotTimeout(run) || 1, 20_000),
     );
     try {
       const resp = await postOpenAICompat(
@@ -1890,7 +1949,9 @@ async function callAiIdentify(
       ),
     queueKind === "enrich" ? "草稿生成" : "出卡AI",
     // 两条链路都要把用户拍的照片喂给模型 —— 正是 deepseek-v4-flash 事故的现场。
-    { requireVision: true },
+    // retry429：序列里有智谱这类「共享容量」免费模型，它们的 429 等几秒就好，
+    // 立刻换家反而会把后面每一项的额度白烧一遍（见 runModelQueue 里的长注释）。
+    { requireVision: true, retry429: true },
   );
 }
 
@@ -5013,9 +5074,12 @@ async function runQuickIdentifyCore(
         .map((s) => (s || "").toString().trim())
         .filter(Boolean)
         .join(" ");
+      // 失败原因写进本次识别自己的数组 —— 以前是模块级全局的，并发跑两次识别时会串（见 ReviewRun）。
+      const reviewFailures: string[] = [];
       const second = await secondOpinionIdentify(dataUrl, priorInline, place, {
         candidate,
         plantNetHint,
+        failures: reviewFailures,
       });
       if (!second) {
         // **这就是用户那个疑问的真凶**：复核该跑、也确实被调用了，但 429 限流 / 30s 超时 /
@@ -5026,7 +5090,7 @@ async function runQuickIdentifyCore(
           `[SecondOpinion] 复核未能完成（限流/超时/未配置），维持疑似 → 进补拍。primary=${primaryEngine}(${primaryLabel})`,
         );
         // 报**真实**原因，不再拿「限流/超时/未配置」三选一去猜（见 noteFailure 注释）。
-        const why = takeSecondOpinionFailures();
+        const why = reviewFailures.join("；");
         trace.review = {
           ran: false,
           reason: why || "复核未能完成（未拿到具体原因）",
