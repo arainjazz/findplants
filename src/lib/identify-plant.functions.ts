@@ -5629,8 +5629,13 @@ async function resolveEnrichTarget(
       summary: src.summary ?? null,
       tags: src.tags ?? [],
       iucn_status: src.iucn_status ?? null,
-      is_invasive: src.is_invasive ?? false,
-      gbif_taxon_key: src.gbif_taxon_key ?? null,
+      // ⚠️ `is_invasive` / `gbif_taxon_key` **刻意不放进这个 insert**。
+      // 它们来自 20260703000000_invasive_species.sql，而那份迁移至今没在线上库应用过
+      // （2026-09-12 实查 plant_drafts 的 30 个列里两个都没有）。PostgREST 遇到不存在的
+      // 列会**整行拒收**，于是「另建草稿」必挂在 DRAFT_FORK_FAILED：
+      //   Could not find the 'gbif_taxon_key' column of 'plant_drafts' in the schema cache
+      // 全站其他三处（L4416 / L5397 / L5895）写这两个字段时都走**独立的 update**，
+      // 正是为了「迁移没应用也不会挂」；只有这里破了例。下面补回同样的分离写法。
       html_content: src.html_content ?? "",
       // 发现者仍是当初拍照的人（铜叶归属、贡献表都按它算）；花掉这枚银叶的人由
       // runEnrichCore 记进 `_enriched_by`，两者本来就分开列。
@@ -5650,6 +5655,16 @@ async function resolveEnrichTarget(
       "DRAFT_FORK_FAILED",
       `生成失败（DRAFT_FORK_FAILED）：无法为已收录的简介卡新建草稿。原因：${forkErr?.message ?? "未知"}。`,
     );
+
+  // 入侵物种标记单独补写，**失败不影响建草稿**（列不存在时这里静默跳过）。
+  // 等 20260703000000_invasive_species.sql 在 dashboard 应用之后，这段会自动开始生效。
+  if (src.is_invasive != null || src.gbif_taxon_key != null) {
+    const { error: invErr } = await (supabaseAdmin as any)
+      .from("plant_drafts")
+      .update({ is_invasive: src.is_invasive ?? false, gbif_taxon_key: src.gbif_taxon_key ?? null })
+      .eq("id", forked.id);
+    if (invErr) console.warn("[EnrichFork] 入侵物种标记未能继承（多半是迁移未应用）：", invErr.message);
+  }
 
   console.log(`[EnrichFork] ${sourceDraftId}（已收录）→ 新草稿 ${forked.id}`);
   return { draftId: forked.id as string, forkedFrom: sourceDraftId };
