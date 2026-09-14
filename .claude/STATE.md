@@ -1,6 +1,838 @@
 # Plantspedia — Working State  (single source of truth)
 
-_Last updated: 2026-08-15（续二）— by Claude（**「点博物趣闻摘要卡出现乱码」查清并修好，
+_Last updated: 2026-09-14 — by Claude（**已部署 `9e4888b4-ac57-44a8-a9ec-1050163014ef`：410/402 顺位 + 出卡思考参数/整项超时 + reasoning_effort none/整词匹配 + 出卡全挂仍复核。配置替换、豆包删除、invasive 迁移均已生效。**）
+
+## 本轮进行中（2026-09-14）—— 断线后从这里接
+
+### 🔄 第二段（用户 09-14 指令）：「410 优先修；豆包删掉；复核第 2 项 glm-4.6v-flash 按 api+url 下拉选可用模型替换；其它所有出问题的模型都换成当前配置的 api/url 里可用的合适模型」
+- ✅ **410/402 顺位**：`src/lib/model-queue.ts` shouldFailOver 加 402、410（带事故注释）。`scratch/failover.test.mjs` 25/25 通过 + 另测 13 条断言全符合。**未部署**。
+- ✅ **豆包删了**：`site_config.doubao_vision_config` 行已删（备份 `scratch/_doubao_vision_config.backup.1789382859510.json`），`second_opinion_config` 保留。
+- ✅ 下拉框 = `listProviderModelsFn`（GET /models 或 Gemini ListModels，**不筛选**）。目录已拉：
+  阿里云百炼两把 key 各 250（同一目录）、智谱 10（全是文本命名，没有 glm-4.6v/4v）、Gemini 各 41、Moonshot 4、NVIDIA 81。存 scratchpad `catalogs.json`。
+- ✅ tsc --noEmit 通过（exit 0）。
+- ✅ 候选探测（`scratch/_probe_candidates.mjs`，scratchpad `probes.json`）要点：
+  - 能看图且答得合理：qwen3-vl-plus（A/B）、qwen-vl-max、qwen3.5-omni-flash、qwen3.7-flash、gemini-3.5/3.6-flash、gemini-3.1-flash-lite
+  - 能调但认错：qwen3-vl-flash（千日红/红叶藜）、qwen3.6-plus / kimi-k2.6（盐地碱蓬）、kimi-k3（柽柳）
+  - 不可用：**qwen3.7-plus 在 key A 也 403**（key B 仍可用）；智谱 glm-5.3/5.3-flash「始终思考、不支持关闭」→ 发 THINKING_OFF 必 400 且报错不含参数名、删参自愈认不出；
+    glm-5-turbo 余额不足；NVIDIA llama-3.2-90b-vision 超时、gemma-3-12b 404；gemini-flash-latest / 3.7-flash 503；qwen3.8-max 看图 60s 超时
+  - 文本可用（金叶候选）：deepseek-v4-pro（B）、glm-5.2（B，阿里云上的，不是智谱直连）
+- ⚠️ **数据疑点**：09-06 草稿「刺藜」(22c130f6) 那张照片，8 个强模型独立答「地肤 Bassia scoparia」；当时是复核把出卡的 Bassia scoparia 改判成 Dysphania aristata 并采纳。可能改错了，未核实。
+- 🔄 真实负载实测（`scratch/_run_cands.mjs` + scratchpad `plan_*.json` → `cands_*.json`）：复核候选×4、出卡 gemini 精简/全量、出卡 OpenAI 兼容×2、金叶×2、银叶×3、器官×3、小P蛙×3。
+- 改配置用 `scratch/_apply_consoles.mjs <changes.json>`（自动备份 + 回读核验）。
+
+### ✅ 第二段完成情况（09-14 下午）
+**迁移**：用户登录 dashboard 后，Claude 经 SQL Editor 应用 `20260703000000_invasive_species.sql` + `notify pgrst, 'reload schema'` → Success。
+核验：information_schema 两列（`is_invasive boolean NOT NULL default false`、`gbif_taxon_key bigint NULL`）+ `plant_drafts_is_invasive_idx` 部分索引都在；
+service key 走 REST 能查到两列（schema cache 已刷新）；存量 311 条全是 false/null。另建草稿那段分离 update 从此真正生效。
+
+**构建**：`npm run build` 通过；产物 `dist/server/assets/model-queue-*.js` 里 shouldFailOver 已含 402/410。**尚未 wrangler deploy** —— 等用户说「部署」。
+
+**配置替换（全部实测后写入，回读一致；备份 `scratch/_<key>.backup.1789383697065.json` / `…1789384022338.json`）**：
+| 控制台 | 新序列 | 替换依据（真实负载实测） |
+|---|---|---|
+| 复核 | qwen3.7-plus(B) → **qwen-vl-max(A)** | 替 glm-4.6v-flash（持续 429）。流式 5.1s，认得合理、high |
+| 出卡 | qwen3.7-plus(B) → **qwen3-vl-plus(B)** → **gemini-3.5-flash(key2)** → **gemini-3.6-flash(key1)** → glm-4v-flash | 替 glm-4.6v-flash、gemini-3-flash-preview×2（全天 503）。qwen3-vl-plus 全量出卡 96s；3.5-flash 精简 32s/全量 36s；3.6-flash 精简 26s（全量有一次 55s 超时，故排后） |
+| 银叶草稿 | qwen3.8-max-0902(A) → **kimi-k2.6(Moonshot)** | 替 qwen3.7-max（403）。整份草稿 235s（队列内可接受），换家分散阿里云额度风险 |
+| 器官识别 | **qwen3-vl-plus(A)** | 替 qwen3.7-max-preview（403）。6 图 8s、恰好 6 项、糊图标不可用 |
+| 小P蛙 | qwen3.8-max(A) → **kimi-k2.6(Moonshot)** → **qwen3.7-flash(A)** | 替 NVIDIA 两项（503/超时/断连）。带图对话 12s / 6s，都看到图 |
+| 金叶 | **deepseek-v4-pro(B)** → kimi-k3 | 替 qwen3.7-max-preview（403）。R1 51s、8 键齐、6 卡；glm-5.2(B) 44s 也过，未用 |
+| 豆包兜底 | **已删** | 404 模型不存在 |
+
+阿里云 key A = `…73549752`、key B = `…2d196cdf`（**两把 key 的免费额度不是同一个池**：qwen3.7-plus 在 A 上 403、在 B 上正常）。
+
+### ✅ 第三段：用户 09-14 指令「都要修」—— 三处代码修复（**未部署**）
+改动文件：`src/lib/ai-key-pool.ts`、`src/lib/identify-plant.functions.ts`（另 `src/lib/model-queue.ts` 的 410/402 见上）。
+
+1. **出卡 OpenAI 兼容分支补发思考参数 + 整项超时**（callAiIdentifyWithConfig）
+   - 请求体加 `...(dbConfig ? thinkingParams(dbConfig) : {})`：出卡默认关、银叶默认开（`THINKING_DEFAULTS`）。
+   - `AbortController` 包住重试循环 / 流式回退 / 读 body：出卡 `CARD_SLOT_TIMEOUT_MS=120s`、银叶 `ENRICH_SLOT_TIMEOUT_MS=300s`
+     （callAiIdentify 按 queueKind 传入）。超时抛 `AI_SLOT_TIMEOUT`（无 HTTP 码 → status 0 → 顺位）。
+   - 顺带：出卡两处 Gemini 调用（identifyQuick、全量链 Gemini 分支）也发 `geminiThinkingConfig`，
+     外包 `callGeminiWithThinkingNet`（400 点名 thinking 就去掉 thinkingConfig 重发，与 geminiChat 同款）。
+     实测：gemini-3.5-flash 精简出卡 14.3s→6.9s（思考 token 2740→627）；3.6-flash 15.5s→5.4s（2285→227）。
+   - 银叶两项实测接受 THINKING_ON（qwen3.8-max-0902 直接 200；kimi-k2.6 只被摘 temperature）。
+2. **关思考参数与 qwen3.8 冲突**（ai-key-pool.ts）
+   - `THINKING_OFF.reasoning_effort: "low" → "none"`。实测 12 个线上 OpenAI 兼容序列项：11 个直接接受；
+     qwen3.8-max-0902 23.4s/801 思维 token → 1.8s/0；qwen3.8-max 7.5s → 2.5s/0；
+     deepseek-v4-pro 不认 "none" → 自愈只摘 reasoning_effort，仍零思维链。
+   - `offendingParams` 改**整词匹配**（旧子串匹配会因 `enable_thinking` 顺带摘掉 `thinking`）。
+3. **出卡全挂、有 Pl@ntNet 候选时照样复核**（runQuickIdentifyCore 兜底分支）
+   - 先 `secondOpinionIdentify(dataUrl, priorInline, place, { candidate: Pl@ntNet 学名, plantNetHint })`；
+     拿到物种 → 直接用复核结果出卡（provider=`plantnet+review-card`，trace.review.ran=true，resolved 时写 `_second_opinion`）；
+     没拿到 → 退回原 Pl@ntNet 兜底卡，trace 写**真实原因**（不再是「无可复核的候选」），复核花掉的 token 照样计入。
+   - 时间保护：`coreStartedAt` 起算；队列任务过 12 分钟、同步入口过 45 秒就不再发起（`REVIEW_AFTER_CARD_FAIL_*_CUTOFF_MS`）。
+
+**验证**：`tsc --noEmit` exit 0 无输出；`scratch/failover.test.mjs` 25/25、`scratch/thinking-toggle.test.mjs` 46/46；
+offendingParams 整词匹配 8 条断言、shouldFailOver 13 条断言全符合；`npm run build` 通过，
+构建产物逐项确认 8 处改动都在（410/402、"none"、整词正则、AI_SLOT_TIMEOUT、thinkingParams、callGeminiWithThinkingNet×3、identifyQuick thinkingConfig、review-card 分支）。
+⚠️ 第 3 项是服务端分支逻辑，本地无法端到端触发（需要出卡序列真的全挂）；部署后看下一次出卡失败的识别痕迹确认。
+
+### 仍未做（需用户决定）
+1. ✅ **已部署**（09-14）：版本 `9e4888b4-ac57-44a8-a9ec-1050163014ef`，`npm run build` + `env -u *_PROXY wrangler deploy`，
+   上传 12.4s / 1.88 MB gzip；绑定齐全（plant-jobs / plant-jobs-long producer+consumer、DLQ consumer）。
+   **部署后要看**：下一次识别的 `ai_payload._identify_trace` —— 出卡是否由 qwen3.7-plus/gemini-3.5-flash 正常出卡；
+   若出卡全挂，trace.review 应为 ran:true（provider=plantnet+review-card）或写明复核失败的真实原因。
+   可用 `node scratch/_recent_identify.mjs` 查。代码已按 09-07 / 09-08 / 09-12 / 09-14 四批分开提交到 main（见 git log；未 push）。
+2. 代码层剩余：智谱 glm-5.x「始终思考」的 400 报错不含参数名 → 删参自愈认不出（目前已不用这些模型）；
+   callAiIdentifyWithConfig 的 Anthropic 分支同样没有超时（目前没有控制台配 anthropic）；识别痕迹 UI 里「未运行」几种情况的措辞。
+3. 百炼「仅使用免费额度」：大部分控制台仍依赖阿里云；额度用完会成片 403。Supabase 项目顶栏显示 **EXCEEDING USAGE LIMITS**，需用户看账单。
+4. 数据疑点：09-06 草稿「刺藜」照片多模型认作地肤，未核实。
+- 待换清单：复核#2 glm-4.6v-flash、出卡 glm-4.6v-flash、出卡 gemini-3-flash-preview×2（全天 503）、银叶#2 qwen3.7-max（403）、
+  器官识别 qwen3.7-max-preview（403）、金叶#1 qwen3.7-max-preview（403）、小P蛙#2 glm-5.3-flash(NVIDIA)、#3 nemotron(NVIDIA)。
+
+**用户指令**：「把剩下的两件事做完，并把所有的配置的模型都测一遍」。
+
+### 新坐实的根因：410 不顺位 → 出卡链停在 minimax，qwen 根本轮不到
+- `model-queue.ts:373 shouldFailOver` 只对 401/403/404/429/≥500/网络错误顺位；**410 返回 false**。
+- `describeHttpAiError`（identify-plant.functions.ts:561）把状态码写进 `HTTP 410`，`httpStatusOf`（L1002）解析得出 410。
+- `runModelQueue`（L1017）：`!shouldFailOver && 不是末项` → **直接抛错停止顺位**。
+- minimax（序列第 4 项）09-12 实测 410 Gone → 第 5 项 qwen（唯一健康）、第 6 项 glm-4v-flash 从未被尝试。
+- 这比「6 项都挂」更准确：09-10 很可能是 gemini×2 失败 + glm-4.6v 429 + **minimax 410 截断**。
+
+### 其他代码层发现（未改）
+- 出卡 OpenAI 兼容分支（L2343 requestBody）**没带 thinking 参数** —— 配置里 `thinking:"off"` 在这条路上不生效。
+- 线上 `cleanJson`（L234）很严格：只去开头 ```json 与结尾 ```，不提取大括号、不去 `<think>`。
+- 出卡 OpenAI 兼容分支无超时（无 signal）；gemini 分支每次 55s + 20s 退避 + 再扫一轮。
+
+### 待用户决定 / 下一步（按优先级）
+1. **迁移**：Chrome 标签页已开在 dashboard 登录页，用户登录后由 Claude 执行 `20260703000000_invasive_species.sql` + `NOTIFY pgrst, 'reload schema'`，再用 service key select 两列核验。
+2. **配置（即时生效，需用户点头）**：器官识别唯一项 qwen3.7-max-preview 403 → 换成实测能读图的 qwen3.7-plus；
+   银叶 #2 qwen3.7-max 403 → 换掉或删；doubao 404 → 删；复核 #2 glm-4.6v-flash 持续 429 且会自信认错 → 考虑换掉。
+   或者用户去百炼控制台关掉「仅使用免费额度」，这几项会一起恢复（按量付费）。
+3. **代码（需部署）**：
+   ① `shouldFailOver` 加 410（模型下线）—— 这次事故的直接根因；
+   ② 出卡 OpenAI 兼容分支补发 `thinkingParams`（qwen 106s → 67s）；
+   ③ `THINKING_OFF.reasoning_effort:"low"` 与 qwen3.8 冲突（要求 enable_thinking=false 时为 "none"），
+      现在删参自愈会把三个思考键一起摘掉 → 模型反而开着思考跑；
+   ④ 出卡 OpenAI 兼容分支无超时；
+   ⑤ 出卡全挂但 Pl@ntNet 有候选时照样不跑复核（用户最初那个问题的设计缺口）；
+   ⑥ 出卡 OpenAI 兼容分支不发 schema、prompt 也没列名称键 → title/scientific_name 常缺。
+
+### 迁移（invasive_species）
+- 本机没有 DB 连接串 / Supabase access token / psql / CLI → 只能走 dashboard SQL Editor。
+- 09-14 Chrome 打开 `supabase.com/dashboard/project/ianlasfsfuaibqldkfyb/sql/new` → **跳登录页，未登录**。
+  不能代输密码 → **需用户先在该标签页登录**，之后由 Claude 执行 SQL。
+
+### 备份
+- `scratch/_all_model_configs.backup.20260914.json`（9 条 *_config，含 key，scratch 已 gitignore）。
+
+### 出卡链路真实结构（工作流从代码抽取）
+两层，**顺序执行**：
+1. `identifyQuick`（L3600）：只用 card 序列里的 **gemini 项**，精简 schema `AI_QUICK_SCHEMA`，每次 45s，单 key 两轮扫池 ≈ 最坏 110s/项。
+2. 返回 null → `callAiIdentify("card")`（L1921）：**按配置顺序跑全部项**，21 字段整份草稿，gemini 每次 55s（≈130s/项），custom 项**无超时**。
+→ **09-10 那 8 分钟就这么来的**：quick 层 gemini×2 ≈ 3.5 分钟 + 全量层 gemini×2 再 ≈ 4 分钟 + glm-4.6v 429 + **minimax 410 截断**。
+
+### 出卡实测（09-14 05:24，真实 prompt + 09-10 真实照片 + max_tokens 16000）
+| 项 | 结果 |
+|---|---|
+| gemini key#1 | 503 high demand ×2（含 20s 退避）70s → 顺位 ✅ |
+| gemini key#2 | 503 ×2，40s → 顺位 ✅ |
+| glm-4.6v-flash | 429 code 1305 ×2（含 3s 原地重试）→ 顺位 ✅ |
+| minimax-m3 | **410 Gone：`reached its end of life on 2026-09-09T09:00:00Z`** → `shouldFailOver=false` → **停链** ❌ |
+| qwen3.7-plus | 200，**106s**（思考开着：reasoning 3396 tok）；**关思考后 67s**。JSON 可解析，但**缺 title/scientific_name/family/genus/common_name_en** |
+| glm-4v-flash | 400 max_tokens[1,1024] → **删参自愈生效** → 200 / 21s；缺名称字段 + 全部 *_en |
+
+- 缺名称字段的原因：OpenAI 兼容分支**不发 schema**，system prompt 的字段清单里也没列这几个名称键。线上 JSON 能解析就算成功，名称靠 Pl@ntNet 学名回填（L5027 附近）。
+- Pl@ntNet：05:30 前后连续 3 次 500（对方故障，代理/直连同样），10 分钟后 5 次 200，额度 495/500。
+
+### ✅ 已改配置（09-14 10:14 UTC，即时生效）
+`card_model_config`：**qwen3.7-plus → glm-4.6v-flash → gemini#1 → gemini#2 → glm-4v-flash**，minimax 移除。
+- qwen 提到第一：quick 层已经试过 gemini，全量层再把 gemini 放前面等于再白等 ~4 分钟。
+- glm-4v-flash 仍保底（质量最差）；max_tokens 不用改配置——配置项没有这个字段，删参自愈已实测生效。
+- 备份：`scratch/_card_config.backup.<ts>.json` + `scratch/_all_model_configs.backup.20260914.json`。
+
+### 实测
+- 底座：`scratch/_harness_lib.mjs`（复刻 postOpenAICompat 删参自愈 / callGeminiWithRotation / shouldFailOver / 线上 cleanJson）。
+- 出卡：`scratch/_test_card.mjs`，真实 prompt（从源码抽取 3967 字）+ 09-10 真实照片 540KB + max_tokens 16000。
+  产物在 scratchpad `results_card.json`。
+- 其余控制台请求规格：工作流 `wf_5f535635-f7a` 已抽完（journal.jsonl；核对轮因额度中断，关键行号已手工复核）。
+- 进行中的实测脚本（结果都写到 scratchpad）：
+  - `scratch/_test_consoles1.mjs` → 复核（流式 1200/28s + 顶替定种 json600/20s）×2、豆包兜底、银叶草稿 ×2（整份草稿带图 16000）、ai（extractPlantMeta gemini 池 30s + kimi-k2.7-code 休眠项）
+  - `scratch/_test_consoles2.mjs` → 出卡主路径 identifyQuick（gemini 精简 schema 45s）×2、小P蛙草稿对话带图 120s ×3、器官识别 6 图 120s
+  - `scratch/_test_gold.mjs` → 金叶 R1（jiti 直接 import 真 premiumPrompt1 + 线上 ccplants v21.2，system 13638 字，300s）×2
+- Pl@ntNet：`/v2/identify/all` 实测 200（额度 495/500）。
+- ⚠️ 本轮 Claude 工作流子 agent 撞了**月度额度上限**，后续实测不再开子 agent，全用脚本。
+
+### 全量实测结果（09-14 10:20–10:30 UTC，全部按线上请求形态复刻）
+| 控制台 | 序列项 | 结果 | 要点 |
+|---|---|---|---|
+| 出卡·主路径 identifyQuick | gemini ×2 | ❌ | 503 high demand（05:24 与 10:24 两个时段都是）；小请求能 200 → key 没坏，是 Google 侧负载 |
+| 出卡·全量链 | qwen3.7-plus（现为第 1 项） | ⚠️ | 200，**106s**（代码没发关思考参数；关掉后 67s）；缺名称字段（该分支不发 schema，靠 Pl@ntNet 回填） |
+| 出卡·全量链 | glm-4.6v-flash | ❌ | 429 code 1305 共享容量满 |
+| 出卡·全量链 | glm-4v-flash（保底） | ✅ | 400 max_tokens → 删参自愈 → 200/21s；质量差、缺 *_en |
+| 出卡·全量链 | minimax-m3 | ❌ **已删** | 410 EOL 2026-09-09 |
+| 复核 | qwen3.7-plus | ✅ | 流式 9.5s；顶替定种 3.8s |
+| 复核 | glm-4.6v-flash | ❌/⚠️ | 流式 429；顶替定种能通但答 **Ambrosia dumosa 80%**（北美荒漠灌木，明显错且自信） |
+| 复核兜底 | doubao-1-5-vision-pro-32k-250115 | ❌ | **404 模型不存在或无权访问**（只在复核序列为空时启用） |
+| 银叶草稿 | qwen3.8-max-0902 | ✅ | 255s（思考开，1.3 万输出 token），在队列 15 分钟内 |
+| 银叶草稿 | qwen3.7-max | ❌ | **403 Free quota exhausted（账号开了「仅使用免费额度」）** |
+| 小P蛙 | qwen3.8-max | ✅ | 73s；首发 400 `'reasoning_effort' must be 'none' when 'enable_thinking' is false` → 三个思考键全被摘 → 于是**反而开着思考**跑 |
+| 小P蛙 | z-ai/glm-5.3-flash | ❓ | 400 不认 enable_thinking → 摘参重发时本机代理断连，待补测 |
+| 小P蛙 | nemotron-3-nano-omni | ❓ | 400 不认 thinking → 摘参重发 503 `Worker local total request limit reached (88/16)`，待补测 |
+| 器官识别 | qwen3.7-max-preview（唯一一项） | ❌ | **403 免费额度耗尽 → 整个控制台失效**（非致命：配图退回数据源标注） |
+| 金叶 | qwen3.7-max-preview | ❌ | 403 免费额度耗尽 → 顺位 |
+| 金叶 | kimi-k3 | ✅ | R1 81s，严格 JSON、8 个必填键齐、6 张特征卡 |
+| ai 杂项 | gemini 抽取（key 池） | ✅ | 28s |
+| ai 杂项 | kimi-k2.7-code（休眠） | ✅ | 268s（只有 card/enrich 序列为空才会用到） |
+| Pl@ntNet | — | ✅ | 200，额度 495/500（05:30 前后曾短暂 500） |
+
+**补测（10:30，每项最多再测一次，按 CLAUDE.md 封顶）**：
+- glm-4.6v-flash：复核流式 429、顶替定种也 429 → **确认持续限流**。
+- gemini ×2（identifyQuick）：503 + 本机 45s 超时 → **确认 Google 侧持续高负载**（第三个时段）。
+- z-ai/glm-5.3-flash：120s 无响应超时（首测是 67s 后才回 400）→ **本机测不出结论**（走代理出境）。
+- nemotron：400 摘参后本机断连（首测是 503 并发满）→ **本机测不出结论**。
+→ 这两个 NVIDIA 项要从 Worker 出口测：管理后台「连通体检」（checkKeyHealthFn，不写库）。
+
+**阿里云账号风险**：同一个百炼工作区里 qwen3.7-max / qwen3.7-max-preview 已免费额度耗尽；qwen3.7-plus、qwen3.8-max 目前还能用，
+但如果它们也是吃免费额度，**用完那天出卡第 1 项和复核第 1 项会同时掉**。需要用户去百炼控制台看额度或关掉「仅使用免费额度」。
+
+---
+
+_上一条 — _Last updated: 2026-09-12 — by Claude（**两件事：① 复核「又没运行」的只读诊断 —— 出卡 6 项全军覆没，复核代码一行都没执行到；② 修了「另建草稿」必挂的 DRAFT_FORK_FAILED —— **已部署，版本 `fdb1a25a-296b-460d-ada0-b9b996db42dd`**。**）
+
+## 用户问题
+「检查最近几次识别，为什么二次复核模型又没有运行？」
+
+## 结论（一句话）
+**不是复核失败，是复核压根没被调用。** 出卡序列 6 项全挂 → `quick === null` →
+`secondOpinionIdentify` 的**唯一**调用点（L5082）整个嵌在 `if (quick) {`（L5027）里被跳过 →
+落进 L5181 的 else 兜底 → L5222 硬写 `ran:false, reason:"出卡模型未返回结果，无可复核的候选"`。
+
+## 最近两次识别（09-10，库里最新的两条，也是 09-08 部署后的**头两次**）
+| job | 入队 | 开跑 | 完成 | 耗时 | 结果 |
+|---|---|---|---|---|---|
+| ffdd026b | 05:59:38 | 05:59:43 | 06:07:57 | **8分14秒** | plantnet(Polygonum equisetiforme) |
+| 54aa986c | 06:03:26 | 06:07:58 | 06:15:36 | **7分38秒** | plantnet(Grubovia dasyphylla) |
+
+正常一次识别 20–40 秒。**09-06 14:16 之后线上再没有识别成功过。**
+
+## 6 项出卡为什么全挂（09-12 用 09-10 那张真实照片 + 真实出卡负载实测）
+负载 = 重 prompt + 528 KB 原图 + `max_tokens: 16000`（跟线上一致）。
+
+| 顺位 | 模型 | 实测结果 |
+|---|---|---|
+| 1 | gemini key#1 | 本机代理 3.0s 掐断（测试假象，不作数） |
+| 2 | gemini key#2 | **503 高负载**，34 秒才返回 |
+| 3 | glm-4.6v-flash | **429** 「该模型当前访问量过大」 |
+| 4 | minimaxai/minimax-m3 | **410 Gone —— NVIDIA 已下线该模型** |
+| 5 | qwen3.7-plus | **200 成功，54.5 秒**（6 项里唯一活着的） |
+| 6 | glm-4v-flash | **400**「max_tokens 限制 [1,1024]」，发的是 16000 |
+
+⚠️ 同样两把 gemini key 用 `hi` 这种小请求测是 **200 / 1.4 秒**。
+**key 没问题**（`AQ.` 是合法的新版 AI Studio 格式，L386 注释 + L420 正则都明确支持），
+**压上真实负载才暴露 503**。别再拿小请求判这条链路的死活。
+
+## 8 分钟的时间账
+- gemini 每项：失败 → `callGeminiWithRotation` 退避 20s → 再扫一轮 → 抛错。两项 ≈ 3–4 分钟。
+- **非 gemini 项没有超时保护**：`postOpenAICompat`（ai-key-pool.ts:136）只接受可选
+  `opts.signal`，**没有默认 timeout**，而出卡调用点 L2381 **没传 signal**。
+- 5xx 还会在 L2409 按 5s / 10s 退避重试，最多 3 次。
+- 429 另外被 runModelQueue 的 `retry429` 原地多等 3 秒重试一次。
+- qwen 单次就要 54.5 秒。
+
+## 已排除（别再查）
+- **不是平台掐断**：494 秒只占 Queues 15 分钟挂钟的 55%，`cpu_ms` 已拉到 300000，
+  且识别绝大部分时间在等 fetch 不计 CPU；两个 job 都正常写完库（真被掐会进 DLQ 写成 SERVER_ABORTED）。
+- **不是 key 失效**：实测 200。
+- **不是并发打爆额度**（09-06 那次的解释）：09-10 两次是**串行**的
+  （第二个等第一个完成后 1 秒才开跑），不存在争抢。
+- **不是「请求没发出去」**：`ai_usage_logs` 每次识别只写**一行**、写的是最终采用的
+  provider/model（L5374），中途试过几个模型、失败几次都不留行。所以「表里没有出卡模型」
+  只说明这次最终走了 plantnet 兜底，推不出别的。
+
+## 线上版本（wrangler deployments list 实查）
+最新部署 = **`4de678a7`，2026-09-08T15:14** —— 就是队列分车道那版。
+所以 09-10 跑的确实是新代码 + 09-07 改的 6 项配置。
+
+## 真正的设计缺口（和「下一步」里那条对上了，仍未做）
+进入 L5181 那个 else 分支的**前提恰恰是 Pl@ntNet 有结果** —— L5191 已经把「什么都没有」
+的情况提前 `throw IDENTIFY_FAILED` 掉了。也就是说：**手上明明握着 Pl@ntNet 的学名候选，
+复核所需的 `dataUrl` / `priorInline` / `place` / `plantNetHint` 全都在作用域里，
+却宣称「无可复核的候选」并放弃复核。** 不是字段依赖，就是这条分支没写。
+
+## 第二件事：「另建草稿，生成完整科普」必挂（已修，⚠️ **未部署**）
+
+**报错**：`生成失败（DRAFT_FORK_FAILED）：… Could not find the 'gbif_taxon_key' column of 'plant_drafts' in the schema cache`
+
+**根因**：`supabase/migrations/20260703000000_invasive_species.sql`（加 `is_invasive` + `gbif_taxon_key`）
+**从来没在线上库应用过** —— 09-12 实查 `plant_drafts` 的 30 个列里两个都没有，
+`select` 这两列直接报 `column does not exist`。
+而 fork 草稿的**主 insert**（L5635 附近）把这两个字段带上了，PostgREST 遇到不存在的列**整行拒收**。
+
+全站其他三处（L4416 / L5397 / L5895）写这两个字段走的都是**独立 update**，
+正是早就定下的「与主 insert 分离，迁移未应用也不会挂」约定 —— 只有 fork 这条路破了例。
+
+**改法**（`src/lib/identify-plant.functions.ts`）：
+1. 从 fork 的 insert 里摘掉 `is_invasive` / `gbif_taxon_key`（**两个都要摘**：
+   只摘 gbif_taxon_key 的话，下一个错就是 is_invasive）。
+2. insert 之后补一段**分离的容错 update**。`src` 走的是 `select("*")`，
+   列不存在时这两个字段是 `undefined`，`!= null` 判定为假 → **update 根本不发出去**，
+   零开销零风险；等迁移在 dashboard 应用之后，这段会自动开始生效。
+
+`tsc --noEmit` 干净通过。`species_dossiers.gbif_taxon_key` 是另一张表、确实存在，不受影响。
+
+**已部署**（2026-09-12）：版本 `fdb1a25a-296b-460d-ada0-b9b996db42dd`，
+`npm run build`（4.85s）+ `wrangler deploy`（上传 104.73s / 1.88 MB gzip，这次代理没掐）。
+绑定核对无误：`PLANT_JOBS` + `PLANT_JOBS_LONG` 两条队列的 producer/consumer 与 DLQ consumer 都在。
+
+**产物级核验**（不是只看源码）：解包 `dist/server/assets/identify-plant.functions-r8QHwbjm.js`，
+fork 的 insert 实际字段里 `is_invasive` / `gbif_taxon_key` **都不在**，
+分离的容错 update 在 `DRAFT_FORK_FAILED` 之后。
+⚠️ 构建产物**保留注释**，所以拿字符串 grep 查字段名会被注释里的字段名误报 —— 要剔除注释行再看键名。
+
+**仍未做**：那份迁移本身还没应用，所以入侵物种标记目前不会被继承（只是不再挂）。
+要让它真正生效，仍需在 Supabase dashboard 跑 `20260703000000_invasive_species.sql`。
+
+## 建议的下一步（未做，按优先级）
+1. **配置层，立刻能做、不用部署**：第 4 项 minimax（410 已下线）删掉；
+   第 6 项 glm-4v-flash 的 `max_tokens` 必须 ≤1024，当前出卡发 16000 必 400；
+   考虑把唯一活着的 qwen 往前提。
+2. **补那条分支**：出卡全挂时拿 Pl@ntNet 学名当候选跑复核（复核序列实测两项都健康）。
+3. **给 OpenAI 兼容分支加超时**：现在 L2381 无 signal，慢模型能挂到天荒地老。
+4. **UI**：把「未运行」三种性质不同的情况拆开说（老问题，仍未做）。
+
+_上一条 — _Last updated: 2026-09-08 — by Claude（**识别链路抗爆发：序列扩容 + 429 原地重试 + 复核状态 per-call + 队列分车道限流。全部已上线（`4de678a7`）。**
+
+## 起因
+用户报「09-06 的识别任务在任务动态里全是『二次复核模型没启动』，晚上点自检又没问题」。
+查库（`ai_payload._identify_trace` + `ai_usage_logs`）：**12 次识别里 8 次复核实际跑了**，
+2 次按设计不触发（结果不是疑似），2 次是真故障 —— `出卡模型未返回结果，无可复核的候选`。
+**UI 把三种性质完全不同的情况都渲染成同一句「未运行」**（identify-trace.ts:191），所以看着像全没跑。
+真故障的根因是出卡序列只有 2 项且都在免费额度层，09:58 前后 Gemini 连挂 3 次、minimax 也抖。
+
+## 已做（配置，`site_config`，即时生效，无需部署）
+出卡 `card_model_config` 2 项 → **6 项**；复核 `second_opinion_config` 1 项 → **2 项**。
+备份：`scratch/_card_config.backup.*.json`、`scratch/_second_opinion_config.backup.*.json`。
+
+| 出卡顺位 | 模型 | 依据 |
+|---|---|---|
+| 1–2 | `gemini-3-flash-preview` × **两把不同 Google Cloud 项目**的 key | 免费额度按**项目×模型**计，不同项目才是独立桶（用户已确认两把 key 不同项目） |
+| 3 | `glm-4.6v-flash`（智谱，免费无日限） | 忙时段回 `code 1305` 429 → 顺位/重试兜底 |
+| 4 | `minimaxai/minimax-m3`（NVIDIA 40 RPM） | 原顺位 2 |
+| 5 | `qwen3.7-plus-2026-05-26`（阿里，付费） | 09-06 复核 8/8 全成功，最稳 |
+| 6 | `glm-4v-flash`（智谱） | **最后保底**：高峰期也不限流、0.5s 出结果 |
+
+## 已做（队列分车道 + 并发上限，已部署 · 版本 `4de678a7-107a-4ce0-8c19-79f6b0be3323`）
+
+**问题**：识别早就走 Queues，但消费者**没设 `max_concurrency`** —— Cloudflare 会自动扩到
+最多 250 个并发调用。队列解决了边缘 100 秒超时，却**没做任何平滑**：连拍 8 张 = 8 个消费者
+同时打同一把 key。09-06 那次两档全挂就是这么来的。
+
+**为什么必须先拆车道**：识别 20–40 秒、金叶 3–10 分钟，差两个数量级，原本挤在一条队列上。
+直接把并发压到 2，两个金叶任务就能把识别堵十分钟。
+
+| 队列 | 装什么 | `max_concurrency` | 依据 |
+|---|---|---|---|
+| `plant-jobs` | 只有识别 | **2** | 一次识别对出卡模型只发 1 请求、20–40 秒 → 3–6 RPM，稳在 Gemini 免费层 10 RPM 之下；智谱免费模型并发上限本身就是 2/key |
+| `plant-jobs-long` | 银叶 / 金叶 | **1** | 单次烧大量 token，并行只会同时撞限流 |
+| `plant-jobs-dlq` | 死信 | 不限 | 只做一次写库标记 |
+
+改动：`wrangler.jsonc`（新增 producer/consumer + 两个并发上限）、`job-queue.ts`
+（`enqueueJob(jobId, lane)`，**绑定缺失时长任务自动退回主队列**，所以代码可以先于队列上线）、
+`worker-ctx.ts`（`PLANT_JOBS_LONG` 类型）、identify-plant.functions.ts L5993 / L7175 传 `"long"`。
+`server.ts` **无需改**：消费者只对 DLQ 特判，其他队列一律走通用 `runQueuedJob`。
+⚠️ 部署前先 `wrangler queues create plant-jobs-long`，否则绑定不存在会直接失败。
+
+## ✅ 已解决：wrangler deploy 传不上去（2026-09-08，当天解决）
+**重启 Mac 后一次就通**（12.94 秒推完 1.88 MB，对比之前 3.00 秒断在 768 KB）。
+当时三次全挂在同一个请求：
+`POST /accounts/…/workers/scripts/tanstack-start-app/versions`（上传 Worker 本体，gzip 后 1.88 MB），
+报 `write EPIPE` / `Client network socket disconnected before secure TLS connection was established`。
+
+**根因不是 wrangler、不是 Cloudflare、也不是代理环境变量**（旧 memory 里那招这次不管用）：
+- 上行实测：200 KB 直连能过（33 KB/s）；1 MB 以上，**直连和走代理都在 3.00 秒整、
+  786432 B（正好 768 KB）处断**。这个整齐的截断点是 MTU 黑洞的特征，不是随机抖动。
+- 打**国内**阿里云 3 MB 同样只有 27 KB/s → 所有流量都被塞进隧道了。
+- `ps aux`：**`com.relayway.tun-helper`（OOCNetWork 的 root TUN 助手）从 08-31 02:51 一直跑到现在**，
+  而 OOC 主程序早就没开。它在 **IP 层**劫持，所以 `NO_PROXY` / 西游云 bypass / `env -u HTTP_PROXY` 全部无效。
+- `ifconfig`：utun3 的 **MTU 只有 1000**，utun1/4/5 是 1380（正常 1500）。
+
+**下次再遇到**（按省事程度）：① **重启 Mac —— 这次就是这么解决的**，清掉残留 TUN；
+② 用手机热点部署；③ 停掉那个 LaunchDaemon（要密码，得用户自己来）。
+部署前先自测：`head -c 3000000 /dev/urandom > /tmp/up.bin && curl -o /dev/null -w '%{size_upload} %{time_total}\n' --max-time 60 -X POST --data-binary @/tmp/up.bin https://speed.cloudflare.com/__up`
+—— 能把 3 MB 推完才有戏。
+
+⚠️ 配置那部分（6 项出卡序列 / 2 项复核）走 Supabase `site_config`，本来就不经过部署。
+
+## 已做（代码，已部署 · 版本 `e74b7d61-bacd-4802-9065-405cf7b0356e`）
+1. **复核状态改成 per-call**（`type ReviewRun`）。`secondOpinionDeadline`/`secondOpinionFailures`
+   原本是**模块级 `let`** —— 识别跑在 Queues 消费者里、同一 isolate 可并发多任务，
+   后来的任务会覆盖前一个的 45 秒预算和失败列表。多人同时识别时是实打实的串味。
+2. **429 原地重试一次**（`runModelQueue` 的 `retry429`，固定 3 秒，只对**非 Gemini** 项）。
+   Gemini 的 429 由 `callGeminiWithRotation` 按 Google RetryInfo 自己分每分钟/每日，不重复。
+   同时把重链路（OpenAI 兼容分支）原有的 429 重试摘掉、只留 5xx —— 否则一项要耗 5+10+3=18 秒。
+
+## 这轮实测出来的硬事实（别再重新试一遍）
+- **免费视觉模型没有「更能扛」的**：Gemini 10–15 RPM、Groq 30 RPM 但 8K TPM（一张图=2048 tok，
+  等于每分钟 1–2 次）、OpenRouter 免费视觉只剩 1 个（20 RPM/50 RPD）、SiliconFlow 免费全是纯文本、
+  GitHub Models 2026-07-30 已下线、Mistral 免费层 ≈1 req/s 且官方标「评估非生产」。
+- **智谱免费池按「共享容量」限流**，不是按日调用数：晚 23:30 实测 `glm-4.6v-flash` **持续 429**
+  （`code 1305 该模型当前访问量过大`），几分钟前同一把 key 还是 200。`glm-4v-flash` 同时段却一直通。
+- **`glm-4.6v-flash` 默认开思考**：不传关思考参数时 64 个输出 token 全是 `reasoning_tokens`、
+  正文一个字没吐。`THINKING_OFF` 里的 `thinking:{type:"disabled"}` 正是智谱的写法，配置里已显式 off。
+- **`glm-4.1v-thinking-flash` 输出带 `<think>` 标签**，会污染 JSON 解析 → **不要用**。
+- **`glm-4v-flash` 的 `max_tokens` 上限只有 1024**（出卡发的是 16000 → 400，靠
+  `postOpenAICompat` 删参自愈重试）；它出卡**会张冠李戴**（把 `Bassia scoparia` 的中文名
+  写成「猪毛菜」、属写成「猪毛菜属」）—— 但 `alignMetaToChecklist` 的名录正名能纠回「地肤」，
+  所以只放最后一位保底可以接受。
+- **`gemini-3.8-flash` / `3.7-flash` ListModels 里有、`generateContent` 却 404**；`3.6-flash` 可用且读图正确。
+- ⚠️ **本机测这些 API 极不可靠**：西游云代理会在 3.0 秒掐断握手，同一模型忽而 200、忽而 404、忽而 000。
+  判模型死活要么多试几次，要么用后台「视觉自检」（从 CF Worker 出口发，才是真实链路）。
+
+## 下一步（没做，按需）
+- **队列并发上限**：`wrangler.jsonc` 的 `plant-jobs` 消费者**没设 `max_concurrency`**，
+  Cloudflare 会自动扩到最多 250 个并发调用 —— 队列解决了 100 秒超时，但**没做任何平滑**。
+  设 2–3 能把爆发变成短暂排队。⚠️ 副作用：金叶/银叶长任务（3–10 分钟）**共用同一条队列**，
+  低并发下会堵住识别。真要上，考虑同时给长任务分一条 `plant-jobs-long`。
+- 跨请求冷却状态（并发任务不再各自撞同一把已 429 的 key），仿 `plantnet_quota_state`。
+- 出卡全挂时用 Pl@ntNet 学名当候选让复核跑（现在直接跳过复核 → 那两张卡就是这么来的）。
+- UI：把 `未运行 —— xxx` 拆成「本次无需复核（已确诊）」和「复核未能进行」两句。
+
+_上一条 — _Last updated: 2026-08-29 — by Claude（**全站 290→285 条植物资料的事实性错误已全部修完并上线。线上 285 页复检零残留。**
+
+## 本轮成果（承接上一轮只读核查，用户指示「接着修」）
+| 类别 | 规模 | 状态 |
+|---|---|---|
+| IUCN 评级 | DB **237 条**同步 + 页面徽章 **74 页** | ✅ 285/285 与 GBIF 真值一致 |
+| 国家保护级别 | **7 页** | ✅ 全部改为可核验表述 |
+| 批量替换错字 | **197 处 / 79 页** | ✅ 清零 |
+| 伪造 IUCN 引用 | **36 条 / 36 页** | ✅ 删除或换成 GBIF |
+| 古籍引文错误 | **6 处** | ✅ 修正/删除 |
+| 重复条目 | **5 组** | ✅ 已删简略版（备份在 scratchpad/deleted_dupes/）|
+| 模板占位 | **69 页 / 200+ 处** | ✅ 逐页按 FOC 重写 |
+
+### 几个值得记住的坑
+1. **批量替换事故波及面远超「有效→有能」**：还有 `食→吃/吸收`（食草动物→吃草动物/吸收草动物、
+   啃食→啃吃/啃吸收、取食→取吸收、主食→主吃）、`效→能`（效应→能应、效率→能率、高效→高能）、
+   `利用→借助`（水分利用速率→水分借助速率）。共 197 处。
+   ⚠️ 修的时候必须区分正常词：「有用于外洗」「没有能吃的球茎」「含有能使牛奶凝结」「高能紫外线」
+   「高能牧草」「能率先占据」「再生能力」都是对的，别误伤。
+2. **孢子植物写了「花期」**：银粉背蕨（蕨类）、问荆/水问荆/木贼（木贼属）都不开花，
+   问荆甚至写着「花期 7–9月 果期 9–10月」。已改孢子期。裸子的杜松/侧柏改用「球花期」。
+3. **达乌里黄芪整段抄了药材黄芪的内容**（正北芪、浑源县、大宗出口）——
+   《中国药典》黄芪只来自蒙古黄芪与膜荚黄芪，达乌里黄芪是饲用/绿肥豆科草本，不是药材来源。
+4. **「国家三级」这个级别不存在**于《国家重点保护野生植物名录》（只设一级58条、二级437条）。
+   蒙古莸、黄芪的「二级/三级」疑似混淆了《国家重点保护野生**药材**物种名录》(1987，分三级)。
+5. **2021 名录兰科改为逐属逐种列举**，不再是 1999 年的「兰科所有种」——绶草、裂瓣角盘兰都被移出了。
+   它们真正的法律依据是 **CITES 附录 II**（兰科全科列入）。裸果木同理，1999 在名录、2021 已移出。
+6. **iplant `protlist/4`（中国红色名录）只收 CR/EN/VU/NT**，查不到 ≠ 未评估，而是未列入受威胁等级。
+7. FOC 抓取：`efloras.org` 证书要 `-k`/`verify_mode=CERT_NONE`；物候句在 `Fl. and fr.` 之后，
+   海拔在生境句的 `;` 之后——**别用宽松正则抓第一个 "X m"，会抓到株高**（牛蒡"to 2 m"）。
+8. **后台跑脚本别用 `&`**：Bash 工具会立刻返回、shell 退出时进程被 SIGHUP 杀掉（第一次 GBIF 核查跑到 100/290 就没了）。
+   用 `run_in_background: true` 且命令里不带 `&`。上传 150+ 页会超 2 分钟，分批 50 页。
+
+### 现成脚本（scratch/）
+`_inventory.mjs` 盘点 · `_fetch_all.mjs` 全量抓页 · `_iucn_audit_all.mjs` 并发核 IUCN ·
+`_sync_iucn.mjs` 同步 DB（带备份）· `_upload_all.mjs <slug...>` 批量上传 ·
+`_verify_final.mjs` 线上全站复检 · `_dedupe.mjs` 去重（带备份）
+
+_上一条 — 2026-08-28（第二轮）— by Claude（**全站 290 条植物资料做了一次系统性事实核查。只读，未改动。**
+
+## 全站核查结论（290 条，已修的那 20 种不计在内）
+用已在 20 种上验证过的错误模式 + GBIF/名录权威源，逐条比对 290 页 HTML 与 `plants` 表。
+**七类可坐实的事实错误，覆盖面远超预期。**
+
+| # | 问题 | 规模 | 说明 |
+|---|---|---|---|
+| 1 | **IUCN 评级错误** | DB **96** 条冲突 / 页面徽章 **72** 页冲突 | 绝大多数把「未评估 NE」写成「无危 LC」 |
+| 2 | **国家保护级别错误** | **7** 页 | 名录中根本没有该种，或用了不存在的「三级」 |
+| 3 | **模板占位从未填写** | **66** 页 189 处 | 「见形态描述」「多样」「分布于特定的生境类型中」等空话 |
+| 4 | **错字（有效→有能/有用）** | **26** 页 36 处 | 与 20 种那批同源的批量替换事故 |
+| 5 | **伪造/存疑 IUCN 引用** | **25** 页 28 处 | 给 NE 物种编造 IUCN Red List 条目 |
+| 6 | **重复条目** | **5** 组 10 页 | 同一物种两个 slug |
+| 7 | **古籍引文错误** | 至少 5 处 | 作者名、书名、时序错误 |
+
+### 1. IUCN 评级（最大面）
+- **DB 96 条冲突**：83 个把 NE 标成 LC；另有 中麻黄 VU→真值LC、草麻黄 VU→LC、绶草/胡杨/黑果枸杞 NT→LC、
+  穿龙薯蓣/达乌里黄芪/远志/黄芪 VU→真值NE、木贼麻黄/矮脚锦鸡儿 NT→NE、斧翅沙芥/梨叶木蓼 DD→NE。
+- **DB 空缺但 GBIF 有值：130 条**（可批量回填）。
+- **页面徽章 72 页冲突**，双向都有：侧柏 真值NT 却标NE、柽柳/杜松/大果榆/蒙桑/膜果麻黄/睡莲/菖蒲/荇菜 真值LC 却标NE。
+- ⚠️ 不少徽章**标签自身就自相矛盾**，例如写 `LC 无危` 而标签是
+  「Least Concern · Global (Unassessed)」「Least Concern · 全球未评估 · 局域种群需监测」
+  「Least Concern · Not IUCN-listed」——等级和说明打架，说明这套徽章是拼出来的不是查出来的。
+- 明细：`scratchpad/iucn_audit.json`、`iucn_issues.json`、`badge_issues.json`
+
+### 2. 国家保护级别（7 页，已双源核实：本地 nat2021_raw.txt + iplant protlist/1）
+| 页面 | 声称 | 事实 |
+|---|---|---|
+| 黄芪、达乌里黄芪 | 国家二级 | **2021 名录豆科下没有 Astragalus 任何种**。疑似混淆了《国家重点保护野生**药材**物种名录》(1987) |
+| 蒙古莸 | 国家**三级** | **名录只有一级(58)、二级(437)，从不设三级**。同上，三级是药材名录的分级 |
+| 矮卫矛 | 国家二级 | 卫矛科只有永瓣藤、斜翼 |
+| 裸果木 | 国家二级 | 石竹科只有金铁锁。裸果木 1999 年在名录、**2021 年已被移出** |
+| 绶草、裂瓣角盘兰 | 国家二级 | **2021 名录兰科改为逐属逐种列举，不再是「所有种」**；Spiranthes、Herminium 都不在。这是 1999→2021 的真实调整，页面停留在旧版 |
+
+### 7. 古籍引文已坐实的错误
+- 细叶韭：《植物名实图考》作者写成 **「吴Qijun」**（拼音混入，应为吴其濬）
+- 发菜：《随园食单》作者写成 **「袁美」**（应为袁枚；本站另一处写对了）
+- 甘草：出处写成 **「《本草纲目》· 陶弘景语引引李时珍 · 1596年」**——语句混乱且时序颠倒
+- 黑沙蒿：引文出处 **《三边志·物产》** 书名存疑（与已证伪的黄柳《三省边防考略》同型）
+- 华北驼绒藜：文言引文却署 **「《蒙古植物志》· 内蒙古植物志编委会 · 20世纪」**——现代植物志不会用文言，书名与编者也对不上
+- 花叶海棠：**编辑元评论混进了 lit-source 出处字段**（「依据：种级证据不足…」）
+
+### 6. 重复条目
+假连翘 `duranta-erecta-ahs`/`duranta-erecta`、天人菊 `gaillardia-pulchella`/`-e8d`、
+朝天委陵菜 `potentilla-supina-l`/`-supina`、砂珍棘豆 `oxytropis-racemosa-hance-1873`/`-racemosa`、
+金色狗尾草 `setaria-pumila`/`-poir-roem-schult`
+
+### 复现脚本（都在 scratch/）
+`_inventory.mjs` 盘点 · `_fetch_all.mjs` 全量抓页到 scratchpad/all/ ·
+`_iucn_audit_all.mjs` 并发核 290 种 IUCN（**别加 `&` 后台跑，shell 退出会杀掉**）
+⚠️ 中国红色名录库 `iplant.cn/rep/protlist/4` **只收 CR/EN/VU/NT，查不到 ≠ 未评估**，别据此删徽章。
+
+_上一条 — 2026-08-28 — by Claude（**20 个荒漠物种详页已全部修正并上线；线上终检 15 页 35 项全过。**
+
+## 结论
+20 页**全部存在**；**17 页有实质改动并已上传 Storage**（肉苁蓉、沙芥、文冠果三页核查后无需改动）。
+`plants.iucn_status` 现 **20/20 与真值表一致**；`title` 错别字「拧条锦鸡儿」→「柠条锦鸡儿」、
+半日花学名 `soongoricum`→`songaricum` 也已同步到库。图片与外链**零丢失**，标签开闭全平衡。
+
+## 本轮修掉的几类硬错误
+1. **IUCN 徽章系统性造假** —— 20 种里原本只有蒙古韭一个是对的。中国红色名录等级被冒充成 IUCN 全球评估。
+   已按真值表（见下）逐页改：绵刺/蒙古扁桃/革苞菊的「CR/EN@IUCN」→ NE，柠条/黄柳/红砂 LC→NE，
+   叉子圆柏 NE→**LC**，肉苁蓉 EN→**NT**，半日花中国名录 VU→**EN**。
+2. **梭梭「国家二级」是假的** —— 2021 名录中根本没有梭梭属任何一种。已删徽章 + 正文 + 博客三处。
+3. **发菜「内蒙古自治区一级」** → 全国一级（1999 为二级，2001 年第53号令调整为一级）。
+4. **伪造文献 8 条**：四合木 IUCN(2024)/Wang2011/Zhu2020/Luo2023（CrossRef 全无匹配）、
+   黑沙蒿/红砂/绵刺/蒙古扁桃/革苞菊的 IUCN 条目（这些种 IUCN 从未评估）。
+5. **伪造古籍 3 条**：黄柳「清·《三省边防考略·沙荒治理》」（书不存在，且该种 1949 才定名）、
+   沙冬青「《蒙古高原植物考察记》普热瓦利斯基」（普氏名下无此书）、四合木《水经注》拼接引文。
+   叉子圆柏《绥远通志》「清」→**民国**（1930 年代纂修）。
+6. **唐古特白刺果色与小果白刺对调** —— 志书：N. tangutorum 熟时**深红色**、果汁玫瑰色、长8–12mm；
+   小果白刺才是近黑色。生境表「多年生草本」→**灌木**（志书：灌木高1–2米）。共改 11 处。
+7. **专名错误**：革苞菊属名纪念的是**鸟类学家 Arkady Ya. Tugarinov**（非「M.N.图加林诺夫、植物学家」）；
+   沙冬青 `Cheng f.` 被音译成「程凡」→ 标准引证 **(Maxim. ex Kom.) S.H.Cheng**。
+8. **「有效」被批量替换成「有能/有用」12 处 / 9 页**（红砂「全草也有用于外洗」是正常词，未动）。
+9. **未清洗的原始资料**：红砂关键特征里粘着「产地分布…园林应用…■红沙-鄂托克旗苏亥图■…」整段（已删 315 字）；
+   蒙古韭关键特征里嵌着植物志图版说明，把「外轮者锥形」从中截断（已复原）。
+10. **梭梭 a–e 小节后又冒出重复的 b、d**（前者是模板占位、后者才是真内容）→ 用真内容替换占位并去重。
+11. **模板占位整节**：白沙蒿、叉子圆柏的「典型生境」+「演化与生态 a/b/c/d」已按《中国植物志》重写。
+12. **元评论清零**（用户明确要求）：正文里不得出现「本页在核查中…」「旧版此处…」「本次核查…」
+    「因此不再罗列」这类编辑自述。已全部删除或改写为客观陈述；页脚「不代表本页观点」是正常免责声明，保留。
+    ⚠️ 以后改页面别把核查过程写进正文——读者要看的是植物，不是编辑的推敲。
+
+## 🔑 权威真值表（本轮亲手查证，以后别再上网重查）
+IUCN → GBIF `species/{key}/iucnRedListCategory`；中国红色名录 → `iplant.cn/rep/protlist/4?key=中文名`
+（**注意：该库只收 CR/EN/VU/NT，查不到 ≠ 未评估，而是未列入受威胁等级**）；
+国家重点保护 → 本地 `scratch/nat2021_raw.txt`；1999 版 → `iplant.cn/rep/protlist/2`（**数据不全，慎用**）。
+
+| 种 | IUCN | 中国红色名录2013 | 国家重点保护2021 |
+|---|---|---|---|
+| 半日花 | NE | EN | 二级 |
+| 四合木 | NE | VU | 二级 |
+| 蒙古沙冬青 | NE | VU | 二级（只有沙冬青，无矮沙冬青）|
+| 绵刺 | NE | VU | 二级 |
+| 鄂尔多斯野丁香 | NE | VU | — |
+| 黑沙蒿 / 白沙蒿 | NE | 未列受威胁 | — |
+| 叉子圆柏 | **LC** | 未列受威胁 | — |
+| 黄柳 / 柠条 / 红砂 / 唐古特白刺 / 沙芥 / 文冠果 | NE | 未列受威胁 | — |
+| 梭梭 | **LC** | 未列受威胁 | **无（新疆地方名录为一级）** |
+| 革苞菊 | NE | VU | 二级（1999 是一级）|
+| 蒙古韭 | **LC** | 未列受威胁 | — |
+| 肉苁蓉 | **NT** | EN | 二级 |
+| 蒙古扁桃 | NE | VU | 二级 |
+| 发菜 | NE | 未列受威胁 | **一级（全国）** |
+
+其它已坐实的一手事实：四合木 `Enum. Pl. Mongol. 129 (1889)`（页面原写的《蒙古植物名录》**是对的**）；
+西鄂尔多斯保护区 **1995 建自治区级、1997 晋升国家级、436116.40 公顷**（原写 5500/5558 km² 均错）；
+1999 名录由**国务院批准、国家林业局+农业部发布**（不是环境保护部）。
+
+## 仍未解决 / 存疑
+- **四合木 1999 年的保护级别拿不到一手证据**（iplant 1999 库不全）→ 页面已改为只讲 2021 版，不声称 1999 级别。
+- GBIF 把 `Nitraria tangutorum` 处理为 `N. sibirica` 的**异名**，中国志书作独立种。页面沿用中国处理，未加说明。
+- `plants.iucn_status` 仍是单列，建议拆 `iucn_status` + `china_redlist_status`（本轮靠改页面徽章间接把库值带正了）。
+
+## 现成脚本
+- `scratch/_upload_fixed.mjs <slug...>` 覆盖上传到原 html_url
+- `scratch/_verify20.mjs` 线上逐页断言式验证（改完必跑）
+- `scratch/_check20_fields.mjs` 查 20 种 plants 表字段
+
+_上一条 — 2026-08-27 — by Claude（**开始修 20 个荒漠物种详页。四合木已改完并上线；其余 19 页在改。**
+
+## 本次任务
+用户要求：把 20 个荒漠物种详页「全部修改正确」，并详列四合木改了什么。
+上一轮（同日早些时候）只做了只读核查，本轮开始**实际写入线上**。
+
+## ✅ 已完成：四合木 tetraena-mongolica（已上传 Storage，线上核验通过）
+本地工作副本 + 原始备份都在本 session scratchpad 的 `pages/` 与 `orig/`。
+改动分 7 批脚本（`fix_tetraena.py`、`fix_tet2..7.py`），逐条报告命中，全部命中或已回补。
+结构校验：div/p/section/h2-h4/li/span/strong 开闭全平衡，**图片 16 张、外链 3 条零丢失**。
+
+## 🔑 权威真值表（本轮亲手查证，以后别再上网重查）
+**IUCN 用 GBIF `species/{key}/iucnRedListCategory` 逐个查；中国红色名录用
+`iplant.cn/rep/protlist/4?key=中文名`；国家重点保护用本地 `scratch/nat2021_raw.txt`。**
+
+| 种 | IUCN真值 | 中国红色名录2013 | 国家重点保护2021 |
+|---|---|---|---|
+| 半日花 | NE | EN 濒危 | 二级 |
+| 四合木 | NE | VU 易危 | 二级 |
+| 蒙古沙冬青 | NE | VU 易危 | 二级（**只有沙冬青，无矮沙冬青**）|
+| 绵刺 | NE | VU 易危 | 二级 |
+| 鄂尔多斯野丁香 | NE | VU 易危 | — |
+| 黑沙蒿/鄂尔多斯蒿 | NE | 未列受威胁 | — |
+| 白沙蒿/圆头蒿 | NE | 未列受威胁 | — |
+| 叉子圆柏 | **LC** | 未列受威胁 | — |
+| 黄柳 | NE | 未列受威胁 | — |
+| 柠条锦鸡儿 | NE | 未列受威胁 | — |
+| 红砂 | NE | 未列受威胁 | — |
+| 唐古特白刺 | NE | 未列受威胁 | — |
+| 梭梭 | **LC** | 未列受威胁 | **无！页面写"二级"是假的** |
+| 沙芥 | NE | 未列受威胁 | — |
+| 革苞菊 | NE | VU 易危 | 二级（1999 是**一级**，2021 降二级）|
+| 蒙古韭 | **LC** | 未列受威胁 | — |
+| 肉苁蓉 | **NT** | EN 濒危 | 二级 |
+| 文冠果 | NE | 未列受威胁 | — |
+| 蒙古扁桃 | NE | VU 易危 | 二级 |
+| 发菜 | NE(蓝藻未评) | 未列受威胁 | **一级（全国！不是"内蒙古一级"）** |
+
+**发菜级别沿革已坐实**：1999 名录为二级 →「2001-08-04 农业部/国家林业局第53号令」调为一级 → 2021 延续一级。
+**1999 名录发布单位**：国务院 1999-08-04 批准，**国家林业局 + 农业部**发布（不是"环境保护部"）。
+1999 名录全文难抓（iplant `protlist/2` 数据库不完整，发菜/绵刺/四合木都查不到），
+**四合木 1999 年的级别至今无一手证据 → 页面改为只陈述 2021 版，不声称 1999 级别。**
+
+## 🔴 待修（19 页）—— 徽章层面已定位
+需改徽章：柠条(LC→NE)、叉子圆柏(NE→**LC**)、黄柳(LC→NE)、红砂(假IUCN LC→NE)、
+绵刺(假IUCN CR→NE + 中国名录 VU)、蒙古扁桃(假IUCN EN→NE + 中国名录 VU)、
+革苞菊(假IUCN CR→NE + 中国名录 VU；且徽章"Cat. I"与正文"国家二级"自相矛盾)、
+半日花(China Red List 应为 **EN** 不是 VU)、梭梭(**删"国家二级"**)、发菜(内蒙古一级→**全国一级**)。
+伪造 IUCN 参考文献 7 条：黑沙蒿1、绵刺2、蒙古扁桃2、革苞菊2。
+「有能/有用」错字扫描命中 12 处/8 页（需逐条看上下文，部分"有用"是正常词）。
+
+## 四合木具体改了什么（用户点名要的清单，勿删）
+见本轮回复正文；要点：①IUCN/中国名录两个徽章内容**完全对调错位**（VU 是中国名录的，被安给 IUCN；
+中国名录又被编成 EN）②株高 30–90cm→**40–80cm** ③种子"镰状披针形"是**果瓣**的形状被误安到种子
+→改"矩圆状卵形" ④果瓣尺寸 6–8mm→**5–6mm** ⑤**"四翅"整个是假的**（志书/FOC 果实描述无"翅"），
+博物趣闻整节"四翅飞行器"重写 ⑥保护区 5500/5558km²→**436116.40 公顷**，1997 建立→**1995 建、1997 晋升国家级**
+⑦删伪造：IUCN(2024)引用、Wang2011、Zhu2020、Luo2023(CrossRef 全无匹配)、1996年"珍惜植物"邮票、
+清代《三边五十一旗地方志》、乌海市2015《四合木保护条例》(市地方性法规目录中无)、《水经注》拼接引文、
+未核实的石泰峰具名引语 ⑧标题"比大熊猫更稀少/没有被任何人拯救"→改（数量不成立且与本页保护叙述矛盾）
+⑨"地下互联网"节的主根2-3m/根系60%/AMF 与本页自己"已撤回该论断"打架 → 重写为待考
+⑩Sheahan&Chase 2000 标题写错（真实文献，标题是三个质体区不是 rbcL）
+
+## 有用的现成脚本
+- `scratch/_upload_fixed.mjs <slug...>` —— 把 scratchpad/pages/<slug>.html 覆盖上传到原 html_url
+- `scratch/_check20_fields.mjs` —— 查 20 种 plants 表字段
+- `scratch/_audit20_fetch.mjs` —— 重新抓取 20 页
+⚠️ `plants.iucn_status` 字段现值 20 个里 **只有蒙古韭一个是对的**，其余是中国名录等级冒充 IUCN。
+建议拆 `iucn_status` + `china_redlist_status` 两列；未拆之前改这个字段要想清楚前端怎么显示。
+
+_上一条 — 2026-08-27 — by Claude（**核查 20 个荒漠物种详页：全部存在，但全部有事实错误。没改任何代码/内容。**
+
+核查报告（artifact）：https://claude.ai/code/artifact/40866a92-e887-4ce9-b062-f8c8e02f02bf
+
+**核查对象**：半日花、四合木、蒙古沙冬青、绵刺、鄂尔多斯野丁香、鄂尔多斯蒿、白沙蒿、
+叉子圆柏、黄柳、柠条锦鸡儿、红砂、唐古特白刺、梭梭、沙芥、革苞菊、蒙古韭、肉苁蓉、
+文冠果、蒙古扁桃、发菜。
+
+**结论**：20/20 存在；338 张配图零断链；130 条外链只 1 条真 404。但 **20 页全部有可判定的
+事实错误**，其中两页（白沙蒿、叉子圆柏）「典型生境」+「演化与生态 a/c/d/e」整节还是模板占位。
+
+**最该先修的四条硬错误（都已对权威源坐实）：**
+🔴 ① **梭梭写「2021 年名录提升至国家二级」——名录里根本没有梭梭**。
+   `scratch/nat2021_raw.txt` 全文搜 Haloxylon = 0 命中；苋科项下只有苞藜、阿拉善单刺蓬。
+   该文件已校验为**完整官方版**：含级别条目 495 行，其中「所有种/spp.」类 40 条，
+   即 455 种 + 40 类，与官方公布数完全吻合。以后核保护级别直接用它，别再上网搜。
+🔴 ② **沙冬青页写「矮沙冬青同为国家二级」** —— 名录里只有 `沙冬青 Ammopiptanthus mongolicus 二级`。
+🔴 ③ **发菜写成「在内蒙古自治区被列为国家一级」** —— 是全国一级（名录第 628 行）。徽章还印着
+   「Category I 国家一级 Inner Mongolia」。
+🔴 ④ **9 页把中国红色名录等级冒充 IUCN 全球评估**，还配了假的 IUCN 引用
+   （绵刺 CR / 蒙古扁桃 EN / 革苞菊 CR / 四合木 VU / 红砂 LC / 柠条 LC / 黑沙蒿）。
+   用 GBIF `species/{key}/iucnRedListCategory` 逐个查过，这些种 IUCN **全部 NOT_EVALUATED**。
+   反向错误：叉子圆柏页写 NE，实际 IUCN 有 **LC**。
+   → `plants.iucn_status` 字段本身也混了两套体系，建议拆成 `iucn_status` + `china_redlist_status`。
+
+**跨页的系统性毛病（可批量修）：**
+· 「有效」被批量替换成「**有能/有用**」共 8 处 / 6 页（半日花 3、梭梭 2、沙冬青、黑沙蒿、
+  叉子圆柏、野丁香、红砂 2、蒙古扁桃）；白沙蒿另有「消能**成果**」。
+· 模块标题与正文错位：**红砂 MODULE iii–vi 整体错一格**、**黄柳 v/vi 标题互换**、梭梭小节
+  编号 a-e 后又冒出 b、d。
+· 未清洗的原始资料被粘进正文：红砂关键特征里有 `■红沙-鄂托克旗苏亥图■…` 图注标记；
+  蒙古韭关键特征里有植物志图版说明 `①植株②花序③花纵剖面…` 并把句子截断。
+· **13 处古籍/文献引文疑伪造**，最硬的三条：黄柳「清·《三省边防考略·沙荒治理》」（书不存在，
+  且该种 1949 才被描述）、沙冬青「《蒙古高原植物考察记》普热瓦利斯基 1873」（书名不存在）、
+  叉子圆柏《绥远通志》标成「清」（实为民国修）。
+· 参考文献与正文角标脱节：黑沙蒿角标到 [14] 只有 5 条；白刺角标 [²]–[¹⁰] 全悬空只有 1 条；
+  沙冬青 4 处 author-year 引用只有 1 条；柠条只有 2 条且都是数据库检索页。
+· 专名已坐实的三个错：**革苞菊属名纪念的是鸟类学家 Arkady Ya. Tugarinov，不是「M.N. 图加林诺夫、
+  植物学家」**；**沙冬青 `Cheng f.` 译成「程凡」，应为郑万钧**；**柠条页面+数据库 title 都是
+  「拧条锦鸡儿」错别字**。
+· 半日花学名站内用 `soongoricum`，而 2021 名录/植物智/POWO 都用 **`songaricum`**；页面还反过来
+  声称「植物智以 soongoricum 为接受名」，与事实相反。
+· 唐古特白刺**果色与小果白刺对调**（志书：N. tangutorum 熟时深红色；N. sibirica 黑色），
+  生境表还把灌木写成「多年生草本」。
+
+**存疑未定（没拿到一手依据，未计入问题数）**：四合木 1999 年名录级别（外部资料指为一级、
+2021 才降二级，但页面写 1999 就是二级）；Tetraena 1889 年的发表出处（页面写《蒙古植物名录》，
+疑应为 Flora Tangutica）；各条古籍引文原文。
+
+**没做的事**：没改任何页面、没动数据库、没部署。全部是只读核查。
+复现脚本在 `scratch/_audit20_exist.mjs`、`scratch/_audit20_fetch.mjs`。
+
+_上一条 — 2026-08-17（续）— by Claude（**修正一处事实错误 + 图例独立成块。**
+
+🔴 **「藜草花粉 65.43%」是错字，正确是「葎草花粉」** —— 葎草 *Humulus scandens*（大麻科）
+是华北头号致敏花粉之一，与藜科不是一回事；错写成藜草还让两条读起来像都是藜科。
+已修 `data/content.json` 并重出大海报（成品 PDF 实测：葎草 1 处、藜草 0 处）。
+
+**这批花粉数据的信源（逐项已核）**：鄂尔多斯市人民政府《关于市五届人大四次会议
+第 54148 号建议的答复函》，2025-10-10，ordos.gov.cn（refs 里的 n=2）。
+传递路径是「答复函 → 用户那份《鄂尔多斯蒿属植物研究报告》§4.1 逐字引用 → 本项目」。
+拿报告原文逐项比对过，**8 个数字全部一致**：88.10 / 65.43 / 62.12 / 49.52 /
+52.89 / 34.70 / 31.51 / 38.12。只有植物名一处抄错。
+⚠️ 只核到了报告的逐字引文，**没有直接打开政府网站原页核对**。
+
+**图例 28 种独立成块**：`build-legend.mjs` → `legend.html` →
+`poster/dist/蒿属图例-30x14.25.pdf`。用户要自己排版，所以这块
+**背景透明、无出血、无裁切线**（实测无整页底色矩形）；位图 0 张、92 条矢量路径。
+参数：`--cols N`（默认 3 栏 10 行）、`--w Ncm`（默认 30）、`--card`（加底衬）。
+高度由行数自动算出，脚本会打印出配套的出片命令 —— 别手填高度，上次填差 0.1cm。
+
+**符号与名录已抽成 `species-symbols.mjs`**，分布图与图例共用一份，防止两处数据走样。
+
+**`render.mjs` 又加了两个参数**（默认值不变）：`--bleed N`、`--margin N`。
+要嵌进别人版面的图块传 `--bleed 0 --margin 0`。
+
+_上一条 2026-08-17 — by Claude（**「Ⅱ 大致分布」独立成图，91×74cm，已出片。**
+`poster/artemisia/build-section2.mjs` → `section2.html` → `poster/dist/鄂尔多斯蒿属分布-91x74.pdf`。
+没碰 `src/`、没部署。
+
+**为什么单独做**：用户给了新材料（殷国梅 2020 的图1 图例 28 个符号 + 正文 §3.2 逐种旗区分布），
+要求把这一节重做成**可编辑 PDF**，并**用 SVG 重绘各蒿符号、参考地图落到合适位置**。
+
+**成品特征（`fitz` 实测）：全页零位图** —— 331 条矢量路径 / 15052 段，位图 0 张，
+可选中文字 2008 字符。色块、线条、符号、底图统统是 PDF path，AI 里可直接改。
+
+**做法：**
+· 底图沿用 `build-map.mjs` 那套 DataV 真实行政区划 + 等距圆柱投影（cos(lat) 校正）。
+· 28 个符号按原图图例形制重绘为 SVG（`SYM` 表，画在 -10..10 局部坐标）。
+  同族保留共用母题：艾组 = 竖画立于横基线，莲蒿组 = 点群，沙蒿组 = 放射状。
+· 落位：广布种 10 枚 × 8 旗区 + 局地种 30 枚 = **110 枚**，全部按 §3.2 逐条录入。
+  取点用「网格候选 → 边界内缩 → 最远点采样」，不是随手撒。
+
+**这一版踩的坑（都已修）：**
+🔴 ① **`<link>` 引 fonts.css 会静默回退系统字**。CSS 里写的是 `url(fonts/xxx.woff2)`，
+   按 CSS 自身目录解析成 `poster/fonts/fonts/` → 全部 404。必须像大海报那样
+   读进来把路径改写成 `../fonts/` 再**内联**。渲染器会报「拉取 0 个 woff2 切片」。
+🔴 ② **符号落位必须几何判，不能眼睛看**。缩略图上分不清符号压在界线内侧还是外侧；
+   脚本里留了硬检查（`stray`，越界即 exit 1），现为 0 枚越界。
+🔴 ③ **沙地名牌别手填经纬**，毛乌素那条填出过市界外的空白。改成对
+   「沙地矩形 ∩ 市域」采样求重心，天然落在阴影区内，再用 `nudge` 避让旗名。
+🔴 ④ 两块沙地的矩形范围早先开得太大，加起来几乎盖满市域，读起来像「全市都是沙」，
+   与 19.17%+28.78% 不符。已收紧范围 + 网纹调淡（opacity .24 / step 30）。
+
+**`render.mjs` 这次被改成通用件**（老命令行为不变）：新增 `--trim WxH`，
+画布 = trim + 四周 2cm 出血；产物名与版心期望值（trim − 8cm）都跟着 trim 走，
+不再写死 91×203 / 83×195。`.canvas` 缺失时跳过该项检查。
+
+**与大海报的口径出入（已按新材料改）**：论文原文是「32 种（含 **4** 个变种）」，
+图例正好 28 条 = 32 − 4；大海报那版按 5 个变种算的 27 种。这张图从论文与图例，用 28。
+灰莲蒿在正文里标了「(变种)」但图例中另有符号，此处从图例并加注。
+
+**复现命令：**
+```
+node poster/artemisia/build-section2.mjs
+node poster/render.mjs poster/artemisia/section2.html --name 鄂尔多斯蒿属分布 --trim 91x74
+```
+
+_上一条 2026-08-16（续二）— by Claude（**鄂尔多斯蒿属 91×203cm 科普海报，已出片。**
+`poster/artemisia/`，与网站代码无关，没碰 `src/`、没部署。
+成品 `poster/dist/鄂尔多斯蒿属-91x203.pdf`，95.00×207.01cm 单页 34.9MB（含四周 2cm 出血）。
+
+**做的是什么**：两份 PDF（殷国梅等 2020 蒿属资源调查 + 用户的鄂尔多斯蒿属研究报告）→
+一张五节海报：Ⅰ 种类版图 / Ⅱ 大致分布 / Ⅲ 一株植物两种叙事（治沙功臣 vs 过敏元凶）/
+Ⅳ 精细化治理展望 / Ⅴ 公民科学行动建议。中文正文 9447 字。
+
+**用户后来追加的四条，都已落地：**
+1. 去掉参考文献区与图片来源许可区（正文里保留行内出处标注）。
+2. 「大致分布」改**双栏**：左 40.7cm 矢量地图（九旗区+毛乌素/库布其沙地），
+   右栏图例 + 全域广布种 + 本地特有 + Plantspedia 实地观察点 + 花期甘特图。
+3. **全部 27 个种**各有图与简介（32 种去掉 5 个变种）；5 个变种收进一张紧凑表格。
+4. **色块线条全矢量**：地图、甘特图、分隔线、卡片底色统统是 PDF path，不是位图。
+
+**矢量校验（`node poster/artemisia/check-vector.mjs`，四项全绿）：**
+· 位图仅 26 张 = 26 张物种照片（27 个种里辽东蒿无可用授权图，留了占位卡）。
+· 矢量图元 367 条路径 / 7266 段（re 319 / l 6339 / c 608）。
+· 字体未内嵌 0 个；可选中文字 9447 字符 —— 文字是真文本不是轮廓。
+· ⚠️ Chrome 把 woff2 切片导成 **Type3 字体**（483 条）：字形是矢量轮廓、文字可提取，
+  但在 Illustrator 里按图形而非活文本编辑。要活文本得换 PDF 引擎，非本次范围。
+
+**踩过的坑（别再踩）：**
+🔴 ① **Latin 展示字体的字体栈必须补中文回退**。`'Cormorant SC',serif` 这种栈遇到汉字
+   会掉到系统 STSongti —— 刊头、章节标题共 18 个字曾走系统字。已全局补成
+   `'Cormorant SC','Noto Serif SC',serif`（Cormorant/EB Garamond/JetBrains Mono 共 20 处）。
+   现在只剩 μ 和 ₁ 两个符号走系统字，字形已内嵌，显示正常。
+🔴 ② Noto Serif SC 是**变量字体**，5 档字重共用同一批 woff2（77 个文件被 328 处引用）。
+   排查字体回退时别往「某字重的切片没下」方向找，那是死路。
+🔴 ③ `fit-check` 报页尾空档 0.00cm 是**假读数** —— colophon 的 `margin-top:auto` 会
+   把余量吸干。量真实空档要单独测「末节下沿 → 页尾上沿」（脚本思路见下）。
+   最终空档 3.47cm，属正常页尾呼吸位。
+
+**复现命令：**
+```
+node poster/artemisia/build.mjs                                   # 生成 poster.html
+node poster/render.mjs poster/artemisia/poster.html --name 鄂尔多斯蒿属   # 出 PDF+PNG
+node poster/artemisia/check-vector.mjs                            # 四项矢量校验
+```
+
+_上一条 2026-08-16 — by Claude（**四合木详页 → 91×203cm 海报，已出片。**
+`poster/` 目录，与网站代码完全无关，没碰 `src/`、没部署。
+最终参数 `--body-pt 16.5 --img-pct 42 --drop en,refs,news`：
+线性 432.8cm / 444.1cm = **97.5%**，每栏灌到 **144.9 / 146.8 / 147.2cm**（栏高 148），
+16 张图**全部 ≥130dpi**，无横向裁切，PDF 95.00×207.01cm 单页 42.6MB。
+内容完整性已逐句核对：**中文 7798 字 → 7798 字**，六节一节不少，16 张图全在。
+
+**用户拍的板（2026-08-16）**：只砍 参考文献 / 最新资讯 / 英文对照；图太小的联网换；
+**「不要严格遵守网页的排版样式」** —— 这条是关键，中间因此不再套详页 CSS。
+
+**为什么必须另写版式**：详页那套是给 1180px 网页写的（卡片边框底色、图的 5px+6px
+双描边加 30px 投影、段距 14px、行高 1.82、每节上边距 52px）。塞进 26cm 的栏子里，
+这些装饰余量吃掉六成版面 —— 套详页 CSS 时全内容只能排到 **13pt**；换成海报自己的
+版式后同样内容排到 **16.5pt**。省的是版式余量，不是内容。
+
+**换过的两张图**：`sim-species` 相似种霸王 418×372 → **2048×1536**
+（iNaturalist obs.387788328，© zeamays，**CC BY-NC，署名+非商业**，商用需另找图）；
+`feat-4` 下垂分果 225×225 → **651×641**（本站原图 —— 详页上这张曾被编辑换成 225px 的
+`images (10).jpeg`，这里取替换前的版本，从编辑痕迹的 base64 快照里挖出来的）。
+⚠️ 四合木开放许可的高清图极少：GBIF 只有 7 条带图记录（多为腊叶标本）、Wikimedia
+没有可用的、PPBC 有但版权属各摄影师且页面是 JS 加载。`feat-1`(702px) 仍偏小。
+
+**做完并实测过的：**
+· `poster/` 出片链路跑通：`build.mjs`（抠详页中间段 + 洗掉网页专用标记 + 注进骨架）
+  → `render.mjs`（无头 Chrome 走 CDP，出 1:1 PDF + 1200px PNG + 版面实测）。
+  `fetch-assets.mjs` 把 16 张图落到 `poster/assets/`（带 manifest：像素/体积/130dpi 下的 maxCm）。
+· **几何全绿**：画布 95×207cm（成品 91×203 + 四周 2cm 出血 + 八条裁切线），
+  版心 83×195cm，页头 masthead+hero 32.5cm、页尾 colophon 13.4cm，中间区 149.1cm。
+· **页头页尾原样搬详页**：DOM 与 CSS 一个值都没改，靠 `zoom:2.937273` 等比放大
+  （1068px × 2.937 = 83cm）。中间用同一招，`--mid-zoom` 由 `--body-pt` 反算。
+· 中间是三栏 `column-fill:auto` 流，栏宽 26.06cm、栏距 2.4cm；详页
+  `@media(max-width:900px)` 那套单栏版式被解开无条件生效 —— 26cm 的栏子要的正是它。
+· **每张图按自己的像素数封顶**（`--slot-max`，130dpi 基准）：现在 16 张全部 ≥130dpi。
+  不封顶时 702px 的 feat-1 撑到 16.5cm 只有 108dpi、418px 的 sim-species 只有 64dpi。
+
+**三个踩过的坑（都已修，别再踩）：**
+🔴 ① `zoom` 子树里的**百分比不能再除 zoom**。`width:calc(100%/1.9556)` 除了两遍，
+   实测 820px（应为 1604px）。zoom 里的 `%` 本来就按"父盒子除掉 zoom"解；
+   但**绝对单位（cm）要除回去**，所以 `column-gap: calc(2.4cm/var(--mid-zoom))` 是对的。
+🔴 ② `Page.printToPDF` 必须 `transferMode:"ReturnAsStream"` + `IO.read`。
+   默认那条路把整份 PDF（25–33MB）base64 塞进**一条** CDP 消息，Node 内置 WebSocket
+   直接卡死 —— 现象是无限等、Chrome 那头 0% CPU，很容易误判成渲染慢。
+🔴 ③ 字体必须本地化（`fetch-fonts.mjs` → `poster/fonts/`，281 个切片 16.9MB）。
+   Noto Serif SC 在 Google Fonts 上切成 505 个 woff2、按字符懒加载，走境外直连时
+   几十个请求挂着不返回，`document.fonts.ready` 永不 resolve，实测一次渲染卡 4 分钟。
+   挑切片不靠猜：拿海报字符集去交每个 @font-face 的 `unicode-range`。
+
+🔴 **卡在这里等用户拍板：详页装不下。** 详页中间是 14452 em（中文 8265 + 拉丁 11789）
+   + 16 张图，相当于十来页杂志稿；91×203cm 在易拉宝可读字号下只有 3 栏可用。实测：
+   · 22pt / 全部内容 → 需要 **13 栏**（差 4.3 倍）
+   · 22pt / 砍掉 19 段英文对照 → 仍需 8 栏
+   · **全部小节都留 → 正文最大只能 13pt**（站着看不清，得走到跟前）
+   · 18pt / 砍英文对照 + 砍「IV 演化与生态」「VI 博物趣闻博客」→ **正好 3 栏（100%，末栏 0 留白）**
+   · 22pt / 只留「简介 + 关键特征 + 典型生境」→ 正好 3 栏
+   **`dist/` 里现在放的是 18pt 那版**（PDF 25.2MB / PNG 1200px）。取舍是内容决定，
+   不是我该替用户做的，已把选项摆给用户。`--body-pt` / `--img-pct` / `--drop` /
+   `--sections` 四个开关都在，改一版就是一条命令。
+   ⚠️ 试排版用 `render.mjs --fit-only`（2.8 秒），不要每次都出片（要几十秒）。
+
+_上一轮：2026-08-15（续二）— by Claude（**「点博物趣闻摘要卡出现乱码」查清并修好，
 已提交 `8e54262`、**已部署上线** `Version ID 6b6c87b8-c6a2-4d9f-9460-8f089663a78d`，
 线上逐条核验过（见文末「线上核验」）。tsc=0 / build 过 / 本地 desktop+mobile 双实测。
 ⚠️ 部署走的是 `env -u HTTP_PROXY -u HTTPS_PROXY …/wrangler deploy`（老规矩，见 memory）。
