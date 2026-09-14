@@ -363,6 +363,7 @@ const BAD_IMAGE_400 =
  * 判断一次失败要不要顺位给下一个序列项。
  *
  * 会顺位：401/403（key 无效或不属于这家）、404（模型 ID 在这家不存在）、
+ * **402（这家账户欠费 / 额度耗尽）、410（这个模型已被厂商下线）**、
  * 429（限流 / 额度用尽，正是「Gemini 用完换 Kimi」的场景）、5xx（服务端故障）、
  * 网络错误 / 超时（status 传 0），以及两类 400 —— **讲可用性的**（SLOT_SPECIFIC_400）
  * 和**讲能力的**（CAPABILITY_400，例如把图发给了纯文本模型）。
@@ -376,5 +377,20 @@ export function shouldFailOver(status: number, message = ""): boolean {
     return CAPABILITY_400.test(message) && !BAD_IMAGE_400.test(message);
   }
   if (status === 0) return true; // 网络错误 / 超时
-  return status === 401 || status === 403 || status === 404 || status === 429 || status >= 500;
+  // 🔴 402 / 410 是 2026-09-14 补上的。它们和 401/403/404 同属「**只是这一项不行**」：
+  //   · 410 Gone —— 厂商把模型下线了。实例：NVIDIA 的 minimaxai/minimax-m3 于
+  //     2026-09-09 EOL（`reached its end of life`），出卡序列第 4 项从此回 410。
+  //     旧规则把它当成「请求本身有毛病、换谁都一样」→ 整条序列**停在第 4 项**，
+  //     排在后面、明明健康的 qwen 一次都没被试过 → 09-10 两次识别全部退回 Pl@ntNet 兜底、
+  //     二次复核因「无可复核的候选」根本没跑。模型下线是常态，这个口子必须一直开着。
+  //   · 402 Payment Required —— 这家账户欠费 / 额度用尽，换一家完全可能就好。
+  return (
+    status === 401 ||
+    status === 402 ||
+    status === 403 ||
+    status === 404 ||
+    status === 410 ||
+    status === 429 ||
+    status >= 500
+  );
 }

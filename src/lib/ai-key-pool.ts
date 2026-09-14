@@ -73,7 +73,15 @@ const TUNABLE_PARAMS = [
  */
 export const THINKING_OFF = {
   enable_thinking: false, // 阿里 Qwen3 / DashScope
-  reasoning_effort: "low", // OpenAI o 系列 / 部分中转
+  // 🔴 "low" → "none"（2026-09-14）。阿里百炼的 qwen3.8 系列对「关思考」有硬约束：
+  //   `'reasoning_effort' must be 'none' when 'enable_thinking' is false`（HTTP 400）。
+  // 旧值 "low" 撞上它之后，删参自愈把三个思考键**一起**摘掉重发 —— 于是模型按默认
+  // **开着思考**跑：小P蛙 qwen3.8-max 7.5s→（摘参后仍思考），银叶 qwen3.8-max-0902 一次 23s、801 个思维链 token。
+  // 改 "none" 后同样的请求 1.8s、零思维链。实测（线上 12 个 OpenAI 兼容序列项）：
+  //   · 11 个直接接受；
+  //   · deepseek-v4-pro 回 400「must be one of: 'low','medium','high','xhigh','max'」→ 删参自愈只摘
+  //     reasoning_effort（见 offendingParams 的整词匹配），enable_thinking:false 照样生效，零思维链。
+  reasoning_effort: "none", // OpenAI 新一代 / 阿里 qwen3.8 / 部分中转
   thinking: { type: "disabled" }, // 智谱 GLM / Anthropic 风格
 } as const;
 
@@ -123,10 +131,18 @@ export function geminiThinkingConfig(model: string, thinkingOn: boolean): Record
   return { thinkingConfig: { thinkingBudget: thinkingOn ? -1 : 0 } };
 }
 
-/** 400 文本里点名了哪些我们发过的可调参数。 */
+/**
+ * 400 文本里点名了哪些我们发过的可调参数。
+ *
+ * 🔴 **整词匹配**（2026-09-14）。旧写法是子串 `t.includes(p)`，而 `thinking` 恰好是
+ * `enable_thinking` 的子串：NVIDIA 回「Unsupported parameter(s): \`enable_thinking\`」时，
+ * 连它明明认得的 `thinking:{type:"disabled"}` 也一起摘掉 —— 关思考的最后一个键没了，模型照样思考。
+ * 参数名前后都不能紧挨字母、数字或下划线，才算真的点到了它。
+ */
 export function offendingParams(errorText: string, body: Record<string, unknown>): string[] {
-  const t = errorText.toLowerCase();
-  return TUNABLE_PARAMS.filter((p) => p in body && t.includes(p));
+  return TUNABLE_PARAMS.filter(
+    (p) => p in body && new RegExp(`(^|[^a-z0-9_])${p}([^a-z0-9_]|$)`, "i").test(errorText),
+  );
 }
 
 /**

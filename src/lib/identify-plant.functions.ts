@@ -557,6 +557,38 @@ async function callGeminiWithRotation(keys: string[], opts: GeminiCallOpts): Pro
   );
 }
 
+/**
+ * callGeminiWithRotation + 「400 点名 thinking 字段就去掉重发一次」的安全网（与 geminiChat 同款）。
+ *
+ * 为什么出卡要单独包一层（2026-09-14）：出卡的两处 Gemini 调用（identifyQuick、
+ * callAiIdentifyWithConfig 的 Gemini 分支）以前**都不发 thinkingConfig**，模型按默认开着思考 ——
+ * gemini-3.5-flash 出一张卡 14.3s、2740 个思维 token；发 `thinkingLevel:"low"` 后 6.9s、627 个。
+ * 但思考字段是分代际的（3 代 thinkingLevel、2.5 代 thinkingBudget），代际只能从模型名猜；
+ * 猜错时 callGeminiWithRotation 对 400 的策略是立刻上抛，而 400 在 shouldFailOver 里**不顺位**
+ * —— 一个猜错的字段会把整条出卡序列停住。所以这里兜一次：去掉 thinkingConfig 重发。
+ */
+async function callGeminiWithThinkingNet(keys: string[], opts: GeminiCallOpts): Promise<any> {
+  try {
+    return await callGeminiWithRotation(keys, opts);
+  } catch (e) {
+    const body = opts.body as { generationConfig?: Record<string, unknown> } | undefined;
+    const gen = body?.generationConfig;
+    const msg = e instanceof Error ? e.message : String(e);
+    const rejectedThinking =
+      /thinking|thought/i.test(msg) &&
+      /400|invalid|unknown|unsupported|not supported|unrecognized/i.test(msg);
+    if (!rejectedThinking || !gen || !("thinkingConfig" in gen)) throw e;
+    const { thinkingConfig: _dropped, ...withoutThinking } = gen;
+    console.warn(
+      `[${opts.label ?? "Gemini"}] ${opts.model} 不接受 thinkingConfig（${msg.slice(0, 120)}）—— 已去掉该字段重发`,
+    );
+    return callGeminiWithRotation(keys, {
+      ...opts,
+      body: { ...(body as object), generationConfig: withoutThinking },
+    });
+  }
+}
+
 /** Generic describer for the OpenAI-compatible / Anthropic branches. */
 function describeHttpAiError(tag: string, httpStatus: number, body: string): AiError {
   let message = "";
@@ -1946,6 +1978,7 @@ async function callAiIdentify(
         hintPlace,
         speciesHint,
         webResearch,
+        queueKind === "enrich" ? ENRICH_SLOT_TIMEOUT_MS : CARD_SLOT_TIMEOUT_MS,
       ),
     queueKind === "enrich" ? "草稿生成" : "出卡AI",
     // 两条链路都要把用户拍的照片喂给模型 —— 正是 deepseek-v4-flash 事故的现场。
@@ -1954,6 +1987,21 @@ async function callAiIdentify(
     { requireVision: true, retry429: true },
   );
 }
+
+/**
+ * callAiIdentifyWithConfig 里 **OpenAI 兼容分支**的整项超时（2026-09-14 补）。
+ *
+ * 在此之前这条分支**没有任何超时**：postOpenAICompat 只接受可选的 signal，这里从来没传。
+ * Gemini 分支每次有 55 秒，这条路却能一直挂到 Queues 消费者的 15 分钟挂钟 —— 慢的推理模型
+ * 会独吞整条出卡序列的时间，后面的备胎一个都轮不上。
+ *
+ * 数值取自 09-14 真实负载实测（整份 21 字段草稿 + 实拍原图）：
+ *  · 出卡：qwen3-vl-plus 96s、qwen3.7-plus 67s（关思考后）→ 给 120s；
+ *  · 银叶：qwen3.8-max-0902 255s、kimi-k2.6 235s（都开思考，跑在长任务车道）→ 给 300s。
+ * 超时抛不带 HTTP 码的 AiError → shouldFailOver 按 status 0 处理 → 顺位下一项。
+ */
+const CARD_SLOT_TIMEOUT_MS = 120_000;
+const ENRICH_SLOT_TIMEOUT_MS = 300_000;
 
 /**
  * 用**指定的一套配置**跑一次完整识别。外面的 callAiIdentify() 负责按优先调用序列
@@ -1971,6 +2019,8 @@ async function callAiIdentifyWithConfig(
   // Web research digest from enrichDraft's 联网调研 step. Injected into the system
   // prompt as authoritative reference material for accuracy + timeliness.
   webResearch?: { digest: string; sources: { title: string; uri: string }[] },
+  // OpenAI 兼容分支的整项超时，见 CARD_SLOT_TIMEOUT_MS 的注释。
+  timeoutMs: number = CARD_SLOT_TIMEOUT_MS,
 ): Promise<{ meta: AiMeta; model: string; provider: string; usage: AiTokenUsage }> {
   // 这一套配置由调用方（序列执行器）给定；null = 走 .env 兜底路径。
   const dbConfig = slotConfig;
@@ -2182,7 +2232,7 @@ async function callAiIdentifyWithConfig(
       console.log(`[AI Identify] Gemini key pool size: ${keyPool.length}`);
 
       // 55s timeout per attempt — Gemini vision calls can be slow for large images.
-      const data = await callGeminiWithRotation(keyPool, {
+      const data = await callGeminiWithThinkingNet(keyPool, {
         model,
         timeoutMs: 55_000,
         label: "AI Identify",
@@ -2203,6 +2253,8 @@ async function callAiIdentifyWithConfig(
             responseMimeType: "application/json",
             responseSchema: AI_META_SCHEMA,
             temperature: 0.0,
+            // 与 OpenAI 兼容分支同一个开关（dbConfig.thinking），见 callGeminiWithThinkingNet。
+            ...(dbConfig ? geminiThinkingConfig(model, dbConfig.thinking === "on") : {}),
           },
         },
       });
@@ -2366,100 +2418,129 @@ async function callAiIdentifyWithConfig(
       max_tokens: 16000,
       temperature: 0.0,
       ...(dbConfig?.provider === "custom" ? {} : { response_format: { type: "json_object" } }),
+      // 🔴 思考开关（2026-09-14 补）。dbConfig.thinking 早就由 callAiIdentify 按控制台算好了
+      // （出卡默认关、银叶默认开），但这条分支**从来没把它发出去** —— 配置里写着「关」，
+      // qwen3.7-plus 出一张卡照样先写几千 token 思维链：106s，关掉后 67s。
+      // 不认的键由 postOpenAICompat 的删参自愈摘掉，不会把请求打死。
+      ...(dbConfig ? thinkingParams(dbConfig) : {}),
     };
 
-    // 429 = rate limit, 503 = overloaded — both transient on relay/中转 endpoints
-    // (which often have strict per-account rate limits). Retry with backoff so a
-    // burst of visitors doesn't fail identify outright.
-    let attempts = 0;
-    const maxAttempts = 3;
-    let resp: Response | null = null;
-    while (attempts < maxAttempts) {
-      attempts++;
-      // postOpenAICompat：某个可调参数被 400 拒收时（如 Kimi K3 只允许 temperature=1）
-      // 自动去掉该参数重试一次。
-      resp = await postOpenAICompat(`${apiBase}/chat/completions`, openaiKey, requestBody);
-
-      // 524/504/408 = 网关等不到上游吐字节就判超时。整份草稿要生成几十秒到几分钟，
-      // 慢模型（Kimi K3 这类推理模型）每次都会同样慢 → 重试多少次都还是超时。
-      // 改用流式：token 边生成边回，网关一直看得到数据就不会超时。
-      // 若对方压根不支持流式（回 599 = 拿到的不是 SSE），就退回原来的非流式结果。
-      if (resp.status === 524 || resp.status === 504 || resp.status === 408) {
-        console.warn(`[AI Identify] HTTP ${resp.status} 网关超时，改用流式重试`);
-        const streamed = await postOpenAICompatStream(
-          `${apiBase}/chat/completions`,
-          openaiKey,
-          requestBody,
-        );
-        if (streamed.ok) {
-          resp = streamed;
-          break;
-        }
-        console.warn(`[AI Identify] 流式重试也失败（HTTP ${streamed.status}），回到常规重试`);
-      }
-
-      // 429 = rate limit; 5xx = relay/中转 gateway hiccup (these endpoints often 502/504
-      // on slow, heavy generations like the full draft). Both transient → retry.
-      if (
-        (resp.status === 429 || (resp.status >= 500 && resp.status < 600)) &&
-        attempts < maxAttempts
-      ) {
-        const delay = attempts * 5000; // 5s, 10s
-        console.warn(
-          `[AI Identify] OpenAI-compatible API returned ${resp.status}. Retrying in ${delay / 1000}s... (Attempt ${attempts}/${maxAttempts})`,
-        );
-        await new Promise((resolve) => setTimeout(resolve, delay));
-        continue;
-      }
-      break;
-    }
-
-    if (!resp || !resp.ok) {
-      const status = resp ? resp.status : 500;
-      const t = resp ? await resp.text() : "网络请求失败";
-      console.error("OpenAI API Error:", status, t);
-      const tag = dbConfig?.provider === "custom" ? "自定义接口" : "OpenAI";
-      // Text-only models (e.g. DeepSeek deepseek-chat) reject the vision `image_url`
-      // content block. Photo ID is impossible without a multimodal model, so surface
-      // a clear, actionable message instead of the raw serde error.
-      if (
-        /image_url|unknown variant|expected\s+`?text`?|does ?n['’]?t support image|not support.*image|multimodal|vision/i.test(
-          t,
-        )
-      ) {
-        throw new AiError(
-          "AI_MODEL_NOT_MULTIMODAL",
-          `AI 文案生成失败（AI_MODEL_NOT_MULTIMODAL）：${tag}的模型「${model}」不支持图片识别（仅接受纯文本）。` +
-            `拍照识别必须用多模态/视觉模型，例如 Gemini、GPT-4o、Claude 3.5 Sonnet、或通义千问 Qwen-VL。请到管理后台更换模型。`,
-        );
-      }
-      throw describeHttpAiError(tag, status, t);
-    }
-
-    const data = await resp.json();
-    const content = data.choices?.[0]?.message?.content;
-    if (!content) {
-      console.error("OpenAI invalid response structure:", JSON.stringify(data));
-      throw new Error("OpenAI 未能返回有效内容");
-    }
-
+    // 整项超时：从第一次发出到拿到可解析的 JSON，重试、流式回退、读 body 全算在内（见 CARD_SLOT_TIMEOUT_MS）。
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const meta = JSON.parse(cleanJson(content));
-      const u = data.usage ?? {};
-      const providerTag = dbConfig?.provider === "custom" ? "custom" : "openai";
-      return {
-        meta,
-        model,
-        provider: providerTag,
-        usage: {
-          prompt_tokens: u.prompt_tokens ?? 0,
-          completion_tokens: u.completion_tokens ?? 0,
-          total_tokens: u.total_tokens ?? 0,
-        },
-      };
+      // 429 = rate limit, 503 = overloaded — both transient on relay/中转 endpoints
+      // (which often have strict per-account rate limits). Retry with backoff so a
+      // burst of visitors doesn't fail identify outright.
+      let attempts = 0;
+      const maxAttempts = 3;
+      let resp: Response | null = null;
+      while (attempts < maxAttempts) {
+        attempts++;
+        // postOpenAICompat：某个可调参数被 400 拒收时（如 Kimi K3 只允许 temperature=1）
+        // 自动去掉该参数重试一次。
+        resp = await postOpenAICompat(`${apiBase}/chat/completions`, openaiKey, requestBody, {
+          signal: controller.signal,
+        });
+
+        // 524/504/408 = 网关等不到上游吐字节就判超时。整份草稿要生成几十秒到几分钟，
+        // 慢模型（Kimi K3 这类推理模型）每次都会同样慢 → 重试多少次都还是超时。
+        // 改用流式：token 边生成边回，网关一直看得到数据就不会超时。
+        // 若对方压根不支持流式（回 599 = 拿到的不是 SSE），就退回原来的非流式结果。
+        if (resp.status === 524 || resp.status === 504 || resp.status === 408) {
+          console.warn(`[AI Identify] HTTP ${resp.status} 网关超时，改用流式重试`);
+          const streamed = await postOpenAICompatStream(
+            `${apiBase}/chat/completions`,
+            openaiKey,
+            requestBody,
+            { signal: controller.signal },
+          );
+          if (streamed.ok) {
+            resp = streamed;
+            break;
+          }
+          console.warn(`[AI Identify] 流式重试也失败（HTTP ${streamed.status}），回到常规重试`);
+        }
+
+        // 5xx = relay/中转 gateway hiccup (these endpoints often 502/504 on slow, heavy
+        // generations like the full draft) → transient, retry here.
+        //
+        // ⚠️ **429 刻意不在这里重试了**（2026-09-07）。它改由外层 runModelQueue 的
+        // `retry429` 统一处理（等 3 秒、只重试一次、然后顺位）。两处都重试的话，
+        // 一个被限流的序列项要耗掉 5 + 10 + 3 = 18 秒才轮到下一项 —— 而 phase-1
+        // 是用户盯着转圈等的链路，这个代价必须只付一次。顺位判定不受影响：
+        // 下面照样把 429 抛成带 `HTTP 429` 的错误，shouldFailOver 认得出来。
+        if (resp.status >= 500 && resp.status < 600 && attempts < maxAttempts) {
+          const delay = attempts * 5000; // 5s, 10s
+          console.warn(
+            `[AI Identify] OpenAI-compatible API returned ${resp.status}. Retrying in ${delay / 1000}s... (Attempt ${attempts}/${maxAttempts})`,
+          );
+          await new Promise((resolve) => setTimeout(resolve, delay));
+          continue;
+        }
+        break;
+      }
+
+      if (!resp || !resp.ok) {
+        const status = resp ? resp.status : 500;
+        const t = resp ? await resp.text() : "网络请求失败";
+        console.error("OpenAI API Error:", status, t);
+        const tag = dbConfig?.provider === "custom" ? "自定义接口" : "OpenAI";
+        // Text-only models (e.g. DeepSeek deepseek-chat) reject the vision `image_url`
+        // content block. Photo ID is impossible without a multimodal model, so surface
+        // a clear, actionable message instead of the raw serde error.
+        if (
+          /image_url|unknown variant|expected\s+`?text`?|does ?n['’]?t support image|not support.*image|multimodal|vision/i.test(
+            t,
+          )
+        ) {
+          throw new AiError(
+            "AI_MODEL_NOT_MULTIMODAL",
+            `AI 文案生成失败（AI_MODEL_NOT_MULTIMODAL）：${tag}的模型「${model}」不支持图片识别（仅接受纯文本）。` +
+              `拍照识别必须用多模态/视觉模型，例如 Gemini、GPT-4o、Claude 3.5 Sonnet、或通义千问 Qwen-VL。请到管理后台更换模型。`,
+          );
+        }
+        throw describeHttpAiError(tag, status, t);
+      }
+
+      const data = await resp.json();
+      const content = data.choices?.[0]?.message?.content;
+      if (!content) {
+        console.error("OpenAI invalid response structure:", JSON.stringify(data));
+        throw new Error("OpenAI 未能返回有效内容");
+      }
+
+      try {
+        const meta = JSON.parse(cleanJson(content));
+        const u = data.usage ?? {};
+        const providerTag = dbConfig?.provider === "custom" ? "custom" : "openai";
+        return {
+          meta,
+          model,
+          provider: providerTag,
+          usage: {
+            prompt_tokens: u.prompt_tokens ?? 0,
+            completion_tokens: u.completion_tokens ?? 0,
+            total_tokens: u.total_tokens ?? 0,
+          },
+        };
+      } catch (e) {
+        console.error("Failed to parse OpenAI response as JSON:", content, e);
+        throw new Error("OpenAI 返回的 JSON 格式不正确");
+      }
     } catch (e) {
-      console.error("Failed to parse OpenAI response as JSON:", content, e);
-      throw new Error("OpenAI 返回的 JSON 格式不正确");
+      if (controller.signal.aborted) {
+        const who = dbConfig?.provider === "custom" ? "自定义接口" : "OpenAI";
+        // 不带「HTTP nnn」→ httpStatusOf 得 0 → shouldFailOver 顺位下一项。
+        throw new AiError(
+          "AI_SLOT_TIMEOUT",
+          `AI 文案生成失败（AI_SLOT_TIMEOUT）：${who}的模型「${model}」在 ${Math.round(timeoutMs / 1000)} 秒内没有返回完整结果，已放弃这一项。` +
+            `常见原因是推理模型思维链过长或中转排队 —— 请在管理后台换更快的模型，或把它排到序列后面。`,
+        );
+      }
+      throw e;
+    } finally {
+      clearTimeout(timer);
     }
   }
 
@@ -3671,7 +3752,7 @@ async function identifyQuick(
         { inlineData: { mimeType, data: base64Data } },
         ...prior.map((im) => ({ inlineData: { mimeType: im.mimeType, data: im.base64 } })),
       ];
-      const data = await callGeminiWithRotation(splitGeminiKeys(slot.apiKey), {
+      const data = await callGeminiWithThinkingNet(splitGeminiKeys(slot.apiKey), {
         model: slot.model,
         timeoutMs: 45_000,
         label: "identifyQuick",
@@ -3682,6 +3763,8 @@ async function identifyQuick(
             responseMimeType: "application/json",
             responseSchema: AI_QUICK_SCHEMA,
             temperature: 0.0,
+            // 出卡控制台的思考开关（默认关 → gemini-3 发 thinkingLevel:"low"），见 callGeminiWithThinkingNet。
+            ...geminiThinkingConfig(slot.model, thinkingOf(slot, "card") === "on"),
           },
         },
       });
@@ -4685,6 +4768,17 @@ async function alignMetaToChecklist(meta: AiMeta, where: string): Promise<void> 
  * （payload 里绝不能塞 base64，见 background-jobs 的 pruneExpiredJobs），
  * 传了就跳过内部那次上传，避免同一张图存两份。
  */
+/**
+ * 出卡链路全挂之后，**最晚**到识别开始多久还值得再请复核模型出卡（2026-09-14）。
+ *
+ * 复核自带 45 秒总预算（SECOND_OPINION_TOTAL_BUDGET_MS），之后还要查名录、渲染卡片、写库、写动态。
+ *  · 走队列（有 jobId）：消费者挂钟 15 分钟，出卡序列最坏能烧掉十几分钟 → 过了 12 分钟就不再发起，
+ *    宁可交一张 Pl@ntNet 兜底卡，也别让整个任务被平台掐掉、连草稿都落不了库。
+ *  · 同步入口（只剩脚本 / 本地重放在用）：挂在单个 HTTP 请求上，边缘 100 秒就断 → 过了 45 秒不发起。
+ */
+const REVIEW_AFTER_CARD_FAIL_QUEUE_CUTOFF_MS = 12 * 60_000;
+const REVIEW_AFTER_CARD_FAIL_SYNC_CUTOFF_MS = 45_000;
+
 async function runQuickIdentifyCore(
   data: QuickIdentifyData,
   onPhase: PhaseFn = () => {},
@@ -4698,6 +4792,8 @@ async function runQuickIdentifyCore(
     jobId?: string;
   } = {},
 ) {
+  // 出卡全挂时要据此判断「还来不来得及再请复核模型出卡」，见 REVIEW_AFTER_CARD_FAIL_*_CUTOFF_MS。
+  const coreStartedAt = Date.now();
   const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
   const { dbCreatedBy, creatorLabel } = await resolveCreator(
     data.creator_label,
@@ -5193,43 +5289,141 @@ async function runQuickIdentifyCore(
         "识别失败（IDENTIFY_FAILED）：出卡模型序列与专业识别引擎都没能给出结果。请稍后重试；若反复出现，请在管理后台检查「出卡AI」序列与 Pl@ntNet 额度。",
       );
     }
-    console.warn(
-      `[Phase1] 出卡链路全部失败，用 Pl@ntNet 判定兜底出摘要卡：${primaryFallback.sci}（${primaryFallback.pct}%）`,
-    );
-    meta = {
-      title: primaryFallback.sci,
-      scientific_name: primaryFallback.sci,
-      family: primaryFallback.family,
-      genus: primaryFallback.genus,
-      // 只有专业引擎的判定、没有模型复核过 → 一律按疑似处理，让用户走补拍把它坐实。
-      identification_confidence: "low",
-      summary_zh: `由专业识别引擎 Pl@ntNet 判定为 ${primaryFallback.sci}（置信度 ${primaryFallback.pct}%）。本次出卡模型未能返回结果，因此暂不做进一步描述——建议补拍关键部位以确认到种。`,
-    } as AiMeta;
-    normalizeIdentification(meta);
-    // 【正名核对】这条兜底路上 title 是一串**拉丁学名**（Pl@ntNet 给的），命中名录就能换成
-    // 中文正名 —— 从「疑似 Oxytropis lanata」变成「疑似绵毛棘豆」，草稿卡上才像个名字。
-    await alignMetaToChecklist(meta, "Pl@ntNet 兜底出卡");
-    // Pl@ntNet 不消耗 token，所以这一趟的用量是 0 —— 用量表上出现 provider=plantnet-fallback
-    // 且 token 为 0 的记录，就代表「出卡模型全挂、靠专业引擎兜底出的卡」。
-    usedProvider = "plantnet-fallback";
-    usedModel = `plantnet(${primaryFallback.sci})`;
-    usage = ZERO_USAGE;
-    trace.phase1Model = "（出卡模型未返回，Pl@ntNet 兜底）";
-    trace.phase1Confidence = "low";
-    trace.review = { ran: false, reason: "出卡模型未返回结果，无可复核的候选" };
-    html = buildSummaryCardHtml({
-      photos: allPhotos,
-      title: meta.title || "",
-      sci: meta.scientific_name || "",
-      summaryZh: meta.summary_zh || "",
-      family: meta.family,
-      genus: meta.genus,
-      tentative: true,
-      chips: await lookupRegistryChips(meta.scientific_name, meta.family),
-      trace,
-      finalConfidence: "low",
-    });
-    enriched = false;
+    // ── 🔴 出卡全挂 ≠ 无可复核（2026-09-14 修）──────────────────────────────────
+    // 以前这里直接写死 `review: { ran: false, reason: "出卡模型未返回结果，无可复核的候选" }`。
+    // 可走进这个分支的前提**恰恰是 Pl@ntNet 有判定**（没有判定上面已经 throw 了）——
+    // 手上明明握着学名候选，复核要的照片、补拍照、地点、Pl@ntNet 提示也全在作用域里，
+    // 所谓「无可复核的候选」根本不成立，只是这条分支没写。
+    // 2026-09-10 的两次识别正是这样：出卡序列被一个已下线的模型（HTTP 410）截断，
+    // 复核一行都没执行，用户拿到一张只有「由 Pl@ntNet 判定为 …」一句话的卡。
+    // 复核模型本身就是视觉模型，返回的字段与简介卡一致 —— 它给出物种就直接用它出卡；
+    // 它也没结果（或来不及跑），才退回下面那张 Pl@ntNet 兜底卡。
+    const elapsedMs = Date.now() - coreStartedAt;
+    const reviewCutoffMs = opts.jobId
+      ? REVIEW_AFTER_CARD_FAIL_QUEUE_CUTOFF_MS
+      : REVIEW_AFTER_CARD_FAIL_SYNC_CUTOFF_MS;
+    const reviewFailures: string[] = [];
+    let rescued: { meta: AiMeta; model: string; usage: AiTokenUsage } | null = null;
+    let reviewSkipped = "";
+    if (elapsedMs > reviewCutoffMs) {
+      reviewSkipped =
+        `出卡模型未返回结果；识别已耗时 ${Math.round(elapsedMs / 1000)} 秒，` +
+        `再跑复核会逼近${opts.jobId ? "队列 15 分钟挂钟" : "同步请求时限"}，未发起`;
+    } else {
+      console.warn(
+        `[Phase1] 出卡链路全部失败，手上有 Pl@ntNet 候选 ${primaryFallback.sci}（${primaryFallback.pct}%）→ 请二次复核模型看图出卡`,
+      );
+      onPhase("出卡模型没给出结果，正在请二次复核模型看图出卡…", 74);
+      rescued = await secondOpinionIdentify(dataUrl, priorInline, place, {
+        candidate: primaryFallback.sci,
+        plantNetHint,
+        failures: reviewFailures,
+      });
+    }
+
+    const rescuedName = rescued
+      ? `${rescued.meta.scientific_name || ""}${rescued.meta.title || ""}`.trim()
+      : "";
+    if (rescued && rescuedName) {
+      normalizeIdentification(rescued.meta);
+      const resolved = rescued.meta.identification_confidence !== "low";
+      const beforeKey = speciesKey(primaryFallback.sci);
+      const afterKey = speciesKey((rescued.meta.scientific_name || "").toString());
+      const action = beforeKey && afterKey && beforeKey === afterKey ? "confirm" : "override";
+      console.log(
+        `[SecondOpinion] 出卡全挂 → 复核出卡 primary=${primaryEngine}(${primaryLabel}) ` +
+          `review=${rescued.meta.identification_confidence}(${(rescued.meta.title || "").toString().trim()} / ${(rescued.meta.scientific_name || "").toString().trim()}) → ${action}`,
+      );
+      meta = rescued.meta;
+      // 补拍满 3 次必须收口 —— 与上面出卡成功那条分支同一条硬规则。
+      if (retakeCount >= 3) {
+        meta.needs_more_photos_zh = "";
+        meta.needs_more_photos_en = "";
+      }
+      await alignMetaToChecklist(meta, "出卡全挂·复核出卡");
+      // 用量表上 provider=plantnet+review-card 就代表「出卡序列全挂、由复核模型看图出的卡」。
+      usedProvider = "plantnet+review-card";
+      usedModel = rescued.model;
+      usage = rescued.usage;
+      if (resolved) {
+        secondOpinion = {
+          by: "second-opinion",
+          model: rescued.model,
+          action,
+          from: primaryFallback.sci,
+          to: (meta.scientific_name || "").toString().trim(),
+          plantnet: `${primaryEngine}:${primaryLabel}`,
+        };
+      }
+      trace.phase1Model = "（出卡模型未返回，由二次复核模型出卡）";
+      trace.phase1Confidence = "low";
+      trace.review = {
+        ran: true,
+        model: rescued.model,
+        confidence: (meta.identification_confidence || "").toString(),
+        action,
+        adopted: resolved,
+      };
+      html = buildSummaryCardHtml({
+        photos: allPhotos,
+        title: meta.title || "",
+        sci: meta.scientific_name || "",
+        summaryZh: meta.summary_zh || "",
+        family: meta.family,
+        genus: meta.genus,
+        tentative: isTentative(meta),
+        chips: await lookupRegistryChips(meta.scientific_name, meta.family),
+        trace,
+        finalConfidence: (meta.identification_confidence || "").toString(),
+      });
+      enriched = false;
+    } else {
+      console.warn(
+        `[Phase1] 出卡链路全部失败、复核也没出卡，用 Pl@ntNet 判定兜底出摘要卡：${primaryFallback.sci}（${primaryFallback.pct}%）`,
+      );
+      meta = {
+        title: primaryFallback.sci,
+        scientific_name: primaryFallback.sci,
+        family: primaryFallback.family,
+        genus: primaryFallback.genus,
+        // 只有专业引擎的判定、没有模型复核过 → 一律按疑似处理，让用户走补拍把它坐实。
+        identification_confidence: "low",
+        summary_zh: `由专业识别引擎 Pl@ntNet 判定为 ${primaryFallback.sci}（置信度 ${primaryFallback.pct}%）。本次出卡模型未能返回结果，因此暂不做进一步描述——建议补拍关键部位以确认到种。`,
+      } as AiMeta;
+      normalizeIdentification(meta);
+      // 【正名核对】这条兜底路上 title 是一串**拉丁学名**（Pl@ntNet 给的），命中名录就能换成
+      // 中文正名 —— 从「疑似 Oxytropis lanata」变成「疑似绵毛棘豆」，草稿卡上才像个名字。
+      await alignMetaToChecklist(meta, "Pl@ntNet 兜底出卡");
+      // Pl@ntNet 不消耗 token —— 用量表上 provider=plantnet-fallback 的记录就代表
+      // 「出卡模型全挂、复核也没出卡、靠专业引擎兜底出的卡」。复核若跑了却没给出物种，
+      // 那次调用的 token 照样花掉了，必须计入，否则成了查不到的隐形开销。
+      usedProvider = "plantnet-fallback";
+      usedModel = rescued ? `plantnet(${primaryFallback.sci})+${rescued.model}` : `plantnet(${primaryFallback.sci})`;
+      usage = rescued ? rescued.usage : ZERO_USAGE;
+      trace.phase1Model = "（出卡模型未返回，Pl@ntNet 兜底）";
+      trace.phase1Confidence = "low";
+      const why = reviewFailures.join("；");
+      trace.review = {
+        ran: false,
+        reason:
+          reviewSkipped ||
+          `出卡模型未返回结果；已拿 Pl@ntNet 候选（${primaryFallback.sci}）发起复核，但复核也没给出物种` +
+            (why ? `：${why}` : rescued ? "（复核返回了内容，但没有物种名）" : "（未拿到具体原因）"),
+      };
+      html = buildSummaryCardHtml({
+        photos: allPhotos,
+        title: meta.title || "",
+        sci: meta.scientific_name || "",
+        summaryZh: meta.summary_zh || "",
+        family: meta.family,
+        genus: meta.genus,
+        tentative: true,
+        chips: await lookupRegistryChips(meta.scientific_name, meta.family),
+        trace,
+        finalConfidence: "low",
+      });
+      enriched = false;
+    }
   }
 
   const safeTitle = draftTitleFor(meta);
