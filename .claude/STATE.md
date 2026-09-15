@@ -1,7 +1,51 @@
 # Plantspedia — Working State  (single source of truth)
 
-_Last updated: 2026-09-14 — by Claude（**已部署 `9e4888b4-ac57-44a8-a9ec-1050163014ef`：410/402 顺位 + 出卡思考参数/整项超时 + reasoning_effort none/整词匹配 + 出卡全挂仍复核。配置替换、豆包删除、invasive 迁移均已生效。**）
+_Last updated: 2026-09-15 — by Claude（**顶替定种后照样复核（排除做过定种的模型）+ 卡片写明 Pl@ntNet 没参与的真实原因 —— 已部署 `afa848db-94d8-4714-bd87-533d53d9f0a3`（走 7888 代理才传上去）。代码未 commit。**）
 
+## 2026-09-15：「若推送，二次复核是否就能运行了？」
+**答：推送 ≠ 部署**（仓库无 CI，线上部署来源全是 wrangler 手动上传）。而且用户截图那条
+「未运行 —— 一线定种已由复核模型顶替，同一模型不重复复核」是**有意写的闸门**，不是 09-14 修的 bug。
+
+### 这次识别（job e95f52a5 / 草稿 2d3fae74「疑似小藜」，09-15 08:36 UTC，跑的是 9e4888b4）
+- Pl@ntNet **请求失败**，不是额度用尽：当日计数 0/500、未标记耗尽；同一张照片几小时后重试 4 秒 200
+  （Oxybasis rubra 13%）。用户的 Pl@ntNet 后台也看不到任何 Error —— 失败请求在它那边不留痕。
+- → 复核序列 1 qwen3.7-plus 顶替定种 Chenopodium ficifolium@85% → 出卡 gemini-3.5-flash 判疑似
+  → 闸门 `primaryEngine !== "vision"` 挡掉复核。可复核序列 2 的 qwen-vl-max 从没看过这张图。
+
+### 改动（用户：「按照你建议的修」）
+1. **顶替定种后照样复核**：闸门去掉 `primaryEngine !== "vision"`；`secondOpinionIdentify` 传
+   `excludeModels: [secondPrimary.model]`，`withSecondOpinionSlots` 过滤掉该模型、从下一个开始；
+   序列里只剩被排除的那个时，痕迹写「除了刚做过顶替定种的 X 之外没有别的可用模型」。
+2. **写明 Pl@ntNet 没参与的真实原因**：`IdentifyTrace.primaryNote`（可选，老痕迹没有）；
+   `describePlantNetMiss`（identify-trace.ts，纯函数）把 status/超时/网络错误翻译成人话；
+   plantNetIdentify 的 catch 区分 AbortError（20s 超时）与网络错误，错误原文里的 `api-key=` 打码。
+   `plantNetMissText` 统一两处渲染（草稿页 traceSteps、服务端简介卡 identifyTraceHtml）；老痕迹沿用旧说法。
+3. 顶替定种给出卡模型的提示文案「Pl@ntNet 额度用尽时顶替」→「未给出判定时顶替」。
+
+### 验证
+tsc exit 0；新单测 `scratch/identify-trace-miss.test.mjs` 16/16（jiti + 别名，supabase 客户端用替身）；
+failover 25/25、thinking-toggle 46/46；`npm run build` 通过，服务端/客户端产物 8 项逐一确认。
+
+### ⚠️ 部署时本机上行又坏了（09-15 12:15 UTC）
+- 第一次 `env -u *_PROXY wrangler deploy`：这次改动碰了草稿页前端 → 要传 66 个静态资源，
+  传到 22/66 后「Asset upload failed. Retrying… 5 of 5」→ `fetch failed`，**没发布新版本**（线上仍 9e4888b4）。
+- 自测：**直连** 3 MB 推 speed.cloudflare.com → TLS 失败（curl exit 35，0 B）；200 KB 直连 19s 才过。
+  **经本地代理 127.0.0.1:7888** 3 MB → 21.5s、HTTP 200。
+- 现场：`com.relayway.tun-helper`（OOCNetWork root TUN 助手）仍在跑（进程启动时间 Aug 31 02:51），utun3 MTU 1000 —— 与 09-08 同一症状。
+- 绕过：**这次改为保留 HTTP(S)_PROXY 走 7888 部署**（与旧 memory「去掉代理才通」相反：哪条路通要现场自测）。
+  仍失败就停手，请用户重启 Mac / 换手机热点 / 停掉那个 LaunchDaemon（需密码）。
+- ✅ **走代理重试一次成功**：资源 44/44、Worker 本体 129s、触发器 7.6s（5 个队列绑定齐全），
+  版本 **`afa848db-94d8-4714-bd87-533d53d9f0a3`**；首页 / 识别页 HTTP 200。
+- **部署后要看**：下一次 Pl@ntNet 失败的识别 —— Pl@ntNet 那行应写「未参与：<真实原因>」，
+  二次复核应由 qwen-vl-max 运行（`ai_usage_logs.provider` 含 `vision-primary+…+review-*`）。
+
+### 已知相关缺口（未改，待用户决定）
+- Pl@ntNet 失败 **且** 出卡序列也全挂时：`primaryFallback` 只来自 Pl@ntNet，顶替定种的结果进不去 →
+  仍会直接 `IDENTIFY_FAILED`，不会像 09-14 修的那样「请复核出卡」。
+
+---
+
+_上一条 — 
 ## 本轮进行中（2026-09-14）—— 断线后从这里接
 
 ### 🔄 第二段（用户 09-14 指令）：「410 优先修；豆包删掉；复核第 2 项 glm-4.6v-flash 按 api+url 下拉选可用模型替换；其它所有出问题的模型都换成当前配置的 api/url 里可用的合适模型」
