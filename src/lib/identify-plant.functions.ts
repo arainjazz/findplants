@@ -88,7 +88,13 @@ import {
   pickDraftCardFields,
 } from "./draft-card-fields";
 import { stripModelChatter } from "./model-chatter";
-import { type IdentifyTrace, computeIdentifyConfidence, confZh } from "./identify-trace";
+import {
+  type IdentifyTrace,
+  computeIdentifyConfidence,
+  confZh,
+  describePlantNetMiss,
+  plantNetMissText,
+} from "./identify-trace";
 import { normalizeBaseUrl } from "./ai-base-url";
 import {
   bearerFetchRotating,
@@ -1509,9 +1515,17 @@ function secondOpinionSlotTimeout(run: ReviewRun): number {
 
 async function withSecondOpinionSlots<T>(
   fn: (cfg: SecondOpinionConfig, run: ReviewRun) => Promise<T | null>,
-  opts?: { failures?: string[] },
+  opts?: {
+    failures?: string[];
+    /**
+     * 本轮**不再使用**的模型（按 model 名）。一线定种已由复核模型顶替时，把刚做过定种的那个传进来 ——
+     * 同一个模型对同一张图再判一遍几乎不会改口，要复核就得换一双眼睛（2026-09-15）。
+     */
+    excludeModels?: string[];
+  },
 ): Promise<T | null> {
   const run = newReviewRun(opts?.failures);
+  const exclude = new Set((opts?.excludeModels ?? []).map((m) => m.trim()).filter(Boolean));
   const { sequence } = await loadSecondOpinionQueue();
   // 复核链路**必须**能看照片（它的全部工作就是重看一遍图）。已测出 blind 的项直接剔除 ——
   // 留着它只会得到一个凭空编造的"复核结论"，而且因为它 HTTP 200，顺位机制永远不会救场。
@@ -1524,24 +1538,32 @@ async function withSecondOpinionSlots<T>(
   // 不读图、刚被剔除的那一个。于是照样把它打了一遍，白花一次调用、必然拿不到有效复核，
   // 而且因为 slots 非空，上面那句「全部被测出不读图」的说明也不会报出来 ——
   // 用户只看到一句语焉不详的「复核未能完成」，查不到真正原因（07-24 线上实测就是这样）。
-  const slots: SecondOpinionConfig[] = seeing.length
-    ? seeing.map((s) => ({
+  // 刚做过一线顶替定种的模型不再复核同一张图（见 opts.excludeModels）。
+  const usable = seeing.filter((s) => !exclude.has(s.model));
+  const envCfg = sequence.length ? null : await loadSecondOpinionConfig();
+  const slots: SecondOpinionConfig[] = usable.length
+    ? usable.map((s) => ({
         apiKey: s.apiKey,
         model: s.model,
         baseUrl: s.baseUrl || SECOND_OPINION_DEFAULT_BASE,
         thinking: thinkingOf(s, "second_opinion"),
       }))
     : sequence.length
-      ? [] // 配了、但全是 blind → 直接放弃，别再拿同一个瞎模型试一次
-      : await loadSecondOpinionConfig().then((c) => (c ? [c] : []));
+      ? [] // 配了、但全是 blind（或只剩被排除的那一个）→ 直接放弃，别再拿同一个模型试一次
+      : envCfg && !exclude.has(envCfg.model)
+        ? [envCfg]
+        : [];
   if (!slots.length) {
     noteFailure(
       run,
-      sequence.length
+      sequence.length && !seeing.length
         ? `「二次复核」控制台的 ${sequence.length} 个序列项**全部被测出不读图**` +
             `（${sequence.map((s) => s.model).join("、")}），已跳过 —— ` +
             `请在该控制台换成能读图的视觉模型，并点「视觉自检」验证`
-        : "「二次复核」控制台没有配置任何模型",
+        : sequence.length || envCfg
+          ? `复核序列里除了刚做过一线顶替定种的「${[...exclude].join("、")}」之外没有别的可用模型 —— ` +
+            `同一个模型不再复核同一张图。在「二次复核」控制台再加一个不同的视觉模型即可`
+          : "「二次复核」控制台没有配置任何模型",
     );
   }
   for (const [i, cfg] of slots.entries()) {
@@ -1577,6 +1599,8 @@ async function secondOpinionIdentify(
     plantNetHint?: string | null;
     /** 失败原因写进调用方的数组 —— 出卡那头要把它原样报给用户。 */
     failures?: string[];
+    /** 本轮不再使用的模型，见 withSecondOpinionSlots 的 opts.excludeModels。 */
+    excludeModels?: string[];
   },
 ): Promise<{ meta: AiMeta; model: string; usage: AiTokenUsage } | null> {
   return withSecondOpinionSlots(async (cfg, run) => {
@@ -1726,7 +1750,7 @@ async function secondOpinionIdentify(
     } finally {
       clearTimeout(timer);
     }
-  }, { failures: ctx.failures });
+  }, { failures: ctx.failures, excludeModels: ctx.excludeModels });
 }
 
 /** 二次复核模型顶替 Pl@ntNet 做「一线专业定种」——只在 Pl@ntNet 不可用（每日 500 次免费额度用尽 /
@@ -1810,7 +1834,7 @@ async function secondOpinionPrimaryVerdict(
       return {
         label: `${sci}@${pct}%`,
         hint:
-          `【专业识别判定（二次复核模型视觉 · Pl@ntNet 额度用尽时顶替）】最可能物种：${sci}` +
+          `【专业识别判定（二次复核模型视觉 · Pl@ntNet 未给出判定时顶替）】最可能物种：${sci}` +
           `${v.family ? `（科 ${v.family}${v.genus ? ` / 属 ${v.genus}` : ""}）` : ""}` +
           `，置信度 ${pct}%。${cands.length ? `备选：${cands.join("、")}。` : ""}` +
           `请以此判定为基准核对照片；若置信度偏低（低于 30%）或与照片明显不符，` +
@@ -4213,10 +4237,10 @@ function identifyTraceHtml(
     );
   } else if (t.primaryEngine === "vision") {
     steps.push(
-      `<li><b>专业引擎 Pl@ntNet</b>：未参与（额度用尽或未配置）→ 由复核模型顶替一线定种：${htmlEsc(t.primaryLabel)}</li>`,
+      `<li><b>专业引擎 Pl@ntNet</b>：${htmlEsc(plantNetMissText(t, "未参与（额度用尽或未配置）"))} → 由复核模型顶替一线定种：${htmlEsc(t.primaryLabel)}</li>`,
     );
   } else {
-    steps.push(`<li><b>专业引擎 Pl@ntNet</b>：未参与</li>`);
+    steps.push(`<li><b>专业引擎 Pl@ntNet</b>：${htmlEsc(plantNetMissText(t, "未参与"))}</li>`);
   }
   steps.push(
     `<li><b>一线识别模型</b>${t.phase1Model ? `（${htmlEsc(t.phase1Model)}）` : ""}：${confZh(t.phase1Confidence)}</li>`,
@@ -4895,6 +4919,8 @@ async function runQuickIdentifyCore(
     primaryEngine: string;
     primaryLabel: string;
     primaryPct: number | null;
+    /** Pl@ntNet 没给出判定时的真实原因，见 identify-trace.ts 的同名字段。 */
+    primaryNote?: string;
     phase1Model: string;
     phase1Confidence: string;
     review:
@@ -5007,11 +5033,28 @@ async function runQuickIdentifyCore(
   let secondPrimary: { usage: AiTokenUsage; model: string } | null = null;
   const plantNetKey = await loadPlantNetKey();
   const quotaKnownExhausted = plantNetKey ? await isPlantNetQuotaExhausted() : false;
+  // Pl@ntNet 没给出判定时的**真实原因**（2026-09-15）。以前卡片上一律写「额度用尽或未配置」，
+  // 可 09-15 那次其实是请求失败 —— 当天调用计数 0/500、Pl@ntNet 后台也没记下任何错误，
+  // 真实原因只在 Worker 日志里一闪而过。现在写进痕迹，简介卡上直接看得到。
+  let plantNetMiss = !plantNetKey
+    ? "未配置 Pl@ntNet API Key"
+    : quotaKnownExhausted
+      ? "今日免费额度已用尽（本站已标记，1 小时内不再尝试）"
+      : "";
 
   if (plantNetKey && !quotaKnownExhausted) {
     const pnRes = await plantNetIdentify(dataUrl, plantNetKey, extraDataUrls).catch((e) => {
       console.warn("[Pl@ntNet] quick-path identify failed; falling back:", e);
-      return { verdict: null, quotaExhausted: false, status: 0, body: "" };
+      const msg = e instanceof Error ? e.message : String(e);
+      // plantNetIdentify 里 20 秒的 AbortController 触发时，fetch 抛的是 AbortError。
+      const aborted = (e as { name?: string } | null)?.name === "AbortError" || /abort/i.test(msg);
+      return {
+        verdict: null,
+        quotaExhausted: false,
+        status: 0,
+        // 请求地址里带着 api-key —— 错误原文要进痕迹、上卡片，先打码。
+        body: aborted ? "__TIMEOUT__" : msg.replace(/api-key=[^&\s]+/gi, "api-key=***"),
+      };
     });
     if (pnRes.quotaExhausted) await markPlantNetQuotaExhausted();
     const pn = pnRes.verdict;
@@ -5038,6 +5081,8 @@ async function runQuickIdentifyCore(
         `，置信度 ${pct}%。备选：${pn.candidates.join("、")}。` +
         `请以此专业判定为基准核对照片；若置信度偏低（低于 30%）或与照片明显不符，` +
         `请在 summary_zh 开头标注「疑似」并简述分歧依据。`;
+    } else {
+      plantNetMiss = describePlantNetMiss(pnRes);
     }
   }
 
@@ -5055,9 +5100,10 @@ async function runQuickIdentifyCore(
       trace.primaryLabel = dv.label;
     }
   }
+  if (primaryEngine !== "plantnet" && plantNetMiss) trace.primaryNote = plantNetMiss;
   console.log(
     `[Phase1] 一线引擎=${primaryEngine}（${primaryLabel}）` +
-      (quotaKnownExhausted ? " · Pl@ntNet 额度已标记用尽，本次跳过" : ""),
+      (plantNetMiss ? ` · Pl@ntNet 未参与：${plantNetMiss}` : ""),
   );
 
   let quick = await identifyQuick(dataUrl, place, {
@@ -5163,9 +5209,12 @@ async function runQuickIdentifyCore(
     // 采纳（确认或纠正物种）→ 直接出确诊卡、跳过补拍；它同样没把握 → 维持疑似 → 照常进
     // 补拍。补拍满 3 次不再复核（那已是强制出终局结论的关卡）。未配置二次复核模型 / 请求失败 →
     // secondOpinionIdentify 返回 null → 行为与改动前完全一致。
-    // primaryEngine==="vision" 时跳过：一线已经是二次复核模型看过这张图了，同一个模型再看一遍
-    // 基本不会得出不同结论，白花一次调用 —— 直接照常进补拍。
-    if (meta.identification_confidence === "low" && retakeCount < 3 && primaryEngine !== "vision") {
+    // 🔴 一线定种由复核模型顶替时（primaryEngine==="vision"）**照样复核**（2026-09-15 改）。
+    // 以前这里直接跳过，理由是「同一个模型再看一遍白花一次调用」—— 可复核序列早就不止一个模型。
+    // 09-15 实例：Pl@ntNet 请求失败 → 序列 1 的 qwen3.7-plus 顶替定种 → 出卡仍判疑似 → 复核被跳过，
+    // 而序列 2 的 qwen-vl-max 根本没看过这张图。现在只排除**刚做过顶替定种的那个模型**，从下一个开始；
+    // 序列里没有别的模型时，withSecondOpinionSlots 会把原因如实写进痕迹。
+    if (meta.identification_confidence === "low" && retakeCount < 3) {
       const candidate = [meta.title, meta.scientific_name]
         .map((s) => (s || "").toString().trim())
         .filter(Boolean)
@@ -5176,6 +5225,7 @@ async function runQuickIdentifyCore(
         candidate,
         plantNetHint,
         failures: reviewFailures,
+        excludeModels: primaryEngine === "vision" && secondPrimary ? [secondPrimary.model] : [],
       });
       if (!second) {
         // **这就是用户那个疑问的真凶**：复核该跑、也确实被调用了，但 429 限流 / 30s 超时 /
@@ -5234,15 +5284,9 @@ async function runQuickIdentifyCore(
         };
       }
     } else if (meta.identification_confidence === "low") {
-      // 确实是疑似，但被闸门另外两个条件挡下了 —— 同样要说清为什么没复核，
+      // 确实是疑似，但补拍已满 3 次 —— 同样要说清为什么没复核，
       // 否则用户又会遇到「疑似了却没见复核」的同一个困惑。
-      trace.review = {
-        ran: false,
-        reason:
-          retakeCount >= 3
-            ? "已补拍 3 次，进入终局裁定，不再复核"
-            : "一线定种已由复核模型顶替，同一模型不重复复核",
-      };
+      trace.review = { ran: false, reason: "已补拍 3 次，进入终局裁定，不再复核" };
     }
 
     // 补拍满 3 次必须收口 —— 代码层硬保证，不依赖模型听话。

@@ -12,6 +12,14 @@ export type IdentifyTrace = {
   primaryEngine: string;
   primaryLabel: string;
   primaryPct: number | null;
+  /**
+   * Pl@ntNet **没给出判定**时的真实原因（2026-09-15 加）：未配置 / 额度用尽 / 请求失败（HTTP nnn）/
+   * 超时 / 网络错误 / 格式不支持 / 没认出物种。
+   * 以前卡片上一律写「额度用尽或未配置」—— 09-15 那次其实是请求失败（当天调用计数 0/500，
+   * 同一张照片几小时后重试 4 秒就 200），这句笼统的话把人往错误的方向引。
+   * 老痕迹没有这个字段，渲染时沿用旧说法（见 plantNetMissText）。
+   */
+  primaryNote?: string;
   phase1Model: string;
   phase1Confidence: string;
   review:
@@ -151,6 +159,33 @@ export function confZh(c: string): string {
   return c === "high" ? "确诊" : c === "medium" ? "较有把握" : c === "low" ? "疑似" : c || "—";
 }
 
+/** Pl@ntNet 那一行「未参与」的写法：有真实原因就写原因；老痕迹没有，就用调用方给的旧说法。 */
+export function plantNetMissText(t: Pick<IdentifyTrace, "primaryNote">, legacy: string): string {
+  return t.primaryNote ? `未参与：${t.primaryNote}` : legacy;
+}
+
+/**
+ * 把 plantNetIdentify 的失败返回翻译成一句人话，写进 `trace.primaryNote`。
+ * `status: 0` = 我们这边压根没拿到响应：`body === "__TIMEOUT__"` 是自己的 20 秒超时，否则 body 是网络错误原文。
+ */
+export function describePlantNetMiss(r: {
+  status: number;
+  body?: string;
+  quotaExhausted?: boolean;
+}): string {
+  const body = (r.body ?? "").toString();
+  if (r.quotaExhausted || r.status === 429) return "今日免费额度已用尽（HTTP 429）";
+  if (r.status === 0)
+    return body === "__TIMEOUT__"
+      ? "请求超时（20 秒没有返回）"
+      : `网络请求失败${body ? `（${body.slice(0, 60)}）` : ""}`;
+  if (r.status === 200) return "返回了结果，但没有识别出任何物种";
+  if (r.status === 401 || r.status === 403) return `API Key 无效或已停用（HTTP ${r.status}）`;
+  if (r.status === 404) return "没有识别出任何物种（HTTP 404）";
+  if (r.status === 415) return "照片格式不受支持（只收 JPEG / PNG）";
+  return `请求失败（HTTP ${r.status}）`;
+}
+
 /** 把痕迹摊成「① 专业引擎 → ② 一线模型 → ③ 二次复核」三行，供 UI 逐条渲染。 */
 export function traceSteps(t: IdentifyTrace): { label: string; value: string }[] {
   const out: { label: string; value: string }[] = [];
@@ -165,10 +200,10 @@ export function traceSteps(t: IdentifyTrace): { label: string; value: string }[]
   } else if (t.primaryEngine === "vision") {
     out.push({
       label: "专业引擎 Pl@ntNet",
-      value: `未参与（额度用尽或未配置）→ 由复核模型顶替定种：${t.primaryLabel}`,
+      value: `${plantNetMissText(t, "未参与（额度用尽或未配置）")} → 由复核模型顶替定种：${t.primaryLabel}`,
     });
   } else {
-    out.push({ label: "专业引擎 Pl@ntNet", value: "未参与" });
+    out.push({ label: "专业引擎 Pl@ntNet", value: plantNetMissText(t, "未参与") });
   }
   out.push({
     // 🔴 **不写具体模型名**（用户 2026-07-31）。模型换得很勤，写在读者面前的那一行迟早是
